@@ -15,8 +15,8 @@ let package = Package(
         .executable(name: "ptrtests", targets: ["ptrtests"]) 
     ],
     targets: [
-        .target(name: "SwiftFTR", path: "Sources/ParallelTraceroute"),
-        .executableTarget(name: "swift-ftr", dependencies: ["SwiftFTR"], path: "Sources/ptroute"),
+        .target(name: "SwiftFTR", path: "Sources/SwiftFTR"),
+        .executableTarget(name: "swift-ftr", dependencies: ["SwiftFTR"], path: "Sources/swift-ftr"),
         .executableTarget(name: "icmpfuzz", dependencies: ["SwiftFTR"]),
         .executableTarget(
             name: "icmpfuzzer",
