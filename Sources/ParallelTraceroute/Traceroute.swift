@@ -8,6 +8,9 @@ public struct TraceHop: Sendable {
     public let host: String?
     public let rtt: TimeInterval?
     public let reachedDestination: Bool
+    public init(ttl: Int, host: String?, rtt: TimeInterval?, reachedDestination: Bool) {
+        self.ttl = ttl; self.host = host; self.rtt = rtt; self.reachedDestination = reachedDestination
+    }
 }
 
 public struct TraceResult: Sendable {
@@ -15,6 +18,12 @@ public struct TraceResult: Sendable {
     public let maxHops: Int
     public let reached: Bool
     public let hops: [TraceHop]
+    public init(destination: String, maxHops: Int, reached: Bool, hops: [TraceHop]) {
+        self.destination = destination
+        self.maxHops = maxHops
+        self.reached = reached
+        self.hops = hops
+    }
 }
 
 public enum TracerouteError: Error, CustomStringConvertible {
@@ -183,6 +192,22 @@ public struct ParallelTraceroute: Sendable {
             hops: finalHops
         )
         return result
+    }
+
+    public func traceClassified(
+        to host: String,
+        maxHops: Int = 30,
+        timeout: TimeInterval = 1.0,
+        payloadSize: Int = 56,
+        resolver: ASNResolver = CymruDNSResolver()
+    ) async throws -> ClassifiedTrace {
+        // Do the trace
+        let destAddr = try resolveIPv4(host: host)
+        let destIP = ipString(destAddr)
+        let tr = try await trace(to: host, maxHops: maxHops, timeout: timeout, payloadSize: payloadSize)
+        // Classify
+        let classifier = TraceClassifier()
+        return try classifier.classify(trace: tr, destinationIP: destIP, resolver: resolver, timeout: 1.5)
     }
 }
 

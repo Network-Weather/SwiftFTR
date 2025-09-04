@@ -11,7 +11,8 @@ let package = Package(
         .executable(name: "ptroute", targets: ["ptroute"]),
         .executable(name: "icmpfuzz", targets: ["icmpfuzz"]),
         .executable(name: "icmpfuzzer", targets: ["icmpfuzzer"]),
-        .executable(name: "genseeds", targets: ["genseeds"]) 
+        .executable(name: "genseeds", targets: ["genseeds"]),
+        .executable(name: "ptrtests", targets: ["ptrtests"]) 
     ],
     targets: [
         .target(name: "ParallelTraceroute"),
@@ -25,6 +26,7 @@ let package = Package(
                 .unsafeFlags(["-sanitize=fuzzer,address,undefined", "-D", "WITH_LIBFUZZER"], .when(platforms: [.linux]))
             ]
         ),
-        .executableTarget(name: "genseeds")
+        .executableTarget(name: "genseeds"),
+        .executableTarget(name: "ptrtests", dependencies: ["ParallelTraceroute"])
     ]
 )

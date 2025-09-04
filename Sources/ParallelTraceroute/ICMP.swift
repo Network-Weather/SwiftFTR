@@ -186,3 +186,30 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
 public func __fuzz_parseICMP(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr_storage) -> Bool {
     return parseICMPv4Message(buffer: buffer, from: saStorage) != nil
 }
+
+@_spi(Test)
+public struct TestParsedICMP: Sendable {
+    public enum Kind: Sendable {
+        case echoReply(id: UInt16, seq: UInt16)
+        case timeExceeded(id: UInt16?, seq: UInt16?)
+        case destinationUnreachable(id: UInt16?, seq: UInt16?)
+        case other(type: UInt8, code: UInt8)
+    }
+    public let kind: Kind
+    public let source: String
+}
+
+@_spi(Test)
+public func __parseICMPMessage(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr_storage) -> TestParsedICMP? {
+    guard let p = parseICMPv4Message(buffer: buffer, from: saStorage) else { return nil }
+    switch p.kind {
+    case .echoReply(let id, let seq):
+        return TestParsedICMP(kind: .echoReply(id: id, seq: seq), source: p.sourceAddress)
+    case .timeExceeded(let oid, let oseq):
+        return TestParsedICMP(kind: .timeExceeded(id: oid, seq: oseq), source: p.sourceAddress)
+    case .destinationUnreachable(let oid, let oseq):
+        return TestParsedICMP(kind: .destinationUnreachable(id: oid, seq: oseq), source: p.sourceAddress)
+    case .other(let t, let c):
+        return TestParsedICMP(kind: .other(type: t, code: c), source: p.sourceAddress)
+    }
+}
