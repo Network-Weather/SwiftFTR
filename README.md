@@ -1,5 +1,5 @@
-ParallelTraceroute
-==================
+SwiftFTR
+========
 
 Massively parallel, async/await traceroute library for macOS using ICMP datagram sockets (no sudo required). It fires one ICMP Echo probe per TTL up to a hop limit, as fast as possible, then concurrently collects ICMP Time Exceeded and Echo Reply messages to map the path.
 
@@ -14,8 +14,8 @@ Swift version
 - Swift 6, macOS 13+
 
 Library API
-- `ParallelTraceroute().trace(to:maxHops:timeout:payloadSize:)` → `TraceResult` (default `maxHops=30`, `timeout=1.0s`)
-- `ParallelTraceroute().traceClassified(to:maxHops:timeout:payloadSize:resolver:)` → `ClassifiedTrace` with ASN/category info
+- `SwiftFTR().trace(to:maxHops:timeout:payloadSize:)` → `TraceResult` (default `maxHops=30`, `timeout=1.0s`)
+- `SwiftFTR().traceClassified(to:maxHops:timeout:payloadSize:resolver:)` → `ClassifiedTrace` with ASN/category info
 - `TraceResult` contains `hops: [TraceHop]`, each with `ttl`, `host` (or `nil` on timeout), `rtt`, and a `reachedDestination` flag for echo replies.
 
 Example (CLI)
@@ -23,17 +23,17 @@ Build and run the included sample executable:
 
 ```
 swift build -c release
-.build/release/ptroute 1.1.1.1 30 1
+.build/release/swift-ftr 1.1.1.1 30 1
 
 # JSON with ASN-based categories and STUN public IP discovery
-.build/release/ptroute --json www.nic.br 30 1
+.build/release/swift-ftr --json www.nic.br 30 1
 ```
 
 Programmatic usage
 ```
-import ParallelTraceroute
+import SwiftFTR
 
-let tracer = ParallelTraceroute()
+let tracer = SwiftFTR()
 let result = try await tracer.trace(to: "1.1.1.1", maxHops: 30, timeout: 1)
 for hop in result.hops {
     print(hop.ttl, hop.host ?? "*", hop.rtt ?? 0)

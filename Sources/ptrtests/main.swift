@@ -1,5 +1,5 @@
 import Foundation
-@_spi(Test) import ParallelTraceroute
+@_spi(Test) import SwiftFTR
 
 struct TestFailure: Error, CustomStringConvertible { let description: String }
 

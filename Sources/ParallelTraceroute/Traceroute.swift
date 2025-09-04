@@ -42,7 +42,7 @@ public enum TracerouteError: Error, CustomStringConvertible {
     }
 }
 
-public struct ParallelTraceroute: Sendable {
+public struct SwiftFTR: Sendable {
     public init() {}
 
     public func trace(

@@ -1,5 +1,5 @@
 import Foundation
-@_spi(Fuzz) import ParallelTraceroute
+@_spi(Fuzz) import SwiftFTR
 
 #if WITH_LIBFUZZER
 @_cdecl("LLVMFuzzerTestOneInput")

@@ -1,5 +1,5 @@
 import Foundation
-import ParallelTraceroute
+import SwiftFTR
 @_implementationOnly import Darwin
 
 @inline(__always)
@@ -56,7 +56,7 @@ struct App {
             ftr - fast traceroute (macOS ICMP DGRAM)
 
             Usage:
-              ptroute [options] <host>
+              swift-ftr [options] <host>
 
             Options:
               -m, --max-hops N       Maximum TTL/hops to probe (default 30)
@@ -91,7 +91,7 @@ struct App {
         }
         if showHelp || host == nil { printHelpAndExit() }
 
-        let tracer = ParallelTraceroute()
+        let tracer = SwiftFTR()
         do {
             if noSTUN { setenv("PTR_SKIP_STUN", "1", 1) }
             if let pip = publicIPOverride { setenv("PTR_PUBLIC_IP", pip, 1) }
@@ -170,7 +170,7 @@ struct App {
 
                 let root = Root(version: "0.6.0", target: classified.destinationHost, target_ip: classified.destinationIP, public_ip: classified.publicIP, isp: ispObj, destination_asn: destObj, hops: hops, protocol_: "ICMP", socket_mode: "Datagram")
                 let enc = JSONEncoder()
-                enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+                enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
                 let data = try enc.encode(root)
                 if let s = String(data: data, encoding: .utf8) { print(s) }
             } else {
