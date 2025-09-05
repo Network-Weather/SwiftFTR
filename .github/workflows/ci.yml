@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  macos:
+    name: macOS (SwiftPM)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Swift version
+        run: swift --version
+
+      - name: Build (debug)
+        run: swift build -c debug
+
+      - name: Test (debug, isolated)
+        env:
+          PTR_SKIP_STUN: "1"
+        run: swift test -c debug
+
+      - name: Build (release)
+        run: swift build -c release
+
