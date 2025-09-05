@@ -7,26 +7,35 @@ on:
     branches: [ main ]
 
 jobs:
-  macos:
-    name: macOS (SwiftPM)
-    runs-on: macos-14
+  format:
+    name: Formatting (Swift 6)
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+      - name: Select Xcode 16 (Swift 6)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '16.0'
+      - name: Swift version
+        run: swift --version
       - name: Formatting (lint)
         run: swift format lint -r Sources Tests
 
+  macos:
+    name: macOS (Build & Test)
+    runs-on: macos-14
+    needs: format
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
       - name: Swift version
         run: swift --version
-
       - name: Build (debug)
         run: swift build -c debug
-
       - name: Test (debug, isolated)
         env:
           PTR_SKIP_STUN: "1"
         run: swift test -c debug
-
       - name: Build (release)
         run: swift build -c release
