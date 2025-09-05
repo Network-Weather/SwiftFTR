@@ -21,11 +21,11 @@ final class SwiftFTRClassificationTests: XCTestCase {
     func testClassificationRulesAndHoleFilling() throws {
         // Synthetic trace: private -> CGNAT -> transit -> timeout -> destination
         let hops: [TraceHop] = [
-            .init(ttl: 1, host: "192.168.1.1", rtt: 0.001, reachedDestination: false),
-            .init(ttl: 2, host: "100.64.0.5", rtt: 0.002, reachedDestination: false),
-            .init(ttl: 3, host: "203.0.113.10", rtt: 0.003, reachedDestination: false),
-            .init(ttl: 4, host: nil, rtt: nil, reachedDestination: false),
-            .init(ttl: 5, host: "93.184.216.34", rtt: 0.010, reachedDestination: true)
+            .init(ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false),
+            .init(ttl: 2, ipAddress: "100.64.0.5", rtt: 0.002, reachedDestination: false),
+            .init(ttl: 3, ipAddress: "203.0.113.10", rtt: 0.003, reachedDestination: false),
+            .init(ttl: 4, ipAddress: nil, rtt: nil, reachedDestination: false),
+            .init(ttl: 5, ipAddress: "93.184.216.34", rtt: 0.010, reachedDestination: true)
         ]
         let tr = TraceResult(destination: "example.com", maxHops: 5, reached: true, hops: hops)
         let destIP = "93.184.216.34"
@@ -58,8 +58,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
 
     func testISPWhenClientASNMatchesHop() throws {
         let hops: [TraceHop] = [
-            .init(ttl: 1, host: "198.51.100.1", rtt: 0.001, reachedDestination: false),
-            .init(ttl: 2, host: "203.0.113.2", rtt: 0.003, reachedDestination: false)
+            .init(ttl: 1, ipAddress: "198.51.100.1", rtt: 0.001, reachedDestination: false),
+            .init(ttl: 2, ipAddress: "203.0.113.2", rtt: 0.003, reachedDestination: false)
         ]
         let tr = TraceResult(destination: "dst", maxHops: 2, reached: false, hops: hops)
         let mapping: [String: ASNInfo] = [
@@ -76,7 +76,7 @@ final class SwiftFTRClassificationTests: XCTestCase {
 
     func testCGNATClassifiedAsISP() throws {
         let hops: [TraceHop] = [
-            .init(ttl: 1, host: "100.64.12.34", rtt: 0.001, reachedDestination: false)
+            .init(ttl: 1, ipAddress: "100.64.12.34", rtt: 0.001, reachedDestination: false)
         ]
         let tr = TraceResult(destination: "dst", maxHops: 1, reached: false, hops: hops)
         let resolver = MockASNResolver(mapping: [:])
@@ -87,8 +87,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
 
     func testDestinationCategoryWhenASMatchesDestination() throws {
         let hops: [TraceHop] = [
-            .init(ttl: 1, host: "203.0.113.10", rtt: 0.001, reachedDestination: false),
-            .init(ttl: 2, host: "93.184.216.34", rtt: 0.010, reachedDestination: true)
+            .init(ttl: 1, ipAddress: "203.0.113.10", rtt: 0.001, reachedDestination: false),
+            .init(ttl: 2, ipAddress: "93.184.216.34", rtt: 0.010, reachedDestination: true)
         ]
         let tr = TraceResult(destination: "example.com", maxHops: 2, reached: true, hops: hops)
         let mapping: [String: ASNInfo] = [
@@ -104,9 +104,9 @@ final class SwiftFTRClassificationTests: XCTestCase {
     func testHoleFillingSameCategorySameASN() throws {
         // TRANSIT -> timeout -> TRANSIT, same ASN on both sides => fill category + ASN
         let hops: [TraceHop] = [
-            .init(ttl: 1, host: "203.0.113.1", rtt: 0.001, reachedDestination: false),
-            .init(ttl: 2, host: nil, rtt: nil, reachedDestination: false),
-            .init(ttl: 3, host: "203.0.113.2", rtt: 0.003, reachedDestination: false)
+            .init(ttl: 1, ipAddress: "203.0.113.1", rtt: 0.001, reachedDestination: false),
+            .init(ttl: 2, ipAddress: nil, rtt: nil, reachedDestination: false),
+            .init(ttl: 3, ipAddress: "203.0.113.2", rtt: 0.003, reachedDestination: false)
         ]
         let tr = TraceResult(destination: "dst", maxHops: 3, reached: false, hops: hops)
         let mapping: [String: ASNInfo] = [
@@ -122,9 +122,9 @@ final class SwiftFTRClassificationTests: XCTestCase {
     func testHoleFillingSameCategoryDifferentASN() throws {
         // TRANSIT -> timeout -> TRANSIT, different ASN on each side => fill category only
         let hops: [TraceHop] = [
-            .init(ttl: 1, host: "198.51.100.1", rtt: 0.001, reachedDestination: false),
-            .init(ttl: 2, host: nil, rtt: nil, reachedDestination: false),
-            .init(ttl: 3, host: "198.51.100.2", rtt: 0.003, reachedDestination: false)
+            .init(ttl: 1, ipAddress: "198.51.100.1", rtt: 0.001, reachedDestination: false),
+            .init(ttl: 2, ipAddress: nil, rtt: nil, reachedDestination: false),
+            .init(ttl: 3, ipAddress: "198.51.100.2", rtt: 0.003, reachedDestination: false)
         ]
         let tr = TraceResult(destination: "dst", maxHops: 3, reached: false, hops: hops)
         let mapping: [String: ASNInfo] = [

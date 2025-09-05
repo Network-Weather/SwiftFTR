@@ -95,14 +95,14 @@ struct StubResolver: ASNResolver {
 func testClassification() throws {
     // Build synthetic trace with gaps and mix of IPs
     let hops: [TraceHop] = [
-        .init(ttl: 1, host: "192.168.1.1", rtt: 0.001, reachedDestination: false), // LOCAL
-        .init(ttl: 2, host: "100.64.1.2", rtt: 0.005, reachedDestination: false),  // CGNAT -> ISP
-        .init(ttl: 3, host: nil, rtt: nil, reachedDestination: false),              // gap
-        .init(ttl: 4, host: nil, rtt: nil, reachedDestination: false),              // gap
-        .init(ttl: 5, host: "9.9.9.9", rtt: 0.010, reachedDestination: false),     // ISP (AS12345)
-        .init(ttl: 6, host: "203.0.113.1", rtt: 0.020, reachedDestination: false), // no ASN -> TRANSIT
-        .init(ttl: 7, host: "5.5.5.4", rtt: 0.030, reachedDestination: false),     // DEST ASN (AS555)
-        .init(ttl: 8, host: "5.5.5.5", rtt: 0.040, reachedDestination: true),      // destination
+        .init(ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false), // LOCAL
+        .init(ttl: 2, ipAddress: "100.64.1.2", rtt: 0.005, reachedDestination: false),  // CGNAT -> ISP
+        .init(ttl: 3, ipAddress: nil, rtt: nil, reachedDestination: false),              // gap
+        .init(ttl: 4, ipAddress: nil, rtt: nil, reachedDestination: false),              // gap
+        .init(ttl: 5, ipAddress: "9.9.9.9", rtt: 0.010, reachedDestination: false),     // ISP (AS12345)
+        .init(ttl: 6, ipAddress: "203.0.113.1", rtt: 0.020, reachedDestination: false), // no ASN -> TRANSIT
+        .init(ttl: 7, ipAddress: "5.5.5.4", rtt: 0.030, reachedDestination: false),     // DEST ASN (AS555)
+        .init(ttl: 8, ipAddress: "5.5.5.5", rtt: 0.040, reachedDestination: true),      // destination
     ]
     let tr = TraceResult(destination: "example.com", maxHops: 30, reached: true, hops: hops)
     let destIP = "5.5.5.5"
