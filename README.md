@@ -3,6 +3,8 @@ SwiftFTR
 
 Fast, parallel traceroute for Swift on macOS — no sudo required. SwiftFTR uses ICMP datagram sockets with async/await to probe every hop at once, then classifies the path into segments like LOCAL, ISP, TRANSIT, and DESTINATION.
 
+[API Documentation](https://network-weather.github.io/SwiftFTR/) — generated via DocC and published by GitHub Pages.
+
 Why SwiftFTR?
 -------------
 - No sudo: Uses `SOCK_DGRAM` with `IPPROTO_ICMP` on macOS, so you can run traceroute‑style measurements from apps, tests, and CI without elevated privileges.

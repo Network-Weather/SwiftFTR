@@ -15,7 +15,9 @@ let package = Package(
         .executable(name: "ptrtests", targets: ["ptrtests"]) 
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.1")
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.1"),
+        // Enables `swift package generate-documentation`
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.0")
     ],
     targets: [
         .target(name: "SwiftFTR", path: "Sources/SwiftFTR"),
