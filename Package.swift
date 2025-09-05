@@ -14,9 +14,19 @@ let package = Package(
         .executable(name: "genseeds", targets: ["genseeds"]),
         .executable(name: "ptrtests", targets: ["ptrtests"]) 
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.1")
+    ],
     targets: [
         .target(name: "SwiftFTR", path: "Sources/SwiftFTR"),
-        .executableTarget(name: "swift-ftr", dependencies: ["SwiftFTR"], path: "Sources/swift-ftr"),
+        .executableTarget(
+            name: "swift-ftr",
+            dependencies: [
+                "SwiftFTR",
+                .product(name: "ArgumentParser", package: "swift-argument-parser")
+            ],
+            path: "Sources/swift-ftr"
+        ),
         .executableTarget(name: "icmpfuzz", dependencies: ["SwiftFTR"]),
         .executableTarget(
             name: "icmpfuzzer",
