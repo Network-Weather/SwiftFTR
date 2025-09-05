@@ -98,10 +98,22 @@ struct App {
                 }
                 func oneDecimal(_ v: Double) -> Double { (v * 10).rounded() / 10 }
 
+                // Concurrent reverse DNS for all relevant IPs
+                let rdnsIPs = Set(allIPs)
+                var hostnameMap: [String: String] = [:]
+                await withTaskGroup(of: (String, String?).self) { group in
+                    for ip in rdnsIPs {
+                        group.addTask { (ip, reverseDNS(ip)) }
+                    }
+                    for await (ip, name) in group {
+                        if let n = name { hostnameMap[ip] = n }
+                    }
+                }
+
                 var hops: [HopObj] = []
                 for h in classified.hops {
                     if let ip = h.ip {
-                        let rdns = reverseDNS(ip)
+                        let rdns = hostnameMap[ip]
                         let seg = segString(h.category)
                         var asninfo: HopASN? = nil
                         if isPrivateIPv4(ip) {
@@ -125,7 +137,7 @@ struct App {
                 if let pip = classified.publicIP {
                     let name = asnMap[pip]?.name ?? ""
                     let asnStr = asnMap[pip].map { String($0.asn) } ?? ""
-                    let host = reverseDNS(pip) ?? pip
+                    let host = hostnameMap[pip] ?? pip
                     ispObj = ISPObj(asn: asnStr, name: name, hostname: host)
                 }
                 if let dest = asnMap[classified.destinationIP] {

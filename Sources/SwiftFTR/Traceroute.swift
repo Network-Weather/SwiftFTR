@@ -199,7 +199,7 @@ public struct SwiftFTR: Sendable {
         maxHops: Int = 30,
         timeout: TimeInterval = 1.0,
         payloadSize: Int = 56,
-        resolver: ASNResolver = CymruDNSResolver()
+        resolver: ASNResolver = CachingASNResolver(base: CymruDNSResolver())
     ) async throws -> ClassifiedTrace {
         // Do the trace
         let destAddr = try resolveIPv4(host: host)

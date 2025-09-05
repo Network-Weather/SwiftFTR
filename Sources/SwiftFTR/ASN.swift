@@ -18,6 +18,57 @@ public protocol ASNResolver: Sendable {
     func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo]
 }
 
+// Simple in-memory cache for ASN lookups with a soft capacity cap.
+final class _ASNMemoryCache: @unchecked Sendable {
+    static let shared = _ASNMemoryCache()
+    private let lock = NSLock()
+    private var map: [String: ASNInfo] = [:]
+    private var order: [String] = []
+    private let capacity = 2048
+
+    func getMany(_ keys: [String]) -> [String: ASNInfo] {
+        lock.lock(); defer { lock.unlock() }
+        var out: [String: ASNInfo] = [:]
+        for k in keys { if let v = map[k] { out[k] = v } }
+        return out
+    }
+
+    func setMany(_ items: [String: ASNInfo]) {
+        lock.lock(); defer { lock.unlock() }
+        for (k, v) in items {
+            if map[k] == nil { order.append(k) }
+            map[k] = v
+        }
+        // naive eviction
+        if map.count > capacity {
+            let over = map.count - capacity
+            if over > 0 && over <= order.count {
+                let drop = order.prefix(over)
+                for k in drop { map.removeValue(forKey: k) }
+                order.removeFirst(over)
+            }
+        }
+    }
+}
+
+public struct CachingASNResolver: ASNResolver {
+    private let base: ASNResolver
+    public init(base: ASNResolver) { self.base = base }
+    public func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo] {
+        let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
+        if ips.isEmpty { return [:] }
+        let cached = _ASNMemoryCache.shared.getMany(ips)
+        let missing = ips.filter { cached[$0] == nil }
+        var resolved: [String: ASNInfo] = cached
+        if !missing.isEmpty {
+            let res = try base.resolve(ipv4Addrs: missing, timeout: timeout)
+            if !res.isEmpty { _ASNMemoryCache.shared.setMany(res) }
+            for (k, v) in res { resolved[k] = v }
+        }
+        return resolved
+    }
+}
+
 // Team Cymru bulk WHOIS client (port 43). Batches queries to reduce load.
 public struct CymruWhoisResolver: ASNResolver {
     public init() {}
