@@ -43,6 +43,15 @@ jobs:
           # Add Pages config files
           touch docs-out/.nojekyll
           echo "$DOCS_DOMAIN" > docs-out/CNAME
+          # Force root redirect to module landing
+          cat > docs-out/index.html <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>SwiftFTR Docs</title>
+          <meta http-equiv="refresh" content="0; url=/documentation/swiftftr/">
+          <link rel="canonical" href="/documentation/swiftftr/">
+          <script>location.replace('/documentation/swiftftr/');</script>
+          HTML
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
