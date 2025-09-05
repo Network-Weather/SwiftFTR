@@ -16,7 +16,7 @@ final class SwiftFTRICMPTests: XCTestCase {
         sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         sin.sin_family = sa_family_t(AF_INET)
         sin.sin_addr = in_addr(s_addr: 0x01020304)
-        withUnsafePointer(to: &sin) { sp in
+        _ = withUnsafePointer(to: &sin) { sp in
             memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size)
         }
 
@@ -52,7 +52,7 @@ final class SwiftFTRICMPTests: XCTestCase {
         sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         sin.sin_family = sa_family_t(AF_INET)
         sin.sin_addr = in_addr(s_addr: 0x08080808)
-        withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
+        _ = withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
 
         let ok = pkt.withUnsafeBytes { raw -> Bool in
             guard let parsed = __parseICMPMessage(buffer: raw, from: ss) else { return false }
@@ -79,7 +79,7 @@ final class SwiftFTRICMPTests: XCTestCase {
 
         var ss = sockaddr_storage()
         var sin = sockaddr_in(); sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size); sin.sin_family = sa_family_t(AF_INET); sin.sin_addr = in_addr(s_addr: 0x7F000001)
-        withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
+        _ = withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
 
         let ok = pkt.withUnsafeBytes { raw -> Bool in
             guard let parsed = __parseICMPMessage(buffer: raw, from: ss) else { return false }

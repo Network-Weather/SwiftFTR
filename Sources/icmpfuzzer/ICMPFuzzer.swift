@@ -10,7 +10,7 @@ public func LLVMFuzzerTestOneInput(_ dataPtr: UnsafePointer<UInt8>, _ size: Int)
     sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     sin.sin_family = sa_family_t(AF_INET)
     sin.sin_addr = in_addr(s_addr: simpleHash32(buf))
-    withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
+    _ = withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
     _ = __fuzz_parseICMP(buffer: buf, from: ss)
     return 0
 }
@@ -37,7 +37,7 @@ struct CorpusRunner {
                     sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
                     sin.sin_family = sa_family_t(AF_INET)
                     sin.sin_addr = in_addr(s_addr: simpleHash32(raw))
-                    withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
+                    _ = withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
                     _ = __fuzz_parseICMP(buffer: raw, from: ss)
                 }
                 count += 1

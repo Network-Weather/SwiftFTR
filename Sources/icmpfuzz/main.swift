@@ -24,7 +24,7 @@ struct Fuzzer {
                 sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
                 sin.sin_family = sa_family_t(AF_INET)
                 sin.sin_addr = in_addr(s_addr: arc4random())
-                withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
+                _ = withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
             }
 
             buf.withUnsafeBytes { raw in

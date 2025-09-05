@@ -54,11 +54,11 @@ func testICMPParsing() throws {
     sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     sin.sin_family = sa_family_t(AF_INET)
     sin.sin_addr = in_addr(s_addr: UInt32(0x01020304).bigEndian)
-    withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
+    _ = withUnsafePointer(to: &sin) { sp in memcpy(&ss, sp, MemoryLayout<sockaddr_in>.size) }
 
     let id: UInt16 = 0xBEEF
     let seq: UInt16 = 0x0102
-    var pkt = makeEchoReply(id: id, seq: seq, payloadLen: 16)
+    let pkt = makeEchoReply(id: id, seq: seq, payloadLen: 16)
     pkt.withUnsafeBytes { raw in
         if let parsed = __parseICMPMessage(buffer: raw, from: ss) {
             switch parsed.kind {

@@ -144,7 +144,7 @@ struct App {
                     destObj = DestASNObj(asn: dest.asn, name: dest.name, country_code: dest.countryCode)
                 }
 
-                let root = Root(version: "0.6.0", target: classified.destinationHost, target_ip: classified.destinationIP, public_ip: classified.publicIP, isp: ispObj, destination_asn: destObj, hops: hops, protocol_: "ICMP", socket_mode: "Datagram")
+                let root = Root(version: "0.1.0", target: classified.destinationHost, target_ip: classified.destinationIP, public_ip: classified.publicIP, isp: ispObj, destination_asn: destObj, hops: hops, protocol_: "ICMP", socket_mode: "Datagram")
                 let enc = JSONEncoder()
                 enc.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
                 let data = try enc.encode(root)
