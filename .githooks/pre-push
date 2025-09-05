@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[pre-push] Linting Swift formatting..."
+
+if ! command -v swift >/dev/null 2>&1; then
+  echo "[pre-push] swift not found; skipping format lint." >&2
+  exit 0
+fi
+
+# Lint all Swift sources; fail push on violations
+swift format lint -r Sources Tests
+
+echo "[pre-push] Formatting OK."
+

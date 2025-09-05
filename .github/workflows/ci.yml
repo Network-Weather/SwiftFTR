@@ -14,6 +14,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Formatting (lint)
+        run: swift format lint -r Sources Tests
+
       - name: Swift version
         run: swift --version
 
@@ -27,4 +30,3 @@ jobs:
 
       - name: Build (release)
         run: swift build -c release
-

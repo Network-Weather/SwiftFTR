@@ -153,6 +153,17 @@ Generate and view the docs:
   open docs/index.html
   ```
 
+Formatting & Hooks
+------------------
+- Lint formatting locally before pushing:
+  ```bash
+  swift format lint -r Sources Tests
+  ```
+- Optional: install repo hooks so pushes fail on formatting issues:
+  ```bash
+  git config core.hooksPath .githooks
+  ```
+
 License
 -------
 MIT — see LICENSE.
