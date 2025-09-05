@@ -10,11 +10,13 @@ func ipString(_ sin: sockaddr_in) -> String {
     _ = withUnsafePointer(to: &sin.sin_addr) { ptr in
         inet_ntop(AF_INET, ptr, &buf, socklen_t(INET_ADDRSTRLEN))
     }
-    return String(cString: buf)
+    return buf.withUnsafeBufferPointer { ptr in
+        return String(cString: ptr.baseAddress!)
+    }
 }
 
 @inline(__always)
-func isPrivateIPv4(_ ip: String) -> Bool {
+public func isPrivateIPv4(_ ip: String) -> Bool {
     // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, link-local 169.254/16
     let parts = ip.split(separator: ".").compactMap { Int($0) }
     guard parts.count == 4 else { return false }
@@ -27,7 +29,7 @@ func isPrivateIPv4(_ ip: String) -> Bool {
 }
 
 @inline(__always)
-func isCGNATIPv4(_ ip: String) -> Bool {
+public func isCGNATIPv4(_ ip: String) -> Bool {
     // 100.64.0.0/10
     let parts = ip.split(separator: ".").compactMap { Int($0) }
     guard parts.count == 4 else { return false }
@@ -35,7 +37,7 @@ func isCGNATIPv4(_ ip: String) -> Bool {
     return a == 100 && (64...127).contains(b)
 }
 
-func reverseDNS(ipv4: String) -> String? {
+public func reverseDNS(_ ipv4: String) -> String? {
     var sin = sockaddr_in()
     sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     sin.sin_family = sa_family_t(AF_INET)
@@ -47,6 +49,21 @@ func reverseDNS(ipv4: String) -> String? {
             getnameinfo(saptr, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0, 0)
         }
     }
-    if res == 0 { return String(cString: host) }
+    if res == 0 {
+        return host.withUnsafeBufferPointer { ptr in
+            String(cString: ptr.baseAddress!)
+        }
+    }
     return nil
+}
+
+@inline(__always)
+func monotonicNow() -> TimeInterval {
+    var ts = timespec()
+    #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
+    _ = clock_gettime(CLOCK_MONOTONIC, &ts)
+    #else
+    _ = clock_gettime(CLOCK_MONOTONIC, &ts)
+    #endif
+    return TimeInterval(ts.tv_sec) + TimeInterval(ts.tv_nsec) / 1_000_000_000
 }

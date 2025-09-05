@@ -112,7 +112,9 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
                     var sin = sinPtr.pointee
                     var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
                     _ = inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
-                    return String(cString: buf)
+                    return buf.withUnsafeBufferPointer { ptr in
+                        String(cString: ptr.baseAddress!)
+                    }
                 }
             }
         }

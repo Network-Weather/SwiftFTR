@@ -84,7 +84,7 @@ public struct SwiftFTR: Sendable {
             }
             let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
             let packet = makeICMPEchoRequest(identifier: identifier, sequence: seq, payloadSize: payloadSize)
-            let sentAt = CFAbsoluteTimeGetCurrent()
+            let sentAt = monotonicNow()
             var addr = destAddr
             let sent = packet.withUnsafeBytes { rawBuf in
                 withUnsafePointer(to: &addr) { aptr -> ssize_t in
@@ -101,8 +101,9 @@ public struct SwiftFTR: Sendable {
         var hops: [TraceHop?] = Array(repeating: nil, count: maxHops)
         var reachedTTL: Int? = nil
 
-        let deadline = CFAbsoluteTimeGetCurrent() + timeout
+        let deadline = monotonicNow() + timeout
         var storage = sockaddr_storage()
+        var buf = [UInt8](repeating: 0, count: 2048)
 
         // Receive loop until timeout or all TTLs resolved up to reachedTTL
         recvLoop: while CFAbsoluteTimeGetCurrent() < deadline {
@@ -113,7 +114,6 @@ public struct SwiftFTR: Sendable {
 
             // Drain available datagrams
             while true {
-                var buf = [UInt8](repeating: 0, count: 2048)
                 var addrlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
                 let n = withUnsafeMutablePointer(to: &storage) { sptr -> ssize_t in
                     sptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
@@ -134,7 +134,7 @@ public struct SwiftFTR: Sendable {
                 case .echoReply(let id, let seq):
                     guard id == identifier else { continue }
                     if let info = outstanding.removeValue(forKey: seq) {
-                        let rtt = CFAbsoluteTimeGetCurrent() - info.sentAt
+                        let rtt = monotonicNow() - info.sentAt
                         let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
                         if hops[hopIndex] == nil {
                             hops[hopIndex] = TraceHop(ttl: info.ttl, host: parsed.sourceAddress, rtt: rtt, reachedDestination: true)
@@ -146,7 +146,7 @@ public struct SwiftFTR: Sendable {
                     if let seq = originalSeq, let info = outstanding[seq] {
                         let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
                         if hops[hopIndex] == nil {
-                            let rtt = CFAbsoluteTimeGetCurrent() - info.sentAt
+                            let rtt = monotonicNow() - info.sentAt
                             hops[hopIndex] = TraceHop(ttl: info.ttl, host: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
                         }
                     }
@@ -154,7 +154,7 @@ public struct SwiftFTR: Sendable {
                     guard originalID == nil || originalID == identifier else { continue }
                     if let seq = originalSeq, let info = outstanding.removeValue(forKey: seq) {
                         let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
-                        let rtt = CFAbsoluteTimeGetCurrent() - info.sentAt
+                        let rtt = monotonicNow() - info.sentAt
                         if hops[hopIndex] == nil {
                             hops[hopIndex] = TraceHop(ttl: info.ttl, host: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
                         }

@@ -1,42 +1,6 @@
 import Foundation
 import SwiftFTR
-@_implementationOnly import Darwin
-
-@inline(__always)
-func isPrivateIPv4(_ ip: String) -> Bool {
-    let parts = ip.split(separator: ".").compactMap { Int($0) }
-    guard parts.count == 4 else { return false }
-    let a = parts[0], b = parts[1]
-    if a == 10 { return true }
-    if a == 172 && (16...31).contains(b) { return true }
-    if a == 192 && b == 168 { return true }
-    if a == 169 && b == 254 { return true }
-    return false
-}
-
-@inline(__always)
-func isCGNATIPv4(_ ip: String) -> Bool {
-    let parts = ip.split(separator: ".").compactMap { Int($0) }
-    guard parts.count == 4 else { return false }
-    let a = parts[0], b = parts[1]
-    return a == 100 && (64...127).contains(b)
-}
-
-@inline(__always)
-func rdnsLookup(_ ipv4: String) -> String? {
-    var sin = sockaddr_in()
-    sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    sin.sin_family = sa_family_t(AF_INET)
-    let ok = ipv4.withCString { cs in inet_pton(AF_INET, cs, &sin.sin_addr) }
-    guard ok == 1 else { return nil }
-    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-    let res = withUnsafePointer(to: &sin) { aptr in
-        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-            getnameinfo(saptr, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0, 0)
-        }
-    }
-    return (res == 0) ? String(cString: host) : nil
-}
+import Darwin
 
 @main
 struct App {
@@ -137,7 +101,7 @@ struct App {
                 var hops: [HopObj] = []
                 for h in classified.hops {
                     if let ip = h.ip {
-                        let rdns = rdnsLookup(ip)
+                        let rdns = reverseDNS(ip)
                         let seg = segString(h.category)
                         var asninfo: HopASN? = nil
                         if isPrivateIPv4(ip) {
@@ -161,7 +125,7 @@ struct App {
                 if let pip = classified.publicIP {
                     let name = asnMap[pip]?.name ?? ""
                     let asnStr = asnMap[pip].map { String($0.asn) } ?? ""
-                    let host = rdnsLookup(pip) ?? pip
+                    let host = reverseDNS(pip) ?? pip
                     ispObj = ISPObj(asn: asnStr, name: name, hostname: host)
                 }
                 if let dest = asnMap[classified.destinationIP] {
@@ -198,7 +162,7 @@ struct App {
                         continue
                     }
                     let ip = hop.ip!
-                    let rdns = (useRDNS ? (rdnsLookup(ip) ?? ip) : ip)
+                    let rdns = (useRDNS ? (reverseDNS(ip) ?? ip) : ip)
                     let label = catLabel(hop.category)
                     let rttMs = hop.rtt.map { String(format: "%.3f ms", $0 * 1000) } ?? "timeout"
                     let right: String
@@ -218,7 +182,7 @@ struct App {
                 print("")
                 let pub = classified.publicIP
                 if let pub = pub {
-                    let rd = rdnsLookup(pub) ?? pub
+                    let rd = reverseDNS(pub) ?? pub
                     print("Detected public IP: \(pub) (\(rd))")
                 }
                 if let casn = classified.clientASN {

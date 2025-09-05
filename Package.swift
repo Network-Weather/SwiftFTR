@@ -27,6 +27,11 @@ let package = Package(
             ]
         ),
         .executableTarget(name: "genseeds"),
-        .executableTarget(name: "ptrtests", dependencies: ["SwiftFTR"])
+        .executableTarget(name: "ptrtests", dependencies: ["SwiftFTR"]),
+        .testTarget(
+            name: "SwiftFTRTests",
+            dependencies: ["SwiftFTR"],
+            path: "Tests/SwiftFTRTests"
+        )
     ]
 )
