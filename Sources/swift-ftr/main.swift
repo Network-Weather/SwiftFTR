@@ -168,13 +168,24 @@ struct App {
                     }
                 }
 
+                // Precompute reverse DNS concurrently when enabled
+                var hopHostnameMap: [String: String] = [:]
+                if useRDNS {
+                    var ips = Set(classified.hops.compactMap { $0.ip })
+                    if let pip = classified.publicIP { ips.insert(pip) }
+                    await withTaskGroup(of: (String, String?).self) { group in
+                        for ip in ips { group.addTask { (ip, reverseDNS(ip)) } }
+                        for await (ip, name) in group { if let n = name { hopHostnameMap[ip] = n } }
+                    }
+                }
+
                 for hop in classified.hops {
                     if hop.ip == nil {
                         print(String(format: "%2d", hop.ttl))
                         continue
                     }
                     let ip = hop.ip!
-                    let rdns = (useRDNS ? (reverseDNS(ip) ?? ip) : ip)
+                    let rdns = (useRDNS ? (hopHostnameMap[ip] ?? ip) : ip)
                     let label = catLabel(hop.category)
                     let rttMs = hop.rtt.map { String(format: "%.3f ms", $0 * 1000) } ?? "timeout"
                     let right: String
@@ -194,7 +205,7 @@ struct App {
                 print("")
                 let pub = classified.publicIP
                 if let pub = pub {
-                    let rd = reverseDNS(pub) ?? pub
+                    let rd = useRDNS ? (hopHostnameMap[pub] ?? pub) : pub
                     print("Detected public IP: \(pub) (\(rd))")
                 }
                 if let casn = classified.clientASN {
