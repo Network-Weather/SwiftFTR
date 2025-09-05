@@ -170,4 +170,13 @@ struct DNSClient {
         let name = labels.joined(separator: ".")
         return (name, off)
     }
+
+    // Expose parsing helpers to tests without networking.
+    @_spi(Test)
+    public static func __parseTXTAnswers(message: Data) -> [Answer]? {
+        return parseAnswers(message: message)
+    }
+
+    @_spi(Test)
+    public static func __encodeQName(_ name: String) -> [UInt8] { encodeQName(name) }
 }
