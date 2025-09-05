@@ -38,7 +38,7 @@ public struct TraceClassifier: Sendable {
         timeout: TimeInterval = 1.5
     ) throws -> ClassifiedTrace {
         // Gather IPs
-        let hopIPs: [String] = trace.hops.compactMap { $0.host }
+        let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
         var allIPs = Set(hopIPs)
         allIPs.insert(destinationIP)
         var publicIP: String? = nil
@@ -66,7 +66,7 @@ public struct TraceClassifier: Sendable {
         // Classify hops
         var out: [ClassifiedHop] = []
         for hop in trace.hops {
-            let ip = hop.host
+            let ip = hop.ipAddress
             var cat: HopCategory = .unknown
             var asn: Int? = nil
             var name: String? = nil

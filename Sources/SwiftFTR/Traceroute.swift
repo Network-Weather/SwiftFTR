@@ -3,26 +3,42 @@ import Foundation
 import Darwin
 #endif
 
+/// One hop result in a traceroute.
+/// - Note: `ipAddress` is the responder's IPv4 address string. It is not a hostname.
 public struct TraceHop: Sendable {
+    /// Time-To-Live probed for this hop (1-based).
     public let ttl: Int
-    public let host: String?
+    /// Responder IPv4 address as a string (not reverse-resolved). `nil` if timed out.
+    public let ipAddress: String?
+    /// Round-trip time in seconds for this hop, or `nil` if no reply.
     public let rtt: TimeInterval?
+    /// Whether this reply came from the destination host.
     public let reachedDestination: Bool
-    public init(ttl: Int, host: String?, rtt: TimeInterval?, reachedDestination: Bool) {
-        self.ttl = ttl; self.host = host; self.rtt = rtt; self.reachedDestination = reachedDestination
+    public init(ttl: Int, ipAddress: String?, rtt: TimeInterval?, reachedDestination: Bool) {
+        self.ttl = ttl; self.ipAddress = ipAddress; self.rtt = rtt; self.reachedDestination = reachedDestination
     }
+    @available(*, deprecated, message: "Use ipAddress instead", renamed: "ipAddress")
+    public var host: String? { ipAddress }
 }
 
+/// Complete result of a traceroute run.
 public struct TraceResult: Sendable {
+    /// Destination hostname or IP string as provided by the caller.
     public let destination: String
+    /// Maximum TTL probed in this run.
     public let maxHops: Int
+    /// Whether the destination responded.
     public let reached: Bool
+    /// Per-hop results in order from TTL=1.
     public let hops: [TraceHop]
-    public init(destination: String, maxHops: Int, reached: Bool, hops: [TraceHop]) {
+    /// Total wall-clock duration (seconds) measured for the trace.
+    public let duration: TimeInterval
+    public init(destination: String, maxHops: Int, reached: Bool, hops: [TraceHop], duration: TimeInterval = 0) {
         self.destination = destination
         self.maxHops = maxHops
         self.reached = reached
         self.hops = hops
+        self.duration = duration
     }
 }
 
@@ -45,6 +61,13 @@ public enum TracerouteError: Error, CustomStringConvertible {
 public struct SwiftFTR: Sendable {
     public init() {}
 
+    /// Perform a fast traceroute by sending one ICMP Echo per TTL and waiting once.
+    /// - Parameters:
+    ///   - host: Destination hostname or IPv4 address.
+    ///   - maxHops: Maximum TTL to probe. Typical internet paths are under 30.
+    ///   - timeout: Overall wait (seconds) after sending all probes. Controls wall-clock duration.
+    ///   - payloadSize: Size in bytes of the Echo payload. Larger payloads can influence path/MTU behavior.
+    /// - Returns: A `TraceResult` with ordered hops and whether the destination responded.
     public func trace(
         to host: String,
         maxHops: Int = 30,
@@ -59,11 +82,12 @@ public struct SwiftFTR: Sendable {
         if fd < 0 { throw TracerouteError.socketCreateFailed(errno: errno) }
         defer { close(fd) }
 
-        // Set non-blocking
+        // Set non-blocking: avoid blocking recvfrom; we use poll(2) for readiness.
         let flags = fcntl(fd, F_GETFL, 0)
         _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
-        // Enable receiving TTL of replies (best-effort)
+        // Enable receiving TTL of replies (best-effort). Some stacks may not support IP_RECVTTL; this is non-fatal
+        // and only affects extra metadata, not core correctness.
         var on: Int32 = 1
         if setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, socklen_t(MemoryLayout<Int32>.size)) != 0 {
             // Not fatal; ignore
@@ -101,11 +125,16 @@ public struct SwiftFTR: Sendable {
         var hops: [TraceHop?] = Array(repeating: nil, count: maxHops)
         var reachedTTL: Int? = nil
 
+        // Global deadline for the receive loop. We probe all TTLs up-front,
+        // then wait until either all earlier hops are filled or the timeout hits.
+        let startWall = Date()
         let deadline = monotonicNow() + timeout
         var storage = sockaddr_storage()
-        var buf = [UInt8](repeating: 0, count: 2048)
+        // Use a named constant to avoid magic numbers for buffer sizes.
+        var buf = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
 
-        // Receive loop until timeout or all TTLs resolved up to reachedTTL
+        // Receive loop until timeout or all TTLs resolved up to reachedTTL.
+        // The loop uses poll(2) to wait for readability and then drains datagrams.
         recvLoop: while CFAbsoluteTimeGetCurrent() < deadline {
             var fds = Darwin.pollfd(fd: fd, events: Int16(Darwin.POLLIN), revents: 0)
             let msLeft = Int32(max(0, (deadline - CFAbsoluteTimeGetCurrent()) * 1000))
@@ -137,7 +166,7 @@ public struct SwiftFTR: Sendable {
                         let rtt = monotonicNow() - info.sentAt
                         let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
                         if hops[hopIndex] == nil {
-                            hops[hopIndex] = TraceHop(ttl: info.ttl, host: parsed.sourceAddress, rtt: rtt, reachedDestination: true)
+                            hops[hopIndex] = TraceHop(ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: true)
                         }
                         if reachedTTL == nil || info.ttl < reachedTTL! { reachedTTL = info.ttl }
                     }
@@ -147,7 +176,7 @@ public struct SwiftFTR: Sendable {
                         let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
                         if hops[hopIndex] == nil {
                             let rtt = monotonicNow() - info.sentAt
-                            hops[hopIndex] = TraceHop(ttl: info.ttl, host: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
+                            hops[hopIndex] = TraceHop(ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
                         }
                     }
                 case .destinationUnreachable(let originalID, let originalSeq):
@@ -156,7 +185,7 @@ public struct SwiftFTR: Sendable {
                         let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
                         let rtt = monotonicNow() - info.sentAt
                         if hops[hopIndex] == nil {
-                            hops[hopIndex] = TraceHop(ttl: info.ttl, host: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
+                            hops[hopIndex] = TraceHop(ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
                         }
                         // Destination unreachable could mean we've hit the dest depending on method, but for ICMP echo it usually signals admin blocks; keep going
                     }
@@ -180,7 +209,7 @@ public struct SwiftFTR: Sendable {
         for ttl in 1...cutoff {
             let idx = ttl - 1
             if hops[idx] == nil {
-                hops[idx] = TraceHop(ttl: ttl, host: nil, rtt: nil, reachedDestination: false)
+                hops[idx] = TraceHop(ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false)
             }
         }
 
@@ -189,7 +218,8 @@ public struct SwiftFTR: Sendable {
             destination: host,
             maxHops: maxHops,
             reached: reachedTTL != nil,
-            hops: finalHops
+            hops: finalHops,
+            duration: Date().timeIntervalSince(startWall)
         )
         return result
     }
@@ -246,3 +276,8 @@ fileprivate func resolveIPv4(host: String) throws -> sockaddr_in {
 }
 
 // Use Darwin.poll and Darwin.pollfd directly
+
+private enum Constants {
+    /// Receive buffer size for incoming ICMP datagrams.
+    static let receiveBufferSize = 2048
+}
