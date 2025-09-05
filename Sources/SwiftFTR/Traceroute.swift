@@ -48,11 +48,16 @@ public struct TraceResult: Sendable {
   }
 }
 
+/// Errors that can occur while performing a traceroute.
 public enum TracerouteError: Error, CustomStringConvertible {
-  case resolutionFailed
-  case socketCreateFailed(errno: Int32)
-  case setsockoptFailed(option: String, errno: Int32)
-  case sendFailed(errno: Int32)
+    /// DNS resolution failed for the destination host.
+    case resolutionFailed
+    /// Creating the socket failed; the associated errno is provided.
+    case socketCreateFailed(errno: Int32)
+    /// Setting a socket option failed (e.g., IP_TTL); associated option and errno are provided.
+    case setsockoptFailed(option: String, errno: Int32)
+    /// Sending a probe failed; the associated errno is provided.
+    case sendFailed(errno: Int32)
 
   public var description: String {
     switch self {
@@ -65,8 +70,10 @@ public enum TracerouteError: Error, CustomStringConvertible {
   }
 }
 
+/// Top-level entry point for performing fast, parallel traceroutes.
 public struct SwiftFTR: Sendable {
-  public init() {}
+    /// Creates a tracer instance. Stateless and safe to reuse.
+    public init() {}
 
   /// Perform a fast traceroute by sending one ICMP Echo per TTL and waiting once.
   /// - Parameters:
@@ -242,13 +249,26 @@ public struct SwiftFTR: Sendable {
     return result
   }
 
-  public func traceClassified(
-    to host: String,
-    maxHops: Int = 30,
-    timeout: TimeInterval = 1.0,
-    payloadSize: Int = 56,
-    resolver: ASNResolver = CachingASNResolver(base: CymruDNSResolver())
-  ) async throws -> ClassifiedTrace {
+    /// Perform a traceroute and enrich results with ASN-based categorization.
+    ///
+    /// This variant computes the client's public IP (via STUN by default), resolves
+    /// origin ASNs for relevant IP addresses using the provided resolver, and labels
+    /// each hop as LOCAL, ISP, TRANSIT, or DESTINATION. Missing stretches between
+    /// identical segments are interpolated for readability.
+    /// - Parameters:
+    ///   - host: Destination hostname or IPv4 address.
+    ///   - maxHops: Maximum TTL to probe.
+    ///   - timeout: Overall wait (seconds) after sending all probes.
+    ///   - payloadSize: Echo payload size in bytes.
+    ///   - resolver: ASN resolver implementation (default: DNS-based Team Cymru with cache).
+    /// - Returns: A ClassifiedTrace containing segment labels and (when available) ASN info.
+    public func traceClassified(
+        to host: String,
+        maxHops: Int = 30,
+        timeout: TimeInterval = 1.0,
+        payloadSize: Int = 56,
+        resolver: ASNResolver = CachingASNResolver(base: CymruDNSResolver())
+    ) async throws -> ClassifiedTrace {
     // Do the trace
     let destAddr = try resolveIPv4(host: host)
     let destIP = ipString(destAddr)

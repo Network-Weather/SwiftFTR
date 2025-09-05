@@ -4,6 +4,7 @@ import Foundation
   import Darwin
 #endif
 
+/// Autonomous System Number (ASN) metadata for an IP address or prefix.
 public struct ASNInfo: Sendable, Hashable, Codable {
   public let asn: Int
   public let name: String
@@ -22,7 +23,13 @@ public struct ASNInfo: Sendable, Hashable, Codable {
   }
 }
 
+/// Resolves origin ASNs and related metadata for IPv4 addresses.
 public protocol ASNResolver: Sendable {
+  /// Resolve metadata for the given IPv4 addresses.
+  /// - Parameters:
+  ///   - ipv4Addrs: IPv4 addresses as dotted-quad strings.
+  ///   - timeout: Per-lookup timeout in seconds.
+  /// - Returns: Map of input IP -> ASNInfo for addresses with public routing data.
   func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo]
 }
 
@@ -61,6 +68,7 @@ final class _ASNMemoryCache: @unchecked Sendable {
   }
 }
 
+/// Decorator that caches results from an underlying ASNResolver in-memory.
 public struct CachingASNResolver: ASNResolver {
   private let base: ASNResolver
   public init(base: ASNResolver) { self.base = base }
@@ -80,6 +88,7 @@ public struct CachingASNResolver: ASNResolver {
 }
 
 // Team Cymru bulk WHOIS client (port 43). Batches queries to reduce load.
+/// Team Cymru bulk WHOIS client (TCP/43) for ASN lookups.
 public struct CymruWhoisResolver: ASNResolver {
   public init() {}
 
@@ -182,6 +191,7 @@ public struct CymruWhoisResolver: ASNResolver {
 }
 
 // Team Cymru DNS-based resolver using TXT queries.
+/// Team Cymru DNS-based resolver using TXT queries for origin ASN and AS names.
 public struct CymruDNSResolver: ASNResolver {
   public init() {}
 

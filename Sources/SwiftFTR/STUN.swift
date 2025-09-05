@@ -4,6 +4,7 @@ import Foundation
   import Darwin
 #endif
 
+/// Public IPv4 discovered via a STUN Binding request.
 public struct STUNPublicIP: Sendable {
   public let ip: String
 }

@@ -1,5 +1,6 @@
 import Foundation
 
+/// Coarse category for a hop in the path.
 public enum HopCategory: String, Sendable, Codable {
   case local = "LOCAL"
   case isp = "ISP"
@@ -8,6 +9,7 @@ public enum HopCategory: String, Sendable, Codable {
   case unknown = "UNKNOWN"
 }
 
+/// A hop annotated with ASN and category information.
 public struct ClassifiedHop: Sendable, Codable {
   public let ttl: Int
   public let ip: String?
@@ -17,6 +19,7 @@ public struct ClassifiedHop: Sendable, Codable {
   public let category: HopCategory
 }
 
+/// Result of a classified trace including destination/public IP metadata.
 public struct ClassifiedTrace: Sendable, Codable {
   public let destinationHost: String
   public let destinationIP: String
@@ -28,15 +31,23 @@ public struct ClassifiedTrace: Sendable, Codable {
   public let hops: [ClassifiedHop]
 }
 
+/// Classifies plain traceroute results into segments and attaches ASN metadata.
 public struct TraceClassifier: Sendable {
   public init() {}
 
-  public func classify(
-    trace: TraceResult,
-    destinationIP: String,
-    resolver: ASNResolver,
-    timeout: TimeInterval = 1.5
-  ) throws -> ClassifiedTrace {
+    /// Classify a TraceResult into segments using ASN lookups and heuristics.
+    /// - Parameters:
+    ///   - trace: Plain traceroute output to classify.
+    ///   - destinationIP: Destination IPv4 address (numeric string) for ASN matching.
+    ///   - resolver: ASN resolver to use (DNS- or WHOIS-based).
+    ///   - timeout: Per-lookup timeout in seconds.
+    /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
+    public func classify(
+        trace: TraceResult,
+        destinationIP: String,
+        resolver: ASNResolver,
+        timeout: TimeInterval = 1.5
+    ) throws -> ClassifiedTrace {
     // Gather IPs
     let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
     var allIPs = Set(hopIPs)

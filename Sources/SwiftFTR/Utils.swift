@@ -16,6 +16,7 @@ func ipString(_ sin: sockaddr_in) -> String {
   }
 }
 
+/// Returns true if the IPv4 string is in RFC1918 private or 169.254/16 link-local space.
 @inline(__always)
 public func isPrivateIPv4(_ ip: String) -> Bool {
   // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, link-local 169.254/16
@@ -30,6 +31,7 @@ public func isPrivateIPv4(_ ip: String) -> Bool {
   return false
 }
 
+/// Returns true if the IPv4 string is in RFC6598 CGNAT range (100.64.0.0/10).
 @inline(__always)
 public func isCGNATIPv4(_ ip: String) -> Bool {
   // 100.64.0.0/10
@@ -40,6 +42,8 @@ public func isCGNATIPv4(_ ip: String) -> Bool {
   return a == 100 && (64...127).contains(b)
 }
 
+/// Performs a best-effort reverse DNS lookup for the given IPv4 string.
+/// - Returns: A hostname if one exists, otherwise nil. Blocking but bounded by system resolver.
 public func reverseDNS(_ ipv4: String) -> String? {
   var sin = sockaddr_in()
   sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
