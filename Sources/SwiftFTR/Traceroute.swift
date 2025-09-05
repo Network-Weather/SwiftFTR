@@ -135,9 +135,9 @@ public struct SwiftFTR: Sendable {
 
         // Receive loop until timeout or all TTLs resolved up to reachedTTL.
         // The loop uses poll(2) to wait for readability and then drains datagrams.
-        recvLoop: while CFAbsoluteTimeGetCurrent() < deadline {
+        recvLoop: while monotonicNow() < deadline {
             var fds = Darwin.pollfd(fd: fd, events: Int16(Darwin.POLLIN), revents: 0)
-            let msLeft = Int32(max(0, (deadline - CFAbsoluteTimeGetCurrent()) * 1000))
+            let msLeft = Int32(max(0, (deadline - monotonicNow()) * 1000))
             let rv = withUnsafeMutablePointer(to: &fds) { p in Darwin.poll(p, 1, msLeft) }
             if rv <= 0 { break }
 
