@@ -55,5 +55,40 @@ final class SwiftFTRClassificationTests: XCTestCase {
         XCTAssertEqual(classified.hops[3].category, .unknown)
         XCTAssertEqual(classified.hops[4].category, .destination)
     }
-}
 
+    func testHoleFillingSameCategorySameASN() throws {
+        // TRANSIT -> timeout -> TRANSIT, same ASN on both sides => fill category + ASN
+        let hops: [TraceHop] = [
+            .init(ttl: 1, host: "203.0.113.1", rtt: 0.001, reachedDestination: false),
+            .init(ttl: 2, host: nil, rtt: nil, reachedDestination: false),
+            .init(ttl: 3, host: "203.0.113.2", rtt: 0.003, reachedDestination: false)
+        ]
+        let tr = TraceResult(destination: "dst", maxHops: 3, reached: false, hops: hops)
+        let mapping: [String: ASNInfo] = [
+            "203.0.113.1": ASNInfo(asn: 64500, name: "TransitNet", prefix: "203.0.113.0/24"),
+            "203.0.113.2": ASNInfo(asn: 64500, name: "TransitNet", prefix: "203.0.113.0/24")
+        ]
+        let resolver = MockASNResolver(mapping: mapping)
+        let classified = try TraceClassifier().classify(trace: tr, destinationIP: "198.51.100.10", resolver: resolver, timeout: 0.1)
+        XCTAssertEqual(classified.hops[1].category, .transit)
+        XCTAssertEqual(classified.hops[1].asn, 64500)
+    }
+
+    func testHoleFillingSameCategoryDifferentASN() throws {
+        // TRANSIT -> timeout -> TRANSIT, different ASN on each side => fill category only
+        let hops: [TraceHop] = [
+            .init(ttl: 1, host: "198.51.100.1", rtt: 0.001, reachedDestination: false),
+            .init(ttl: 2, host: nil, rtt: nil, reachedDestination: false),
+            .init(ttl: 3, host: "198.51.100.2", rtt: 0.003, reachedDestination: false)
+        ]
+        let tr = TraceResult(destination: "dst", maxHops: 3, reached: false, hops: hops)
+        let mapping: [String: ASNInfo] = [
+            "198.51.100.1": ASNInfo(asn: 64500, name: "TransitA", prefix: "198.51.100.0/24"),
+            "198.51.100.2": ASNInfo(asn: 64501, name: "TransitB", prefix: "198.51.100.0/24")
+        ]
+        let resolver = MockASNResolver(mapping: mapping)
+        let classified = try TraceClassifier().classify(trace: tr, destinationIP: "203.0.113.10", resolver: resolver, timeout: 0.1)
+        XCTAssertEqual(classified.hops[1].category, .transit)
+        XCTAssertNil(classified.hops[1].asn)
+    }
+}
