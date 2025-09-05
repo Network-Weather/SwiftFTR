@@ -10,6 +10,12 @@ Key points
 - IPv4 only, macOS-focused.
 - Route segmentation: classifies hops into `LOCAL`, `ISP`, `TRANSIT`, `DESTINATION` with hole-filling for non-responsive hops.
 
+Performance highlights
+- Monotonic RTT timing for stability under clock adjustments.
+- Reused receive buffers in hot paths to reduce allocations.
+- In-memory ASN cache to avoid repeated lookups within a process run.
+- Concurrent reverse DNS resolution (CLI) for faster output when hostnames are enabled.
+
 Swift version
 - Swift 6, macOS 13+
 
@@ -86,6 +92,9 @@ Testing
   - Build: `swift build -c debug`
   - Run: `.build/debug/ptrtests` (returns non-zero on failure)
   - What it covers: ICMP parsing (Echo Reply, Time Exceeded w/ embedded echo), classification rules (LOCAL/ISP/TRANSIT/DESTINATION, CGNAT handling, hole-filling). Uses env vars to avoid network.
+- XCTest (macOS + Xcode toolchain):
+  - Ensure Xcode is selected: `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`
+  - Run: `swift test -c debug` (CI sets `PTR_SKIP_STUN=1` for isolation)
 
 License
 - No license specified. Add one if you plan to distribute.
