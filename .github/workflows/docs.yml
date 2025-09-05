@@ -20,17 +20,17 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       DOCS_DOMAIN: swiftftr.networkweather.com
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select Xcode 15.4 (Swift 5.10)
+      - name: Select Xcode 16 (Swift 6)
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: '15.4'
+          xcode-version: '16.0'
 
       - name: Generate DocC
         run: |
