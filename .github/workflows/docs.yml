@@ -21,6 +21,8 @@ concurrency:
 jobs:
   build:
     runs-on: macos-14
+    env:
+      DOCS_DOMAIN: swiftftr.networkweather.com
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,9 +39,10 @@ jobs:
           swift package --allow-writing-to-directory docs-out \
             generate-documentation --target SwiftFTR \
             --output-path docs-out \
-            --transform-for-static-hosting \
-            --hosting-base-path SwiftFTR
+            --transform-for-static-hosting
+          # Add Pages config files
           touch docs-out/.nojekyll
+          echo "$DOCS_DOMAIN" > docs-out/CNAME
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
@@ -56,4 +59,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
