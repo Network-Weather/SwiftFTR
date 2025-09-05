@@ -3,6 +3,19 @@ import Foundation
 import Darwin
 #endif
 
+// Fileprivate helper so tests can call an SPI wrapper without exposing the type.
+fileprivate func _encodeQName(_ name: String) -> [UInt8] {
+    var out: [UInt8] = []
+    for label in name.trimmingCharacters(in: CharacterSet(charactersIn: ".")).split(separator: ".") {
+        let lb = Array(label.utf8)
+        guard lb.count < 64 else { continue }
+        out.append(UInt8(lb.count))
+        out.append(contentsOf: lb)
+    }
+    out.append(0) // terminator
+    return out
+}
+
 struct DNSClient {
     struct Answer {
         let name: String
@@ -58,7 +71,7 @@ struct DNSClient {
         append16(0)                // ARCOUNT
 
         // Question
-        msg.append(contentsOf: encodeQName(name))
+        msg.append(contentsOf: _encodeQName(name))
         append16(16)               // QTYPE TXT
         append16(1)                // QCLASS IN
 
@@ -98,18 +111,6 @@ struct DNSClient {
             if !chunks.isEmpty { out.append(chunks.joined()) }
         }
         return out.isEmpty ? nil : out
-    }
-
-    private static func encodeQName(_ name: String) -> [UInt8] {
-        var out: [UInt8] = []
-        for label in name.trimmingCharacters(in: CharacterSet(charactersIn: ".")).split(separator: ".") {
-            let lb = Array(label.utf8)
-            guard lb.count < 64 else { continue }
-            out.append(UInt8(lb.count))
-            out.append(contentsOf: lb)
-        }
-        out.append(0) // terminator
-        return out
     }
 
     private static func parseAnswers(message: Data) -> [Answer]? {
@@ -171,12 +172,59 @@ struct DNSClient {
         return (name, off)
     }
 
-    // Expose parsing helpers to tests without networking.
-    @_spi(Test)
-    public static func __parseTXTAnswers(message: Data) -> [Answer]? {
-        return parseAnswers(message: message)
-    }
+}
 
-    @_spi(Test)
-    public static func __encodeQName(_ name: String) -> [UInt8] { encodeQName(name) }
+// SPI: lightweight wrappers for tests (avoid exposing DNSClient or internals)
+@_spi(Test)
+public struct __TXTAnswer: Sendable {
+    public let type: UInt16
+    public let klass: UInt16
+    public let rdata: Data
+}
+
+@_spi(Test)
+public func __dnsEncodeQName(_ name: String) -> [UInt8] { _encodeQName(name) }
+
+@_spi(Test)
+public func __dnsParseTXTAnswers(message: Data) -> [__TXTAnswer]? {
+    // Minimal independent parser for TXT answers (sufficient for tests).
+    // This mirrors parseAnswers enough for tests.
+    let bytes = [UInt8](message)
+    if bytes.count < 12 { return nil }
+    func r16(_ off: Int) -> UInt16 { return (UInt16(bytes[off]) << 8) | UInt16(bytes[off+1]) }
+    func r32(_ off: Int) -> UInt32 { return (UInt32(bytes[off]) << 24) | (UInt32(bytes[off+1]) << 16) | (UInt32(bytes[off+2]) << 8) | UInt32(bytes[off+3]) }
+    let qd = Int(r16(4)); let an = Int(r16(6))
+    var off = 12
+    // skip questions
+    for _ in 0..<qd {
+        // skip qname
+        while off < bytes.count {
+            let len = Int(bytes[off]); off += 1
+            if len == 0 { break }
+            if (len & 0xC0) == 0xC0 { off += 1; break }
+            off += len
+        }
+        off += 4
+        if off > bytes.count { return nil }
+    }
+    var out: [__TXTAnswer] = []
+    for _ in 0..<an {
+        // skip name
+        if off >= bytes.count { return nil }
+        let b0 = Int(bytes[off])
+        if (b0 & 0xC0) == 0xC0 { off += 2 } else {
+            while off < bytes.count {
+                let len = Int(bytes[off]); off += 1
+                if len == 0 { break }
+                off += len
+            }
+        }
+        if off + 10 > bytes.count { return nil }
+        let typ = r16(off); let cls = r16(off+2); _ = r32(off+4); let rdlen = Int(r16(off+8)); off += 10
+        if off + rdlen > bytes.count { return nil }
+        let rdata = Data(bytes[off..<(off+rdlen)])
+        off += rdlen
+        out.append(__TXTAnswer(type: typ, klass: cls, rdata: rdata))
+    }
+    return out
 }

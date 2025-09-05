@@ -1,5 +1,5 @@
 import XCTest
-@testable import SwiftFTR
+@_spi(Test) import SwiftFTR
 
 final class SwiftFTRDNSTests: XCTestCase {
     func testParseSingleTXTAnswer() {
@@ -16,7 +16,7 @@ final class SwiftFTRDNSTests: XCTestCase {
         a16(0)      // ARCOUNT
 
         // Question: name = AS15169.asn.cymru.com, TXT, IN
-        let qname = DNSClient.__encodeQName("AS15169.asn.cymru.com")
+        let qname = __dnsEncodeQName("AS15169.asn.cymru.com")
         msg.append(contentsOf: qname)
         a16(16) // QTYPE TXT
         a16(1)  // QCLASS IN
@@ -36,7 +36,7 @@ final class SwiftFTRDNSTests: XCTestCase {
         a16(UInt16(rdata.count))
         msg.append(contentsOf: rdata)
 
-        guard let answers = DNSClient.__parseTXTAnswers(message: msg) else {
+        guard let answers = __dnsParseTXTAnswers(message: msg) else {
             return XCTFail("Failed to parse DNS TXT answers")
         }
         XCTAssertEqual(answers.count, 1)
@@ -46,4 +46,3 @@ final class SwiftFTRDNSTests: XCTestCase {
         XCTAssertFalse(first.rdata.isEmpty)
     }
 }
-
