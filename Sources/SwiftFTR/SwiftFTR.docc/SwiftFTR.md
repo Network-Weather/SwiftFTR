@@ -21,7 +21,7 @@ import SwiftFTR
 let tracer = SwiftFTR()
 let result = try await tracer.trace(to: "1.1.1.1", maxHops: 30, timeout: 1.0)
 for hop in result.hops {
-    print(hop.ttl, hop.host ?? "*", hop.rtt ?? 0)
+    print(hop.ttl, hop.ipAddress ?? "*", hop.rtt ?? 0)
 }
 ```
 
@@ -57,4 +57,3 @@ for hop in classified.hops {
 - ``SwiftFTR/ClassifiedTrace``
 - ``SwiftFTR/ClassifiedHop``
 - ``SwiftFTR/HopCategory``
-

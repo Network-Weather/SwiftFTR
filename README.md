@@ -67,10 +67,11 @@ let tracer = SwiftFTR()
 // Basic trace
 let result = try await tracer.trace(to: "1.1.1.1", maxHops: 30, timeout: 1.0)
 for hop in result.hops {
-    let host = hop.host ?? "*"
+    let addr = hop.ipAddress ?? "*"
     let rtt  = hop.rtt.map { String(format: "%.3f ms", $0 * 1000) } ?? "timeout"
-    print("\(hop.ttl)\t\(host)\t\(rtt)")
+    print("\(hop.ttl)\t\(addr)\t\(rtt)")
 }
+print("duration: \(String(format: "%.3f s", result.duration))")
 
 // With ASN classification and segments
 let classified = try await tracer.traceClassified(to: "www.example.com", maxHops: 30, timeout: 1.0)
@@ -96,7 +97,7 @@ swift build -c release
 .build/release/swift-ftr example.com -m 30 -w 1.0
 ```
 
-Selected options:
+Selected options (ArgumentParser-powered):
 - `-m, --max-hops N`: Max TTL/hops to probe (default 30)
 - `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
 - `--json`: Emit JSON with ASN categories and public IP
@@ -140,6 +141,17 @@ Fuzzing
 Documentation
 -------------
 - DocC bundle at `Sources/SwiftFTR/SwiftFTR.docc`.
+
+Generate and view the docs:
+
+- Xcode: Product → Build Documentation (or use the Documentation sidebar).
+- SwiftPM plugin (Xcode 15+/Swift 5.9+):
+  ```bash
+  swift package --allow-writing-to-directory docs \
+    generate-documentation --target SwiftFTR \
+    --output-path docs --transform-for-static-hosting --hosting-base-path SwiftFTR
+  open docs/index.html
+  ```
 
 License
 -------
