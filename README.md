@@ -36,9 +36,9 @@ Classic traceroute often probes sequentially and waits per hop; SwiftFTR probes 
 
 If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e.g., `20`). You can also tune `payloadSize` in advanced scenarios.
 
-Requirements
-------------
-- Swift 6
+- Requirements
+--------------
+- Swift 5.10+
 - macOS 13+
 - IPv4 only at the moment (ICMPv4 Echo). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS’s ICMP datagram behavior.
 
