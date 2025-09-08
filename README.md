@@ -43,7 +43,7 @@ If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e
 
 - Requirements
 --------------
-- Swift 6.1+ (requires Xcode 16 or later)
+- Swift 6.1+ (requires Xcode 16.4 or later)
 - macOS 13+
 - IPv4 only at the moment (ICMPv4 Echo). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS’s ICMP datagram behavior.
 
@@ -169,7 +169,7 @@ Documentation
 Generate and view the docs:
 
 - Xcode: Product → Build Documentation (or use the Documentation sidebar).
-- SwiftPM plugin (Xcode 16+/Swift 6.1+):
+- SwiftPM plugin (Xcode 16.4+/Swift 6.1+):
   ```bash
   swift package --allow-writing-to-directory docs \
     generate-documentation --target SwiftFTR \

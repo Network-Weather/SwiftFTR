@@ -7,7 +7,7 @@
 SwiftFTR v0.2.0 is a major update that replaces environment variable configuration with a type-safe configuration API and achieves full Swift 6.1 compliance. This release improves API ergonomics, thread safety, and testability while maintaining backward compatibility for basic usage.
 
 ## Breaking Changes
-- **Swift 6.1 minimum**: Package now requires Swift 6.1+ and Xcode 16+
+- **Swift 6.1 minimum**: Package now requires Swift 6.1+ and Xcode 16.4+
 - **Environment variables removed**: `PTR_SKIP_STUN` and `PTR_PUBLIC_IP` are no longer supported
 - **Configuration API required**: All settings must now be passed via `SwiftFTRConfig` struct
 
