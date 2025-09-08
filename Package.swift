@@ -1,4 +1,4 @@
-// swift-tools-version: 5.10
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
@@ -47,5 +47,7 @@ let package = Package(
             dependencies: ["SwiftFTR"],
             path: "Tests/SwiftFTRTests"
         )
-    ]
+    ],
+    // Support building with Swift 5 and Swift 6 toolchains.
+    swiftLanguageModes: [.v5, .v6]
 )

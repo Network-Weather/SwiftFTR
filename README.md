@@ -43,7 +43,7 @@ If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e
 
 - Requirements
 --------------
-- Swift 5.10+
+- Swift 5.10+ (Swift 6–ready; builds in Swift 6 mode with Xcode 16)
 - macOS 13+
 - IPv4 only at the moment (ICMPv4 Echo). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS’s ICMP datagram behavior.
 
@@ -64,10 +64,10 @@ Install (SwiftPM)
 Swift 6.1 Compliance
 --------------------
 SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
-- ✅ All types are `Sendable`
-- ✅ Methods are `nonisolated` - no MainActor required
-- ✅ Thread-safe - can be called from any actor or task
-- ✅ Strict concurrency checking passes with no warnings
+- ✅ All public value types are `Sendable`
+- ✅ API works without `@MainActor` requirements
+- ✅ Thread-safe usage from any actor or task
+- ✅ Builds under Swift 6 language mode with strict concurrency checks
 
 Use It as a Library
 -------------------
@@ -134,10 +134,10 @@ Example: JSON output
 .build/release/swift-ftr --json www.example.com -m 30 -w 1.0
 ```
 
-Environment Variables
----------------------
-- `PTR_SKIP_STUN=1`: Disable STUN public IP discovery (useful for tests/CI).
-- `PTR_PUBLIC_IP=x.y.z.w`: Override public IP used for ISP/ASN matching.
+Configuration and Flags
+-----------------------
+- Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
+- CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`.
 
 Design Details
 --------------
