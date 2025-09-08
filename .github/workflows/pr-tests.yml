@@ -64,7 +64,7 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Setup Swift ${{ matrix.swift }}
-        uses: swift-actions/setup-swift@v1
+        uses: swift-actions/setup-swift@next
         with:
           swift-version: ${{ matrix.swift }}
       
@@ -104,7 +104,7 @@ jobs:
       - uses: actions/checkout@v4
       
       - name: Setup Swift ${{ matrix.swift }}
-        uses: swift-actions/setup-swift@v1
+        uses: swift-actions/setup-swift@next
         with:
           swift-version: ${{ matrix.swift }}
       
