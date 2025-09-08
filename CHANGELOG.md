@@ -5,6 +5,9 @@ All notable changes to this project are documented here. This project follows Se
 
 0.2.0 — 2025-09-08
 -------------------
+- **BREAKING**: Minimum Swift version now 6.0 (was 5.10)
+  - Package now builds exclusively in Swift 6 language mode
+  - Requires Xcode 16 or later
 - **BREAKING**: Removed all environment variable dependencies in favor of configuration API
   - Replaced `PTR_SKIP_STUN` and `PTR_PUBLIC_IP` with `SwiftFTRConfig` struct
   - All configuration now passed explicitly via `SwiftFTRConfig` initialization

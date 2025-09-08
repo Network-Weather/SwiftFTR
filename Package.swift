@@ -48,6 +48,6 @@ let package = Package(
             path: "Tests/SwiftFTRTests"
         )
     ],
-    // Support building with Swift 5 and Swift 6 toolchains.
-    swiftLanguageModes: [.v5, .v6]
+    // Swift 6 language mode with strict concurrency checking
+    swiftLanguageModes: [.v6]
 )
