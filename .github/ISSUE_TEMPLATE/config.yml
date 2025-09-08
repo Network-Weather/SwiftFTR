@@ -1,0 +1,9 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://swiftftr.networkweather.com/
+    about: Read the API docs and usage guides
+  - name: Security vulnerability
+    url: https://github.com/Network-Weather/SwiftFTR/security/advisories/new
+    about: Please report security issues privately
+
