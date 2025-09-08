@@ -176,3 +176,7 @@ Versioning & Releases
 ---------------------
 - Semantic Versioning. See CHANGELOG.md for release notes.
 - To consume via SwiftPM, use the `0.1.0` tag or later.
+
+Contributing
+------------
+See CONTRIBUTING.md for development setup, formatting, testing, docs, and release guidance.
