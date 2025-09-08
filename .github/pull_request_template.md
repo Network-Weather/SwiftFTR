@@ -27,4 +27,4 @@ swift build -c release && .build/release/swift-ftr -w 1.5 8.8.8.8
 - [ ] Public APIs documented (DocC / Xcode Quick Help)
 - [ ] README / docs updated if behavior or flags changed
 - [ ] No secrets or tokens added
-
+- [ ] I have read and agree to follow the project's Code of Conduct (CODE_OF_CONDUCT.md)

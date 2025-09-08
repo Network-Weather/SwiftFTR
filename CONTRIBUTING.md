@@ -81,3 +81,5 @@ If you discover a vulnerability, please open a private security advisory or emai
 ## License
 By contributing, you agree that your contributions will be licensed under the repository’s MIT license.
 
+## Code of Conduct
+This project follows a Code of Conduct. Please read and follow CODE_OF_CONDUCT.md when participating in discussions and contributions.

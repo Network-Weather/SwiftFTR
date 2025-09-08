@@ -180,3 +180,7 @@ Versioning & Releases
 Contributing
 ------------
 See CONTRIBUTING.md for development setup, formatting, testing, docs, and release guidance.
+
+Code of Conduct
+---------------
+This project adheres to a Code of Conduct. By participating, you agree to abide by its terms. See CODE_OF_CONDUCT.md.
