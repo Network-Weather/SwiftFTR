@@ -18,7 +18,7 @@ on:
 jobs:
   unit-tests:
     name: Unit Tests
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       
@@ -96,7 +96,7 @@ jobs:
   # Safe to run on GitHub cloud runners
   integration-tests-mock:
     name: Integration Tests (Build Only)
-    runs-on: macos-latest
+    runs-on: macos-15
     strategy:
       matrix:
         swift: ["6.1"]
@@ -175,7 +175,7 @@ jobs:
     name: Platform Compatibility
     strategy:
       matrix:
-        os: [macos-13, macos-14]
+        os: [macos-14, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -192,7 +192,7 @@ jobs:
 
   performance-regression:
     name: Performance Regression Check
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       
@@ -253,7 +253,7 @@ jobs:
 
   security-check:
     name: Security & Best Practices
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       
@@ -280,7 +280,7 @@ jobs:
 
   documentation-check:
     name: Documentation Build
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       
