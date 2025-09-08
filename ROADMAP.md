@@ -11,7 +11,58 @@
 - ✅ Enhanced error handling with contextual details
 - ✅ CLI improvements with verbose logging and payload size configuration
 
-## Version 0.3.0 - Q4 2025: Offline ASN Support
+## Version 0.3.0 - Q4 2025: VPN/Zero Trust/SASE Support
+### Enterprise Network Compatibility
+- [ ] VPN tunnel detection and classification
+- [ ] Split-tunnel VPN handling
+- [ ] Zero Trust Network Access (ZTNA) path detection
+- [ ] SASE (Secure Access Service Edge) endpoint identification
+- [ ] WireGuard and IPSec tunnel awareness
+- [ ] Overlay network detection (SD-WAN, VXLAN)
+- [ ] Proxy and gateway detection (SOCKS, HTTP CONNECT)
+
+**Benefits:**
+- Accurate path discovery through VPN tunnels
+- Distinguish between underlay and overlay networks
+- Identify security service insertion points
+- Better enterprise network visibility
+
+**Challenges:**
+- VPNs may encapsulate or drop ICMP packets
+- Zero Trust proxies may terminate connections
+- SASE solutions add multiple hops that appear as single entities
+- Need heuristics to detect tunneled vs native traffic
+
+**Testing Requirements:**
+- Test with major VPN providers (NordVPN, ExpressVPN, ProtonVPN)
+- Test with enterprise VPNs (Cisco AnyConnect, GlobalProtect, OpenVPN)
+- Test with Zero Trust solutions (Cloudflare WARP, Zscaler, Netskope)
+- Test with SASE platforms (Prisma Access, Cato Networks)
+- Test split-tunnel vs full-tunnel configurations
+- Document behavior differences across providers
+
+**Implementation:**
+```swift
+// Future API
+let config = SwiftFTRConfig(
+    maxHops: 30,
+    tunnelDetection: true,
+    probeProtocols: [.icmp, .udp, .tcp] // Multi-protocol for better tunnel traversal
+)
+
+// Enhanced classification
+enum HopCategory {
+    case local
+    case vpnTunnel(type: VPNType)
+    case saseGateway(provider: String)
+    case zeroTrustProxy
+    case isp
+    case transit
+    case destination
+}
+```
+
+## Version 0.4.0 - Q1 2026: Offline ASN Support
 ### Swift-IP2ASN Integration
 - [ ] Integrate Swift-IP2ASN library for offline IP-to-ASN mapping
 - [ ] Hybrid resolution: offline first, fallback to DNS
@@ -34,7 +85,7 @@ let config = SwiftFTRConfig(
 )
 ```
 
-## Version 0.4.0 - Q1 2026: Enhanced Protocol Support
+## Version 0.5.0 - Q2 2026: Enhanced Protocol Support
 ### Multiple Probe Methods
 - [ ] UDP probe support (like traditional traceroute)
 - [ ] TCP SYN probe support (for firewall traversal)
@@ -46,7 +97,7 @@ let config = SwiftFTRConfig(
 - More complete path discovery
 - Protocol-specific path detection
 
-## Version 0.5.0 - Q2 2026: IPv6 Support
+## Version 0.6.0 - Q3 2026: IPv6 Support
 ### Full Dual-Stack Support
 - [ ] ICMPv6 implementation
 - [ ] IPv6 address resolution
@@ -58,7 +109,7 @@ let config = SwiftFTRConfig(
 - IPv6 path discovery complexity
 - Dual-stack result merging
 
-## Version 0.6.0 - Q3 2026: Advanced Analytics
+## Version 0.7.0 - Q4 2026: Advanced Analytics
 ### Path Analysis Features
 - [ ] Path change detection over time
 - [ ] Latency variance analysis
@@ -72,7 +123,7 @@ let config = SwiftFTRConfig(
 - [ ] Result caching with TTL
 - [ ] Streaming results API
 
-## Version 1.0.0 - Q4 2026: Production Ready
+## Version 1.0.0 - Q1 2027: Production Ready
 ### Enterprise Features
 - [ ] Distributed tracing coordination
 - [ ] Metrics export (Prometheus, StatsD)
@@ -107,10 +158,11 @@ let config = SwiftFTRConfig(
 ## Contributing
 
 We welcome contributions! Priority areas:
-1. Swift-IP2ASN integration (immediate)
-2. IPv6 support planning
-3. Performance benchmarking
-4. Platform compatibility testing
+1. VPN/Zero Trust/SASE testing and detection (immediate)
+2. Swift-IP2ASN integration (Q4 2025)
+3. Enterprise network compatibility
+4. Performance benchmarking with tunneled traffic
+5. Platform compatibility testing
 
 ## Dependencies & Integration Points
 
@@ -119,9 +171,9 @@ We welcome contributions! Priority areas:
 - macOS 13+ (ICMP datagram socket support)
 
 ### Planned Integrations
-- **Swift-IP2ASN**: Offline ASN database (v0.3.0)
+- **Swift-IP2ASN**: Offline ASN database (v0.4.0)
 - **SwiftNIO**: Optional high-performance I/O (v1.0.0)
-- **Swift Metrics**: Observability API (v0.6.0)
+- **Swift Metrics**: Observability API (v0.7.0)
 
 ## Breaking Changes Policy
 
@@ -132,12 +184,14 @@ We welcome contributions! Priority areas:
 
 ## Performance Targets
 
-| Metric | Current (v0.2.0) | v0.6.0 Target | v1.0.0 Target |
+| Metric | Current (v0.2.0) | v0.7.0 Target | v1.0.0 Target |
 |--------|------------------|---------------|---------------|
 | Single trace (30 hops) | ~1.0s | ~0.8s | ~0.5s |
 | Concurrent traces | 10 | 50 | 100+ |
 | Memory per trace | ~5KB | ~3KB | ~2KB |
 | ASN lookup time | ~100ms | ~1ms (offline) | ~0.1ms |
+| VPN tunnel detection | N/A | <100ms | <50ms |
+| SASE endpoint identification | N/A | 95% accuracy | 99% accuracy |
 
 ## Success Metrics
 
