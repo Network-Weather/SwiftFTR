@@ -98,7 +98,7 @@ To run complete integration tests, set up a self-hosted runner:
 Requirements for self-hosted runners:
 - macOS 13+ (for ICMP datagram socket support)
 - Network access to internet
-- Swift 6.0+
+- Swift 6.1+
 - GitHub Actions runner software
 
 ## Network Topology Considerations

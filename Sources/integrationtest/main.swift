@@ -79,12 +79,8 @@ struct IntegrationTest {
             Foundation.exit(1)
         }
         
-        // Test 5: Verify no environment variables are needed
-        print("\n5. Verifying no environment variables needed...")
-        // Clear any potential environment variables
-        unsetenv("PTR_PUBLIC_IP")
-        unsetenv("PTR_SKIP_STUN")
-        unsetenv("PTR_DNS")
+        // Test 5: Verify configuration API works correctly
+        print("\n5. Verifying configuration API...")
         
         do {
             let cleanConfig = SwiftFTRConfig(
@@ -94,7 +90,7 @@ struct IntegrationTest {
             )
             let cleanTracer = SwiftFTR(config: cleanConfig)
             let _ = try await cleanTracer.trace(to: "8.8.8.8")
-            print("✓ Trace works without environment variables")
+            print("✓ Configuration API works correctly")
         } catch {
             print("✗ Failed without env vars: \(error)")
             Foundation.exit(1)

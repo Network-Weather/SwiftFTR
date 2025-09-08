@@ -167,7 +167,7 @@ We welcome contributions! Priority areas:
 ## Dependencies & Integration Points
 
 ### Current Dependencies
-- Swift 6.0+ (minimum requirement as of v0.2.0)
+- Swift 6.1+ (minimum requirement as of v0.2.0)
 - macOS 13+ (ICMP datagram socket support)
 
 ### Planned Integrations

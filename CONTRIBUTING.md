@@ -3,7 +3,7 @@
 Thanks for your interest in improving SwiftFTR! This guide describes how to set up your environment, propose changes, and keep contributions consistent and easy to review.
 
 ## Quick Start
-- Requirements: macOS 13+, Xcode 16+ (Swift 6.0+), GitHub CLI (optional).
+- Requirements: macOS 13+, Xcode 16+ (Swift 6.1+), GitHub CLI (optional).
 - Build & test:
   ```bash
   swift build -c debug

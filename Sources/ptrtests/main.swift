@@ -132,14 +132,9 @@ func testClassification() throws {
     "5.5.5.5": ASNInfo(asn: 555, name: "DEST-AS"),
     "203.0.113.45": ASNInfo(asn: 12345, name: "ISP-AS"),  // public IP override ASN
   ])
-  setenv("PTR_SKIP_STUN", "1", 1)
-  setenv("PTR_PUBLIC_IP", "203.0.113.45", 1)
-  defer {
-    unsetenv("PTR_SKIP_STUN")
-    unsetenv("PTR_PUBLIC_IP")
-  }
+  // Use publicIP parameter instead of environment variables
   let cls = try TraceClassifier().classify(
-    trace: tr, destinationIP: destIP, resolver: stub, timeout: 0.2)
+    trace: tr, destinationIP: destIP, resolver: stub, timeout: 0.2, publicIP: "203.0.113.45")
   // Expectations
   try assert(cls.hops[0].category == HopCategory.local, "TTL1 should be LOCAL")
   try assert(cls.hops[1].category == HopCategory.isp, "TTL2 CGNAT should be ISP")

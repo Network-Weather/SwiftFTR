@@ -25,7 +25,7 @@ jobs:
       - name: Setup Swift
         uses: swift-actions/setup-swift@next
         with:
-          swift-version: "6.0"
+          swift-version: "6.1"
       
       - name: Build
         run: swift build -v
@@ -59,7 +59,7 @@ jobs:
     if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'test-integration')
     strategy:
       matrix:
-        swift: ["6.0"]
+        swift: ["6.1"]
     steps:
       - uses: actions/checkout@v4
       
@@ -99,7 +99,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        swift: ["6.0"]
+        swift: ["6.1"]
     steps:
       - uses: actions/checkout@v4
       
@@ -136,7 +136,7 @@ jobs:
       - name: Setup Swift
         uses: swift-actions/setup-swift@next
         with:
-          swift-version: "6.0"
+          swift-version: "6.1"
       
       - name: Run Stress Tests
         run: |
@@ -183,7 +183,7 @@ jobs:
       - name: Setup Swift
         uses: swift-actions/setup-swift@next
         with:
-          swift-version: "6.0"
+          swift-version: "6.1"
       
       - name: Build and Test
         run: |
@@ -199,7 +199,7 @@ jobs:
       - name: Setup Swift
         uses: swift-actions/setup-swift@next
         with:
-          swift-version: "6.0"
+          swift-version: "6.1"
       
       - name: Run Performance Tests
         run: |
@@ -287,7 +287,7 @@ jobs:
       - name: Setup Swift
         uses: swift-actions/setup-swift@next
         with:
-          swift-version: "6.0"
+          swift-version: "6.1"
       
       - name: Build Documentation
         run: |
