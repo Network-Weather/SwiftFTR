@@ -9,7 +9,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
     abstract: "Fast traceroute on macOS using ICMP datagram sockets",
     discussion: """
       Performs parallel traceroute by sending all probes at once, then waiting for responses.
-      
+
       Examples:
         swift-ftr example.com                    # Basic trace
         swift-ftr 1.1.1.1 -m 10 -t 2.0          # Limit to 10 hops, 2 second timeout  
@@ -27,10 +27,10 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
   @Option(name: .customLong("public-ip"), help: "Override public IP (bypasses STUN)")
   var publicIP: String?
-  
+
   @Option(name: [.short, .customLong("payload-size")], help: "ICMP payload size in bytes")
   var payloadSize: Int = 56
-  
+
   @Flag(name: .customLong("verbose"), help: "Enable verbose logging")
   var verbose: Bool = false
 

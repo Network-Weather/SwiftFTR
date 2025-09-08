@@ -35,21 +35,21 @@ public struct ClassifiedTrace: Sendable, Codable {
 public struct TraceClassifier: Sendable {
   public init() {}
 
-    /// Classify a TraceResult into segments using ASN lookups and heuristics.
-    /// - Parameters:
-    ///   - trace: Plain traceroute output to classify.
-    ///   - destinationIP: Destination IPv4 address (numeric string) for ASN matching.
-    ///   - resolver: ASN resolver to use (DNS- or WHOIS-based).
-    ///   - timeout: Per-lookup timeout in seconds.
-    ///   - publicIP: Override public IP (bypasses STUN if provided).
-    /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
-    public func classify(
-        trace: TraceResult,
-        destinationIP: String,
-        resolver: ASNResolver,
-        timeout: TimeInterval = 1.5,
-        publicIP: String? = nil
-    ) throws -> ClassifiedTrace {
+  /// Classify a TraceResult into segments using ASN lookups and heuristics.
+  /// - Parameters:
+  ///   - trace: Plain traceroute output to classify.
+  ///   - destinationIP: Destination IPv4 address (numeric string) for ASN matching.
+  ///   - resolver: ASN resolver to use (DNS- or WHOIS-based).
+  ///   - timeout: Per-lookup timeout in seconds.
+  ///   - publicIP: Override public IP (bypasses STUN if provided).
+  /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
+  public func classify(
+    trace: TraceResult,
+    destinationIP: String,
+    resolver: ASNResolver,
+    timeout: TimeInterval = 1.5,
+    publicIP: String? = nil
+  ) throws -> ClassifiedTrace {
     // Gather IPs
     let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
     var allIPs = Set(hopIPs)

@@ -70,7 +70,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
     ]
     let resolver = MockASNResolver(mapping: mapping)
     let classified = try TraceClassifier().classify(
-      trace: tr, destinationIP: "203.0.113.200", resolver: resolver, timeout: 0.1, publicIP: "198.51.100.50")
+      trace: tr, destinationIP: "203.0.113.200", resolver: resolver, timeout: 0.1,
+      publicIP: "198.51.100.50")
     XCTAssertEqual(classified.hops[0].category, .isp)
     XCTAssertEqual(classified.hops[1].category, .transit)
   }

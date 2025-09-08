@@ -26,7 +26,9 @@ struct DNSClient {
     let rdata: Data
   }
 
-  static func queryTXT(name: String, timeout: TimeInterval = 1.0, servers: [String] = ["1.1.1.1", "8.8.8.8"])
+  static func queryTXT(
+    name: String, timeout: TimeInterval = 1.0, servers: [String] = ["1.1.1.1", "8.8.8.8"]
+  )
     -> [String]?
   {
     for server in servers {
