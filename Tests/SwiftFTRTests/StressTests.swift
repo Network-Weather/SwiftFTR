@@ -42,7 +42,7 @@ final class StressAndEdgeCaseTests: XCTestCase {
         
         // Track memory usage (basic check)
         for _ in 1...50 {
-            autoreleasepool {
+            _ = autoreleasepool {
                 Task {
                     _ = try? await tracer.trace(to: "8.8.8.8")
                 }
@@ -188,12 +188,12 @@ final class StressAndEdgeCaseTests: XCTestCase {
         // First trace should populate cache
         let start1 = Date()
         let classified1 = try await tracer.traceClassified(to: "1.1.1.1")
-        let duration1 = Date().timeIntervalSince(start1)
+        _ = Date().timeIntervalSince(start1)
         
         // Second trace to same destination should be faster due to caching
         let start2 = Date()
         let classified2 = try await tracer.traceClassified(to: "1.1.1.1")
-        let duration2 = Date().timeIntervalSince(start2)
+        _ = Date().timeIntervalSince(start2)
         
         XCTAssertEqual(classified1.destinationASN, classified2.destinationASN)
         // Cache might make second request faster, but network variance exists
