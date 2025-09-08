@@ -1,5 +1,8 @@
 # SwiftFTR v0.2.0 Release Notes
 
+**Release Date:** September 8, 2025  
+**Pull Request:** [#1](https://github.com/Network-Weather/SwiftFTR/pull/1)
+
 ## Overview
 SwiftFTR v0.2.0 is a major update that replaces environment variable configuration with a type-safe configuration API and achieves full Swift 6.1 compliance. This release improves API ergonomics, thread safety, and testability while maintaining backward compatibility for basic usage.
 
@@ -63,8 +66,18 @@ swift test                    # Run all tests
 swift test --filter Config   # Run configuration tests only
 ```
 
+## What's Changed
+- Configuration API replacing environment variables by @dewrich in #1
+- Swift 6.1 full compliance with Sendable and nonisolated
+- Enhanced CLI with verbose logging and payload size options
+- Comprehensive test suite additions (44 tests)
+- Documentation improvements (EXAMPLES.md, MIGRATION.md, ROADMAP.md)
+
 ## Next Steps
-The v0.2.0 release sets the foundation for v0.3.0, which will integrate Swift-IP2ASN for offline IP-to-ASN mapping, eliminating the need for DNS lookups and enabling deterministic testing.
+The v0.2.0 release sets the foundation for v0.3.0, which will focus on VPN/Zero Trust/SASE support for enterprise network compatibility. Future releases will add offline ASN mapping and IPv6 support.
+
+## Full Changelog
+https://github.com/Network-Weather/SwiftFTR/compare/v0.1.0...v0.2.0
 
 ## Contributors
 This release was developed with assistance from Claude Code.
