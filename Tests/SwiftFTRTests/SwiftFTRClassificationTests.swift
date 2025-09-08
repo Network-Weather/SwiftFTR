@@ -38,10 +38,9 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "198.51.100.50": ASNInfo(asn: 64501, name: "ISPNet", prefix: "198.51.100.0/24"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    // Simulate public IP via env so classifier records client ASN
-    setenv("PTR_PUBLIC_IP", "198.51.100.50", 1)
+    // Provide public IP directly to classifier
     let classified = try TraceClassifier().classify(
-      trace: tr, destinationIP: destIP, resolver: resolver, timeout: 0.1)
+      trace: tr, destinationIP: destIP, resolver: resolver, timeout: 0.1, publicIP: "198.51.100.50")
 
     XCTAssertEqual(classified.destinationIP, destIP)
     XCTAssertEqual(classified.clientASN, 64501)
@@ -70,9 +69,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "198.51.100.50": ASNInfo(asn: 64501, name: "ISPNet"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    setenv("PTR_PUBLIC_IP", "198.51.100.50", 1)
     let classified = try TraceClassifier().classify(
-      trace: tr, destinationIP: "203.0.113.200", resolver: resolver, timeout: 0.1)
+      trace: tr, destinationIP: "203.0.113.200", resolver: resolver, timeout: 0.1, publicIP: "198.51.100.50")
     XCTAssertEqual(classified.hops[0].category, .isp)
     XCTAssertEqual(classified.hops[1].category, .transit)
   }

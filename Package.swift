@@ -12,7 +12,8 @@ let package = Package(
         .executable(name: "icmpfuzz", targets: ["icmpfuzz"]),
         .executable(name: "icmpfuzzer", targets: ["icmpfuzzer"]),
         .executable(name: "genseeds", targets: ["genseeds"]),
-        .executable(name: "ptrtests", targets: ["ptrtests"]) 
+        .executable(name: "ptrtests", targets: ["ptrtests"]),
+        .executable(name: "integrationtest", targets: ["integrationtest"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.1"),
@@ -40,6 +41,7 @@ let package = Package(
         ),
         .executableTarget(name: "genseeds"),
         .executableTarget(name: "ptrtests", dependencies: ["SwiftFTR"]),
+        .executableTarget(name: "integrationtest", dependencies: ["SwiftFTR"]),
         .testTarget(
             name: "SwiftFTRTests",
             dependencies: ["SwiftFTR"],

@@ -51,49 +51,113 @@ public struct TraceResult: Sendable {
 /// Errors that can occur while performing a traceroute.
 public enum TracerouteError: Error, CustomStringConvertible {
     /// DNS resolution failed for the destination host.
-    case resolutionFailed
+    case resolutionFailed(host: String, details: String?)
     /// Creating the socket failed; the associated errno is provided.
-    case socketCreateFailed(errno: Int32)
+    case socketCreateFailed(errno: Int32, details: String)
     /// Setting a socket option failed (e.g., IP_TTL); associated option and errno are provided.
     case setsockoptFailed(option: String, errno: Int32)
     /// Sending a probe failed; the associated errno is provided.
     case sendFailed(errno: Int32)
+    /// Invalid configuration provided
+    case invalidConfiguration(reason: String)
+    /// Platform not supported
+    case platformNotSupported(details: String)
 
   public var description: String {
     switch self {
-    case .resolutionFailed: return "Failed to resolve host"
-    case .socketCreateFailed(let e): return "socket() failed: \(String(cString: strerror(e)))"
-    case .setsockoptFailed(let opt, let e):
-      return "setsockopt(\(opt)) failed: \(String(cString: strerror(e)))"
-    case .sendFailed(let e): return "sendto failed: \(String(cString: strerror(e)))"
+    case .resolutionFailed(let host, let details): 
+        return "Failed to resolve host '\(host)'" + (details.map { ": \($0)" } ?? "")
+    case .socketCreateFailed(let errno, let details): 
+        return "socket() failed (errno=\(errno)): \(String(cString: strerror(errno))). \(details)"
+    case .setsockoptFailed(let opt, let errno):
+        return "setsockopt(\(opt)) failed (errno=\(errno)): \(String(cString: strerror(errno)))"
+    case .sendFailed(let errno): 
+        return "sendto failed (errno=\(errno)): \(String(cString: strerror(errno)))"
+    case .invalidConfiguration(let reason):
+        return "Invalid configuration: \(reason)"
+    case .platformNotSupported(let details):
+        return "Platform not supported: \(details)"
     }
   }
 }
 
+/// Configuration options for SwiftFTR operations.
+public struct SwiftFTRConfig: Sendable {
+    /// Maximum TTL/hops to probe (default: 30)
+    public let maxHops: Int
+    /// Maximum wait time per probe in milliseconds (default: 1000ms)
+    public let maxWaitMs: Int
+    /// Size in bytes of the Echo payload (default: 56)
+    public let payloadSize: Int
+    /// Override the public IP address (bypasses STUN discovery if set)
+    public let publicIP: String?
+    /// Enable verbose logging for debugging
+    public let enableLogging: Bool
+    
+    public init(
+        maxHops: Int = 30,
+        maxWaitMs: Int = 1000,
+        payloadSize: Int = 56,
+        publicIP: String? = nil,
+        enableLogging: Bool = false
+    ) {
+        self.maxHops = maxHops
+        self.maxWaitMs = maxWaitMs
+        self.payloadSize = payloadSize
+        self.publicIP = publicIP
+        self.enableLogging = enableLogging
+    }
+}
+
 /// Top-level entry point for performing fast, parallel traceroutes.
+/// 
+/// SwiftFTR is fully thread-safe and does not require MainActor isolation.
+/// All methods can be called from any actor or task context.
+@available(macOS 13.0, *)
 public struct SwiftFTR: Sendable {
-    /// Creates a tracer instance. Stateless and safe to reuse.
-    public init() {}
+    private let config: SwiftFTRConfig
+    
+    /// Creates a tracer instance with optional configuration.
+    /// - Parameter config: Configuration for traceroute behavior
+    nonisolated public init(config: SwiftFTRConfig = SwiftFTRConfig()) {
+        self.config = config
+    }
 
   /// Perform a fast traceroute by sending one ICMP Echo per TTL and waiting once.
+  /// 
+  /// This method is nonisolated and can be called from any actor context.
   /// - Parameters:
   ///   - host: Destination hostname or IPv4 address.
-  ///   - maxHops: Maximum TTL to probe. Typical internet paths are under 30.
-  ///   - timeout: Overall wait (seconds) after sending all probes. Controls wall-clock duration.
-  ///   - payloadSize: Size in bytes of the Echo payload. Larger payloads can influence path/MTU behavior.
   /// - Returns: A `TraceResult` with ordered hops and whether the destination responded.
-  public func trace(
-    to host: String,
-    maxHops: Int = 30,
-    timeout: TimeInterval = 1.0,
-    payloadSize: Int = 56
+  /// - Throws: `TracerouteError` if resolution or socket operations fail
+  nonisolated public func trace(
+    to host: String
   ) async throws -> TraceResult {
+    let maxHops = config.maxHops
+    let timeout = TimeInterval(config.maxWaitMs) / 1000.0
+    let payloadSize = config.payloadSize
+    
+    if config.enableLogging {
+        print("[SwiftFTR] Starting trace to \(host) with maxHops=\(maxHops), timeout=\(timeout)s, payloadSize=\(payloadSize)")
+    }
     // Resolve host (IPv4 only)
-    let destAddr = try resolveIPv4(host: host)
+    let destAddr = try resolveIPv4(host: host, enableLogging: config.enableLogging)
 
     // Create ICMP datagram socket (no root required on macOS)
+    if config.enableLogging {
+        print("[SwiftFTR] Creating ICMP datagram socket...")
+    }
+    
     let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
-    if fd < 0 { throw TracerouteError.socketCreateFailed(errno: errno) }
+    if fd < 0 { 
+        let error = errno
+        let details = "This typically indicates: (1) Platform doesn't support ICMP datagram sockets, (2) Network permissions denied, (3) Running in sandbox without network entitlement. On macOS, this should work without root privileges."
+        throw TracerouteError.socketCreateFailed(errno: error, details: details) 
+    }
+    
+    if config.enableLogging {
+        print("[SwiftFTR] Socket created successfully (fd=\(fd))")
+    }
     defer { close(fd) }
 
     // Set non-blocking: avoid blocking recvfrom; we use poll(2) for readiness.
@@ -118,6 +182,10 @@ public struct SwiftFTR: Sendable {
     var outstanding: [UInt16: SendInfo] = [:]  // key = sequence (== ttl)
 
     // Send one probe per TTL, quickly adjusting IP_TTL between sends.
+    if config.enableLogging {
+        print("[SwiftFTR] Sending \(maxHops) probes...")
+    }
+    
     for ttl in 1...maxHops {
       var ttlVar: Int32 = Int32(ttl)
       if setsockopt(fd, IPPROTO_IP, IP_TTL, &ttlVar, socklen_t(MemoryLayout<Int32>.size)) != 0 {
@@ -149,6 +217,10 @@ public struct SwiftFTR: Sendable {
     // then wait until either all earlier hops are filled or the timeout hits.
     let startWall = Date()
     let deadline = monotonicNow() + timeout
+    
+    if config.enableLogging {
+        print("[SwiftFTR] Entering receive loop, deadline in \(timeout)s...")
+    }
     var storage = sockaddr_storage()
     // Use a named constant to avoid magic numbers for buffer sizes.
     var buf = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
@@ -251,37 +323,37 @@ public struct SwiftFTR: Sendable {
 
     /// Perform a traceroute and enrich results with ASN-based categorization.
     ///
-    /// This variant computes the client's public IP (via STUN by default), resolves
-    /// origin ASNs for relevant IP addresses using the provided resolver, and labels
+    /// This variant computes the client's public IP (via STUN by default unless overridden in config), 
+    /// resolves origin ASNs for relevant IP addresses using the provided resolver, and labels
     /// each hop as LOCAL, ISP, TRANSIT, or DESTINATION. Missing stretches between
     /// identical segments are interpolated for readability.
+    /// 
+    /// This method is nonisolated and can be called from any actor context.
     /// - Parameters:
     ///   - host: Destination hostname or IPv4 address.
-    ///   - maxHops: Maximum TTL to probe.
-    ///   - timeout: Overall wait (seconds) after sending all probes.
-    ///   - payloadSize: Echo payload size in bytes.
     ///   - resolver: ASN resolver implementation (default: DNS-based Team Cymru with cache).
     /// - Returns: A ClassifiedTrace containing segment labels and (when available) ASN info.
-    public func traceClassified(
+    /// - Throws: `TracerouteError` if resolution or socket operations fail
+    nonisolated public func traceClassified(
         to host: String,
-        maxHops: Int = 30,
-        timeout: TimeInterval = 1.0,
-        payloadSize: Int = 56,
         resolver: ASNResolver = CachingASNResolver(base: CymruDNSResolver())
     ) async throws -> ClassifiedTrace {
     // Do the trace
-    let destAddr = try resolveIPv4(host: host)
+    let destAddr = try resolveIPv4(host: host, enableLogging: config.enableLogging)
     let destIP = ipString(destAddr)
-    let tr = try await trace(to: host, maxHops: maxHops, timeout: timeout, payloadSize: payloadSize)
+    let tr = try await trace(to: host)
     // Classify
     let classifier = TraceClassifier()
     return try classifier.classify(
-      trace: tr, destinationIP: destIP, resolver: resolver, timeout: 1.5)
+      trace: tr, destinationIP: destIP, resolver: resolver, timeout: 1.5, publicIP: config.publicIP)
   }
 }
 
 // Helpers
-private func resolveIPv4(host: String) throws -> sockaddr_in {
+private func resolveIPv4(host: String, enableLogging: Bool = false) throws -> sockaddr_in {
+  if enableLogging {
+    print("[SwiftFTR] Resolving host: \(host)")
+  }
   // Try numeric IPv4 first (fast path, works without DNS)
   var addr = sockaddr_in()
   addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -303,7 +375,10 @@ private func resolveIPv4(host: String) throws -> sockaddr_in {
   )
   var res: UnsafeMutablePointer<addrinfo>? = nil
   let err = getaddrinfo(host, nil, &hints, &res)
-  guard err == 0, let info = res else { throw TracerouteError.resolutionFailed }
+  guard err == 0, let info = res else { 
+    let details = err != 0 ? "getaddrinfo error: \(String(cString: gai_strerror(err)))" : "Failed to get address info"
+    throw TracerouteError.resolutionFailed(host: host, details: details) 
+  }
   defer { freeaddrinfo(info) }
   if info.pointee.ai_family == AF_INET, let sa = info.pointee.ai_addr {
     memcpy(&addr, sa, min(MemoryLayout<sockaddr_in>.size, Int(info.pointee.ai_addrlen)))
@@ -311,7 +386,7 @@ private func resolveIPv4(host: String) throws -> sockaddr_in {
     addr.sin_family = sa.pointee.sa_family
     return addr
   }
-  throw TracerouteError.resolutionFailed
+  throw TracerouteError.resolutionFailed(host: host, details: "Host resolved but no IPv4 address available")
 }
 
 // Use Darwin.poll and Darwin.pollfd directly

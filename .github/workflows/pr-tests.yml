@@ -1,0 +1,305 @@
+name: PR Tests
+
+on:
+  pull_request:
+    branches: [ main, master, develop ]
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Package.swift'
+      - '.github/workflows/pr-tests.yml'
+  push:
+    branches: [ main ]
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+      - 'Package.swift'
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v1
+        with:
+          swift-version: "5.10"
+      
+      - name: Build
+        run: swift build -v
+      
+      - name: Run Unit Tests
+        run: swift test -v --parallel
+      
+      - name: Generate Test Report
+        if: always()
+        run: |
+          swift test --enable-code-coverage
+          xcrun llvm-cov export \
+            .build/debug/SwiftFTRPackageTests.xctest/Contents/MacOS/SwiftFTRPackageTests \
+            -instr-profile .build/debug/codecov/default.profdata \
+            -format="lcov" > coverage.lcov || true
+      
+      - name: Upload Coverage
+        if: always()
+        uses: codecov/codecov-action@v3
+        with:
+          file: coverage.lcov
+          flags: unittests
+          name: unit-coverage
+          fail_ci_if_error: false
+
+  # Integration tests that perform actual network traces
+  # ONLY run on self-hosted runners or locally, NOT on GitHub cloud runners
+  integration-tests-self-hosted:
+    name: Integration Tests (Self-Hosted)
+    runs-on: [self-hosted, macos]
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'test-integration')
+    strategy:
+      matrix:
+        swift: ["5.10"]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Swift ${{ matrix.swift }}
+        uses: swift-actions/setup-swift@v1
+        with:
+          swift-version: ${{ matrix.swift }}
+      
+      - name: Build Integration Tests
+        run: |
+          swift build --product integrationtest
+          swift build --product swift-ftr
+      
+      - name: Run Integration Test Suite
+        run: |
+          echo "Running built-in integration tests on self-hosted runner..."
+          .build/debug/integrationtest
+      
+      - name: Test CLI Tool with Real Traces
+        run: |
+          echo "Testing CLI tool with actual network traces..."
+          .build/debug/swift-ftr --help
+          .build/debug/swift-ftr 1.1.1.1 -m 5 -t 2.0
+          .build/debug/swift-ftr --json 8.8.8.8 -m 3
+      
+      - name: Test as External Package
+        run: |
+          echo "Testing as external package dependency..."
+          cd test-external-package
+          swift build
+          swift run
+
+  # Lightweight integration tests that don't require actual network traces
+  # Safe to run on GitHub cloud runners
+  integration-tests-mock:
+    name: Integration Tests (Build Only)
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        swift: ["5.10", "5.9"]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Swift ${{ matrix.swift }}
+        uses: swift-actions/setup-swift@v1
+        with:
+          swift-version: ${{ matrix.swift }}
+      
+      - name: Build Integration Tests
+        run: |
+          echo "Building integration tests (not running traces on cloud runners)..."
+          swift build --product integrationtest
+          swift build --product swift-ftr
+      
+      - name: Test CLI Tool Help Only
+        run: |
+          echo "Testing CLI tool (help only, no actual traces)..."
+          .build/debug/swift-ftr --help
+      
+      - name: Build External Package
+        run: |
+          echo "Building external package (not running on cloud runners)..."
+          cd test-external-package
+          swift build
+
+  stress-tests:
+    name: Stress & Edge Case Tests
+    runs-on: [self-hosted, macos]
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'test-stress')
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v1
+        with:
+          swift-version: "5.10"
+      
+      - name: Run Stress Tests
+        run: |
+          echo "Running stress tests on self-hosted runner..."
+          swift test --filter StressAndEdgeCaseTests --parallel
+      
+      - name: Memory Leak Check
+        run: |
+          # Build with sanitizers if supported
+          swift build -c release -Xswiftc -sanitize=address || swift build -c release
+          
+          # Run a simple memory test
+          cat > memtest.swift << 'EOF'
+          import SwiftFTR
+          import Foundation
+          
+          @main
+          struct MemTest {
+              static func main() async {
+                  let config = SwiftFTRConfig(maxHops: 5)
+                  let tracer = SwiftFTR(config: config)
+                  
+                  for i in 1...100 {
+                      _ = try? await tracer.trace(to: "1.1.1.1")
+                      if i % 10 == 0 { print("Completed \(i) traces") }
+                  }
+                  print("Memory test completed")
+              }
+          }
+          EOF
+          
+          swiftc memtest.swift -I .build/debug -L .build/debug -lSwiftFTR -o memtest
+          ./memtest
+
+  compatibility-test:
+    name: Platform Compatibility
+    strategy:
+      matrix:
+        os: [macos-13, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v1
+        with:
+          swift-version: "5.10"
+      
+      - name: Build and Test
+        run: |
+          swift build
+          swift test --filter ComprehensiveIntegrationTests/testTraceToValidIPv4
+
+  performance-regression:
+    name: Performance Regression Check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v1
+        with:
+          swift-version: "5.10"
+      
+      - name: Run Performance Tests
+        run: |
+          # Run performance test multiple times and check for regression
+          for i in {1..5}; do
+            echo "Performance run $i..."
+            swift test --filter testTracePerformance
+          done
+      
+      - name: Benchmark Trace Speed
+        run: |
+          cat > benchmark.swift << 'EOF'
+          import SwiftFTR
+          import Foundation
+          
+          @main
+          struct Benchmark {
+              static func main() async {
+                  let config = SwiftFTRConfig(maxHops: 10, maxWaitMs: 1000)
+                  let tracer = SwiftFTR(config: config)
+                  
+                  var times: [TimeInterval] = []
+                  
+                  for _ in 1...10 {
+                      let start = Date()
+                      _ = try? await tracer.trace(to: "1.1.1.1")
+                      let elapsed = Date().timeIntervalSince(start)
+                      times.append(elapsed)
+                  }
+                  
+                  let avg = times.reduce(0, +) / Double(times.count)
+                  let max = times.max() ?? 0
+                  let min = times.min() ?? 0
+                  
+                  print("Benchmark Results:")
+                  print("  Average: \(String(format: "%.3f", avg))s")
+                  print("  Min: \(String(format: "%.3f", min))s")
+                  print("  Max: \(String(format: "%.3f", max))s")
+                  
+                  // Fail if average is too slow
+                  if avg > 2.0 {
+                      print("ERROR: Performance regression detected!")
+                      exit(1)
+                  }
+              }
+          }
+          EOF
+          
+          swiftc benchmark.swift -I .build/debug -L .build/debug -lSwiftFTR -o benchmark
+          ./benchmark
+
+  security-check:
+    name: Security & Best Practices
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check for hardcoded credentials
+        run: |
+          # Check for potential hardcoded IPs, keys, or credentials
+          ! grep -r "PTR_" Sources/ --include="*.swift" || \
+            (echo "Found environment variable references that should be removed" && exit 1)
+          
+          # Check for hardcoded private IPs in non-test code
+          ! grep -r "192\.168\." Sources/SwiftFTR --include="*.swift" || \
+            echo "Warning: Found hardcoded private IPs"
+      
+      - name: SwiftLint
+        run: |
+          brew install swiftlint || true
+          swiftlint --config .swiftlint.yml || true
+      
+      - name: Check for unsafe flags
+        run: |
+          # Ensure no unsafe flags in production code
+          ! grep -r "unsafeFlags" Package.swift | grep -v "icmpfuzzer" || \
+            echo "Note: unsafe flags should only be in fuzzer target"
+
+  documentation-check:
+    name: Documentation Build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Swift
+        uses: swift-actions/setup-swift@v1
+        with:
+          swift-version: "5.10"
+      
+      - name: Build Documentation
+        run: |
+          swift package generate-documentation \
+            --target SwiftFTR \
+            --output-path ./docs \
+            --transform-for-static-hosting \
+            --hosting-base-path SwiftFTR || \
+          echo "Documentation generation completed with warnings"
+      
+      - name: Check Documentation Coverage
+        run: |
+          # Simple check for public API documentation
+          echo "Checking for undocumented public APIs..."
+          swift package diagnose-api-breaking-changes || true

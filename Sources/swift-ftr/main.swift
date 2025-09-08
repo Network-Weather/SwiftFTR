@@ -6,7 +6,17 @@ import SwiftFTR
 struct SwiftFTRCommand: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
     commandName: "swift-ftr",
-    abstract: "Fast traceroute on macOS using ICMP datagram sockets"
+    abstract: "Fast traceroute on macOS using ICMP datagram sockets",
+    discussion: """
+      Performs parallel traceroute by sending all probes at once, then waiting for responses.
+      
+      Examples:
+        swift-ftr example.com                    # Basic trace
+        swift-ftr 1.1.1.1 -m 10 -t 2.0          # Limit to 10 hops, 2 second timeout  
+        swift-ftr --json 8.8.8.8                 # JSON output with ASN data
+        swift-ftr --verbose google.com           # Show debug logging
+        swift-ftr --public-ip 1.2.3.4 host.com  # Override public IP detection
+      """
   )
 
   @Flag(name: .customLong("json"), help: "Emit JSON with ASN categories and public IP")
@@ -15,11 +25,14 @@ struct SwiftFTRCommand: AsyncParsableCommand {
   @Flag(name: .customLong("no-rdns"), help: "Disable reverse DNS lookups")
   var noRDNS: Bool = false
 
-  @Flag(name: .customLong("no-stun"), help: "Skip STUN public IP discovery")
-  var noSTUN: Bool = false
-
   @Option(name: .customLong("public-ip"), help: "Override public IP (bypasses STUN)")
   var publicIP: String?
+  
+  @Option(name: [.short, .customLong("payload-size")], help: "ICMP payload size in bytes")
+  var payloadSize: Int = 56
+  
+  @Flag(name: .customLong("verbose"), help: "Enable verbose logging")
+  var verbose: Bool = false
 
   @Option(name: [.short, .customLong("max-hops")], help: "Maximum TTL/hops to probe")
   var maxHops: Int = 30
@@ -32,9 +45,14 @@ struct SwiftFTRCommand: AsyncParsableCommand {
   var host: String
 
   mutating func run() async throws {
-    let tracer = SwiftFTR()
-    if noSTUN { setenv("PTR_SKIP_STUN", "1", 1) }
-    if let pip = publicIP { setenv("PTR_PUBLIC_IP", pip, 1) }
+    let config = SwiftFTRConfig(
+      maxHops: maxHops,
+      maxWaitMs: Int(timeout * 1000),
+      payloadSize: payloadSize,
+      publicIP: publicIP,
+      enableLogging: verbose
+    )
+    let tracer = SwiftFTR(config: config)
 
     do {
       if json {
@@ -49,7 +67,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
   }
 
   private func runJSON(tracer: SwiftFTR) async throws {
-    let classified = try await tracer.traceClassified(to: host, maxHops: maxHops, timeout: timeout)
+    let classified = try await tracer.traceClassified(to: host)
     var allIPs = classified.hops.compactMap { $0.ip }
     allIPs.append(classified.destinationIP)
     if let pip = classified.publicIP { allIPs.append(pip) }
@@ -158,7 +176,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
   }
 
   private func runPretty(tracer: SwiftFTR) async throws {
-    let classified = try await tracer.traceClassified(to: host, maxHops: maxHops, timeout: timeout)
+    let classified = try await tracer.traceClassified(to: host)
     let probeMs = Int(timeout * 1000)
     let overallMs = probeMs * 3
     print(

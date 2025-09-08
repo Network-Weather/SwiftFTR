@@ -141,11 +141,11 @@ public struct CymruWhoisResolver: ASNResolver {
       ai_protocol: IPPROTO_TCP, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
     var res: UnsafeMutablePointer<addrinfo>? = nil
     guard getaddrinfo(host, String(port), &hints, &res) == 0, let info = res else {
-      throw TracerouteError.resolutionFailed
+      throw TracerouteError.resolutionFailed(host: host, details: "Failed to resolve WHOIS server")
     }
     defer { freeaddrinfo(info) }
     let fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-    if fd < 0 { throw TracerouteError.socketCreateFailed(errno: errno) }
+    if fd < 0 { throw TracerouteError.socketCreateFailed(errno: errno, details: "Failed to create TCP socket for WHOIS connection") }
 
     // Set non-blocking connect with timeout
     let flags = fcntl(fd, F_GETFL, 0)
@@ -164,18 +164,18 @@ public struct CymruWhoisResolver: ASNResolver {
       let pr = withUnsafeMutablePointer(to: &pfd) { Darwin.poll($0, 1, ms) }
       if pr <= 0 {
         close(fd)
-        throw TracerouteError.socketCreateFailed(errno: ETIMEDOUT)
+        throw TracerouteError.socketCreateFailed(errno: ETIMEDOUT, details: "Connection to WHOIS server timed out")
       }
       // Check for error
       var err: Int32 = 0
       var len = socklen_t(MemoryLayout<Int32>.size)
       if getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) != 0 || err != 0 {
         close(fd)
-        throw TracerouteError.socketCreateFailed(errno: err)
+        throw TracerouteError.socketCreateFailed(errno: err, details: "Connection to WHOIS server failed")
       }
     } else if rv < 0 {
       close(fd)
-      throw TracerouteError.socketCreateFailed(errno: errno)
+      throw TracerouteError.socketCreateFailed(errno: errno, details: "Connection to WHOIS server failed")
     }
     // Set timeouts for read/write
     var tv = timeval(
