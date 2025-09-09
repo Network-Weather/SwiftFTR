@@ -248,8 +248,34 @@ jobs:
           }
           EOF
           
-          swiftc benchmark.swift -I .build/debug -L .build/debug -lSwiftFTR -o benchmark
-          ./benchmark
+          # Clean and build fresh to avoid module conflicts
+          swift build --clean
+          swift build -c release
+          
+          # Use swift run with a temporary executable target
+          mkdir -p BenchmarkRunner/Sources/BenchmarkRunner
+          mv benchmark.swift BenchmarkRunner/Sources/BenchmarkRunner/main.swift
+          
+          cat > BenchmarkRunner/Package.swift << 'EOF'
+          // swift-tools-version: 6.0
+          import PackageDescription
+          let package = Package(
+              name: "BenchmarkRunner",
+              platforms: [.macOS(.v13)],
+              dependencies: [.package(path: "../")],
+              targets: [
+                  .executableTarget(
+                      name: "BenchmarkRunner",
+                      dependencies: ["SwiftFTR"]
+                  )
+              ]
+          )
+          EOF
+          
+          cd BenchmarkRunner
+          swift run
+          cd ..
+          rm -rf BenchmarkRunner
 
   security-check:
     name: Security & Best Practices
