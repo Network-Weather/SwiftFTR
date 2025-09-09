@@ -68,7 +68,7 @@ swift test --filter Config   # Run configuration tests only
 ```
 
 ## What's Changed
-- Configuration API replacing environment variables by @dewrich in #1
+- Configuration API replacing environment variables in #1
 - Swift 6.1 full compliance with Sendable and nonisolated
 - Enhanced CLI with verbose logging and payload size options
 - Comprehensive test suite additions (44 tests)
