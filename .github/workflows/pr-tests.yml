@@ -249,7 +249,7 @@ jobs:
           EOF
           
           # Clean and build fresh to avoid module conflicts
-          swift build --clean
+          swift package clean
           swift build -c release
           
           # Use swift run with a temporary executable target
