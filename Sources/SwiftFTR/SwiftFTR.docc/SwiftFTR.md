@@ -9,7 +9,7 @@ Massively parallel, async/await traceroute for macOS using ICMP datagram sockets
 - IPv4, macOS-focused (uses `SOCK_DGRAM` with `IPPROTO_ICMP`).
 - Async/await API returning structured hop results.
 - Optional classification into segments (LOCAL, ISP, TRANSIT, DESTINATION) using ASN lookups and heuristics.
-- STUN-based public IP discovery (opt-out via environment).
+- STUN-based public IP discovery (can be bypassed via configuration).
 
 ## Usage
 
@@ -18,8 +18,8 @@ Massively parallel, async/await traceroute for macOS using ICMP datagram sockets
 ```swift
 import SwiftFTR
 
-let tracer = SwiftFTR()
-let result = try await tracer.trace(to: "1.1.1.1", maxHops: 30, timeout: 1.0)
+let tracer = SwiftFTR(config: SwiftFTRConfig(maxHops: 30, maxWaitMs: 1000))
+let result = try await tracer.trace(to: "1.1.1.1")
 for hop in result.hops {
     print(hop.ttl, hop.ipAddress ?? "*", hop.rtt ?? 0)
 }
@@ -37,11 +37,10 @@ for hop in classified.hops {
 }
 ```
 
-## Environment toggles
+## Configuration
 
-- `PTR_SKIP_STUN=1`: disable STUN lookup (keeps runtime isolated/offline).
-- `PTR_PUBLIC_IP=x.y.z.w`: override public IP used for ISP-ASN matching.
-- `PTR_DNS=ip,ip,...`: override DNS servers used by the DNS-based ASN resolver.
+- Use ``SwiftFTRConfig(publicIP:)`` to override/bypass STUN public IP discovery.
+- Inject a custom ``SwiftFTR/ASNResolver`` for offline or deterministic lookups.
 
 ## Topics
 

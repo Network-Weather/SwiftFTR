@@ -3,11 +3,11 @@
 Thanks for your interest in improving SwiftFTR! This guide describes how to set up your environment, propose changes, and keep contributions consistent and easy to review.
 
 ## Quick Start
-- Requirements: macOS 13+, Xcode 16 (Swift 6) or Xcode 15.4 (Swift 5.10+), GitHub CLI (optional).
+- Requirements: macOS 13+, Xcode 16.4+ (Swift 6.1+), GitHub CLI (optional).
 - Build & test:
   ```bash
   swift build -c debug
-  PTR_SKIP_STUN=1 swift test -c debug
+  swift test -c debug
   ```
 - Run CLI:
   ```bash
@@ -21,7 +21,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 3. Ensure formatting and tests pass locally:
    ```bash
    swift format lint -r Sources Tests
-   PTR_SKIP_STUN=1 swift test -c debug
+   swift test -c debug
    ```
 4. Open a Pull Request. The CI will run format, build, tests, docs.
 
@@ -50,7 +50,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 
 ## Testing
 - Unit tests should not depend on network access. Use fakes/mocks.
-- For code paths that perform DNS/WHOIS/STUN, prefer injectable resolvers and guard with env vars. CI sets `PTR_SKIP_STUN=1` to ensure isolation.
+- For code paths that perform DNS/WHOIS/STUN, prefer injectable resolvers via configuration. Use `SwiftFTRConfig(publicIP: ...)` to bypass STUN in tests.
 - Add tests next to the code they exercise under `Tests/SwiftFTRTests`.
 
 ## Commit Style

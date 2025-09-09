@@ -43,7 +43,7 @@ If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e
 
 - Requirements
 --------------
-- Swift 5.10+
+- Swift 6.1+ (requires Xcode 16.4 or later)
 - macOS 13+
 - IPv4 only at the moment (ICMPv4 Echo). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS’s ICMP datagram behavior.
 
@@ -61,35 +61,55 @@ Install (SwiftPM)
   ]
   ```
 
+Swift 6.1 Compliance
+--------------------
+SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
+- ✅ All public value types are `Sendable`
+- ✅ API works without `@MainActor` requirements
+- ✅ Thread-safe usage from any actor or task
+- ✅ Builds under Swift 6 language mode with strict concurrency checks
+
 Use It as a Library
 -------------------
 ```swift
 import SwiftFTR
 
-let tracer = SwiftFTR()
+// Configure once, use everywhere
+let config = SwiftFTRConfig(
+    maxHops: 30,        // Max TTL to probe
+    maxWaitMs: 1000,    // Timeout in milliseconds  
+    payloadSize: 56,    // ICMP payload size
+    publicIP: nil,      // Auto-detect via STUN
+    enableLogging: false // Set true for debugging
+)
 
-// Basic trace
-let result = try await tracer.trace(to: "1.1.1.1", maxHops: 30, timeout: 1.0)
+let tracer = SwiftFTR(config: config)
+
+// Basic trace - can be called from any actor context
+let result = try await tracer.trace(to: "1.1.1.1")
 for hop in result.hops {
     let addr = hop.ipAddress ?? "*"
     let rtt  = hop.rtt.map { String(format: "%.3f ms", $0 * 1000) } ?? "timeout"
     print("\(hop.ttl)\t\(addr)\t\(rtt)")
 }
-print("duration: \(String(format: "%.3f s", result.duration))")
 
-// With ASN classification and segments
-let classified = try await tracer.traceClassified(to: "www.example.com", maxHops: 30, timeout: 1.0)
+// With ASN classification
+let classified = try await tracer.traceClassified(to: "www.example.com")
 for hop in classified.hops {
     print(hop.ttl, hop.ip ?? "*", hop.category.rawValue, hop.asn ?? 0, hop.asName ?? "")
 }
 ```
 
+📚 **[See comprehensive examples](EXAMPLES.md)** including SwiftUI integration, error handling, concurrent traces, and more.
+
 Notes for Embedding
 -------------------
-- Public IP discovery: Set `PTR_SKIP_STUN=1` to disable STUN in sandboxed/test environments, or set `PTR_PUBLIC_IP=x.y.z.w` to provide a known address.
-- ASN lookups: `traceClassified` uses a DNS‑based Team Cymru client by default with a small in‑memory cache. You can inject your own `ASNResolver` implementation.
-- Concurrency: All probes are sent quickly; the receiver loop runs until a global deadline so embedding won’t block longer than `timeout`.
-- Error handling: Resolution, socket creation, and send errors surface as `TracerouteError` with human‑readable descriptions.
+- **Thread Safety**: SwiftFTR is fully thread-safe and `nonisolated`. Call from any actor, task, or queue.
+- **Public IP**: Configure via `SwiftFTRConfig(publicIP: "x.y.z.w")` to bypass STUN discovery.
+- **ASN Lookups**: `traceClassified` uses DNS‑based Team Cymru with caching. Inject custom `ASNResolver` for offline lookups.
+- **Timeout Behavior**: Operations complete within configured `maxWaitMs`, guaranteed non-blocking.
+- **Error Handling**: Detailed `TracerouteError` with context about failures (permissions, network, platform).
+- **SwiftUI Ready**: No MainActor requirements - integrate directly into SwiftUI views and view models.
 
 Use It from the CLI
 -------------------
@@ -114,10 +134,10 @@ Example: JSON output
 .build/release/swift-ftr --json www.example.com -m 30 -w 1.0
 ```
 
-Environment Variables
----------------------
-- `PTR_SKIP_STUN=1`: Disable STUN public IP discovery (useful for tests/CI).
-- `PTR_PUBLIC_IP=x.y.z.w`: Override public IP used for ISP/ASN matching.
+Configuration and Flags
+-----------------------
+- Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
+- CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`.
 
 Design Details
 --------------
@@ -149,7 +169,7 @@ Documentation
 Generate and view the docs:
 
 - Xcode: Product → Build Documentation (or use the Documentation sidebar).
-- SwiftPM plugin (Xcode 15+/Swift 5.9+):
+- SwiftPM plugin (Xcode 16.4+/Swift 6.1+):
   ```bash
   swift package --allow-writing-to-directory docs \
     generate-documentation --target SwiftFTR \

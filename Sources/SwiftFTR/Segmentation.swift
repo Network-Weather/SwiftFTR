@@ -35,42 +35,39 @@ public struct ClassifiedTrace: Sendable, Codable {
 public struct TraceClassifier: Sendable {
   public init() {}
 
-    /// Classify a TraceResult into segments using ASN lookups and heuristics.
-    /// - Parameters:
-    ///   - trace: Plain traceroute output to classify.
-    ///   - destinationIP: Destination IPv4 address (numeric string) for ASN matching.
-    ///   - resolver: ASN resolver to use (DNS- or WHOIS-based).
-    ///   - timeout: Per-lookup timeout in seconds.
-    /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
-    public func classify(
-        trace: TraceResult,
-        destinationIP: String,
-        resolver: ASNResolver,
-        timeout: TimeInterval = 1.5
-    ) throws -> ClassifiedTrace {
+  /// Classify a TraceResult into segments using ASN lookups and heuristics.
+  /// - Parameters:
+  ///   - trace: Plain traceroute output to classify.
+  ///   - destinationIP: Destination IPv4 address (numeric string) for ASN matching.
+  ///   - resolver: ASN resolver to use (DNS- or WHOIS-based).
+  ///   - timeout: Per-lookup timeout in seconds.
+  ///   - publicIP: Override public IP (bypasses STUN if provided).
+  /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
+  public func classify(
+    trace: TraceResult,
+    destinationIP: String,
+    resolver: ASNResolver,
+    timeout: TimeInterval = 1.5,
+    publicIP: String? = nil
+  ) throws -> ClassifiedTrace {
     // Gather IPs
     let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
     var allIPs = Set(hopIPs)
     allIPs.insert(destinationIP)
-    var publicIP: String? = nil
-    let env = ProcessInfo.processInfo.environment
-    if let pubOverride = env["PTR_PUBLIC_IP"], !pubOverride.isEmpty {
-      publicIP = pubOverride
-      allIPs.insert(pubOverride)
+    var resolvedPublicIP: String? = publicIP
+    if let providedIP = publicIP {
+      allIPs.insert(providedIP)
     } else {
-      // Try STUN (best effort) unless disabled via env
-      let skipSTUN = env["PTR_SKIP_STUN"] == "1"
-      if !skipSTUN {
-        if let pub = try? stunGetPublicIPv4(timeout: 0.8) {
-          publicIP = pub.ip
-          allIPs.insert(pub.ip)
-        }
+      // Try STUN (best effort) if no public IP provided
+      if let pub = try? stunGetPublicIPv4(timeout: 0.8) {
+        resolvedPublicIP = pub.ip
+        allIPs.insert(pub.ip)
       }
     }
 
     // Lookup ASNs in batch
     let asnMap = try? resolver.resolve(ipv4Addrs: Array(allIPs), timeout: timeout)
-    let clientAS = publicIP.flatMap { asnMap?[$0] }
+    let clientAS = resolvedPublicIP.flatMap { asnMap?[$0] }
     let clientASN = clientAS?.asn
     let clientASName = clientAS?.name
     let destAS = asnMap?[destinationIP]
@@ -153,7 +150,7 @@ public struct TraceClassifier: Sendable {
     return ClassifiedTrace(
       destinationHost: trace.destination,
       destinationIP: destinationIP,
-      publicIP: publicIP,
+      publicIP: resolvedPublicIP,
       clientASN: clientASN,
       clientASName: clientASName,
       destinationASN: destASN,

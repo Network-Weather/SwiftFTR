@@ -1,0 +1,201 @@
+name: Local Integration Tests
+
+# This workflow is designed to run on self-hosted runners or locally with act
+# It performs actual network traces which don't work on GitHub cloud runners
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [labeled]
+    # Only run when 'test-integration' label is added
+  push:
+    branches: [main]
+    paths:
+      - 'Sources/**'
+      - 'Tests/**'
+
+jobs:
+  full-integration-suite:
+    name: Full Integration Test Suite
+    # Requires self-hosted runner with 'macos' and 'traceroute' labels
+    runs-on: [self-hosted, macos, traceroute]
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'test-integration')) ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: System Info
+        run: |
+          echo "Runner: $(hostname)"
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "Swift: $(swift --version | head -1)"
+          echo "Network: $(networksetup -getinfo Wi-Fi 2>/dev/null | head -2 || echo 'Unknown')"
+      
+      - name: Build All Targets
+        run: |
+          swift build --build-tests
+          swift build --product integrationtest
+          swift build --product swift-ftr
+      
+      - name: Run Unit Tests
+        run: |
+          echo "📦 Running unit tests..."
+          swift test --skip-build
+      
+      - name: Run Integration Tests
+        run: |
+          echo "🌐 Running integration tests with real network..."
+          .build/debug/integrationtest
+      
+      - name: Test Traceroute to Common Destinations
+        run: |
+          echo "🔍 Testing traceroutes to common destinations..."
+          
+          destinations=(
+            "1.1.1.1"        # Cloudflare
+            "8.8.8.8"        # Google
+            "9.9.9.9"        # Quad9
+            "208.67.222.222" # OpenDNS
+          )
+          
+          for dest in "${destinations[@]}"; do
+            echo ""
+            echo "Tracing to $dest..."
+            .build/debug/swift-ftr "$dest" -m 10 -t 2.0 || echo "Failed to trace $dest"
+          done
+      
+      - name: Test Classification Accuracy
+        run: |
+          echo "🏷️ Testing ASN classification..."
+          .build/debug/swift-ftr --json 1.1.1.1 -m 15 | jq '.hops[] | {ttl, ip, category, asn, asName}' || true
+      
+      - name: Performance Benchmark
+        run: |
+          echo "⚡ Running performance benchmark..."
+          
+          cat > /tmp/perf-test.swift << 'EOF'
+          import SwiftFTR
+          import Foundation
+          
+          @main
+          struct PerfTest {
+              static func main() async {
+                  let config = SwiftFTRConfig(maxHops: 10, maxWaitMs: 1000)
+                  let tracer = SwiftFTR(config: config)
+                  
+                  var times: [TimeInterval] = []
+                  let iterations = 10
+                  
+                  print("Running \(iterations) traces for performance measurement...")
+                  
+                  for i in 1...iterations {
+                      let start = Date()
+                      if let result = try? await tracer.trace(to: "1.1.1.1") {
+                          let elapsed = Date().timeIntervalSince(start)
+                          times.append(elapsed)
+                          print("  Run \(i): \(String(format: "%.3f", elapsed))s (\(result.hops.count) hops)")
+                      }
+                  }
+                  
+                  if !times.isEmpty {
+                      let avg = times.reduce(0, +) / Double(times.count)
+                      let min = times.min() ?? 0
+                      let max = times.max() ?? 0
+                      
+                      print("\nPerformance Results:")
+                      print("  Average: \(String(format: "%.3f", avg))s")
+                      print("  Min: \(String(format: "%.3f", min))s")
+                      print("  Max: \(String(format: "%.3f", max))s")
+                      
+                      if avg > 2.0 {
+                          print("⚠️  WARNING: Average time exceeds 2 seconds!")
+                          exit(1)
+                      }
+                  }
+              }
+          }
+          EOF
+          
+          swiftc /tmp/perf-test.swift -I .build/debug -L .build/debug -lSwiftFTR -o /tmp/perf-test
+          /tmp/perf-test
+          rm -f /tmp/perf-test.swift /tmp/perf-test
+      
+      - name: Test External Package Integration
+        run: |
+          echo "📦 Testing as external package..."
+          cd test-external-package
+          swift run
+          cd ..
+      
+      - name: Stress Test - Concurrent Traces
+        run: |
+          echo "💪 Running concurrent trace stress test..."
+          
+          cat > /tmp/stress-test.swift << 'EOF'
+          import SwiftFTR
+          import Foundation
+          
+          @main
+          struct StressTest {
+              static func main() async {
+                  let config = SwiftFTRConfig(maxHops: 5, maxWaitMs: 1000)
+                  let tracer = SwiftFTR(config: config)
+                  
+                  print("Starting 5 concurrent traces...")
+                  
+                  await withTaskGroup(of: Bool.self) { group in
+                      let destinations = ["1.1.1.1", "8.8.8.8", "9.9.9.9", "208.67.222.222", "1.0.0.1"]
+                      
+                      for dest in destinations {
+                          group.addTask {
+                              if let _ = try? await tracer.trace(to: dest) {
+                                  print("  ✓ Completed trace to \(dest)")
+                                  return true
+                              }
+                              print("  ✗ Failed trace to \(dest)")
+                              return false
+                          }
+                      }
+                      
+                      var successes = 0
+                      for await success in group {
+                          if success { successes += 1 }
+                      }
+                      
+                      print("\nCompleted \(successes)/5 concurrent traces successfully")
+                  }
+              }
+          }
+          EOF
+          
+          swiftc /tmp/stress-test.swift -I .build/debug -L .build/debug -lSwiftFTR -o /tmp/stress-test
+          /tmp/stress-test
+          rm -f /tmp/stress-test.swift /tmp/stress-test
+      
+      - name: Coverage Report
+        if: always()
+        run: |
+          echo "📊 Generating coverage report..."
+          swift test --enable-code-coverage || true
+          
+          if [ -f ".build/debug/codecov/default.profdata" ]; then
+            xcrun llvm-cov report \
+              .build/debug/SwiftFTRPackageTests.xctest/Contents/MacOS/SwiftFTRPackageTests \
+              -instr-profile .build/debug/codecov/default.profdata \
+              -ignore-filename-regex="Tests|.build" || true
+          fi
+      
+      - name: Summary
+        if: always()
+        run: |
+          echo ""
+          echo "========================================="
+          echo "Local Integration Test Summary"
+          echo "========================================="
+          echo "✅ Tests completed on self-hosted runner"
+          echo "Runner: $(hostname)"
+          echo "Time: $(date)"
+          echo "========================================="

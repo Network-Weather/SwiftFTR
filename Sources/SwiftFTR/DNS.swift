@@ -26,23 +26,17 @@ struct DNSClient {
     let rdata: Data
   }
 
-  static func queryTXT(name: String, timeout: TimeInterval = 1.0, servers: [String]? = nil)
+  static func queryTXT(
+    name: String, timeout: TimeInterval = 1.0, servers: [String] = ["1.1.1.1", "8.8.8.8"]
+  )
     -> [String]?
   {
-    let svrList = servers ?? dnsServersFromEnvOrDefault()
-    for server in svrList {
+    for server in servers {
       if let res = queryTXTOnce(name: name, timeout: timeout, server: server) {
         return res
       }
     }
     return nil
-  }
-
-  private static func dnsServersFromEnvOrDefault() -> [String] {
-    if let env = ProcessInfo.processInfo.environment["PTR_DNS"], !env.isEmpty {
-      return env.split(separator: ",").map { String($0) }
-    }
-    return ["1.1.1.1", "8.8.8.8"]
   }
 
   private static func queryTXTOnce(name: String, timeout: TimeInterval, server: String) -> [String]?
