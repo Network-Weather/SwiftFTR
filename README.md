@@ -69,6 +69,14 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
 
+New in v0.3.0
+-------------
+- **Trace Cancellation**: Cancel in-flight traces when network conditions change
+- **rDNS Support**: Automatic reverse DNS lookups with built-in caching (86400s TTL)
+- **STUN Caching**: Public IP discovery results are cached until network changes
+- **Network Change API**: Call `networkChanged()` to invalidate caches and cancel active traces
+- **Actor-based Architecture**: SwiftFTR is now an actor for better concurrency safety
+
 Use It as a Library
 -------------------
 ```swift
@@ -97,7 +105,14 @@ for hop in result.hops {
 let classified = try await tracer.traceClassified(to: "www.example.com")
 for hop in classified.hops {
     print(hop.ttl, hop.ip ?? "*", hop.category.rawValue, hop.asn ?? 0, hop.asName ?? "")
+    // New: hostname from reverse DNS
+    if let hostname = hop.hostname {
+        print("  Hostname: \(hostname)")
+    }
 }
+
+// Handle network changes (e.g., WiFi to cellular, VPN connect/disconnect)
+await tracer.networkChanged()  // Cancels active traces and clears caches
 ```
 
 📚 **[See comprehensive examples](EXAMPLES.md)** including SwiftUI integration, error handling, concurrent traces, and more.

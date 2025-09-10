@@ -183,7 +183,7 @@ public actor SwiftFTR {
     return try await withTaskCancellationHandler {
       try await performTrace(to: host, handle: handle)
     } onCancel: {
-      handle.cancel()
+      Task { await handle.cancel() }
     }
   }
   
@@ -291,7 +291,7 @@ public actor SwiftFTR {
     // The loop uses poll(2) to wait for readability and then drains datagrams.
     recvLoop: while monotonicNow() < deadline {
       // Check if cancelled
-      if handle.isCancelled {
+      if await handle.isCancelled {
         throw TracerouteError.cancelled
       }
       
@@ -522,7 +522,7 @@ public actor SwiftFTR {
   public func networkChanged() async {
     // Cancel all active traces
     for trace in activeTraces {
-      trace.cancel()
+      await trace.cancel()
     }
     activeTraces.removeAll()
     
