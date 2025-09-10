@@ -4,16 +4,16 @@ import Foundation
 ///
 /// This actor provides a thread-safe mechanism to cancel ongoing trace operations,
 /// particularly useful when network conditions change or when the trace is no longer needed.
-/// 
+///
 /// Uses Swift 6's actor isolation for thread safety.
 public actor TraceHandle {
   private var _isCancelled = false
-  
+
   /// Whether this trace has been cancelled.
   public var isCancelled: Bool {
     _isCancelled
   }
-  
+
   /// Cancel this trace operation.
   ///
   /// Once cancelled, the trace will stop at the next cancellation check point
@@ -21,7 +21,7 @@ public actor TraceHandle {
   public func cancel() {
     _isCancelled = true
   }
-  
+
   init() {}
 }
 
@@ -30,7 +30,7 @@ extension TraceHandle: Hashable {
   nonisolated public static func == (lhs: TraceHandle, rhs: TraceHandle) -> Bool {
     ObjectIdentifier(lhs) == ObjectIdentifier(rhs)
   }
-  
+
   nonisolated public func hash(into hasher: inout Hasher) {
     ObjectIdentifier(self).hash(into: &hasher)
   }

@@ -19,7 +19,7 @@ public struct ClassifiedHop: Sendable, Codable {
   public let category: HopCategory
   /// Hostname from reverse DNS lookup
   public let hostname: String?
-  
+
   public init(
     ttl: Int,
     ip: String?,
@@ -53,7 +53,7 @@ public struct ClassifiedTrace: Sendable, Codable {
   public let destinationASN: Int?
   public let destinationASName: String?
   public let hops: [ClassifiedHop]
-  
+
   public init(
     destinationHost: String,
     destinationIP: String,
@@ -149,12 +149,12 @@ public struct TraceClassifier: Sendable {
       }
       out.append(
         ClassifiedHop(
-          ttl: hop.ttl, 
-          ip: ip, 
-          rtt: hop.rtt, 
-          asn: asn, 
-          asName: name, 
-          category: cat, 
+          ttl: hop.ttl,
+          ip: ip,
+          rtt: hop.rtt,
+          asn: asn,
+          asName: name,
+          category: cat,
           hostname: hop.hostname
         )
       )
@@ -191,10 +191,10 @@ public struct TraceClassifier: Sendable {
               for k in start..<end {
                 let hop = filled[k]
                 filled[k] = ClassifiedHop(
-                  ttl: hop.ttl, 
-                  ip: hop.ip, 
-                  rtt: hop.rtt, 
-                  asn: fillASN, 
+                  ttl: hop.ttl,
+                  ip: hop.ip,
+                  rtt: hop.rtt,
+                  asn: fillASN,
                   asName: fillName,
                   category: cat,
                   hostname: hop.hostname
@@ -213,9 +213,9 @@ public struct TraceClassifier: Sendable {
     return ClassifiedTrace(
       destinationHost: trace.destination,
       destinationIP: destinationIP,
-      destinationHostname: nil, // Will be filled by SwiftFTR.traceClassified
+      destinationHostname: nil,  // Will be filled by SwiftFTR.traceClassified
       publicIP: resolvedPublicIP,
-      publicHostname: nil, // Will be filled by SwiftFTR.traceClassified
+      publicHostname: nil,  // Will be filled by SwiftFTR.traceClassified
       clientASN: clientASN,
       clientASName: clientASName,
       destinationASN: destASN,

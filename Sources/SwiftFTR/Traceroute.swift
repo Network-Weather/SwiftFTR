@@ -16,11 +16,11 @@ public struct TraceHop: Sendable {
   public let reachedDestination: Bool
   /// Hostname from reverse DNS lookup. `nil` if lookup disabled, failed, or timed out.
   public let hostname: String?
-  
+
   public init(
-    ttl: Int, 
-    ipAddress: String?, 
-    rtt: TimeInterval?, 
+    ttl: Int,
+    ipAddress: String?,
+    rtt: TimeInterval?,
     reachedDestination: Bool,
     hostname: String? = nil
   ) {
@@ -30,7 +30,7 @@ public struct TraceHop: Sendable {
     self.reachedDestination = reachedDestination
     self.hostname = hostname
   }
-  
+
   @available(*, deprecated, message: "Use ipAddress instead", renamed: "ipAddress")
   public var host: String? { ipAddress }
 }
@@ -142,12 +142,12 @@ public struct SwiftFTRConfig: Sendable {
 @available(macOS 13.0, *)
 public actor SwiftFTR {
   private var config: SwiftFTRConfig
-  
+
   // Cache storage
   private var cachedPublicIP: String?
   private let rdnsCache: RDNSCache
   private let asnResolver: ASNResolver
-  
+
   // Active trace tracking
   private var activeTraces: Set<TraceHandle> = []
 
@@ -174,11 +174,11 @@ public actor SwiftFTR {
     to host: String
   ) async throws -> TraceResult {
     let handle = TraceHandle()
-    
+
     // Register active trace
     activeTraces.insert(handle)
     defer { activeTraces.remove(handle) }
-    
+
     // Run trace in a task so we can check cancellation
     return try await withTaskCancellationHandler {
       try await performTrace(to: host, handle: handle)
@@ -186,7 +186,7 @@ public actor SwiftFTR {
       Task { await handle.cancel() }
     }
   }
-  
+
   // Internal implementation of trace with cancellation support
   private func performTrace(
     to host: String,
@@ -294,13 +294,13 @@ public actor SwiftFTR {
       if await handle.isCancelled {
         throw TracerouteError.cancelled
       }
-      
+
       var fds = Darwin.pollfd(fd: fd, events: Int16(Darwin.POLLIN), revents: 0)
       // Use shorter poll timeout for responsive cancellation (max 100ms)
       let msLeft = Int32(min(100, max(0, (deadline - monotonicNow()) * 1000)))
       let rv = withUnsafeMutablePointer(to: &fds) { p in Darwin.poll(p, 1, msLeft) }
-      if rv == 0 { continue } // Timeout - check cancellation and continue
-      if rv < 0 { break }     // Error
+      if rv == 0 { continue }  // Timeout - check cancellation and continue
+      if rv < 0 { break }  // Error
 
       // Drain available datagrams
       while true {
@@ -380,12 +380,12 @@ public actor SwiftFTR {
     }
 
     var finalHops = Array(hops[0..<(reachedTTL ?? maxHops)]).compactMap { $0 }
-    
+
     // Perform rDNS lookups if enabled
     if !config.noReverseDNS {
       let ips = finalHops.compactMap { $0.ipAddress }
       let hostnames = await rdnsCache.batchLookup(ips)
-      
+
       finalHops = finalHops.map { hop in
         TraceHop(
           ttl: hop.ttl,
@@ -396,7 +396,7 @@ public actor SwiftFTR {
         )
       }
     }
-    
+
     let result = TraceResult(
       destination: host,
       maxHops: maxHops,
@@ -435,19 +435,19 @@ public actor SwiftFTR {
     } else {
       effectivePublicIP = nil
     }
-    
+
     // Perform base trace (includes rDNS if enabled)
     let tr = try await trace(to: host)
-    
+
     // Resolve destination IP
     let destAddr = try resolveIPv4(host: host, enableLogging: config.enableLogging)
     let destIP = ipString(destAddr)
-    
+
     // Collect IPs for batch operations
     var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
     allIPs.insert(destIP)
     if let pip = effectivePublicIP { allIPs.insert(pip) }
-    
+
     // Get hostnames (either from trace or via rDNS)
     var hostnameMap: [String: String] = [:]
     if !config.noReverseDNS {
@@ -459,7 +459,7 @@ public actor SwiftFTR {
         let additionalHostnames = await rdnsCache.batchLookup(Array(ipsNeedingRDNS))
         hostnameMap = additionalHostnames
       }
-      
+
       // Add hostnames from trace
       for hop in tr.hops {
         if let ip = hop.ipAddress, let hostname = hop.hostname {
@@ -467,20 +467,20 @@ public actor SwiftFTR {
         }
       }
     }
-    
+
     // Use provided resolver or internal one
     let effectiveResolver = resolver ?? asnResolver
-    
+
     // Classify with enhanced data
     let classifier = TraceClassifier()
     let baseClassified = try classifier.classify(
-      trace: tr, 
-      destinationIP: destIP, 
-      resolver: effectiveResolver, 
-      timeout: 1.5, 
+      trace: tr,
+      destinationIP: destIP,
+      resolver: effectiveResolver,
+      timeout: 1.5,
       publicIP: effectivePublicIP
     )
-    
+
     // Enhance classified result with hostnames
     let enhancedHops = baseClassified.hops.map { hop in
       ClassifiedHop(
@@ -490,10 +490,12 @@ public actor SwiftFTR {
         asn: hop.asn,
         asName: hop.asName,
         category: hop.category,
-        hostname: hop.ip.flatMap { hostnameMap[$0] ?? tr.hops.first { $0.ipAddress == hop.ip }?.hostname }
+        hostname: hop.ip.flatMap {
+          hostnameMap[$0] ?? tr.hops.first { $0.ipAddress == hop.ip }?.hostname
+        }
       )
     }
-    
+
     return ClassifiedTrace(
       destinationHost: baseClassified.destinationHost,
       destinationIP: baseClassified.destinationIP,
@@ -507,14 +509,14 @@ public actor SwiftFTR {
       hops: enhancedHops
     )
   }
-  
+
   /// Discover public IP via STUN
   private func discoverPublicIP() async throws -> String {
     try stunGetPublicIPv4(timeout: 0.8).ip
   }
-  
+
   // MARK: - Cache Management
-  
+
   /// Handle network changes by cancelling active traces and clearing caches.
   ///
   /// Call this method when the network configuration changes (e.g., WiFi to cellular,
@@ -525,23 +527,23 @@ public actor SwiftFTR {
       await trace.cancel()
     }
     activeTraces.removeAll()
-    
+
     // Clear cached public IP
     cachedPublicIP = nil
-    
+
     // Clear rDNS cache
     await rdnsCache.clear()
-    
+
     // Note: ASN cache could optionally be cleared too
   }
-  
+
   /// Get the effective public IP (configured or cached).
   ///
   /// This returns the configured public IP if set, otherwise the cached discovered IP.
   public var publicIP: String? {
     config.publicIP ?? cachedPublicIP
   }
-  
+
   /// Clear all caches (convenience method).
   ///
   /// This clears both the public IP cache and the rDNS cache.
@@ -549,7 +551,7 @@ public actor SwiftFTR {
     cachedPublicIP = nil
     await rdnsCache.clear()
   }
-  
+
   /// Invalidate just the public IP cache.
   ///
   /// Forces re-discovery via STUN on the next trace.
