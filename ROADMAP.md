@@ -11,7 +11,31 @@
 - ✅ Enhanced error handling with contextual details
 - ✅ CLI improvements with verbose logging and payload size configuration
 
-## Version 0.3.0 - Q4 2025: VPN/Zero Trust/SASE Support
+## Version 0.3.0 - Q4 2025: Caching, rDNS, and Cancellation Support
+### Core Library Enhancements
+- [ ] Actor-based architecture using Swift 6.1 features
+- [ ] Reverse DNS (rDNS) support with caching (86400s default TTL)
+- [ ] STUN public IP caching between traces
+- [ ] Trace cancellation support for network changes
+- [ ] Enhanced data models with hostname fields
+- [ ] `networkChanged()` API for cache invalidation
+- [ ] Feature parity between CLI and library
+
+**Implementation Details:**
+- See [CACHING_PLAN.md](CACHING_PLAN.md) for detailed implementation plan
+- Convert SwiftFTR from struct to actor for thread safety
+- Add RDNSCache actor with LRU eviction
+- TraceHandle for cancellation with Swift Atomics
+- Batch rDNS lookups for performance
+
+**Benefits:**
+- Eliminate redundant STUN queries (save 100-500ms per trace)
+- Cache rDNS lookups for repeated IPs
+- Gracefully handle network changes
+- Feature parity between CLI and library API
+- Thread-safe caching with actor isolation
+
+## Version 0.4.0 - Q1 2026: VPN/Zero Trust/SASE Support
 ### Enterprise Network Compatibility
 - [ ] VPN tunnel detection and classification
 - [ ] Split-tunnel VPN handling
@@ -62,7 +86,7 @@ enum HopCategory {
 }
 ```
 
-## Version 0.4.0 - Q1 2026: Offline ASN Support
+## Version 0.5.0 - Q2 2026: Offline ASN Support
 ### Swift-IP2ASN Integration
 - [ ] Integrate Swift-IP2ASN library for offline IP-to-ASN mapping
 - [ ] Hybrid resolution: offline first, fallback to DNS
@@ -85,7 +109,7 @@ let config = SwiftFTRConfig(
 )
 ```
 
-## Version 0.5.0 - Q2 2026: Enhanced Protocol Support
+## Version 0.6.0 - Q3 2026: Enhanced Protocol Support
 ### Multiple Probe Methods
 - [ ] UDP probe support (like traditional traceroute)
 - [ ] TCP SYN probe support (for firewall traversal)
@@ -97,7 +121,7 @@ let config = SwiftFTRConfig(
 - More complete path discovery
 - Protocol-specific path detection
 
-## Version 0.6.0 - Q3 2026: IPv6 Support
+## Version 0.7.0 - Q4 2026: IPv6 Support
 ### Full Dual-Stack Support
 - [ ] ICMPv6 implementation
 - [ ] IPv6 address resolution
@@ -109,7 +133,7 @@ let config = SwiftFTRConfig(
 - IPv6 path discovery complexity
 - Dual-stack result merging
 
-## Version 0.7.0 - Q4 2026: Advanced Analytics
+## Version 0.8.0 - Q1 2027: Advanced Analytics
 ### Path Analysis Features
 - [ ] Path change detection over time
 - [ ] Latency variance analysis
