@@ -17,11 +17,18 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.1"),
+        .package(url: "https://github.com/apple/swift-atomics", from: "1.2.0"),
         // Enables `swift package generate-documentation`
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.0")
     ],
     targets: [
-        .target(name: "SwiftFTR", path: "Sources/SwiftFTR"),
+        .target(
+            name: "SwiftFTR", 
+            dependencies: [
+                .product(name: "Atomics", package: "swift-atomics")
+            ],
+            path: "Sources/SwiftFTR"
+        ),
         .executableTarget(
             name: "swift-ftr",
             dependencies: [

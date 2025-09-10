@@ -17,18 +17,66 @@ public struct ClassifiedHop: Sendable, Codable {
   public let asn: Int?
   public let asName: String?
   public let category: HopCategory
+  /// Hostname from reverse DNS lookup
+  public let hostname: String?
+  
+  public init(
+    ttl: Int,
+    ip: String?,
+    rtt: TimeInterval?,
+    asn: Int?,
+    asName: String?,
+    category: HopCategory,
+    hostname: String? = nil
+  ) {
+    self.ttl = ttl
+    self.ip = ip
+    self.rtt = rtt
+    self.asn = asn
+    self.asName = asName
+    self.category = category
+    self.hostname = hostname
+  }
 }
 
 /// Result of a classified trace including destination/public IP metadata.
 public struct ClassifiedTrace: Sendable, Codable {
   public let destinationHost: String
   public let destinationIP: String
+  /// Hostname of the destination IP from reverse DNS
+  public let destinationHostname: String?
   public let publicIP: String?
+  /// Hostname of the public IP from reverse DNS
+  public let publicHostname: String?
   public let clientASN: Int?
   public let clientASName: String?
   public let destinationASN: Int?
   public let destinationASName: String?
   public let hops: [ClassifiedHop]
+  
+  public init(
+    destinationHost: String,
+    destinationIP: String,
+    destinationHostname: String? = nil,
+    publicIP: String? = nil,
+    publicHostname: String? = nil,
+    clientASN: Int? = nil,
+    clientASName: String? = nil,
+    destinationASN: Int? = nil,
+    destinationASName: String? = nil,
+    hops: [ClassifiedHop]
+  ) {
+    self.destinationHost = destinationHost
+    self.destinationIP = destinationIP
+    self.destinationHostname = destinationHostname
+    self.publicIP = publicIP
+    self.publicHostname = publicHostname
+    self.clientASN = clientASN
+    self.clientASName = clientASName
+    self.destinationASN = destinationASN
+    self.destinationASName = destinationASName
+    self.hops = hops
+  }
 }
 
 /// Classifies plain traceroute results into segments and attaches ASN metadata.
@@ -100,7 +148,16 @@ public struct TraceClassifier: Sendable {
         }
       }
       out.append(
-        ClassifiedHop(ttl: hop.ttl, ip: ip, rtt: hop.rtt, asn: asn, asName: name, category: cat))
+        ClassifiedHop(
+          ttl: hop.ttl, 
+          ip: ip, 
+          rtt: hop.rtt, 
+          asn: asn, 
+          asName: name, 
+          category: cat, 
+          hostname: hop.hostname
+        )
+      )
     }
 
     // Interpolate non-reported segments (ip == nil) that are sandwiched between
@@ -134,8 +191,14 @@ public struct TraceClassifier: Sendable {
               for k in start..<end {
                 let hop = filled[k]
                 filled[k] = ClassifiedHop(
-                  ttl: hop.ttl, ip: hop.ip, rtt: hop.rtt, asn: fillASN, asName: fillName,
-                  category: cat)
+                  ttl: hop.ttl, 
+                  ip: hop.ip, 
+                  rtt: hop.rtt, 
+                  asn: fillASN, 
+                  asName: fillName,
+                  category: cat,
+                  hostname: hop.hostname
+                )
               }
             }
           }
@@ -150,7 +213,9 @@ public struct TraceClassifier: Sendable {
     return ClassifiedTrace(
       destinationHost: trace.destination,
       destinationIP: destinationIP,
+      destinationHostname: nil, // Will be filled by SwiftFTR.traceClassified
       publicIP: resolvedPublicIP,
+      publicHostname: nil, // Will be filled by SwiftFTR.traceClassified
       clientASN: clientASN,
       clientASName: clientASName,
       destinationASN: destASN,
