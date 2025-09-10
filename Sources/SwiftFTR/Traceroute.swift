@@ -31,8 +31,6 @@ public struct TraceHop: Sendable {
     self.hostname = hostname
   }
 
-  @available(*, deprecated, message: "Use ipAddress instead", renamed: "ipAddress")
-  public var host: String? { ipAddress }
 }
 
 /// Complete result of a traceroute run.

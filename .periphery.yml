@@ -1,0 +1,31 @@
+# Periphery Configuration for SwiftFTR
+# This library provides a public API that may not be used internally
+
+# Retain all public declarations since this is a library
+retain_public: true
+
+# Only scan the main library target
+targets:
+  - SwiftFTR
+
+# Retain specific symbols that are part of the public API
+retain_objc_accessible: false
+retain_objc_annotated: false
+
+# Quiet mode for CI
+quiet: false
+
+# Disable auto-update check
+disable_update_check: true
+
+# Format for output
+format: csv
+
+# Retain unused parameters in protocol conformances
+retain_unused_protocol_func_params: true
+
+# Verbose output
+verbose: false
+
+# Skip the build phase since we build separately
+skip_build: true
