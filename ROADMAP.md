@@ -1,6 +1,6 @@
 # SwiftFTR Roadmap
 
-## Current Version: 0.2.0 (September 2025)
+## Current Version: 0.3.0 (September 2025)
 - ✅ Core traceroute functionality with ICMP datagram sockets
 - ✅ Swift 6.1 concurrency compliance
 - ✅ Thread-safe, nonisolated API
@@ -10,8 +10,15 @@
 - ✅ Comprehensive test suite
 - ✅ Enhanced error handling with contextual details
 - ✅ CLI improvements with verbose logging and payload size configuration
+- ✅ Actor-based architecture using Swift 6.1 features
+- ✅ Reverse DNS (rDNS) support with caching (86400s default TTL)
+- ✅ STUN public IP caching between traces
+- ✅ Trace cancellation support for network changes
+- ✅ Enhanced data models with hostname fields
+- ✅ `networkChanged()` API for cache invalidation
+- ✅ Feature parity between CLI and library
 
-## Version 0.3.0 - Q4 2025: VPN/Zero Trust/SASE Support
+## Version 0.4.0 - Q4 2025: VPN/Zero Trust/SASE Support
 ### Enterprise Network Compatibility
 - [ ] VPN tunnel detection and classification
 - [ ] Split-tunnel VPN handling
@@ -62,7 +69,7 @@ enum HopCategory {
 }
 ```
 
-## Version 0.4.0 - Q1 2026: Offline ASN Support
+## Version 0.5.0 - Q1 2026: Offline ASN Support
 ### Swift-IP2ASN Integration
 - [ ] Integrate Swift-IP2ASN library for offline IP-to-ASN mapping
 - [ ] Hybrid resolution: offline first, fallback to DNS
@@ -85,7 +92,7 @@ let config = SwiftFTRConfig(
 )
 ```
 
-## Version 0.5.0 - Q2 2026: Enhanced Protocol Support
+## Version 0.6.0 - Q2 2026: Enhanced Protocol Support
 ### Multiple Probe Methods
 - [ ] UDP probe support (like traditional traceroute)
 - [ ] TCP SYN probe support (for firewall traversal)
@@ -97,7 +104,7 @@ let config = SwiftFTRConfig(
 - More complete path discovery
 - Protocol-specific path detection
 
-## Version 0.6.0 - Q3 2026: IPv6 Support
+## Version 0.7.0 - Q3 2026: IPv6 Support
 ### Full Dual-Stack Support
 - [ ] ICMPv6 implementation
 - [ ] IPv6 address resolution
@@ -109,7 +116,7 @@ let config = SwiftFTRConfig(
 - IPv6 path discovery complexity
 - Dual-stack result merging
 
-## Version 0.7.0 - Q4 2026: Advanced Analytics
+## Version 0.8.0 - Q4 2026: Advanced Analytics
 ### Path Analysis Features
 - [ ] Path change detection over time
 - [ ] Latency variance analysis
@@ -159,7 +166,7 @@ let config = SwiftFTRConfig(
 
 We welcome contributions! Priority areas:
 1. VPN/Zero Trust/SASE testing and detection (immediate)
-2. Swift-IP2ASN integration (Q4 2025)
+2. Swift-IP2ASN integration (Q1 2026)
 3. Enterprise network compatibility
 4. Performance benchmarking with tunneled traffic
 5. Platform compatibility testing
@@ -167,11 +174,12 @@ We welcome contributions! Priority areas:
 ## Dependencies & Integration Points
 
 ### Current Dependencies
-- Swift 6.1+ (minimum requirement as of v0.2.0)
+- Swift 6.1+ (minimum requirement)
 - macOS 13+ (ICMP datagram socket support)
+- Swift Concurrency with actors (v0.3.0+)
 
 ### Planned Integrations
-- **Swift-IP2ASN**: Offline ASN database (v0.4.0)
+- **Swift-IP2ASN**: Offline ASN database (v0.5.0)
 - **SwiftNIO**: Optional high-performance I/O (v1.0.0)
 - **Swift Metrics**: Observability API (v0.7.0)
 
@@ -184,12 +192,14 @@ We welcome contributions! Priority areas:
 
 ## Performance Targets
 
-| Metric | Current (v0.2.0) | v0.7.0 Target | v1.0.0 Target |
+| Metric | Current (v0.3.0) | v0.7.0 Target | v1.0.0 Target |
 |--------|------------------|---------------|---------------|
 | Single trace (30 hops) | ~1.0s | ~0.8s | ~0.5s |
 | Concurrent traces | 10 | 50 | 100+ |
 | Memory per trace | ~5KB | ~3KB | ~2KB |
-| ASN lookup time | ~100ms | ~1ms (offline) | ~0.1ms |
+| ASN lookup time | ~100ms (cached: ~0ms) | ~1ms (offline) | ~0.1ms |
+| rDNS lookup time | ~50ms (cached: ~0ms) | ~10ms | ~5ms |
+| STUN public IP | ~200ms (cached: ~0ms) | ~100ms | ~50ms |
 | VPN tunnel detection | N/A | <100ms | <50ms |
 | SASE endpoint identification | N/A | 95% accuracy | 99% accuracy |
 
