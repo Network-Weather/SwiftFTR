@@ -40,11 +40,11 @@ All notable changes to this project are documented here. This project follows Se
   - Removed deprecated `host` property from TraceHop
 
 ### Documentation
-- **NEW**: Comprehensive AI_REFERENCE.md (1000+ lines)
+- **NEW**: Comprehensive AI_REFERENCE.md (1000+ lines) - see docs/reference/
   - Complete API documentation
   - Real-world data samples
   - Usage patterns and best practices
-- **NEW**: PERIPHERY_ANALYSIS.md documenting code cleanup
+- **NEW**: PERIPHERY_ANALYSIS.md documenting code cleanup - see docs/development/
 
 ### Performance
 - rDNS lookups: ~50ms uncached → ~0ms cached
@@ -88,9 +88,9 @@ All notable changes to this project are documented here. This project follows Se
   - `TracerouteError` now includes contextual details for debugging
   - Platform-specific error messages for better troubleshooting
 - **NEW**: Documentation improvements
-  - Added EXAMPLES.md with SwiftUI integration examples
+  - Added EXAMPLES.md with SwiftUI integration examples - see docs/guides/
   - Added MIGRATION.md guide for v0.1.0 to v0.2.0 transition
-  - Updated ROADMAP.md with Swift-IP2ASN integration plans
+  - Updated ROADMAP.md with Swift-IP2ASN integration plans - see docs/development/
 - **FIXED**: Test reliability improvements
   - Tests now account for missing TRANSIT segments in direct ISP peering
   - Integration tests only run on self-hosted runners

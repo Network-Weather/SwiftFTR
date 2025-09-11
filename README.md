@@ -115,7 +115,7 @@ for hop in classified.hops {
 await tracer.networkChanged()  // Cancels active traces and clears caches
 ```
 
-📚 **[See comprehensive examples](EXAMPLES.md)** including SwiftUI integration, error handling, concurrent traces, and more.
+📚 **[See comprehensive examples](docs/guides/EXAMPLES.md)** including SwiftUI integration, error handling, concurrent traces, and more.
 
 Notes for Embedding
 -------------------

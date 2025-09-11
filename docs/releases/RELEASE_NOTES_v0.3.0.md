@@ -163,7 +163,7 @@ Thanks to all contributors and users who provided feedback for this release.
 - Some CLI warnings from swift-format (intentional for JSON compatibility)
 
 ## 📈 What's Next
-See [ROADMAP.md](ROADMAP.md) for upcoming features:
+See [ROADMAP.md](../development/ROADMAP.md) for upcoming features:
 - v0.4.0: VPN/Zero Trust/SASE support
 - v0.5.0: Offline ASN support
 - v0.6.0: Enhanced protocol support
