@@ -1,0 +1,27 @@
+# CODEOWNERS for SwiftFTR
+# This file defines who is responsible for code in this repository.
+# These owners will be automatically requested for review when someone 
+# opens a pull request modifying code they own.
+
+# Default owners for everything in the repo
+*                           @Network-Weather/swiftftr-maintainers
+
+# Core library code
+/Sources/SwiftFTR/          @Network-Weather/swiftftr-maintainers
+
+# CLI tool
+/Sources/swift-ftr/         @Network-Weather/swiftftr-maintainers
+
+# Tests
+/Tests/                     @Network-Weather/swiftftr-maintainers
+
+# Documentation
+*.md                        @Network-Weather/swiftftr-maintainers
+/docs/                      @Network-Weather/swiftftr-maintainers
+
+# CI/CD and GitHub configuration
+/.github/                   @Network-Weather/swiftftr-maintainers
+
+# Package configuration
+Package.swift               @Network-Weather/swiftftr-maintainers
+Package.resolved            @Network-Weather/swiftftr-maintainers

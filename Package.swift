@@ -7,13 +7,11 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
+        // Primary library product
         .library(name: "SwiftFTR", targets: ["SwiftFTR"]),
-        .executable(name: "swift-ftr", targets: ["swift-ftr"]),
-        .executable(name: "icmpfuzz", targets: ["icmpfuzz"]),
-        .executable(name: "icmpfuzzer", targets: ["icmpfuzzer"]),
-        .executable(name: "genseeds", targets: ["genseeds"]),
-        .executable(name: "ptrtests", targets: ["ptrtests"]),
-        .executable(name: "integrationtest", targets: ["integrationtest"])
+        // CLI tool
+        .executable(name: "swift-ftr", targets: ["swift-ftr"])
+        // Note: Test and fuzzing executables are internal targets only
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.1"),
