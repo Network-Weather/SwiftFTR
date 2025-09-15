@@ -7,6 +7,7 @@ on:
       - 'Sources/**'
       - 'README.md'
       - '.github/workflows/docs.yml'
+      - '.github/workflows/docc-generate.yml'
   workflow_dispatch:
 
 permissions:
@@ -20,38 +21,9 @@ concurrency:
 
 jobs:
   build:
-    runs-on: macos-15
-    env:
-      DOCS_DOMAIN: swiftftr.networkweather.com
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Generate DocC
-        run: |
-          swift --version
-          rm -rf docc
-          swift package --allow-writing-to-directory docc \
-            generate-documentation --target SwiftFTR \
-            --output-path docc \
-            --transform-for-static-hosting
-          # Add Pages config files
-          touch docc/.nojekyll
-          echo "$DOCS_DOMAIN" > docc/CNAME
-          # Force root redirect to module landing
-          cat > docc/index.html <<'HTML'
-          <!doctype html>
-          <meta charset="utf-8">
-          <title>SwiftFTR Docs</title>
-          <meta http-equiv="refresh" content="0; url=/documentation/swiftftr/">
-          <link rel="canonical" href="/documentation/swiftftr/">
-          <script>location.replace('/documentation/swiftftr/');</script>
-          HTML
-
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: docc
+    uses: ./.github/workflows/docc-generate.yml
+    with:
+      docs-domain: 'swiftftr.networkweather.com'
 
   deploy:
     needs: build
