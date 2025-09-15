@@ -13,7 +13,8 @@ final class StressAndEdgeCaseTests: XCTestCase {
     for i in 1...10 {
       let result = try await tracer.trace(to: "1.1.1.1")
       XCTAssertFalse(result.hops.isEmpty, "Trace \(i) should have hops")
-      XCTAssertLessThanOrEqual(result.duration, 1.0, "Trace \(i) should complete quickly")
+      // Allow more tolerance for CI environments and network variance
+      XCTAssertLessThanOrEqual(result.duration, 1.5, "Trace \(i) should complete within reasonable time")
     }
   }
 
