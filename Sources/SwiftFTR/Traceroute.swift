@@ -64,6 +64,10 @@ public enum TracerouteError: Error, CustomStringConvertible {
   case socketCreateFailed(errno: Int32, details: String)
   /// Setting a socket option failed (e.g., IP_TTL); associated option and errno are provided.
   case setsockoptFailed(option: String, errno: Int32)
+  /// Binding to interface failed; interface name and errno are provided.
+  case interfaceBindFailed(interface: String, errno: Int32, details: String?)
+  /// Binding to source IP failed; IP address and errno are provided.
+  case sourceIPBindFailed(sourceIP: String, errno: Int32, details: String?)
   /// Sending a probe failed; the associated errno is provided.
   case sendFailed(errno: Int32)
   /// Invalid configuration provided
@@ -81,6 +85,14 @@ public enum TracerouteError: Error, CustomStringConvertible {
       return "socket() failed (errno=\(errno)): \(String(cString: strerror(errno))). \(details)"
     case .setsockoptFailed(let opt, let errno):
       return "setsockopt(\(opt)) failed (errno=\(errno)): \(String(cString: strerror(errno)))"
+    case .interfaceBindFailed(let interface, let errno, let details):
+      let errStr = String(cString: strerror(errno))
+      let baseMsg = "Failed to bind to interface '\(interface)' (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
+    case .sourceIPBindFailed(let sourceIP, let errno, let details):
+      let errStr = String(cString: strerror(errno))
+      let baseMsg = "Failed to bind to source IP '\(sourceIP)' (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
     case .sendFailed(let errno):
       return "sendto failed (errno=\(errno)): \(String(cString: strerror(errno)))"
     case .invalidConfiguration(let reason):
@@ -111,6 +123,11 @@ public struct SwiftFTRConfig: Sendable {
   public let rdnsCacheTTL: TimeInterval?
   /// Maximum rDNS cache size (default: 1000 entries)
   public let rdnsCacheSize: Int?
+  /// Network interface to use for sending probes (e.g. "en0"). If nil, uses system default.
+  public let interface: String?
+  /// Source IP address to bind to (e.g. "192.168.1.100"). If nil, uses system default.
+  /// Note: The source IP must be assigned to the selected interface (if specified) or any interface.
+  public let sourceIP: String?
 
   public init(
     maxHops: Int = 30,
@@ -120,7 +137,9 @@ public struct SwiftFTRConfig: Sendable {
     enableLogging: Bool = false,
     noReverseDNS: Bool = false,
     rdnsCacheTTL: TimeInterval? = nil,
-    rdnsCacheSize: Int? = nil
+    rdnsCacheSize: Int? = nil,
+    interface: String? = nil,
+    sourceIP: String? = nil
   ) {
     self.maxHops = maxHops
     self.maxWaitMs = maxWaitMs
@@ -130,6 +149,8 @@ public struct SwiftFTRConfig: Sendable {
     self.noReverseDNS = noReverseDNS
     self.rdnsCacheTTL = rdnsCacheTTL
     self.rdnsCacheSize = rdnsCacheSize
+    self.interface = interface
+    self.sourceIP = sourceIP
   }
 }
 
@@ -185,6 +206,27 @@ public actor SwiftFTR {
     }
   }
 
+  // Validate network interface exists and is available
+  private func validateInterface(_ interfaceName: String) throws -> UInt32 {
+    #if os(macOS)
+      let ifIndex = if_nametoindex(interfaceName)
+      if ifIndex == 0 {
+        let error = errno
+        let details =
+          "Interface '\(interfaceName)' not found. Common causes: (1) Interface doesn't exist, (2) Interface is down, (3) Typo in interface name. Use 'ifconfig' to list available interfaces."
+        throw TracerouteError.interfaceBindFailed(
+          interface: interfaceName, errno: error, details: details)
+      }
+      return ifIndex
+    #else
+      let error = ENOTSUP
+      let details =
+        "Interface binding is currently only supported on macOS. Linux support requires SO_BINDTODEVICE with CAP_NET_RAW capability."
+      throw TracerouteError.interfaceBindFailed(
+        interface: interfaceName, errno: error, details: details)
+    #endif
+  }
+
   // Internal implementation of trace with cancellation support
   private func performTrace(
     to host: String,
@@ -193,6 +235,39 @@ public actor SwiftFTR {
     let maxHops = config.maxHops
     let timeout = TimeInterval(config.maxWaitMs) / 1000.0
     let payloadSize = config.payloadSize
+
+    // Validate interface early if specified
+    var interfaceIndex: UInt32? = nil
+    if let interfaceName = config.interface {
+      if config.enableLogging {
+        print("[SwiftFTR] Validating interface '\(interfaceName)'...")
+      }
+      interfaceIndex = try validateInterface(interfaceName)
+      if config.enableLogging {
+        print(
+          "[SwiftFTR] Interface '\(interfaceName)' validated successfully (index: \(interfaceIndex!))"
+        )
+      }
+    }
+
+    // Validate source IP early if specified
+    if let sourceIP = config.sourceIP {
+      if config.enableLogging {
+        print("[SwiftFTR] Validating source IP '\(sourceIP)'...")
+      }
+
+      var testAddr = sockaddr_in()
+      if inet_pton(AF_INET, sourceIP, &testAddr.sin_addr) != 1 {
+        let details =
+          "Invalid source IP address '\(sourceIP)'. Must be a valid IPv4 address in dotted decimal notation (e.g., 192.168.1.100)."
+        throw TracerouteError.sourceIPBindFailed(
+          sourceIP: sourceIP, errno: EINVAL, details: details)
+      }
+
+      if config.enableLogging {
+        print("[SwiftFTR] Source IP '\(sourceIP)' format validated")
+      }
+    }
 
     if config.enableLogging {
       print(
@@ -219,6 +294,86 @@ public actor SwiftFTR {
       print("[SwiftFTR] Socket created successfully (fd=\(fd))")
     }
     defer { close(fd) }
+
+    // Bind to specific interface if requested (using pre-validated index)
+    if let interfaceName = config.interface, let ifIndex = interfaceIndex {
+      if config.enableLogging {
+        print(
+          "[SwiftFTR] Binding ICMP socket to interface '\(interfaceName)' (index: \(ifIndex))...")
+      }
+
+      #if os(macOS)
+        var index = ifIndex
+        if setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout<UInt32>.size))
+          != 0
+        {
+          let error = errno
+          let details =
+            "Failed to bind ICMP socket to interface '\(interfaceName)' (index: \(ifIndex)). This may indicate: (1) Insufficient permissions, (2) Interface is not available for ICMP binding, (3) Interface doesn't support the operation."
+          if config.enableLogging {
+            print(
+              "[SwiftFTR] ERROR: setsockopt(IP_BOUND_IF) failed - errno=\(error): \(String(cString: strerror(error)))"
+            )
+          }
+          throw TracerouteError.interfaceBindFailed(
+            interface: interfaceName, errno: error, details: details)
+        }
+
+        if config.enableLogging {
+          print(
+            "[SwiftFTR] Successfully bound ICMP socket to interface '\(interfaceName)' (index: \(ifIndex))"
+          )
+        }
+      #endif
+    }
+
+    // Bind to specific source IP if requested
+    if let sourceIP = config.sourceIP {
+      if config.enableLogging {
+        print("[SwiftFTR] Binding ICMP socket to source IP '\(sourceIP)'...")
+      }
+
+      var sourceAddr = sockaddr_in()
+      sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+      sourceAddr.sin_family = sa_family_t(AF_INET)
+      sourceAddr.sin_port = 0  // Any port for ICMP
+
+      // Convert IP string to network address
+      if inet_pton(AF_INET, sourceIP, &sourceAddr.sin_addr) != 1 {
+        let error = errno
+        let details =
+          "Invalid source IP address '\(sourceIP)'. Must be a valid IPv4 address in dotted decimal notation (e.g., 192.168.1.100)."
+        if config.enableLogging {
+          print("[SwiftFTR] ERROR: Invalid source IP format")
+        }
+        throw TracerouteError.sourceIPBindFailed(
+          sourceIP: sourceIP, errno: error, details: details)
+      }
+
+      // Bind socket to source address
+      let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+          bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+      }
+
+      if bindResult != 0 {
+        let error = errno
+        let details =
+          "Failed to bind to source IP '\(sourceIP)'. Common causes: (1) IP not assigned to any interface, (2) IP assigned to different interface than specified, (3) Insufficient permissions, (4) Address already in use."
+        if config.enableLogging {
+          print(
+            "[SwiftFTR] ERROR: bind() failed - errno=\(error): \(String(cString: strerror(error)))"
+          )
+        }
+        throw TracerouteError.sourceIPBindFailed(
+          sourceIP: sourceIP, errno: error, details: details)
+      }
+
+      if config.enableLogging {
+        print("[SwiftFTR] Successfully bound ICMP socket to source IP '\(sourceIP)'")
+      }
+    }
 
     // Set non-blocking: avoid blocking recvfrom; we use poll(2) for readiness.
     let flags = fcntl(fd, F_GETFL, 0)
@@ -421,6 +576,17 @@ public actor SwiftFTR {
     to host: String,
     resolver: ASNResolver? = nil
   ) async throws -> ClassifiedTrace {
+    // Validate interface early if specified (before any network operations)
+    if let interfaceName = config.interface {
+      if config.enableLogging {
+        print("[SwiftFTR] Validating interface '\(interfaceName)' for classified trace...")
+      }
+      _ = try validateInterface(interfaceName)
+      if config.enableLogging {
+        print("[SwiftFTR] Interface '\(interfaceName)' validated successfully")
+      }
+    }
+
     // Get or discover public IP with caching
     let effectivePublicIP: String?
     if let configIP = config.publicIP {
@@ -476,7 +642,10 @@ public actor SwiftFTR {
       destinationIP: destIP,
       resolver: effectiveResolver,
       timeout: 1.5,
-      publicIP: effectivePublicIP
+      publicIP: effectivePublicIP,
+      interface: config.interface,
+      sourceIP: config.sourceIP,
+      enableLogging: config.enableLogging
     )
 
     // Enhance classified result with hostnames
@@ -510,7 +679,10 @@ public actor SwiftFTR {
 
   /// Discover public IP via STUN
   private func discoverPublicIP() async throws -> String {
-    try stunGetPublicIPv4(timeout: 0.8).ip
+    try stunGetPublicIPv4(
+      timeout: 0.8, interface: config.interface, sourceIP: config.sourceIP,
+      enableLogging: config.enableLogging
+    ).ip
   }
 
   // MARK: - Cache Management

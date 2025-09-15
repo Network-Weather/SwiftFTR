@@ -12,10 +12,12 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
       Examples:
         swift-ftr example.com                    # Basic trace
-        swift-ftr 1.1.1.1 -m 10 -t 2.0          # Limit to 10 hops, 2 second timeout  
+        swift-ftr 1.1.1.1 -m 10 -t 2.0          # Limit to 10 hops, 2 second timeout
         swift-ftr --json 8.8.8.8                 # JSON output with ASN data
         swift-ftr --verbose google.com           # Show debug logging
         swift-ftr --public-ip 1.2.3.4 host.com  # Override public IP detection
+        swift-ftr -i en0 google.com             # Use specific network interface
+        swift-ftr -s 192.168.1.100 google.com   # Use specific source IP
       """
   )
 
@@ -27,6 +29,12 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
   @Option(name: .customLong("public-ip"), help: "Override public IP (bypasses STUN)")
   var publicIP: String?
+
+  @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+  var interface: String?
+
+  @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
+  var sourceIP: String?
 
   @Option(name: [.short, .customLong("payload-size")], help: "ICMP payload size in bytes")
   var payloadSize: Int = 56
@@ -50,7 +58,9 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       maxWaitMs: Int(timeout * 1000),
       payloadSize: payloadSize,
       publicIP: publicIP,
-      enableLogging: verbose
+      enableLogging: verbose,
+      interface: interface,
+      sourceIP: sourceIP
     )
     let tracer = SwiftFTR(config: config)
 
@@ -159,7 +169,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       DestASNObj(asn: d.asn, name: d.name, country_code: d.countryCode)
     }
     let root = Root(
-      version: "0.2.0",
+      version: "0.4.0",
       target: classified.destinationHost,
       target_ip: classified.destinationIP,
       public_ip: classified.publicIP,

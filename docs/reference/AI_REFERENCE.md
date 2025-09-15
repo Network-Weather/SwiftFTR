@@ -61,16 +61,20 @@ public struct SwiftFTRConfig: Sendable {
     public let payloadSize: Int        // ICMP payload size in bytes (default: 56)
     public let publicIP: String?       // Override public IP (default: nil, auto-detect)
     public let enableLogging: Bool     // Enable debug logging (default: false)
+    public let interface: String?      // Network interface to bind to (default: nil)
+    public let sourceIP: String?       // Source IP to bind to (default: nil)
     public let noReverseDNS: Bool      // Disable rDNS lookups (default: false)
     public let rdnsCacheTTL: TimeInterval?  // rDNS cache TTL seconds (default: 86400)
     public let rdnsCacheSize: Int?     // Max rDNS cache entries (default: 1000)
-    
+
     public init(
         maxHops: Int = 30,
         maxWaitMs: Int = 1000,
         payloadSize: Int = 56,
         publicIP: String? = nil,
         enableLogging: Bool = false,
+        interface: String? = nil,
+        sourceIP: String? = nil,
         noReverseDNS: Bool = false,
         rdnsCacheTTL: TimeInterval? = nil,
         rdnsCacheSize: Int? = nil
@@ -333,6 +337,8 @@ Possible errors during traceroute operations.
 public enum TracerouteError: Error, CustomStringConvertible {
     case resolutionFailed(host: String, details: String?)
     case socketCreateFailed(errno: Int32, details: String)
+    case interfaceBindFailed(interface: String, errno: Int32, details: String?)
+    case sourceIPBindFailed(sourceIP: String, errno: Int32, details: String?)
     case setsockoptFailed(option: String, errno: Int32)
     case sendFailed(errno: Int32)
     case invalidConfiguration(reason: String)

@@ -78,6 +78,48 @@ let prodConfig = SwiftFTRConfig(
 let prodTracer = SwiftFTR(config: prodConfig)
 ```
 
+### Network Interface Selection (v0.4.0+)
+```swift
+// Use specific network interface
+let wifiConfig = SwiftFTRConfig(
+    maxHops: 30,
+    interface: "en0"  // WiFi interface on macOS
+)
+let wifiTracer = SwiftFTR(config: wifiConfig)
+
+// Use ethernet interface
+let ethernetConfig = SwiftFTRConfig(
+    maxHops: 30,
+    interface: "en1"  // Ethernet interface
+)
+let ethernetTracer = SwiftFTR(config: ethernetConfig)
+
+// Bind to specific source IP
+let sourceIPConfig = SwiftFTRConfig(
+    maxHops: 30,
+    sourceIP: "192.168.1.100"  // Use specific local IP
+)
+let sourceTracer = SwiftFTR(config: sourceIPConfig)
+
+// Combine interface and source IP for precise control
+let preciseConfig = SwiftFTRConfig(
+    maxHops: 30,
+    interface: "en0",
+    sourceIP: "192.168.1.100"  // Must be an IP on en0
+)
+let preciseTracer = SwiftFTR(config: preciseConfig)
+
+// Handle interface binding errors
+do {
+    let result = try await preciseTracer.trace(to: "example.com")
+    print("Trace completed via \(preciseConfig.interface ?? "default")")
+} catch TracerouteError.interfaceBindFailed(let iface, let errno, let details) {
+    print("Failed to bind to interface \(iface): \(details ?? "")")
+} catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
+    print("Failed to bind to source IP \(ip): \(details ?? "")")
+}
+```
+
 ## SwiftUI Integration
 
 ### Basic SwiftUI View
