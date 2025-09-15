@@ -72,8 +72,14 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
 
-New in v0.3.0
+New in v0.4.0
 -------------
+- **Network Interface Selection**: Specify which interface to use with `interface` config or `-i` CLI option
+- **Source IP Binding**: Bind to specific source IP with `sourceIP` config or `-s` CLI option
+- **Enhanced Error Reporting**: Detailed OS-level error messages with errno values
+- **Context-aware Classification**: Improved private IP classification for ISP internal routing
+
+Previous v0.3.0 features:
 - **Trace Cancellation**: Cancel in-flight traces when network conditions change
 - **rDNS Support**: Automatic reverse DNS lookups with built-in caching (86400s TTL)
 - **STUN Caching**: Public IP discovery results are cached until network changes
@@ -88,10 +94,12 @@ import SwiftFTR
 // Configure once, use everywhere
 let config = SwiftFTRConfig(
     maxHops: 30,        // Max TTL to probe
-    maxWaitMs: 1000,    // Timeout in milliseconds  
+    maxWaitMs: 1000,    // Timeout in milliseconds
     payloadSize: 56,    // ICMP payload size
     publicIP: nil,      // Auto-detect via STUN
-    enableLogging: false // Set true for debugging
+    enableLogging: false, // Set true for debugging
+    interface: "en0",   // Optional: specific network interface
+    sourceIP: "192.168.1.100" // Optional: specific source IP
 )
 
 let tracer = SwiftFTR(config: config)
@@ -142,10 +150,13 @@ swift build -c release
 Selected options (ArgumentParser-powered):
 - `-m, --max-hops N`: Max TTL/hops to probe (default 30)
 - `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
+- `-i, --interface IFACE`: Use specific network interface (e.g., en0)
+- `-s, --source IP`: Bind to specific source IP address
+- `-p, --payload-size N`: ICMP payload size in bytes (default 56)
 - `--json`: Emit JSON with ASN categories and public IP
 - `--no-rdns`: Disable reverse DNS lookups
-- `--no-stun`: Skip STUN public IP discovery
 - `--public-ip IP`: Override public IP (bypasses STUN)
+- `--verbose`: Enable debug logging
 
 Example: JSON output
 ```bash
@@ -155,7 +166,9 @@ Example: JSON output
 Configuration and Flags
 -----------------------
 - Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
-- CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`.
+- Use `SwiftFTRConfig(interface: "en0")` to bind to a specific network interface.
+- Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind to a specific source IP.
+- CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
 
 Design Details
 --------------
