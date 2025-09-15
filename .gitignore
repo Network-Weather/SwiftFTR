@@ -8,3 +8,4 @@ xcuserdata/
 *.xcodeproj/
 *.xcworkspace/
 Package.resolved
+docc/

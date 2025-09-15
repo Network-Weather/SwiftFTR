@@ -202,10 +202,10 @@ Generate and view the docs:
 - Xcode: Product → Build Documentation (or use the Documentation sidebar).
 - SwiftPM plugin (Xcode 16.4+/Swift 6.1+):
   ```bash
-  swift package --allow-writing-to-directory docs \
+  swift package --allow-writing-to-directory docc \
     generate-documentation --target SwiftFTR \
-    --output-path docs --transform-for-static-hosting --hosting-base-path SwiftFTR
-  open docs/index.html
+    --output-path docc --transform-for-static-hosting --hosting-base-path SwiftFTR
+  open docc/index.html
   ```
 
 Formatting & Hooks

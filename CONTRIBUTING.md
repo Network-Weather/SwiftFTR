@@ -41,12 +41,14 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 - Public APIs should have Swift doc comments (///) suitable for Xcode Quick Help.
 - Generate and preview DocC locally:
   ```bash
-  swift package --allow-writing-to-directory docs \
+  swift package --allow-writing-to-directory docc \
     generate-documentation --target SwiftFTR \
-    --output-path docs --transform-for-static-hosting
-  open docs/index.html
+    --output-path docc --transform-for-static-hosting
+  open docc/index.html
   ```
 - Docs auto‑publish to GitHub Pages on pushes to `main`: https://swiftftr.networkweather.com/
+- Manual documentation is maintained in the `docs/` directory
+- Generated DocC output goes to `docc/` (gitignored)
 
 ## Testing
 - Unit tests should not depend on network access. Use fakes/mocks.

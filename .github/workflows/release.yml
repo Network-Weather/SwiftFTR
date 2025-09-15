@@ -78,16 +78,16 @@ jobs:
       - name: Generate DocC
         run: |
           swift --version
-          rm -rf docs-out
-          swift package --allow-writing-to-directory docs-out \
+          rm -rf docc
+          swift package --allow-writing-to-directory docc \
             generate-documentation --target SwiftFTR \
-            --output-path docs-out \
+            --output-path docc \
             --transform-for-static-hosting
           # Add Pages config files
-          touch docs-out/.nojekyll
-          echo "$DOCS_DOMAIN" > docs-out/CNAME
+          touch docc/.nojekyll
+          echo "$DOCS_DOMAIN" > docc/CNAME
           # Force root redirect to module landing
-          cat > docs-out/index.html <<'HTML'
+          cat > docc/index.html <<'HTML'
           <!doctype html>
           <meta charset="utf-8">
           <title>SwiftFTR Docs</title>
@@ -99,7 +99,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs-out
+          path: docc
 
   deploy-docs:
     needs: docs-update
