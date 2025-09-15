@@ -70,10 +70,40 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
   - Public symbols have reasonable documentation
 
 ## Releases (maintainers)
-- Tag a version (e.g., `v0.1.0`) on `main`.
-- Run the manual release workflow if needed (attestation + SBOM):
-  - Actions → "Release (manual)" → Run workflow with `ref = vX.Y.Z`.
-- Artifacts: binary, SHA‑256 checksum, CycloneDX SBOM, build provenance attestation.
+
+### Release Checklist
+Before creating a new release, ensure:
+1. [ ] Update version in `Package.swift` (if applicable)
+2. [ ] Update `CHANGELOG.md` with release notes
+3. [ ] Update `docs/development/ROADMAP.md` to reflect current version
+4. [ ] Update any version references in documentation
+5. [ ] Run tests: `swift test`
+6. [ ] Build release binary: `swift build -c release`
+7. [ ] Test CLI binary: `.build/release/swift-ftr --version`
+
+### Creating a Release
+1. Commit all changes and push to `main`
+2. Create and push a version tag:
+   ```bash
+   git tag v0.X.Y
+   git push origin v0.X.Y
+   ```
+3. The automated release workflow will:
+   - Build the release binary with attestation
+   - Generate SBOM (Software Bill of Materials)
+   - Create GitHub Release with auto-generated notes
+   - **Automatically update DocC documentation on GitHub Pages**
+4. Verify the release:
+   - Check GitHub Releases page for binaries and checksums
+   - Verify DocC updated at https://swiftftr.networkweather.com/
+
+### Manual Release (if needed)
+- Actions → "Release (manual)" → Run workflow with `ref = vX.Y.Z`
+- This will trigger the same process as tag-based releases
+
+### Post-Release
+- Announce the release if it contains significant features
+- Update any dependent projects or documentation
 
 ## Security
 If you discover a vulnerability, please open a private security advisory or email the maintainer instead of filing a public issue.
