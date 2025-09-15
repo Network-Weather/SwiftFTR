@@ -9,11 +9,36 @@ public struct STUNPublicIP: Sendable {
   public let ip: String
 }
 
-enum STUNError: Error { case resolveFailed, socketFailed, sendFailed, recvTimeout }
+enum STUNError: Error, CustomStringConvertible {
+  case resolveFailed
+  case socketFailed
+  case sendFailed
+  case recvTimeout
+  case interfaceBindFailed(interface: String, errno: Int32, details: String?)
+
+  var description: String {
+    switch self {
+    case .resolveFailed:
+      return "Failed to resolve STUN server"
+    case .socketFailed:
+      return "Failed to create UDP socket for STUN"
+    case .sendFailed:
+      return "Failed to send STUN request"
+    case .recvTimeout:
+      return "STUN request timed out"
+    case .interfaceBindFailed(let interface, let errno, let details):
+      let errStr = String(cString: strerror(errno))
+      let baseMsg =
+        "Failed to bind STUN socket to interface '\(interface)' (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
+    }
+  }
+}
 
 // Minimal STUN RFC 5389 Binding request to obtain public IP address via XOR-MAPPED-ADDRESS.
 func stunGetPublicIPv4(
-  host: String = "stun.l.google.com", port: UInt16 = 19302, timeout: TimeInterval = 1.0
+  host: String = "stun.l.google.com", port: UInt16 = 19302, timeout: TimeInterval = 1.0,
+  interface: String? = nil, enableLogging: Bool = false
 ) throws -> STUNPublicIP {
   // Resolve server
   var hints = addrinfo(
@@ -30,6 +55,52 @@ func stunGetPublicIPv4(
   let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
   if fd < 0 { throw STUNError.socketFailed }
   defer { close(fd) }
+
+  // Bind to specific interface if requested
+  if let interfaceName = interface {
+    if enableLogging {
+      print("[STUN] Binding socket to interface '\(interfaceName)'...")
+    }
+
+    #if os(macOS)
+      let ifIndex = if_nametoindex(interfaceName)
+      if ifIndex == 0 {
+        let error = errno
+        let details =
+          "Interface '\(interfaceName)' not found for STUN. Common causes: (1) Interface doesn't exist, (2) Interface is down, (3) Typo in interface name. Use 'ifconfig' to list available interfaces."
+        if enableLogging {
+          print("[STUN] ERROR: \(details)")
+        }
+        throw STUNError.interfaceBindFailed(
+          interface: interfaceName, errno: error, details: details)
+      }
+
+      var index = ifIndex
+      if setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout<UInt32>.size)) != 0
+      {
+        let error = errno
+        let details =
+          "Failed to bind STUN socket to interface index \(ifIndex). This may indicate: (1) Insufficient permissions, (2) Interface is not available for UDP binding, (3) Interface doesn't support the operation."
+        if enableLogging {
+          print("[STUN] ERROR: \(details)")
+        }
+        throw STUNError.interfaceBindFailed(
+          interface: interfaceName, errno: error, details: details)
+      }
+
+      if enableLogging {
+        print("[STUN] Successfully bound to interface '\(interfaceName)' (index: \(ifIndex))")
+      }
+    #else
+      let error = ENOTSUP
+      let details =
+        "Interface binding for STUN is currently only supported on macOS. Linux support requires SO_BINDTODEVICE."
+      if enableLogging {
+        print("[STUN] ERROR: \(details)")
+      }
+      throw STUNError.interfaceBindFailed(interface: interfaceName, errno: error, details: details)
+    #endif
+  }
 
   // Set timeouts
   var tv = timeval(

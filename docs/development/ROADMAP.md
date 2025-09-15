@@ -18,15 +18,30 @@
 - ✅ `networkChanged()` API for cache invalidation
 - ✅ Feature parity between CLI and library
 
-## Version 0.4.0 - Q4 2025: VPN/Zero Trust/SASE Support
-### Enterprise Network Compatibility
-- [ ] VPN tunnel detection and classification
+## Version 0.4.0 - Q4 2025: Enhanced Network Classification
+### Sophisticated Network Type Detection
+- [ ] VPN/Overlay network detection (Tailscale, WireGuard, ZeroTier)
+- [ ] SASE/SSE infrastructure identification
+- [ ] Proxy and CDN edge node detection
+- [ ] SD-WAN endpoint classification
+- [ ] Cloud provider backbone recognition (AWS, Azure, GCP)
 - [ ] Split-tunnel VPN handling
 - [ ] Zero Trust Network Access (ZTNA) path detection
-- [ ] SASE (Secure Access Service Edge) endpoint identification
-- [ ] WireGuard and IPSec tunnel awareness
-- [ ] Overlay network detection (SD-WAN, VXLAN)
-- [ ] Proxy and gateway detection (SOCKS, HTTP CONNECT)
+
+### New Hop Categories
+- [ ] `.vpn` or `.overlay` for VPN/overlay network hops
+- [ ] `.proxy` for forward/reverse proxy servers
+- [ ] `.cdn` for CDN edge locations
+- [ ] `.cloud` for cloud provider internal routing
+- [ ] `.cgnat` for carrier-grade NAT (distinct from ISP)
+
+### Detection Heuristics
+- [ ] Hostname pattern matching (*.ts.net, *.vpn.*, etc.)
+- [ ] CGNAT context analysis (first hop vs. after public IPs)
+- [ ] AS name patterns for VPN/SASE providers
+- [ ] Cloud provider IP range detection
+- [ ] RTT pattern analysis for VPN endpoints
+- [ ] Improved private IP classification based on position in path
 
 **Benefits:**
 - Accurate path discovery through VPN tunnels

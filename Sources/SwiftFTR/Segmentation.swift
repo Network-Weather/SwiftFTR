@@ -90,13 +90,17 @@ public struct TraceClassifier: Sendable {
   ///   - resolver: ASN resolver to use (DNS- or WHOIS-based).
   ///   - timeout: Per-lookup timeout in seconds.
   ///   - publicIP: Override public IP (bypasses STUN if provided).
+  ///   - interface: Network interface to use for STUN discovery (if needed).
+  ///   - enableLogging: Enable verbose logging for debugging.
   /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
   public func classify(
     trace: TraceResult,
     destinationIP: String,
     resolver: ASNResolver,
     timeout: TimeInterval = 1.5,
-    publicIP: String? = nil
+    publicIP: String? = nil,
+    interface: String? = nil,
+    enableLogging: Bool = false
   ) throws -> ClassifiedTrace {
     // Gather IPs
     let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
@@ -107,7 +111,9 @@ public struct TraceClassifier: Sendable {
       allIPs.insert(providedIP)
     } else {
       // Try STUN (best effort) if no public IP provided
-      if let pub = try? stunGetPublicIPv4(timeout: 0.8) {
+      if let pub = try? stunGetPublicIPv4(
+        timeout: 0.8, interface: interface, enableLogging: enableLogging)
+      {
         resolvedPublicIP = pub.ip
         allIPs.insert(pub.ip)
       }
@@ -124,27 +130,56 @@ public struct TraceClassifier: Sendable {
 
     // Classify hops
     var out: [ClassifiedHop] = []
+    var seenPublicIP = false  // Track if we've seen any public IP yet
+    var lastPublicASN: Int? = nil  // Track the last public ASN we saw
+
     for hop in trace.hops {
       let ip = hop.ipAddress
       var cat: HopCategory = .unknown
       var asn: Int? = nil
       var name: String? = nil
       if let ip = ip {
-        if isPrivateIPv4(ip) {
-          cat = .local
-        } else if isCGNATIPv4(ip) {
-          // CGNAT indicates ISP regardless of ASN lookup availability
-          cat = .isp
-        }
+        let isPrivate = isPrivateIPv4(ip)
+        let isCGNAT = isCGNATIPv4(ip)
+
+        // Get ASN info regardless of IP type
         asn = asnMap?[ip]?.asn
         name = asnMap?[ip]?.name
-        if let asn = asn {
-          if let cASN = clientASN, asn == cASN { cat = .isp }
-          if let dASN = destASN, asn == dASN { cat = .destination }
-          if cat == .unknown { cat = .transit }
-        } else if cat == .unknown {
-          // No ASN found for a public IP: mark as TRANSIT per spec
-          cat = .transit
+
+        if isPrivate {
+          // Private IP classification depends on context
+          if !seenPublicIP {
+            // Private IP before any public IP = LOCAL (LAN)
+            cat = .local
+          } else {
+            // Private IP after public IP = likely ISP internal routing
+            // If the last public ASN was the client's ISP, this is ISP routing
+            if let lastASN = lastPublicASN, let cASN = clientASN, lastASN == cASN {
+              cat = .isp
+            } else {
+              // Could be ISP or transit provider's internal routing
+              cat = .isp  // Default to ISP since it's most common
+            }
+          }
+        } else if isCGNAT {
+          // CGNAT always indicates ISP
+          cat = .isp
+        } else {
+          // Public IP
+          seenPublicIP = true
+          if let asn = asn {
+            lastPublicASN = asn
+            if let cASN = clientASN, asn == cASN {
+              cat = .isp
+            } else if let dASN = destASN, asn == dASN {
+              cat = .destination
+            } else {
+              cat = .transit
+            }
+          } else {
+            // No ASN found for a public IP: mark as TRANSIT per spec
+            cat = .transit
+          }
         }
       }
       out.append(
