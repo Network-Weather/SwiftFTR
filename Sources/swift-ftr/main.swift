@@ -169,7 +169,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       DestASNObj(asn: d.asn, name: d.name, country_code: d.countryCode)
     }
     let root = Root(
-      version: "0.2.0",
+      version: "0.4.0",
       target: classified.destinationHost,
       target_ip: classified.destinationIP,
       public_ip: classified.publicIP,

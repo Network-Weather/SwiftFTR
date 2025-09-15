@@ -3,6 +3,43 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.4.0 — 2025-09-15
+------------------
+### Major Features
+- **NEW**: Network interface selection support
+  - Specify interface via `SwiftFTRConfig(interface:)` or CLI `-i/--interface`
+  - Binds both ICMP and STUN sockets to selected interface
+  - Early validation with detailed error messages
+  - No silent fallbacks - explicit failure if interface unavailable
+- **NEW**: Source IP binding capability
+  - Specify source IP via `SwiftFTRConfig(sourceIP:)` or CLI `-s/--source`
+  - Precise control when interface has multiple IPs
+  - Works in conjunction with interface selection
+  - Validates IP format and binding capability
+
+### Improvements
+- **ENHANCED**: Context-aware hop classification
+  - Fixed private IP classification after public IPs
+  - ISP internal routing (10.x.x.x) now correctly identified
+  - Tracks first public hop and ASN context
+  - Better handling of CGNAT and ISP infrastructure
+- **ENHANCED**: Error reporting with OS-level details
+  - All binding errors include errno values
+  - Contextual error messages for troubleshooting
+  - Interface validation errors provide suggestions
+  - Source IP errors explain common causes
+
+### Technical Details
+- Uses `IP_BOUND_IF` socket option on macOS for interface binding
+- Uses `bind()` system call for source IP selection
+- Interface names converted via `if_nametoindex()`
+- Both ICMP and STUN sockets honor interface/IP selection
+
+### CLI Updates
+- Added `-i/--interface` parameter (e.g., `-i en0`)
+- Added `-s/--source` parameter (e.g., `-s 192.168.1.100`)
+- Help text includes usage examples for both options
+
 0.3.0 — 2025-09-10
 ------------------
 ### Major Features
