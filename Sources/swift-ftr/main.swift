@@ -17,6 +17,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
         swift-ftr --verbose google.com           # Show debug logging
         swift-ftr --public-ip 1.2.3.4 host.com  # Override public IP detection
         swift-ftr -i en0 google.com             # Use specific network interface
+        swift-ftr -s 192.168.1.100 google.com   # Use specific source IP
       """
   )
 
@@ -31,6 +32,9 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
   @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
   var interface: String?
+
+  @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
+  var sourceIP: String?
 
   @Option(name: [.short, .customLong("payload-size")], help: "ICMP payload size in bytes")
   var payloadSize: Int = 56
@@ -55,7 +59,8 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       payloadSize: payloadSize,
       publicIP: publicIP,
       enableLogging: verbose,
-      interface: interface
+      interface: interface,
+      sourceIP: sourceIP
     )
     let tracer = SwiftFTR(config: config)
 

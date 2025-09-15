@@ -10,26 +10,38 @@ public struct STUNPublicIP: Sendable {
 }
 
 enum STUNError: Error, CustomStringConvertible {
-  case resolveFailed
-  case socketFailed
-  case sendFailed
+  case resolveFailed(errno: Int32, details: String?)
+  case socketFailed(errno: Int32, details: String?)
+  case sendFailed(errno: Int32, details: String?)
   case recvTimeout
   case interfaceBindFailed(interface: String, errno: Int32, details: String?)
+  case sourceIPBindFailed(sourceIP: String, errno: Int32, details: String?)
 
   var description: String {
     switch self {
-    case .resolveFailed:
-      return "Failed to resolve STUN server"
-    case .socketFailed:
-      return "Failed to create UDP socket for STUN"
-    case .sendFailed:
-      return "Failed to send STUN request"
+    case .resolveFailed(let errno, let details):
+      let errStr = errno != 0 ? String(cString: strerror(errno)) : "Unknown error"
+      let baseMsg = "Failed to resolve STUN server (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
+    case .socketFailed(let errno, let details):
+      let errStr = String(cString: strerror(errno))
+      let baseMsg = "Failed to create UDP socket for STUN (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
+    case .sendFailed(let errno, let details):
+      let errStr = String(cString: strerror(errno))
+      let baseMsg = "Failed to send STUN request (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
     case .recvTimeout:
       return "STUN request timed out"
     case .interfaceBindFailed(let interface, let errno, let details):
       let errStr = String(cString: strerror(errno))
       let baseMsg =
         "Failed to bind STUN socket to interface '\(interface)' (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
+    case .sourceIPBindFailed(let sourceIP, let errno, let details):
+      let errStr = String(cString: strerror(errno))
+      let baseMsg =
+        "Failed to bind STUN socket to source IP '\(sourceIP)' (errno=\(errno)): \(errStr)"
       return details.map { "\(baseMsg). \($0)" } ?? baseMsg
     }
   }
@@ -38,22 +50,33 @@ enum STUNError: Error, CustomStringConvertible {
 // Minimal STUN RFC 5389 Binding request to obtain public IP address via XOR-MAPPED-ADDRESS.
 func stunGetPublicIPv4(
   host: String = "stun.l.google.com", port: UInt16 = 19302, timeout: TimeInterval = 1.0,
-  interface: String? = nil, enableLogging: Bool = false
+  interface: String? = nil, sourceIP: String? = nil, enableLogging: Bool = false
 ) throws -> STUNPublicIP {
   // Resolve server
   var hints = addrinfo(
     ai_flags: AI_ADDRCONFIG, ai_family: AF_INET, ai_socktype: SOCK_DGRAM, ai_protocol: IPPROTO_UDP,
     ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
   var res: UnsafeMutablePointer<addrinfo>? = nil
-  guard getaddrinfo(host, String(port), &hints, &res) == 0, let info = res,
-    let sa = info.pointee.ai_addr
-  else { throw STUNError.resolveFailed }
+  let resolveResult = getaddrinfo(host, String(port), &hints, &res)
+  guard resolveResult == 0, let info = res, let sa = info.pointee.ai_addr else {
+    let error = errno
+    throw STUNError.resolveFailed(
+      errno: error,
+      details: "Failed to resolve STUN server '\(host):\(port)'"
+    )
+  }
   defer { freeaddrinfo(info) }
   var server = sockaddr_in()
   memcpy(&server, sa, min(MemoryLayout<sockaddr_in>.size, Int(info.pointee.ai_addrlen)))
 
   let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-  if fd < 0 { throw STUNError.socketFailed }
+  if fd < 0 {
+    let error = errno
+    throw STUNError.socketFailed(
+      errno: error,
+      details: "Unable to create UDP socket for STUN. May indicate system resource limits."
+    )
+  }
   defer { close(fd) }
 
   // Bind to specific interface if requested
@@ -102,6 +125,48 @@ func stunGetPublicIPv4(
     #endif
   }
 
+  // Bind to specific source IP if requested
+  if let srcIP = sourceIP {
+    if enableLogging {
+      print("[STUN] Binding socket to source IP '\(srcIP)'...")
+    }
+
+    var sourceAddr = sockaddr_in()
+    sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    sourceAddr.sin_family = sa_family_t(AF_INET)
+    sourceAddr.sin_port = 0  // Any port
+
+    if inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) != 1 {
+      let error = EINVAL
+      let details =
+        "Invalid source IP address format '\(srcIP)'. Must be valid IPv4 in dotted decimal notation."
+      if enableLogging {
+        print("[STUN] ERROR: \(details)")
+      }
+      throw STUNError.sourceIPBindFailed(sourceIP: srcIP, errno: error, details: details)
+    }
+
+    let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+        bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+
+    if bindResult != 0 {
+      let error = errno
+      let details =
+        "Failed to bind to source IP. Common causes: (1) IP not assigned to any interface, (2) IP on different interface than specified, (3) Permission denied."
+      if enableLogging {
+        print("[STUN] ERROR: bind() failed - errno=\(error): \(String(cString: strerror(error)))")
+      }
+      throw STUNError.sourceIPBindFailed(sourceIP: srcIP, errno: error, details: details)
+    }
+
+    if enableLogging {
+      print("[STUN] Successfully bound to source IP '\(srcIP)'")
+    }
+  }
+
   // Set timeouts
   var tv = timeval(
     tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000))
@@ -134,7 +199,13 @@ func stunGetPublicIPv4(
       }
     }
   }
-  if sent < 0 { throw STUNError.sendFailed }
+  if sent < 0 {
+    let error = errno
+    throw STUNError.sendFailed(
+      errno: error,
+      details: "Failed to send STUN request to \(host):\(port)"
+    )
+  }
 
   // Receive response
   var buf = [UInt8](repeating: 0, count: 512)

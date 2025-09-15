@@ -100,6 +100,7 @@ public struct TraceClassifier: Sendable {
     timeout: TimeInterval = 1.5,
     publicIP: String? = nil,
     interface: String? = nil,
+    sourceIP: String? = nil,
     enableLogging: Bool = false
   ) throws -> ClassifiedTrace {
     // Gather IPs
@@ -112,7 +113,7 @@ public struct TraceClassifier: Sendable {
     } else {
       // Try STUN (best effort) if no public IP provided
       if let pub = try? stunGetPublicIPv4(
-        timeout: 0.8, interface: interface, enableLogging: enableLogging)
+        timeout: 0.8, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
       {
         resolvedPublicIP = pub.ip
         allIPs.insert(pub.ip)
