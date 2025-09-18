@@ -46,7 +46,7 @@ import SwiftFTR
 // Configure all options
 let config = SwiftFTRConfig(
     maxHops: 20,           // Maximum TTL to probe (default: 30)
-    maxWaitMs: 2000,       // Max wait time in milliseconds (default: 1000)
+    maxWaitMs: 2000,       // Max wait time in milliseconds (default: 2000)
     payloadSize: 32,       // ICMP payload size in bytes (default: 56)
     publicIP: "1.2.3.4",   // Override public IP (skips STUN)
     enableLogging: true    // Enable debug logging (default: false)

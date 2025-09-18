@@ -47,7 +47,7 @@ final class ConfigurationTests: XCTestCase {
     // Test default config
     let defaultConfig = SwiftFTRConfig()
     XCTAssertEqual(defaultConfig.maxHops, 30)
-    XCTAssertEqual(defaultConfig.maxWaitMs, 1000)
+    XCTAssertEqual(defaultConfig.maxWaitMs, 2000)
     XCTAssertEqual(defaultConfig.payloadSize, 56)
     XCTAssertNil(defaultConfig.publicIP)
     XCTAssertFalse(defaultConfig.enableLogging)

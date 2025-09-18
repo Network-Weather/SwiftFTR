@@ -109,7 +109,7 @@ public enum TracerouteError: Error, CustomStringConvertible {
 public struct SwiftFTRConfig: Sendable {
   /// Maximum TTL/hops to probe (default: 30)
   public let maxHops: Int
-  /// Maximum wait time per probe in milliseconds (default: 1000ms)
+  /// Maximum wait time per probe in milliseconds (default: 2000ms)
   public let maxWaitMs: Int
   /// Size in bytes of the Echo payload (default: 56)
   public let payloadSize: Int
@@ -131,7 +131,7 @@ public struct SwiftFTRConfig: Sendable {
 
   public init(
     maxHops: Int = 30,
-    maxWaitMs: Int = 1000,
+    maxWaitMs: Int = 2000,
     payloadSize: Int = 56,
     publicIP: String? = nil,
     enableLogging: Bool = false,

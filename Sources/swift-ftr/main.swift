@@ -27,6 +27,9 @@ struct SwiftFTRCommand: AsyncParsableCommand {
   @Flag(name: .customLong("no-rdns"), help: "Disable reverse DNS lookups")
   var noRDNS: Bool = false
 
+  @Flag(name: [.short, .customLong("version")], help: "Print the swift-ftr version and exit")
+  var showVersion: Bool = false
+
   @Option(name: .customLong("public-ip"), help: "Override public IP (bypasses STUN)")
   var publicIP: String?
 
@@ -47,18 +50,28 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
   @Option(
     name: [.short, .customLong("timeout")], help: "Overall wait after sending probes (seconds)")
-  var timeout: Double = 1.0
+  var timeout: Double = 2.0
 
   @Argument(help: "Destination hostname or IPv4 address")
-  var host: String
+  var host: String?
 
   mutating func run() async throws {
+    if showVersion {
+      print(SwiftFTRVersion.current)
+      return
+    }
+
+    guard let targetHost = host else {
+      throw CleanExit.helpRequest(self)
+    }
+
     let config = SwiftFTRConfig(
       maxHops: maxHops,
       maxWaitMs: Int(timeout * 1000),
       payloadSize: payloadSize,
       publicIP: publicIP,
       enableLogging: verbose,
+      noReverseDNS: noRDNS,
       interface: interface,
       sourceIP: sourceIP
     )
@@ -66,9 +79,9 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
     do {
       if json {
-        try await runJSON(tracer: tracer)
+        try await runJSON(tracer: tracer, host: targetHost)
       } else {
-        try await runPretty(tracer: tracer)
+        try await runPretty(tracer: tracer, host: targetHost)
       }
     } catch {
       fputs("Error: \(error)\n", stderr)
@@ -76,7 +89,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
     }
   }
 
-  private func runJSON(tracer: SwiftFTR) async throws {
+  private func runJSON(tracer: SwiftFTR, host: String) async throws {
     let classified = try await tracer.traceClassified(to: host)
     var allIPs = classified.hops.compactMap { $0.ip }
     allIPs.append(classified.destinationIP)
@@ -169,7 +182,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       DestASNObj(asn: d.asn, name: d.name, country_code: d.countryCode)
     }
     let root = Root(
-      version: "0.4.0",
+      version: SwiftFTRVersion.current,
       target: classified.destinationHost,
       target_ip: classified.destinationIP,
       public_ip: classified.publicIP,
@@ -185,7 +198,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
     if let s = String(data: data, encoding: .utf8) { print(s) }
   }
 
-  private func runPretty(tracer: SwiftFTR) async throws {
+  private func runPretty(tracer: SwiftFTR, host: String) async throws {
     let classified = try await tracer.traceClassified(to: host)
     let probeMs = Int(timeout * 1000)
     let overallMs = probeMs * 3

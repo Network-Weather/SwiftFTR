@@ -8,8 +8,10 @@ Unreleased
 ### Breaking Changes
 - Minimum supported Swift has been raised to 6.2 (requires Xcode 26+) to adopt the "Approachable Concurrency" defaults and stricter Sendable checking.
 
-### Documentation
+### Enhancements
 - Updated README, contributor guides, and DocC content to reference Swift 6.2 best practices and tooling.
+- Increased the default probe timeout to 2000 ms (`SwiftFTRConfig.maxWaitMs`) and adjusted CLI defaults accordingly.
+- Added `-v/--version` to the `swift-ftr` CLI and show extended help when no destination is provided.
 
 0.4.0 — 2025-09-15
 ------------------
@@ -111,7 +113,7 @@ Unreleased
   - All configuration now passed explicitly via `SwiftFTRConfig` initialization
 - **NEW**: Configuration-based API with `SwiftFTRConfig` struct
   - `maxHops`: Maximum TTL to probe (default: 30)
-  - `maxWaitMs`: Timeout in milliseconds (default: 1000)
+  - `maxWaitMs`: Timeout in milliseconds (default: 2000)
   - `payloadSize`: ICMP payload size in bytes (default: 56)
   - `publicIP`: Override public IP detection (optional)
   - `enableLogging`: Enable debug logging (default: false)

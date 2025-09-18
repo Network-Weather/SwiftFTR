@@ -85,7 +85,7 @@ swift build -c release -Xswiftc -sanitize=address -Xswiftc -sanitize=undefined
 
 `SwiftFTRConfig` controls behavior:
 - `maxHops`: Maximum TTL to probe (default: 30)
-- `maxWaitMs`: Timeout in milliseconds (default: 1000)
+- `maxWaitMs`: Timeout in milliseconds (default: 2000)
 - `payloadSize`: ICMP payload size (default: 56)
 - `publicIP`: Override public IP to skip STUN
 - `enableLogging`: Debug logging flag

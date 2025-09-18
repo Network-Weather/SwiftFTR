@@ -95,7 +95,7 @@ import SwiftFTR
 // Configure once, use everywhere
 let config = SwiftFTRConfig(
     maxHops: 30,        // Max TTL to probe
-    maxWaitMs: 1000,    // Timeout in milliseconds
+    maxWaitMs: 2000,    // Timeout in milliseconds
     payloadSize: 56,    // ICMP payload size
     publicIP: nil,      // Auto-detect via STUN
     enableLogging: false, // Set true for debugging
@@ -145,12 +145,13 @@ Build the bundled executable and run it:
 ```bash
 swift build -c release
 .build/release/swift-ftr --help
-.build/release/swift-ftr example.com -m 30 -w 1.0
+.build/release/swift-ftr example.com -m 30 -w 2.0
 ```
 
 Selected options (ArgumentParser-powered):
 - `-m, --max-hops N`: Max TTL/hops to probe (default 30)
-- `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
+- `-w, --timeout SEC`: Overall wait after sending probes (default 2.0)
+- `-v, --version`: Print the swift-ftr version and exit
 - `-i, --interface IFACE`: Use specific network interface (e.g., en0)
 - `-s, --source IP`: Bind to specific source IP address
 - `-p, --payload-size N`: ICMP payload size in bytes (default 56)
@@ -161,7 +162,7 @@ Selected options (ArgumentParser-powered):
 
 Example: JSON output
 ```bash
-.build/release/swift-ftr --json www.example.com -m 30 -w 1.0
+.build/release/swift-ftr --json www.example.com -m 30 -w 2.0
 ```
 
 Configuration and Flags
@@ -169,7 +170,7 @@ Configuration and Flags
 - Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
 - Use `SwiftFTRConfig(interface: "en0")` to bind to a specific network interface.
 - Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind to a specific source IP.
-- CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
+- CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`, `-v/--version`.
 
 Design Details
 --------------
