@@ -8,7 +8,7 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   func testDefaultConfiguration() async throws {
     let config = SwiftFTRConfig()
     XCTAssertEqual(config.maxHops, 30)
-    XCTAssertEqual(config.maxWaitMs, 1000)
+    XCTAssertEqual(config.maxWaitMs, 2000)
     XCTAssertEqual(config.payloadSize, 56)
     XCTAssertNil(config.publicIP)
     XCTAssertFalse(config.enableLogging)

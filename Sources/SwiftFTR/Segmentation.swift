@@ -91,6 +91,7 @@ public struct TraceClassifier: Sendable {
   ///   - timeout: Per-lookup timeout in seconds.
   ///   - publicIP: Override public IP (bypasses STUN if provided).
   ///   - interface: Network interface to use for STUN discovery (if needed).
+  ///   - sourceIP: Source IPv4 address to bind ASN/STUN lookups to when explicit binding is required.
   ///   - enableLogging: Enable verbose logging for debugging.
   /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
   public func classify(

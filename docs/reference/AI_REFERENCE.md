@@ -5,9 +5,9 @@ SwiftFTR is a Swift library for performing fast, parallel traceroute operations 
 
 ## Core Requirements
 - **Platform**: macOS 13.0+
-- **Swift**: 6.1+
+- **Swift**: 6.2+
 - **Permissions**: No sudo required (uses SOCK_DGRAM)
-- **Concurrency**: Actor-based architecture with Swift 6 strict concurrency
+- **Concurrency**: Actor-based architecture with Swift 6.2 "Approachable Concurrency" defaults (`-default-isolation MainActor`, `@concurrent` helpers, upcoming features `NonisolatedNonsendingByDefault` & `InferIsolatedConformances`)
 
 ## Installation
 
@@ -57,7 +57,7 @@ Configuration for traceroute behavior and caching.
 ```swift
 public struct SwiftFTRConfig: Sendable {
     public let maxHops: Int           // Maximum TTL to probe (default: 30)
-    public let maxWaitMs: Int          // Timeout in milliseconds (default: 1000)
+    public let maxWaitMs: Int          // Timeout in milliseconds (default: 2000)
     public let payloadSize: Int        // ICMP payload size in bytes (default: 56)
     public let publicIP: String?       // Override public IP (default: nil, auto-detect)
     public let enableLogging: Bool     // Enable debug logging (default: false)
@@ -69,7 +69,7 @@ public struct SwiftFTRConfig: Sendable {
 
     public init(
         maxHops: Int = 30,
-        maxWaitMs: Int = 1000,
+        maxWaitMs: Int = 2000,
         payloadSize: Int = 56,
         publicIP: String? = nil,
         enableLogging: Bool = false,
@@ -825,7 +825,7 @@ public func stunGetPublicIPv4(
 ### Sendable Conformance
 - All public types conform to Sendable
 - Safe to pass between actor boundaries
-- No data races under Swift 6 strict concurrency
+- No data races under Swift 6.2 strict concurrency
 
 ## Network Protocols Used
 
@@ -1033,7 +1033,7 @@ swift build -c release
 # With options
 .build/release/swift-ftr example.com \
     --max-hops 20 \
-    --timeout 2.0 \
+    --timeout 2000 \
     --payload-size 64 \
     --json \
     --no-rdns \
@@ -1113,6 +1113,6 @@ SwiftFTR provides a comprehensive, production-ready traceroute implementation fo
 - rDNS support
 - Caching for performance
 - Thread-safe actor design
-- Swift 6 concurrency compliance
+- Swift 6.2 concurrency compliance
 
 Use it for network diagnostics, monitoring, path analysis, and understanding internet routing from Swift applications.

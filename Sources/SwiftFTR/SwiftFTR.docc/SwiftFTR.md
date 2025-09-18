@@ -18,7 +18,7 @@ Massively parallel, async/await traceroute for macOS using ICMP datagram sockets
 ```swift
 import SwiftFTR
 
-let tracer = SwiftFTR(config: SwiftFTRConfig(maxHops: 30, maxWaitMs: 1000))
+let tracer = SwiftFTR(config: SwiftFTRConfig(maxHops: 30, maxWaitMs: 2000))
 let result = try await tracer.trace(to: "1.1.1.1")
 for hop in result.hops {
     print(hop.ttl, hop.ipAddress ?? "*", hop.rtt ?? 0)
@@ -39,7 +39,7 @@ for hop in classified.hops {
 
 ## Configuration
 
-- Use ``SwiftFTRConfig(publicIP:)`` to override/bypass STUN public IP discovery.
+- Use ``SwiftFTRConfig`` to override/bypass STUN discovery (`publicIP`) or bind to a specific interface/IP pair.
 - Inject a custom ``SwiftFTR/ASNResolver`` for offline or deterministic lookups.
 
 ## Topics

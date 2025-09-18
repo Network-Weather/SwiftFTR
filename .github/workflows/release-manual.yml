@@ -23,6 +23,11 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
+      - name: Select Xcode 26 (Swift 6.2)
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.0'
+
       - name: Swift version
         run: swift --version
 
@@ -67,4 +72,3 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

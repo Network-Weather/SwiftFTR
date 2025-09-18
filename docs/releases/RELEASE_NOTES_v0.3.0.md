@@ -145,7 +145,7 @@ None. This release maintains full backward compatibility.
 - Removed deprecated `host` property from `TraceHop`
 
 ## 📦 Dependencies
-- Swift 6.1+ (required)
+- Swift 6.2+ (required)
 - macOS 13+ (required)
 - No external dependencies
 
