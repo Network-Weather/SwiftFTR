@@ -83,10 +83,11 @@ The codebase defines several protocols for extensibility:
 - `DNSResolver`: Alternative DNS resolution strategies
 - All public types conform to `Sendable` for Swift 6 concurrency
 
-## Swift 6 Compliance
+## Swift 6.2 Concurrency
 
-This project requires Swift 6.1+ and builds with strict concurrency checking enabled:
+This project requires Swift 6.2+ and follows Apple's "Approachable Concurrency" defaults:
 - Language mode: Swift 6 (`swiftLanguageModes: [.v6]` in Package.swift)
-- All public types are `Sendable`
-- No `@MainActor` requirements for library APIs
-- Thread-safe from any actor or task context
+- Upcoming features `NonisolatedNonsendingByDefault` and `InferIsolatedConformances` stay enabled for every target.
+- CLI entry points build with `-default-isolation MainActor` so executor hops are explicit.
+- Synchronous helpers that may fan out work are marked `@concurrent` before being invoked in parallel contexts.
+- All public types remain `Sendable` and the library stays actor-agnostic (no imposed `@MainActor`).

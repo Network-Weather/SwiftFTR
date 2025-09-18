@@ -3,7 +3,7 @@ SwiftFTR
 
 [![CI](https://github.com/Network-Weather/SwiftFTR/actions/workflows/ci.yml/badge.svg)](https://github.com/Network-Weather/SwiftFTR/actions/workflows/ci.yml)
 [![Docs](https://github.com/Network-Weather/SwiftFTR/actions/workflows/docs.yml/badge.svg)](https://swiftftr.networkweather.com/)
-[![Swift 6.1](https://img.shields.io/badge/Swift-6.1-orange.svg)](https://swift.org)
+[![Swift 6.2](https://img.shields.io/badge/Swift-6.2-orange.svg)](https://swift.org)
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue.svg)](https://developer.apple.com/macos/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -46,7 +46,7 @@ If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e
 
 - Requirements
 --------------
-- Swift 6.1+ (requires Xcode 16.4 or later)
+- Swift 6.2+ (requires Xcode 26 or later)
 - macOS 13+
 - IPv4 only at the moment (ICMPv4 Echo). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS’s ICMP datagram behavior.
 
@@ -64,13 +64,14 @@ Install (SwiftPM)
   ]
   ```
 
-Swift 6.1 Compliance
---------------------
-SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
-- ✅ All public value types are `Sendable`
-- ✅ API works without `@MainActor` requirements
-- ✅ Thread-safe usage from any actor or task
-- ✅ Builds under Swift 6 language mode with strict concurrency checks
+Swift 6.2 Concurrency Posture
+-----------------------------
+SwiftFTR follows the Swift 6.2 "Approachable Concurrency" guidance:
+- ✅ CLI and other single-threaded entry points opt into `-default-isolation MainActor`, keeping predictable executor hopping.
+- ✅ Synchronous helpers that can run in parallel are marked `@concurrent`, clarifying intent for the compiler and reviewers.
+- ✅ Every target builds in Swift 6 language mode with upcoming features `NonisolatedNonsendingByDefault` and `InferIsolatedConformances` enabled, hardening Sendable and actor isolation checks.
+- ✅ All public APIs remain usable from any actor without additional `@MainActor` or global locking requirements.
+- 📚 See [Swift 6.2 Released](https://www.swift.org/blog/swift-6.2-released/) for the official "Approachable Concurrency" recommendations this project adheres to.
 
 New in v0.4.0
 -------------
@@ -200,7 +201,7 @@ Documentation
 Generate and view the docs:
 
 - Xcode: Product → Build Documentation (or use the Documentation sidebar).
-- SwiftPM plugin (Xcode 16.4+/Swift 6.1+):
+- SwiftPM plugin (Xcode 26+/Swift 6.2+):
   ```bash
   swift package --allow-writing-to-directory docc \
     generate-documentation --target SwiftFTR \

@@ -5,9 +5,9 @@ SwiftFTR is a Swift library for performing fast, parallel traceroute operations 
 
 ## Core Requirements
 - **Platform**: macOS 13.0+
-- **Swift**: 6.1+
+- **Swift**: 6.2+
 - **Permissions**: No sudo required (uses SOCK_DGRAM)
-- **Concurrency**: Actor-based architecture with Swift 6 strict concurrency
+- **Concurrency**: Actor-based architecture with Swift 6.2 "Approachable Concurrency" defaults (`-default-isolation MainActor`, `@concurrent` helpers, upcoming features `NonisolatedNonsendingByDefault` & `InferIsolatedConformances`)
 
 ## Installation
 
@@ -825,7 +825,7 @@ public func stunGetPublicIPv4(
 ### Sendable Conformance
 - All public types conform to Sendable
 - Safe to pass between actor boundaries
-- No data races under Swift 6 strict concurrency
+- No data races under Swift 6.2 strict concurrency
 
 ## Network Protocols Used
 
@@ -1113,6 +1113,6 @@ SwiftFTR provides a comprehensive, production-ready traceroute implementation fo
 - rDNS support
 - Caching for performance
 - Thread-safe actor design
-- Swift 6 concurrency compliance
+- Swift 6.2 concurrency compliance
 
 Use it for network diagnostics, monitoring, path analysis, and understanding internet routing from Swift applications.

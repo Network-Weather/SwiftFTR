@@ -3,7 +3,7 @@
 Thanks for your interest in improving SwiftFTR! This guide describes how to set up your environment, propose changes, and keep contributions consistent and easy to review.
 
 ## Quick Start
-- Requirements: macOS 13+, Xcode 16.4+ (Swift 6.1+), GitHub CLI (optional).
+- Requirements: macOS 13+, Xcode 26+ (Swift 6.2+), GitHub CLI (optional).
 - Build & test:
   ```bash
   swift build -c debug
@@ -26,7 +26,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 4. Open a Pull Request. The CI will run format, build, tests, docs.
 
 ## Formatting
-- We enforce Swift formatting in CI using `swift format` (Swift 6 toolchain).
+- We enforce Swift formatting in CI using `swift format` (Swift 6.2 toolchain).
 - Locally, you can install the git pre‑push hook once:
   ```bash
   git config core.hooksPath .githooks
@@ -54,6 +54,12 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 - Unit tests should not depend on network access. Use fakes/mocks.
 - For code paths that perform DNS/WHOIS/STUN, prefer injectable resolvers via configuration. Use `SwiftFTRConfig(publicIP: ...)` to bypass STUN in tests.
 - Add tests next to the code they exercise under `Tests/SwiftFTRTests`.
+
+## Concurrency Guidelines
+- Keep single-threaded entry points (CLI, integration harnesses) on the main actor via `-Xswiftc -default-isolation -Xswiftc MainActor` to honor Swift 6.2's default isolation recommendations.
+- Mark synchronous helpers that can execute in parallel with `@concurrent` so reviewers and the compiler understand intent before adding new async work.
+- The package manifest enables the `NonisolatedNonsendingByDefault` and `InferIsolatedConformances` upcoming features; keep new code free of diagnostics under these stricter Sendable checks.
+- Skim the Swift team’s "[Swift 6.2 Released](https://www.swift.org/blog/swift-6.2-released/)" blog post when adding concurrency-heavy features—it captures the rationale behind these defaults.
 
 ## Commit Style
 - Conventional commits preferred:

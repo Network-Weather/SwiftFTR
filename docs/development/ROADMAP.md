@@ -2,7 +2,7 @@
 
 ## Current Version: 0.4.0 (September 2025)
 - ✅ Core traceroute functionality with ICMP datagram sockets
-- ✅ Swift 6.1 concurrency compliance
+- ✅ Swift 6.2 concurrency compliance
 - ✅ Thread-safe, nonisolated API
 - ✅ ASN resolution via DNS (Team Cymru)
 - ✅ Hop categorization (LOCAL, ISP, TRANSIT, DESTINATION)
@@ -10,7 +10,7 @@
 - ✅ Comprehensive test suite
 - ✅ Enhanced error handling with contextual details
 - ✅ CLI improvements with verbose logging and payload size configuration
-- ✅ Actor-based architecture using Swift 6.1 features
+- ✅ Actor-based architecture using Swift 6.2 features
 - ✅ Reverse DNS (rDNS) support with caching (86400s default TTL)
 - ✅ STUN public IP caching between traces
 - ✅ Trace cancellation support for network changes
@@ -192,7 +192,7 @@ We welcome contributions! Priority areas:
 ## Dependencies & Integration Points
 
 ### Current Dependencies
-- Swift 6.1+ (minimum requirement)
+- Swift 6.2+ (minimum requirement)
 - macOS 13+ (ICMP datagram socket support)
 - Swift Concurrency with actors (v0.3.0+)
 

@@ -3,6 +3,14 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+### Breaking Changes
+- Minimum supported Swift has been raised to 6.2 (requires Xcode 26+) to adopt the "Approachable Concurrency" defaults and stricter Sendable checking.
+
+### Documentation
+- Updated README, contributor guides, and DocC content to reference Swift 6.2 best practices and tooling.
+
 0.4.0 — 2025-09-15
 ------------------
 ### Major Features
@@ -90,14 +98,14 @@ All notable changes to this project are documented here. This project follows Se
 
 ### Compatibility
 - No breaking changes - fully backward compatible
-- Maintains Swift 6.1 strict concurrency compliance
+- Maintains Swift 6.2 strict concurrency compliance
 - All 44 tests passing
 
 0.2.0 — 2025-09-08
 -------------------
-- **BREAKING**: Minimum Swift version now 6.1 (was 5.10)
+- **BREAKING**: Minimum Swift version now 6.1 (was 5.10) *(superseded; project now targets Swift 6.2 in Unreleased section)*
   - Package now builds exclusively in Swift 6 language mode
-  - Requires Xcode 16.4 or later
+  - Requires Xcode 16.4 or later *(original baseline; current requirement is Xcode 26+)*
 - **BREAKING**: Removed all environment variable dependencies in favor of configuration API
   - Replaced `PTR_SKIP_STUN` and `PTR_PUBLIC_IP` with `SwiftFTRConfig` struct
   - All configuration now passed explicitly via `SwiftFTRConfig` initialization
@@ -112,7 +120,7 @@ All notable changes to this project are documented here. This project follows Se
   - `--payload-size`: Configure ICMP payload size
   - `--public-ip`: Override public IP (replaces PTR_PUBLIC_IP env var)
   - Removed `--no-stun` flag (now implied when `--public-ip` is set)
-- **NEW**: Swift 6.1 full compliance
+- **NEW**: Swift 6.2 full compliance
   - All types marked `Sendable`
   - All public methods marked `nonisolated`
   - Thread-safe without MainActor requirements

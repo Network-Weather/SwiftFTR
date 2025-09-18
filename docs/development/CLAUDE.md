@@ -92,7 +92,7 @@ swift build -c release -Xswiftc -sanitize=address -Xswiftc -sanitize=undefined
 
 ## Platform Requirements
 
-- Swift 6.1+ (Xcode 16.4+)
+- Swift 6.2+ (Xcode 26+)
 - macOS 13+
 - IPv4 only (uses ICMPv4 Echo)
 - Requires ICMP datagram socket support (macOS specific, no sudo needed)
@@ -118,3 +118,4 @@ swift build -c release -Xswiftc -sanitize=address -Xswiftc -sanitize=undefined
 - DNS/ASN lookups are injectable for testing
 - Formatting enforced via `swift format` in CI
 - Optional git hooks available: `git config core.hooksPath .githooks`
+- Concurrency defaults follow Swift 6.2 guidance: CLI targets pass `-default-isolation MainActor`, helper APIs use `@concurrent`, and upcoming features `NonisolatedNonsendingByDefault` + `InferIsolatedConformances` stay enabled.

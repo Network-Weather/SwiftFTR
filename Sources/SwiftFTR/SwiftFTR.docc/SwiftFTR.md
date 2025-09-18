@@ -39,7 +39,7 @@ for hop in classified.hops {
 
 ## Configuration
 
-- Use ``SwiftFTRConfig(publicIP:)`` to override/bypass STUN public IP discovery.
+- Use ``SwiftFTRConfig`` to override/bypass STUN discovery (`publicIP`) or bind to a specific interface/IP pair.
 - Inject a custom ``SwiftFTR/ASNResolver`` for offline or deterministic lookups.
 
 ## Topics

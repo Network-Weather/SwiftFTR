@@ -3,7 +3,7 @@ import Foundation
 /// Actor-based cache for reverse DNS lookups with TTL and LRU eviction.
 ///
 /// This cache provides thread-safe storage for hostname lookups with automatic
-/// expiration and size-based eviction. It uses Swift 6.1's actor isolation for
+/// expiration and size-based eviction. It uses Swift 6.2's actor isolation for
 /// thread safety and the Clock API for accurate timing.
 actor RDNSCache {
   private struct CacheEntry {
