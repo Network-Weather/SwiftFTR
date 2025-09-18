@@ -1033,7 +1033,7 @@ swift build -c release
 # With options
 .build/release/swift-ftr example.com \
     --max-hops 20 \
-    --timeout 2.0 \
+    --timeout 2000 \
     --payload-size 64 \
     --json \
     --no-rdns \

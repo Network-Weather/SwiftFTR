@@ -11,13 +11,13 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       Performs parallel traceroute by sending all probes at once, then waiting for responses.
 
       Examples:
-        swift-ftr example.com                    # Basic trace
-        swift-ftr 1.1.1.1 -m 10 -t 2.0          # Limit to 10 hops, 2 second timeout
-        swift-ftr --json 8.8.8.8                 # JSON output with ASN data
-        swift-ftr --verbose google.com           # Show debug logging
-        swift-ftr --public-ip 1.2.3.4 host.com  # Override public IP detection
-        swift-ftr -i en0 google.com             # Use specific network interface
-        swift-ftr -s 192.168.1.100 google.com   # Use specific source IP
+        swift-ftr example.com                     # Basic trace
+        swift-ftr 1.1.1.1 -m 10 -w 2000          # Limit to 10 hops, 2000 ms timeout
+        swift-ftr --json 8.8.8.8                  # JSON output with ASN data
+        swift-ftr --verbose google.com            # Show debug logging
+        swift-ftr --public-ip 1.2.3.4 host.com   # Override public IP detection
+        swift-ftr -i en0 google.com              # Use specific network interface
+        swift-ftr -s 192.168.1.100 google.com    # Use specific source IP
       """
   )
 
@@ -49,8 +49,10 @@ struct SwiftFTRCommand: AsyncParsableCommand {
   var maxHops: Int = 30
 
   @Option(
-    name: [.short, .customLong("timeout")], help: "Overall wait after sending probes (seconds)")
-  var timeout: Double = 2.0
+    name: [.customShort("w"), .customLong("timeout")],
+    help: "Probe timeout in milliseconds"
+  )
+  var timeoutMs: Int = 2000
 
   @Argument(help: "Destination hostname or IPv4 address")
   var host: String?
@@ -67,7 +69,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
     let config = SwiftFTRConfig(
       maxHops: maxHops,
-      maxWaitMs: Int(timeout * 1000),
+      maxWaitMs: timeoutMs,
       payloadSize: payloadSize,
       publicIP: publicIP,
       enableLogging: verbose,
@@ -95,7 +97,8 @@ struct SwiftFTRCommand: AsyncParsableCommand {
     allIPs.append(classified.destinationIP)
     if let pip = classified.publicIP { allIPs.append(pip) }
     let resolver = CymruDNSResolver()
-    let asnMap = (try? resolver.resolve(ipv4Addrs: allIPs, timeout: max(0.8, timeout))) ?? [:]
+    let timeoutSeconds = max(Double(timeoutMs) / 1000.0, 0.8)
+    let asnMap = (try? resolver.resolve(ipv4Addrs: allIPs, timeout: timeoutSeconds)) ?? [:]
     struct ISPObj: Codable {
       let asn: String
       let name: String
@@ -200,7 +203,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
   private func runPretty(tracer: SwiftFTR, host: String) async throws {
     let classified = try await tracer.traceClassified(to: host)
-    let probeMs = Int(timeout * 1000)
+    let probeMs = timeoutMs
     let overallMs = probeMs * 3
     print(
       "ftr to \(classified.destinationHost) (\(classified.destinationIP)), \(maxHops) max hops, \(probeMs)ms probe timeout, \(overallMs)ms overall timeout"

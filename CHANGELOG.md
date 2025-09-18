@@ -11,7 +11,7 @@ Unreleased
 ### Enhancements
 - Updated README, contributor guides, and DocC content to reference Swift 6.2 best practices and tooling.
 - Increased the default probe timeout to 2000 ms (`SwiftFTRConfig.maxWaitMs`) and adjusted CLI defaults accordingly.
-- Added `-v/--version` to the `swift-ftr` CLI and show extended help when no destination is provided.
+- Added `-v/--version` to the `swift-ftr` CLI, show extended help when no destination is provided, and made `-w/--timeout` accept milliseconds instead of seconds.
 
 0.4.0 — 2025-09-15
 ------------------

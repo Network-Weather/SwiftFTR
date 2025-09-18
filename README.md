@@ -150,7 +150,7 @@ swift build -c release
 
 Selected options (ArgumentParser-powered):
 - `-m, --max-hops N`: Max TTL/hops to probe (default 30)
-- `-w, --timeout SEC`: Overall wait after sending probes (default 2.0)
+- `-w, --timeout MS`: Probe timeout in milliseconds (default 2000)
 - `-v, --version`: Print the swift-ftr version and exit
 - `-i, --interface IFACE`: Use specific network interface (e.g., en0)
 - `-s, --source IP`: Bind to specific source IP address
