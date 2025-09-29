@@ -408,7 +408,9 @@ extension SwiftFTRCommand {
         """
     )
 
-    @Option(name: [.short, .customLong("flows")], help: "Number of flow variations to try (default: 8)")
+    @Option(
+      name: [.short, .customLong("flows")],
+      help: "Number of flow variations to try (default: 8)")
     var flows: Int = 8
 
     @Option(name: .customLong("max-paths"), help: "Max unique paths to discover (default: 16)")
