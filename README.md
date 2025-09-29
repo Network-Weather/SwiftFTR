@@ -199,15 +199,15 @@ Options:
 
 ### Multipath Discovery (v0.5.0+)
 ```bash
-.build/release/swift-ftr multipath 8.8.8.8 -f 8 --max-paths 16
+.build/release/swift-ftr multipath 8.8.8.8 --flows 8 --max-paths 16
 ```
 
 Options:
-- `-f, --flows N`: Number of flow variations (default 8)
+- `--flows N`: Number of flow variations (default 8)
 - `--max-paths N`: Max unique paths to find (default 16)
 - `--early-stop N`: Stop after N flows with no new paths (default 3)
 - `-m, --max-hops N`: Max TTL to probe (default 30)
-- `-w, --wait SEC`: Timeout in seconds (default 2.0)
+- `-t, --timeout SEC`: Timeout per flow in seconds (default 2.0)
 - `--json`: Output JSON format
 
 Configuration and Flags

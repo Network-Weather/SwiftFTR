@@ -54,7 +54,7 @@ PTR_SKIP_STUN=1 swift test -c debug
 
 # Test CLI commands
 .build/release/swift-ftr ping 1.1.1.1 -c 5
-.build/release/swift-ftr multipath 8.8.8.8 -f 5
+.build/release/swift-ftr multipath 8.8.8.8 --flows 5
 .build/release/swift-ftr trace 1.1.1.1
 ```
 

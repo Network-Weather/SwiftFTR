@@ -61,10 +61,10 @@ Options: `--count`, `--interval`, `--timeout`, `--payload-size`, `--interface`, 
 
 ### New Multipath Subcommand
 ```bash
-swift-ftr multipath 8.8.8.8 -f 8 --max-paths 16 --json
+swift-ftr multipath 8.8.8.8 --flows 8 --max-paths 16 --json
 ```
 
-Options: `--flows`, `--max-paths`, `--early-stop`, `--max-hops`, `--wait`, `--json`
+Options: `--flows`, `--max-paths`, `--early-stop`, `--max-hops`, `--timeout`, `--json`
 
 ## 📚 Documentation
 

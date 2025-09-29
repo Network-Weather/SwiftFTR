@@ -57,7 +57,7 @@ All notable changes to this project are documented here. This project follows Se
   - Options: `-c/--count`, `-i/--interval`, `-t/--timeout`, `--payload-size`, `--json`
   - Human-readable and JSON output formats
 - Added `swift-ftr multipath <host>` subcommand
-  - Options: `-f/--flows`, `--max-paths`, `--early-stop`, `-m/--max-hops`, `-w/--wait`, `--json`
+  - Options: `--flows`, `--max-paths`, `--early-stop`, `-m/--max-hops`, `-t/--timeout`, `--json`
   - Displays discovered paths, divergence point, unique path count
 
 ### Compatibility
