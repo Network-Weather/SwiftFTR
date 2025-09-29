@@ -57,10 +57,10 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.1.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.5.0")
   ],
   targets: [
-      .target(name: "YourTarget", dependencies: ["SwiftFTR"]) 
+      .target(name: "YourTarget", dependencies: ["SwiftFTR"])
   ]
   ```
 
@@ -72,8 +72,14 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
 
-New in v0.4.0
+New in v0.5.0
 -------------
+- **Ping API**: Efficient ICMP echo monitoring with comprehensive statistics (min/avg/max RTT, packet loss, jitter)
+- **Multipath Discovery**: Dublin Traceroute-style ECMP path enumeration with smart deduplication
+- **Flow Identifier Control**: Optional flow ID parameter for stable, reproducible traces
+- **CLI Enhancements**: New `swift-ftr ping` and `swift-ftr multipath` subcommands with JSON output
+
+Previous v0.4.0 features:
 - **Network Interface Selection**: Specify which interface to use with `interface` config or `-i` CLI option
 - **Source IP Binding**: Bind to specific source IP with `sourceIP` config or `-s` CLI option
 - **Enhanced Error Reporting**: Detailed OS-level error messages with errno values
@@ -124,9 +130,25 @@ for hop in classified.hops {
 
 // Handle network changes (e.g., WiFi to cellular, VPN connect/disconnect)
 await tracer.networkChanged()  // Cancels active traces and clears caches
+
+// NEW in v0.5.0: Ping API
+let pingConfig = PingConfig(count: 5, interval: 1.0, timeout: 2.0)
+let pingResult = try await tracer.ping(to: "1.1.1.1", config: pingConfig)
+print("Packet loss: \(Int(pingResult.statistics.packetLoss * 100))%")
+if let avg = pingResult.statistics.avgRTT {
+    print("Avg RTT: \(String(format: "%.2f ms", avg * 1000))")
+}
+
+// NEW in v0.5.0: Multipath Discovery (ECMP enumeration)
+let multipathConfig = MultipathConfig(flowVariations: 8, maxPaths: 16)
+let topology = try await tracer.discoverPaths(to: "8.8.8.8", config: multipathConfig)
+print("Found \(topology.uniquePathCount) unique paths")
+for hop in topology.uniqueHops() {
+    print("Discovered hop at TTL \(hop.ttl): \(hop.ip ?? "*")")
+}
 ```
 
-📚 **[See comprehensive examples](docs/guides/EXAMPLES.md)** including SwiftUI integration, error handling, concurrent traces, and more.
+📚 **[See comprehensive examples](docs/guides/EXAMPLES.md)** including SwiftUI integration, error handling, concurrent traces, ping monitoring, multipath discovery, and more.
 
 Notes for Embedding
 -------------------
@@ -144,10 +166,14 @@ Build the bundled executable and run it:
 ```bash
 swift build -c release
 .build/release/swift-ftr --help
-.build/release/swift-ftr example.com -m 30 -w 1.0
 ```
 
-Selected options (ArgumentParser-powered):
+### Traceroute (default command)
+```bash
+.build/release/swift-ftr trace example.com -m 30 -w 1.0
+```
+
+Options:
 - `-m, --max-hops N`: Max TTL/hops to probe (default 30)
 - `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
 - `-i, --interface IFACE`: Use specific network interface (e.g., en0)
@@ -158,10 +184,31 @@ Selected options (ArgumentParser-powered):
 - `--public-ip IP`: Override public IP (bypasses STUN)
 - `--verbose`: Enable debug logging
 
-Example: JSON output
+### Ping (v0.5.0+)
 ```bash
-.build/release/swift-ftr --json www.example.com -m 30 -w 1.0
+.build/release/swift-ftr ping 1.1.1.1 -c 10 -i 1.0
 ```
+
+Options:
+- `-c, --count N`: Number of pings (default 5)
+- `-i, --interval SEC`: Interval between pings (default 1.0)
+- `-t, --timeout SEC`: Timeout per ping (default 2.0)
+- `--payload-size N`: ICMP payload size (default 56)
+- `--interface IFACE`: Network interface to use
+- `--json`: Output JSON format
+
+### Multipath Discovery (v0.5.0+)
+```bash
+.build/release/swift-ftr multipath 8.8.8.8 -f 8 --max-paths 16
+```
+
+Options:
+- `-f, --flows N`: Number of flow variations (default 8)
+- `--max-paths N`: Max unique paths to find (default 16)
+- `--early-stop N`: Stop after N flows with no new paths (default 3)
+- `-m, --max-hops N`: Max TTL to probe (default 30)
+- `-w, --wait SEC`: Timeout in seconds (default 2.0)
+- `--json`: Output JSON format
 
 Configuration and Flags
 -----------------------

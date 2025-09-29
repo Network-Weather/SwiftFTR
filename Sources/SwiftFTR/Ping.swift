@@ -204,7 +204,8 @@ actor PingExecutor {
           identifier: identifier
         ) {
           let receiveTime = monotonicTime()
-          await actor.recordResponse(seq: Int(parsed.sequence), receiveTime: receiveTime, ttl: parsed.ttl)
+          await actor.recordResponse(
+            seq: Int(parsed.sequence), receiveTime: receiveTime, ttl: parsed.ttl)
         }
 
         // Check if we've received all responses
@@ -237,7 +238,7 @@ actor PingExecutor {
 
     // Cancel receiver and collect results
     receiverTask.cancel()
-    try? await receiverTask.value
+    _ = await receiverTask.value
 
     let (sentTimes, receiveTimes, ttls) = await actor.getResults()
 

@@ -1,6 +1,6 @@
 # SwiftFTR Roadmap
 
-## Current Version: 0.4.0 (September 2025)
+## Current Version: 0.5.0 (September 2025)
 - ✅ Core traceroute functionality with ICMP datagram sockets
 - ✅ Swift 6.1 concurrency compliance
 - ✅ Thread-safe, nonisolated API
@@ -20,8 +20,11 @@
 - ✅ Network interface selection (`-i/--interface` CLI, `interface` config)
 - ✅ Source IP binding (`-s/--source` CLI, `sourceIP` config)
 - ✅ Context-aware private IP classification (ISP vs LAN)
+- ✅ Ping API for ICMP echo monitoring (completed in v0.5.0)
+- ✅ Multipath discovery with ECMP enumeration (completed in v0.5.0)
+- ✅ Flow identifier control for reproducible traces (completed in v0.5.0)
 
-## Version 0.5.0 - Q4 2025: Enhanced Network Classification
+## Version 0.6.0 - Q1 2026: Enhanced Network Classification
 ### Sophisticated Network Type Detection
 - [ ] VPN/Overlay network detection (Tailscale, WireGuard, ZeroTier)
 - [ ] SASE/SSE infrastructure identification
@@ -87,7 +90,82 @@ enum HopCategory {
 }
 ```
 
-## Version 0.6.0 - Q1 2026: Offline ASN Support
+## Version 0.5.5 - Q4 2025: UDP-Based Multipath Discovery ⚡ HIGH PRIORITY
+### Enhanced ECMP Path Enumeration
+- [ ] UDP probe support for multipath discovery (varying destination port)
+- [ ] Parallel ICMP and UDP multipath discovery
+- [ ] Protocol-aware path comparison and merging
+- [ ] Configurable protocol selection for multipath (ICMP, UDP, or both)
+- [ ] Raw socket implementation for UDP traceroute probes
+- [ ] Privilege requirement detection and error messages
+
+**Why This is Important:**
+Current ICMP-based multipath discovery has significant limitations:
+- ECMP routers often **do not hash ICMP ID field** when load balancing
+- ICMP discovery found **1 unique path** to 8.8.8.8 in testing
+- UDP-based Dublin-traceroute found **7 unique paths** to the same destination
+- UDP varies destination port, which ECMP routers actively hash (5-tuple hashing)
+- This severely limits visibility into actual TCP/UDP application routing diversity
+
+**Real-World Impact:**
+```
+Test: Multipath discovery to 8.8.8.8
+- ICMP (current): 1 path via 135.180.179.42 → 75.101.33.185 → Google
+- UDP (dublin-traceroute): 7 paths via different ISP hops and Google ingress points
+- Missing diversity: 6 additional ECMP paths invisible to ICMP probes
+```
+
+**Use Cases:**
+- ICMP multipath: Accurate for **ping monitoring** path discovery (what ping sees)
+- UDP multipath: Accurate for **TCP/UDP application** path discovery (what apps see)
+- Combined: Complete picture of network path diversity
+
+**Implementation:**
+```swift
+// Future API
+let config = MultipathConfig(
+    flowVariations: 16,
+    protocol: .udp,        // .icmp (current), .udp (new), .both
+    startPort: 33434,      // For UDP
+    maxPaths: 20
+)
+
+let topology = try await ftr.discoverPaths(to: "example.com", config: config)
+print("UDP found \(topology.uniquePathCount) paths")
+```
+
+**Technical Requirements:**
+- Raw socket (SOCK_RAW) for sending UDP packets with low TTL
+- Requires elevated privileges on macOS (may need sudo or entitlements)
+- ICMP Time Exceeded reception (already implemented)
+- UDP payload generation (simple random data)
+- Port range iteration (33434-33453, Paris consistency within flow)
+
+**Backwards Compatibility:**
+- Existing ICMP multipath API unchanged (default behavior)
+- New `protocol` field in `MultipathConfig` (default: `.icmp`)
+- Existing NetworkTopology structure unchanged
+- Add optional `protocol` field to DiscoveredPath for tracking
+
+**Benefits:**
+- More complete ECMP topology discovery
+- Match UDP-based tools (dublin-traceroute, mtr)
+- Better application path prediction
+- Full parity with industry-standard multipath tools
+
+**Challenges:**
+- Requires raw sockets (elevated privileges)
+- macOS raw socket permissions may require entitlements
+- Need clear error messages when privileges insufficient
+- Testing requires actual ECMP networks
+
+**Success Criteria:**
+- Find 5-10x more paths on ECMP networks compared to ICMP
+- Match or exceed dublin-traceroute path discovery
+- Clear documentation of privilege requirements
+- Graceful fallback to ICMP when UDP unavailable
+
+## Version 0.7.0 - Q2 2026: Offline ASN Support
 ### Swift-IP2ASN Integration
 - [ ] Integrate Swift-IP2ASN library for offline IP-to-ASN mapping
 - [ ] Hybrid resolution: offline first, fallback to DNS
@@ -110,7 +188,7 @@ let config = SwiftFTRConfig(
 )
 ```
 
-## Version 0.7.0 - Q2 2026: Enhanced Protocol Support
+## Version 0.8.0 - Q3 2026: Enhanced Protocol Support
 ### Multiple Probe Methods
 - [ ] UDP probe support (like traditional traceroute)
 - [ ] TCP SYN probe support (for firewall traversal)
@@ -122,7 +200,7 @@ let config = SwiftFTRConfig(
 - More complete path discovery
 - Protocol-specific path detection
 
-## Version 0.8.0 - Q3 2026: IPv6 Support
+## Version 0.9.0 - Q4 2026: IPv6 Support
 ### Full Dual-Stack Support
 - [ ] ICMPv6 implementation
 - [ ] IPv6 address resolution
@@ -134,7 +212,7 @@ let config = SwiftFTRConfig(
 - IPv6 path discovery complexity
 - Dual-stack result merging
 
-## Version 0.9.0 - Q4 2026: Advanced Analytics
+## Version 0.10.0 - Q1 2027: Advanced Analytics
 ### Path Analysis Features
 - [ ] Path change detection over time
 - [ ] Latency variance analysis
@@ -148,7 +226,7 @@ let config = SwiftFTRConfig(
 - [ ] Result caching with TTL
 - [ ] Streaming results API
 
-## Version 1.0.0 - Q1 2027: Production Ready
+## Version 1.0.0 - Q2 2027: Production Ready
 ### Enterprise Features
 - [ ] Distributed tracing coordination
 - [ ] Metrics export (Prometheus, StatsD)
@@ -183,11 +261,12 @@ let config = SwiftFTRConfig(
 ## Contributing
 
 We welcome contributions! Priority areas:
-1. VPN/Zero Trust/SASE testing and detection (immediate)
-2. Swift-IP2ASN integration (Q1 2026)
-3. Enterprise network compatibility
-4. Performance benchmarking with tunneled traffic
-5. Platform compatibility testing
+1. **UDP-based multipath discovery** (Q4 2025) ⚡ **HIGHEST PRIORITY**
+2. VPN/Zero Trust/SASE testing and detection (immediate)
+3. Swift-IP2ASN integration (Q1 2026)
+4. Enterprise network compatibility
+5. Performance benchmarking with tunneled traffic
+6. Platform compatibility testing
 
 ## Dependencies & Integration Points
 
@@ -197,9 +276,9 @@ We welcome contributions! Priority areas:
 - Swift Concurrency with actors (v0.3.0+)
 
 ### Planned Integrations
-- **Swift-IP2ASN**: Offline ASN database (v0.6.0)
+- **Swift-IP2ASN**: Offline ASN database (v0.7.0)
 - **SwiftNIO**: Optional high-performance I/O (v1.0.0)
-- **Swift Metrics**: Observability API (v0.8.0)
+- **Swift Metrics**: Observability API (v0.10.0)
 
 ## Breaking Changes Policy
 

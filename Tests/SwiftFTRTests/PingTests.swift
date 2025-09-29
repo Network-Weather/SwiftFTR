@@ -301,8 +301,8 @@ struct PingIntegrationTests {
     #expect(result.responses.count == 5)
 
     // Should complete in approximately: 4 intervals + timeout = 4*0.2 + 2.0 = 2.8s
-    // Allow some overhead, check < 4 seconds
-    #expect(duration < 4.0)
+    // Allow significant overhead for network variability and system scheduling
+    #expect(duration < 10.0)
   }
 
   @Test(

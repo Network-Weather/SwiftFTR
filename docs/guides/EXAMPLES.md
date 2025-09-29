@@ -3,6 +3,8 @@
 ## Table of Contents
 - [Basic Usage](#basic-usage)
 - [Configuration Options](#configuration-options)
+- [Ping (v0.5.0+)](#ping-v050)
+- [Multipath Discovery (v0.5.0+)](#multipath-discovery-v050)
 - [SwiftUI Integration](#swiftui-integration)
 - [Concurrent Traces](#concurrent-traces)
 - [Error Handling](#error-handling)
@@ -118,6 +120,357 @@ do {
 } catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
     print("Failed to bind to source IP \(ip): \(details ?? "")")
 }
+```
+
+## Ping (v0.5.0+)
+
+### Basic Ping
+```swift
+import SwiftFTR
+
+// Create tracer and ping configuration
+let tracer = SwiftFTR()
+let config = PingConfig(
+    count: 5,           // Number of pings (default: 5)
+    interval: 1.0,      // Interval between pings in seconds (default: 1.0)
+    timeout: 2.0,       // Timeout per ping in seconds (default: 2.0)
+    payloadSize: 56     // ICMP payload size (default: 56)
+)
+
+// Perform ping
+let result = try await tracer.ping(to: "1.1.1.1", config: config)
+
+// Process results
+print("PING \(result.target) (\(result.resolvedIP))")
+print("Statistics: \(result.statistics.sent) sent, \(result.statistics.received) received, \(Int(result.statistics.packetLoss * 100))% packet loss")
+
+if let avgRTT = result.statistics.avgRTT {
+    print("Average RTT: \(String(format: "%.2f", avgRTT * 1000)) ms")
+}
+if let jitter = result.statistics.jitter {
+    print("Jitter: \(String(format: "%.2f", jitter * 1000)) ms")
+}
+```
+
+### Continuous Ping Monitoring
+```swift
+import SwiftFTR
+
+actor PingMonitor {
+    private let tracer = SwiftFTR()
+    private var isRunning = false
+
+    func startMonitoring(target: String, interval: TimeInterval = 60.0) async {
+        guard !isRunning else { return }
+        isRunning = true
+
+        let config = PingConfig(count: 5, interval: 0.5, timeout: 2.0)
+
+        while isRunning {
+            do {
+                let result = try await tracer.ping(to: target, config: config)
+                analyzeResults(result)
+
+                // Wait before next monitoring cycle
+                try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            } catch {
+                print("Ping failed: \(error)")
+            }
+        }
+    }
+
+    func stop() {
+        isRunning = false
+    }
+
+    private func analyzeResults(_ result: PingResult) {
+        let stats = result.statistics
+
+        // Check for high packet loss
+        if stats.packetLoss > 0.2 {
+            print("⚠️  High packet loss to \(result.target): \(Int(stats.packetLoss * 100))%")
+        }
+
+        // Check for high latency
+        if let avg = stats.avgRTT, avg > 0.1 {
+            print("⚠️  High latency to \(result.target): \(String(format: "%.2f", avg * 1000)) ms")
+        }
+
+        // Check for high jitter
+        if let jitter = stats.jitter, jitter > 0.05 {
+            print("⚠️  High jitter to \(result.target): \(String(format: "%.2f", jitter * 1000)) ms")
+        }
+    }
+}
+
+// Usage
+let monitor = PingMonitor()
+Task {
+    await monitor.startMonitoring(target: "1.1.1.1", interval: 30.0)
+}
+```
+
+### Fast Ping for Quick Checks
+```swift
+import SwiftFTR
+
+// Quick reachability check
+func isReachable(host: String) async -> Bool {
+    let tracer = SwiftFTR()
+    let config = PingConfig(count: 3, interval: 0.2, timeout: 1.0)
+
+    do {
+        let result = try await tracer.ping(to: host, config: config)
+        return result.statistics.received > 0
+    } catch {
+        return false
+    }
+}
+
+// Usage
+if await isReachable(host: "8.8.8.8") {
+    print("Host is reachable")
+} else {
+    print("Host is unreachable")
+}
+```
+
+### Concurrent Ping to Multiple Hosts
+```swift
+import SwiftFTR
+
+func pingMultipleHosts(hosts: [String]) async throws -> [String: PingStatistics] {
+    let tracer = SwiftFTR()
+    let config = PingConfig(count: 5, interval: 0.5, timeout: 2.0)
+
+    return try await withThrowingTaskGroup(of: (String, PingStatistics).self) { group in
+        for host in hosts {
+            group.addTask {
+                let result = try await tracer.ping(to: host, config: config)
+                return (host, result.statistics)
+            }
+        }
+
+        var results: [String: PingStatistics] = [:]
+        for try await (host, stats) in group {
+            results[host] = stats
+        }
+        return results
+    }
+}
+
+// Usage
+let hosts = ["1.1.1.1", "8.8.8.8", "9.9.9.9"]
+let results = try await pingMultipleHosts(hosts: hosts)
+
+for (host, stats) in results {
+    print("\(host): \(stats.received)/\(stats.sent) received, avg RTT: \(stats.avgRTT.map { String(format: "%.2f ms", $0 * 1000) } ?? "N/A")")
+}
+```
+
+## Multipath Discovery (v0.5.0+)
+
+### Basic Multipath Discovery
+```swift
+import SwiftFTR
+
+// Create tracer and multipath configuration
+let tracer = SwiftFTR()
+let config = MultipathConfig(
+    flowVariations: 8,        // Number of flow variations to try (default: 8)
+    maxPaths: 16,            // Max unique paths to discover (default: 16)
+    earlyStopThreshold: 3,   // Stop after N consecutive duplicates (default: 3)
+    timeoutMs: 2000,         // Timeout per flow in ms (default: 2000)
+    maxHops: 30              // Maximum TTL to probe (default: 30)
+)
+
+// Discover all ECMP paths
+let topology = try await tracer.discoverPaths(to: "example.com", config: config)
+
+// Analyze results
+print("Discovered \(topology.uniquePathCount) unique path(s)")
+print("Discovery took \(String(format: "%.2f", topology.discoveryDuration)) seconds")
+
+if let divergence = topology.divergencePoint() {
+    print("⚡ Paths diverge at TTL \(divergence) (ECMP detected)")
+} else {
+    print("ℹ️  Single path (no ECMP)")
+}
+```
+
+### Extract Monitoring Targets from Multipath
+```swift
+import SwiftFTR
+
+// Discover paths and extract unique hops for monitoring
+let tracer = SwiftFTR()
+let multipathConfig = MultipathConfig(flowVariations: 8, maxPaths: 16)
+
+// Step 1: Discover all ECMP paths
+let topology = try await tracer.discoverPaths(to: "example.com", config: multipathConfig)
+
+// Step 2: Extract unique hops (all IPs discovered across paths)
+let uniqueHops = topology.uniqueHops()
+print("Found \(uniqueHops.count) unique hops to monitor")
+
+// Step 3: Set up continuous monitoring of each hop
+let pingConfig = PingConfig(count: 5, interval: 0.5, timeout: 2.0)
+
+for hop in uniqueHops {
+    guard let ip = hop.ip else { continue }
+
+    Task {
+        while true {
+            do {
+                let result = try await tracer.ping(to: ip, config: pingConfig)
+
+                // Log metrics for this hop
+                print("[\(hop.ttl)] \(ip): RTT \(result.statistics.avgRTT.map { String(format: "%.2f ms", $0 * 1000) } ?? "N/A"), loss \(Int(result.statistics.packetLoss * 100))%")
+
+                // Wait 60 seconds before next ping
+                try await Task.sleep(nanoseconds: 60_000_000_000)
+            } catch {
+                print("[\(hop.ttl)] \(ip): Error - \(error)")
+            }
+        }
+    }
+}
+```
+
+### Path Analysis and Filtering
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+let topology = try await tracer.discoverPaths(to: "8.8.8.8", config: MultipathConfig())
+
+// Get common prefix (shared by all paths)
+let commonPrefix = topology.commonPrefix()
+print("Common path prefix: \(commonPrefix.count) hops")
+for hop in commonPrefix {
+    print("  TTL \(hop.ttl): \(hop.ip ?? "*")")
+}
+
+// Find paths through specific IP
+let pathsThroughIP = topology.paths(throughIP: "142.250.160.160")
+print("\(pathsThroughIP.count) path(s) traverse 142.250.160.160")
+
+// Find paths through specific ASN
+let pathsThroughGoogle = topology.paths(throughASN: 15169)  // Google ASN
+print("\(pathsThroughGoogle.count) path(s) traverse Google's network (AS15169)")
+
+// Analyze each unique path
+for (index, path) in topology.paths.filter({ $0.isUnique }).enumerated() {
+    print("\nPath \(index + 1):")
+    print("  Flow ID: 0x\(String(path.flowIdentifier.icmpID, radix: 16))")
+    print("  Hops: \(path.trace.hops.count)")
+    print("  Fingerprint: \(path.fingerprint)")
+}
+```
+
+### ECMP Detection and Alerting
+```swift
+import SwiftFTR
+
+actor ECMPMonitor {
+    private let tracer = SwiftFTR()
+    private var previousTopology: NetworkTopology?
+
+    func checkForPathChanges(target: String) async throws {
+        let config = MultipathConfig(flowVariations: 10, maxPaths: 20)
+        let current = try await tracer.discoverPaths(to: target, config: config)
+
+        if let previous = previousTopology {
+            // Check if number of paths changed
+            if current.uniquePathCount != previous.uniquePathCount {
+                print("⚠️  Path count changed: \(previous.uniquePathCount) → \(current.uniquePathCount)")
+            }
+
+            // Check if divergence point changed
+            let currentDiv = current.divergencePoint()
+            let previousDiv = previous.divergencePoint()
+            if currentDiv != previousDiv {
+                print("⚠️  Divergence point changed: \(previousDiv?.description ?? "none") → \(currentDiv?.description ?? "none")")
+            }
+
+            // Check for new or removed hops
+            let currentIPs = Set(current.uniqueHops().compactMap { $0.ip })
+            let previousIPs = Set(previous.uniqueHops().compactMap { $0.ip })
+
+            let added = currentIPs.subtracting(previousIPs)
+            let removed = previousIPs.subtracting(currentIPs)
+
+            if !added.isEmpty {
+                print("⚠️  New hops discovered: \(added)")
+            }
+            if !removed.isEmpty {
+                print("⚠️  Hops no longer seen: \(removed)")
+            }
+        }
+
+        previousTopology = current
+    }
+}
+
+// Usage: Monitor for path changes every 5 minutes
+let monitor = ECMPMonitor()
+Task {
+    while true {
+        try await monitor.checkForPathChanges(target: "example.com")
+        try await Task.sleep(nanoseconds: 300_000_000_000)  // 5 minutes
+    }
+}
+```
+
+### Export Topology as JSON
+```swift
+import SwiftFTR
+import Foundation
+
+let tracer = SwiftFTR()
+let topology = try await tracer.discoverPaths(to: "example.com", config: MultipathConfig())
+
+// Encode to JSON
+let encoder = JSONEncoder()
+encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+let jsonData = try encoder.encode(topology)
+
+// Save to file or send to API
+if let jsonString = String(data: jsonData, encoding: .utf8) {
+    print(jsonString)
+
+    // Or write to file
+    try jsonString.write(
+        toFile: "/tmp/network-topology.json",
+        atomically: true,
+        encoding: .utf8
+    )
+}
+```
+
+### ICMP Limitation Note
+```swift
+import SwiftFTR
+
+/*
+ * IMPORTANT: SwiftFTR v0.5.0 uses ICMP Echo Request for multipath discovery.
+ * Many ECMP routers do not hash ICMP ID fields, so this may find fewer paths
+ * than UDP-based tools like dublin-traceroute.
+ *
+ * The discovered paths accurately represent ICMP routing behavior, which is
+ * ideal for ping monitoring. For TCP/UDP application path discovery, a future
+ * UDP-based implementation is planned (see ROADMAP.md).
+ *
+ * Example: UDP may find 7 paths, ICMP may find 1-2 paths to the same destination.
+ * Both are correct - they show different protocols' routing behavior.
+ */
+
+// For now, understand that multipath results show paths ICMP packets take
+let tracer = SwiftFTR()
+let topology = try await tracer.discoverPaths(to: "8.8.8.8", config: MultipathConfig())
+
+print("Discovered \(topology.uniquePathCount) ICMP path(s)")
+print("Note: UDP-based discovery might find more paths due to port-based ECMP hashing")
 ```
 
 ## SwiftUI Integration

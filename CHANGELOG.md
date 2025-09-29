@@ -3,6 +3,69 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.5.0 — 2025-09-29
+------------------
+### Major Features
+- **NEW**: Ping API for ICMP echo monitoring
+  - `ping()` method with `PingConfig`, `PingResult`, and `PingStatistics`
+  - Single ping, multiple pings, or continuous monitoring workflows
+  - Configurable count, interval, timeout, and payload size
+  - Statistics: min/avg/max RTT, packet loss, standard deviation, jitter
+  - CLI: `swift-ftr ping <host>` subcommand with `--count`, `--interval`, `--timeout`, `--json`
+- **NEW**: Multipath discovery (Dublin Traceroute-style ECMP enumeration)
+  - `discoverPaths()` method with `MultipathConfig` and `NetworkTopology` result
+  - ECMP path enumeration using ICMP ID field variations
+  - Smart path deduplication for intermittent hop responders
+  - Early stopping when no new unique paths found (configurable threshold)
+  - Utility methods: `uniqueHops()`, `commonPrefix()`, `divergencePoint()`
+  - CLI: `swift-ftr multipath <host>` subcommand with `--flows`, `--max-paths`, `--early-stop`, `--json`
+
+### Improvements
+- **ENHANCED**: Flow identifier control for reproducible traces
+  - Optional `flowID` parameter in `trace()` and `traceClassified()` methods
+  - Stable flow identifiers enable consistent path discovery
+  - Used internally by multipath discovery for ECMP enumeration
+
+### Technical Details
+- ICMP-based multipath using ICMP ID field variation (16-bit space)
+- Path deduplication via signature-based comparison of hop sequences
+- `NetworkTopology` struct with `Codable` support for JSON export
+- Comprehensive test suite: 44 tests across 12 suites
+- Integration tests validate real network behavior with ECMP targets
+
+### Known Limitations
+- **ICMP multipath may discover fewer paths than UDP-based tools**
+  - Many ECMP routers do not hash ICMP ID field for load balancing
+  - UDP-based tools vary destination port (5-tuple hashing)
+  - Testing: ICMP found 1 path to 8.8.8.8, UDP (dublin-traceroute) found 7 paths
+  - Use case: ICMP accurately reflects ping diversity, UDP reflects TCP/UDP app diversity
+  - **UDP multipath support planned for v0.5.5** (high priority, see ROADMAP.md)
+
+### Documentation
+- **ENHANCED**: Updated `docs/guides/EXAMPLES.md` with v0.5.0 features
+  - 4 ping examples: basic, continuous monitoring, fast reachability, concurrent
+  - 6 multipath examples: basic discovery, monitoring workflow, path analysis, ECMP detection
+  - Key example: Extract unique hops from multipath for monitoring (NWX use case)
+  - ICMP vs UDP limitation explanation with reference to ROADMAP
+- **ENHANCED**: Updated `docs/development/ROADMAP.md`
+  - Added v0.5.5 UDP-based multipath discovery section (high priority)
+  - Documented ICMP limitations with real-world test results
+  - Implementation plan for raw UDP socket support
+
+### CLI Updates
+- Added `swift-ftr ping <host>` subcommand
+  - Options: `-c/--count`, `-i/--interval`, `-t/--timeout`, `--payload-size`, `--json`
+  - Human-readable and JSON output formats
+- Added `swift-ftr multipath <host>` subcommand
+  - Options: `-f/--flows`, `--max-paths`, `--early-stop`, `-m/--max-hops`, `-w/--wait`, `--json`
+  - Displays discovered paths, divergence point, unique path count
+
+### Compatibility
+- No breaking changes to existing traceroute API
+- All new features are additive (ping and multipath methods)
+- Swift 6.1 strict concurrency compliance maintained
+- All 44 tests passing (15 multipath unit, 7 multipath integration, 22 ping)
+
 0.4.0 — 2025-09-15
 ------------------
 ### Major Features

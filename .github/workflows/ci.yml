@@ -32,6 +32,7 @@ jobs:
       - name: Test (debug, isolated)
         env:
           PTR_SKIP_STUN: "1"
+          SKIP_NETWORK_TESTS: "1"
         run: swift test -c debug
       - name: Build (release)
         run: swift build -c release

@@ -160,15 +160,15 @@ public struct SwiftFTRConfig: Sendable {
 /// built-in caching for rDNS lookups and STUN public IP discovery.
 @available(macOS 13.0, *)
 public actor SwiftFTR {
-  private var config: SwiftFTRConfig
+  internal var config: SwiftFTRConfig
 
   // Cache storage
-  private var cachedPublicIP: String?
-  private let rdnsCache: RDNSCache
-  private let asnResolver: ASNResolver
+  internal var cachedPublicIP: String?
+  internal let rdnsCache: RDNSCache
+  internal let asnResolver: ASNResolver
 
   // Active trace tracking
-  private var activeTraces: Set<TraceHandle> = []
+  internal var activeTraces: Set<TraceHandle> = []
 
   /// Creates a tracer instance with optional configuration.
   /// - Parameter config: Configuration for traceroute behavior
@@ -207,7 +207,7 @@ public actor SwiftFTR {
   }
 
   // Validate network interface exists and is available
-  private func validateInterface(_ interfaceName: String) throws -> UInt32 {
+  internal func validateInterface(_ interfaceName: String) throws -> UInt32 {
     #if os(macOS)
       let ifIndex = if_nametoindex(interfaceName)
       if ifIndex == 0 {
@@ -228,9 +228,10 @@ public actor SwiftFTR {
   }
 
   // Internal implementation of trace with cancellation support
-  private func performTrace(
+  internal func performTrace(
     to host: String,
-    handle: TraceHandle
+    handle: TraceHandle,
+    flowIdentifier: UInt16? = nil
   ) async throws -> TraceResult {
     let maxHops = config.maxHops
     let timeout = TimeInterval(config.maxWaitMs) / 1000.0
@@ -386,8 +387,8 @@ public actor SwiftFTR {
       // Not fatal; ignore
     }
 
-    // Use a random identifier per run
-    let identifier = UInt16.random(in: 0...UInt16.max)
+    // Use provided flow identifier or generate random one
+    let identifier = flowIdentifier ?? UInt16.random(in: 0...UInt16.max)
 
     // Tracking maps
     struct SendInfo {
@@ -705,7 +706,7 @@ public actor SwiftFTR {
   }
 
   /// Discover public IP via STUN
-  private func discoverPublicIP() async throws -> String {
+  internal func discoverPublicIP() async throws -> String {
     try stunGetPublicIPv4(
       timeout: 0.8, interface: config.interface, sourceIP: config.sourceIP,
       enableLogging: config.enableLogging
@@ -758,7 +759,7 @@ public actor SwiftFTR {
 }
 
 // Helpers
-private func resolveIPv4(host: String, enableLogging: Bool = false) throws -> sockaddr_in {
+internal func resolveIPv4(host: String, enableLogging: Bool = false) throws -> sockaddr_in {
   if enableLogging {
     print("[SwiftFTR] Resolving host: \(host)")
   }
