@@ -677,6 +677,33 @@ public actor SwiftFTR {
     )
   }
 
+  /// Ping a target host with specified configuration.
+  ///
+  /// Sends ICMP Echo Request packets and measures round-trip time, packet loss, and jitter.
+  /// This method is more efficient than traceroute for monitoring known hops, as it sends
+  /// direct echo requests rather than probing every TTL.
+  ///
+  /// Safe to call concurrently for multiple targets - each ping operation uses its own socket.
+  ///
+  /// - Parameters:
+  ///   - target: Hostname or IP address to ping
+  ///   - config: Ping configuration (count, interval, timeout, payload size)
+  /// - Returns: Ping result with response data and computed statistics
+  /// - Throws: `TracerouteError` on failure (resolution, socket creation, permission issues)
+  ///
+  /// ## Example
+  /// ```swift
+  /// let tracer = SwiftFTR(config: SwiftFTRConfig())
+  /// let result = try await tracer.ping(to: "8.8.8.8", config: PingConfig(count: 10))
+  /// print("Packet loss: \(result.statistics.packetLoss * 100)%")
+  /// print("Avg latency: \(result.statistics.avgRTT! * 1000) ms")
+  /// ```
+  public func ping(to target: String, config: PingConfig = PingConfig()) async throws -> PingResult
+  {
+    let executor = PingExecutor(config: self.config)
+    return try await executor.ping(to: target, config: config)
+  }
+
   /// Discover public IP via STUN
   private func discoverPublicIP() async throws -> String {
     try stunGetPublicIPv4(
