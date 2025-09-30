@@ -27,6 +27,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 
 ## Formatting
 - We enforce Swift formatting in CI using `swift format` (Swift 6 toolchain).
+- See [docs/development/CODE_STYLE.md](docs/development/CODE_STYLE.md) for naming conventions and intentional exceptions (JSON API compatibility, external integration requirements).
 - Locally, you can install the git pre‑push hook once:
   ```bash
   git config core.hooksPath .githooks

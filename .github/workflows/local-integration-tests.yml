@@ -8,11 +8,6 @@ on:
   pull_request:
     types: [labeled]
     # Only run when 'test-integration' label is added
-  push:
-    branches: [main]
-    paths:
-      - 'Sources/**'
-      - 'Tests/**'
 
 jobs:
   full-integration-suite:
@@ -21,8 +16,7 @@ jobs:
     runs-on: [self-hosted, macos, traceroute]
     if: |
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'test-integration')) ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'test-integration'))
     
     steps:
       - uses: actions/checkout@v4

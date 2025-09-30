@@ -49,6 +49,7 @@ for hop in classified.hops {
 - ``SwiftFTR/SwiftFTR``
 - ``SwiftFTR/TraceResult``
 - ``SwiftFTR/TraceHop``
+- <doc:Tracing>
 
 ### Classification
 
@@ -56,3 +57,17 @@ for hop in classified.hops {
 - ``SwiftFTR/ClassifiedTrace``
 - ``SwiftFTR/ClassifiedHop``
 - ``SwiftFTR/HopCategory``
+
+### Ping (v0.5.0+)
+
+- ``SwiftFTR/PingConfig``
+- ``SwiftFTR/PingResult``
+- ``SwiftFTR/PingStatistics``
+- <doc:Ping>
+
+### Multipath Discovery (v0.5.0+)
+
+- ``SwiftFTR/MultipathConfig``
+- ``SwiftFTR/NetworkTopology``
+- ``SwiftFTR/DiscoveredPath``
+- <doc:Multipath>
