@@ -10,7 +10,6 @@ permissions:
   attestations: write   # publish build attestations
   id-token: write       # OIDC for provenance
   actions: read
-  pages: write         # deploy docs to GitHub Pages
 
 jobs:
   macos-release:
@@ -64,21 +63,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  # Automatically update DocC documentation when a release is created
-  docs-update:
-    name: Update DocC Documentation
-    needs: macos-release
-    uses: ./.github/workflows/docc-generate.yml
-    with:
-      docs-domain: 'swiftftr.networkweather.com'
-
-  deploy-docs:
-    needs: docs-update
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+  # Note: DocC documentation is automatically deployed by docs.yml workflow
+  # when changes are pushed to the main branch. No need to deploy from tags.
