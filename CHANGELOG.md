@@ -3,6 +3,50 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.5.1 — 2025-10-02
+------------------
+### Major Features
+- **NEW**: Bufferbloat detection with RPM scoring
+  - `testBufferbloat()` method with `BufferbloatConfig` and `BufferbloatResult`
+  - Measures network responsiveness under saturating load
+  - Detects latency spikes that impact video call quality (Zoom/Teams)
+  - A-F grading based on latency increase under load
+  - RPM (Round-trips Per Minute) scoring per IETF draft-ietf-ippm-responsiveness
+  - Video call impact assessment (jitter and latency thresholds)
+  - Supports upload, download, and bidirectional load testing
+  - CLI: `swift-ftr bufferbloat` subcommand with configurable duration and load type
+
+### Implementation Details
+- **Efficient single-session ping architecture**
+  - Uses PingExecutor's multi-ping capability (one socket + one Task per phase)
+  - Baseline phase: measures idle latency (default 5s)
+  - Load phase: parallel TCP streams while measuring latency (default 10s)
+  - Load generation: URLSession with 4 parallel upload/download streams
+- **Test duration:** ~15 seconds (5s baseline + 10s load by default)
+- **Grading scale:** A (<25ms), B (25-75ms), C (75-150ms), D (150-300ms), F (>300ms)
+- **RPM tiers:** Excellent (>6000), Good (1000-6000), Fair (300-1000), Poor (<300)
+
+### CLI Updates
+- Added `swift-ftr bufferbloat` subcommand
+  - Options: `--target`, `--baseline`, `--load`, `--load-type`, `--streams`, `--no-rpm`, `--json`
+  - Human-readable output with grade, latency increase, RPM score, video call impact
+  - JSON output for programmatic analysis
+
+### Documentation
+- DocC documentation for all bufferbloat APIs
+- Examples demonstrating WFH network troubleshooting
+- Explains video conferencing sensitivity to bufferbloat
+
+### Testing
+- All 44 existing tests pass
+- Real network validation with multiple configurations
+- Tested with 2s-15s durations and various load types
+
+### Compatibility
+- No breaking changes to existing APIs
+- All new features are additive (bufferbloat method)
+- Swift 6.1 strict concurrency compliance maintained
+
 0.5.0 — 2025-09-29
 ------------------
 ### Major Features

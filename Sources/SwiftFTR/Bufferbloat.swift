@@ -194,9 +194,9 @@ public struct RPMScore: Sendable, Codable {
 
 /// RPM grading per IETF specification
 public enum RPMGrade: String, Sendable, Codable {
-  case poor = "Poor"          // <300 RPM (>200ms RTT)
-  case fair = "Fair"          // 300-1000 RPM (60-200ms RTT)
-  case good = "Good"          // 1000-6000 RPM (10-60ms RTT)
+  case poor = "Poor"  // <300 RPM (>200ms RTT)
+  case fair = "Fair"  // 300-1000 RPM (60-200ms RTT)
+  case good = "Good"  // 1000-6000 RPM (10-60ms RTT)
   case excellent = "Excellent"  // >6000 RPM (<10ms RTT)
 }
 
@@ -239,10 +239,10 @@ public struct VideoCallImpact: Sendable, Codable {
 
 /// Severity of video call impact
 public enum VideoCallSeverity: String, Sendable, Codable {
-  case none = "None"        // No impact expected
-  case minor = "Minor"      // May see occasional glitches
+  case none = "None"  // No impact expected
+  case minor = "Minor"  // May see occasional glitches
   case moderate = "Moderate"  // Noticeable quality issues
-  case severe = "Severe"    // Calls will be problematic
+  case severe = "Severe"  // Calls will be problematic
 }
 
 /// Single ping result during bufferbloat test
@@ -449,8 +449,8 @@ extension SwiftFTR {
 
     let latencyIncrease = LatencyIncrease(
       absoluteMs: loadedStats.avgMs - baselineStats.avgMs,
-      percentageIncrease:
-        ((loadedStats.avgMs - baselineStats.avgMs) / max(baselineStats.avgMs, 0.001)) * 100,
+      percentageIncrease: ((loadedStats.avgMs - baselineStats.avgMs)
+        / max(baselineStats.avgMs, 0.001)) * 100,
       p99IncreaseMs: loadedStats.p99Ms - baselineStats.p99Ms
     )
 
@@ -519,28 +519,28 @@ private func measureBaseline(
   interval: TimeInterval,
   swiftFTRConfig: SwiftFTRConfig
 ) async throws -> [BufferbloatPingResult] {
-    guard duration > 0 else { return [] }
+  guard duration > 0 else { return [] }
 
-    let count = Int(duration / interval)
-    guard count > 0 else { return [] }
+  let count = Int(duration / interval)
+  guard count > 0 else { return [] }
 
-    // Use PingExecutor with count > 1 to do all pings in a single session
-    // This creates only ONE socket and ONE receiver Task for all pings
-    let executor = PingExecutor(config: swiftFTRConfig)
-    let pingConfig = PingConfig(count: count, interval: interval, timeout: 2.0)
+  // Use PingExecutor with count > 1 to do all pings in a single session
+  // This creates only ONE socket and ONE receiver Task for all pings
+  let executor = PingExecutor(config: swiftFTRConfig)
+  let pingConfig = PingConfig(count: count, interval: interval, timeout: 2.0)
 
-    let pingResult = try await executor.ping(to: target, config: pingConfig)
+  let pingResult = try await executor.ping(to: target, config: pingConfig)
 
-    // Convert PingResponse to BufferbloatPingResult
-    return pingResult.responses.enumerated().map { (seq, response) in
-      BufferbloatPingResult(
-        timestamp: response.timestamp,
-        phase: .baseline,
-        rtt: response.rtt,
-        sequence: seq
-      )
-    }
+  // Convert PingResponse to BufferbloatPingResult
+  return pingResult.responses.enumerated().map { (seq, response) in
+    BufferbloatPingResult(
+      timestamp: response.timestamp,
+      phase: .baseline,
+      rtt: response.rtt,
+      sequence: seq
+    )
   }
+}
 
 /// Measure latency under network load
 /// Non-actor-isolated to avoid Swift 6.2 actor scheduling issues
@@ -552,184 +552,184 @@ private func measureUnderLoad(
   config: BufferbloatConfig,
   swiftFTRConfig: SwiftFTRConfig
 ) async throws -> [BufferbloatPingResult] {
-    guard loadDuration > 0 else { return [] }
+  guard loadDuration > 0 else { return [] }
 
-    let count = Int(loadDuration / interval)
-    guard count > 0 else { return [] }
+  let count = Int(loadDuration / interval)
+  guard count > 0 else { return [] }
 
-    // Start load generation in background
-    let loadGen = LoadGenerator(config: config)
-    let loadTask = Task {
-      await loadGen.startLoad(duration: loadDuration, type: loadType)
-    }
-
-    // Use PingExecutor with count > 1 to do all pings in a single session
-    // This creates only ONE socket and ONE receiver Task for all pings
-    let executor = PingExecutor(config: swiftFTRConfig)
-    let pingConfig = PingConfig(count: count, interval: interval, timeout: 2.0)
-
-    let pingResult = try await executor.ping(to: target, config: pingConfig)
-
-    // Wait for load generation to finish
-    await loadTask.value
-    await loadGen.stopLoad()
-
-    // Convert PingResponse to BufferbloatPingResult with phase classification
-    let rampUpCount = max(1, count / 10)  // First 10% is ramp-up
-    let rampDownCount = max(1, count / 10)  // Last 10% is ramp-down
-
-    return pingResult.responses.enumerated().map { (seq, response) in
-      let phase: TestPhase
-      if seq < rampUpCount {
-        phase = .rampUp
-      } else if seq >= count - rampDownCount {
-        phase = .rampDown
-      } else {
-        phase = .sustained
-      }
-
-      return BufferbloatPingResult(
-        timestamp: response.timestamp,
-        phase: phase,
-        rtt: response.rtt,
-        sequence: seq
-      )
-    }
+  // Start load generation in background
+  let loadGen = LoadGenerator(config: config)
+  let loadTask = Task {
+    await loadGen.startLoad(duration: loadDuration, type: loadType)
   }
 
-  /// Compute statistics from ping results
-  private func computeStatistics(_ results: [BufferbloatPingResult]) -> LatencyMeasurements {
-    let rtts = results.compactMap { $0.rtt }.map { $0 * 1000 }  // Convert to ms
-    guard !rtts.isEmpty else {
-      return LatencyMeasurements(
-        sampleCount: 0, minMs: 0, avgMs: 0, maxMs: 0,
-        p50Ms: 0, p95Ms: 0, p99Ms: 0, jitterMs: 0)
+  // Use PingExecutor with count > 1 to do all pings in a single session
+  // This creates only ONE socket and ONE receiver Task for all pings
+  let executor = PingExecutor(config: swiftFTRConfig)
+  let pingConfig = PingConfig(count: count, interval: interval, timeout: 2.0)
+
+  let pingResult = try await executor.ping(to: target, config: pingConfig)
+
+  // Wait for load generation to finish
+  await loadTask.value
+  await loadGen.stopLoad()
+
+  // Convert PingResponse to BufferbloatPingResult with phase classification
+  let rampUpCount = max(1, count / 10)  // First 10% is ramp-up
+  let rampDownCount = max(1, count / 10)  // Last 10% is ramp-down
+
+  return pingResult.responses.enumerated().map { (seq, response) in
+    let phase: TestPhase
+    if seq < rampUpCount {
+      phase = .rampUp
+    } else if seq >= count - rampDownCount {
+      phase = .rampDown
+    } else {
+      phase = .sustained
     }
 
-    let sorted = rtts.sorted()
-    let min = sorted.first!
-    let max = sorted.last!
-    let avg = rtts.reduce(0, +) / Double(rtts.count)
-    let p50 = percentile(sorted, 0.50)
-    let p95 = percentile(sorted, 0.95)
-    let p99 = percentile(sorted, 0.99)
+    return BufferbloatPingResult(
+      timestamp: response.timestamp,
+      phase: phase,
+      rtt: response.rtt,
+      sequence: seq
+    )
+  }
+}
 
-    // Jitter = standard deviation
-    let variance = rtts.map { pow($0 - avg, 2) }.reduce(0, +) / Double(rtts.count)
-    let jitter = sqrt(variance)
-
+/// Compute statistics from ping results
+private func computeStatistics(_ results: [BufferbloatPingResult]) -> LatencyMeasurements {
+  let rtts = results.compactMap { $0.rtt }.map { $0 * 1000 }  // Convert to ms
+  guard !rtts.isEmpty else {
     return LatencyMeasurements(
-      sampleCount: rtts.count,
-      minMs: min,
-      avgMs: avg,
-      maxMs: max,
-      p50Ms: p50,
-      p95Ms: p95,
-      p99Ms: p99,
-      jitterMs: jitter
-    )
+      sampleCount: 0, minMs: 0, avgMs: 0, maxMs: 0,
+      p50Ms: 0, p95Ms: 0, p99Ms: 0, jitterMs: 0)
   }
 
-  /// Calculate RPM (Round-trips Per Minute) score per IETF spec
-  private func calculateRPM(baseline: LatencyMeasurements, loaded: LatencyMeasurements)
-    -> RPMScore
-  {
-    // RPM = 60 / avg_rtt_seconds
-    let workingRTT = max(loaded.avgMs / 1000, 0.001)  // Convert to seconds, avoid divide by zero
-    let idleRTT = max(baseline.avgMs / 1000, 0.001)
+  let sorted = rtts.sorted()
+  let min = sorted.first!
+  let max = sorted.last!
+  let avg = rtts.reduce(0, +) / Double(rtts.count)
+  let p50 = percentile(sorted, 0.50)
+  let p95 = percentile(sorted, 0.95)
+  let p99 = percentile(sorted, 0.99)
 
-    let workingRPM = Int(60.0 / workingRTT)
-    let idleRPM = Int(60.0 / idleRTT)
+  // Jitter = standard deviation
+  let variance = rtts.map { pow($0 - avg, 2) }.reduce(0, +) / Double(rtts.count)
+  let jitter = sqrt(variance)
 
-    // Grade based on working RPM per IETF thresholds
-    let grade: RPMGrade
-    switch workingRPM {
-    case ..<300:
-      grade = .poor  // >200ms RTT
-    case 300..<1000:
-      grade = .fair  // 60-200ms RTT
-    case 1000..<6000:
-      grade = .good  // 10-60ms RTT
-    default:
-      grade = .excellent  // <10ms RTT
-    }
+  return LatencyMeasurements(
+    sampleCount: rtts.count,
+    minMs: min,
+    avgMs: avg,
+    maxMs: max,
+    p50Ms: p50,
+    p95Ms: p95,
+    p99Ms: p99,
+    jitterMs: jitter
+  )
+}
 
-    return RPMScore(workingRPM: workingRPM, idleRPM: idleRPM, grade: grade)
+/// Calculate RPM (Round-trips Per Minute) score per IETF spec
+private func calculateRPM(baseline: LatencyMeasurements, loaded: LatencyMeasurements)
+  -> RPMScore
+{
+  // RPM = 60 / avg_rtt_seconds
+  let workingRTT = max(loaded.avgMs / 1000, 0.001)  // Convert to seconds, avoid divide by zero
+  let idleRTT = max(baseline.avgMs / 1000, 0.001)
+
+  let workingRPM = Int(60.0 / workingRTT)
+  let idleRPM = Int(60.0 / idleRTT)
+
+  // Grade based on working RPM per IETF thresholds
+  let grade: RPMGrade
+  switch workingRPM {
+  case ..<300:
+    grade = .poor  // >200ms RTT
+  case 300..<1000:
+    grade = .fair  // 60-200ms RTT
+  case 1000..<6000:
+    grade = .good  // 10-60ms RTT
+  default:
+    grade = .excellent  // <10ms RTT
   }
 
-  /// Grade bufferbloat based on latency increase
-  private func gradeBufferbloat(latencyIncrease: LatencyIncrease) -> BufferbloatGrade {
-    let increase = latencyIncrease.absoluteMs
+  return RPMScore(workingRPM: workingRPM, idleRPM: idleRPM, grade: grade)
+}
 
-    switch increase {
-    case ..<25: return .a
-    case 25..<75: return .b
-    case 75..<150: return .c
-    case 150..<300: return .d
-    default: return .f
-    }
+/// Grade bufferbloat based on latency increase
+private func gradeBufferbloat(latencyIncrease: LatencyIncrease) -> BufferbloatGrade {
+  let increase = latencyIncrease.absoluteMs
+
+  switch increase {
+  case ..<25: return .a
+  case 25..<75: return .b
+  case 75..<150: return .c
+  case 150..<300: return .d
+  default: return .f
+  }
+}
+
+/// Assess impact on video calling (Zoom, Teams, etc.)
+private func assessVideoCallImpact(
+  grade: BufferbloatGrade,
+  latencyIncrease: LatencyIncrease,
+  jitter: Double,
+  rpm: Int?
+) -> VideoCallImpact {
+  // Zoom/Teams requirements:
+  // - <150ms latency
+  // - <50ms jitter
+  // - Stable connection
+
+  let impacts = grade >= .d || jitter > 50 || (rpm ?? 1000) < 1000
+
+  let severity: VideoCallSeverity
+  let description: String
+
+  switch (grade, jitter) {
+  case (.a, ..<30):
+    severity = .none
+    description = "Excellent network quality. Video calls will work great."
+
+  case (.b, ..<50):
+    severity = .minor
+    description = "Good network quality. Video calls should work well."
+
+  case (.c, ..<50):
+    severity = .moderate
+    description = "Acceptable quality. May see occasional glitches during video calls."
+
+  case (.c, 50...):
+    severity = .moderate
+    description =
+      "High jitter (\(String(format: "%.0f", jitter))ms). Video may stutter during busy periods."
+
+  case (.d, _):
+    severity = .severe
+    description =
+      "Significant bufferbloat detected. Video calls will freeze when network is busy."
+
+  case (.f, _):
+    severity = .severe
+    description =
+      "Critical bufferbloat (\(String(format: "%.0f", latencyIncrease.absoluteMs))ms spike). "
+      + "Video calls unusable when network is busy. Enable QoS/SQM on router."
+
+  default:
+    severity = .moderate
+    description = "Network quality may impact video calls."
   }
 
-  /// Assess impact on video calling (Zoom, Teams, etc.)
-  private func assessVideoCallImpact(
-    grade: BufferbloatGrade,
-    latencyIncrease: LatencyIncrease,
-    jitter: Double,
-    rpm: Int?
-  ) -> VideoCallImpact {
-    // Zoom/Teams requirements:
-    // - <150ms latency
-    // - <50ms jitter
-    // - Stable connection
+  return VideoCallImpact(
+    impactsVideoCalls: impacts,
+    severity: severity,
+    description: description
+  )
+}
 
-    let impacts = grade >= .d || jitter > 50 || (rpm ?? 1000) < 1000
-
-    let severity: VideoCallSeverity
-    let description: String
-
-    switch (grade, jitter) {
-    case (.a, ..<30):
-      severity = .none
-      description = "Excellent network quality. Video calls will work great."
-
-    case (.b, ..<50):
-      severity = .minor
-      description = "Good network quality. Video calls should work well."
-
-    case (.c, ..<50):
-      severity = .moderate
-      description = "Acceptable quality. May see occasional glitches during video calls."
-
-    case (.c, 50...):
-      severity = .moderate
-      description =
-        "High jitter (\(String(format: "%.0f", jitter))ms). Video may stutter during busy periods."
-
-    case (.d, _):
-      severity = .severe
-      description =
-        "Significant bufferbloat detected. Video calls will freeze when network is busy."
-
-    case (.f, _):
-      severity = .severe
-      description =
-        "Critical bufferbloat (\(String(format: "%.0f", latencyIncrease.absoluteMs))ms spike). "
-        + "Video calls unusable when network is busy. Enable QoS/SQM on router."
-
-    default:
-      severity = .moderate
-      description = "Network quality may impact video calls."
-    }
-
-    return VideoCallImpact(
-      impactsVideoCalls: impacts,
-      severity: severity,
-      description: description
-    )
-  }
-
-  /// Calculate percentile from sorted array
-  private func percentile(_ sorted: [Double], _ p: Double) -> Double {
-    let index = Int(Double(sorted.count) * p)
-    return sorted[min(index, sorted.count - 1)]
-  }
+/// Calculate percentile from sorted array
+private func percentile(_ sorted: [Double], _ p: Double) -> Double {
+  let index = Int(Double(sorted.count) * p)
+  return sorted[min(index, sorted.count - 1)]
+}

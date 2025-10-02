@@ -5,6 +5,7 @@
 - [Configuration Options](#configuration-options)
 - [Ping (v0.5.0+)](#ping-v050)
 - [Multipath Discovery (v0.5.0+)](#multipath-discovery-v050)
+- [Bufferbloat Detection (v0.5.1+)](#bufferbloat-detection-v051)
 - [SwiftUI Integration](#swiftui-integration)
 - [Concurrent Traces](#concurrent-traces)
 - [Error Handling](#error-handling)
@@ -471,6 +472,237 @@ let topology = try await tracer.discoverPaths(to: "8.8.8.8", config: MultipathCo
 
 print("Discovered \(topology.uniquePathCount) ICMP path(s)")
 print("Note: UDP-based discovery might find more paths due to port-based ECMP hashing")
+```
+
+## Bufferbloat Detection (v0.5.1+)
+
+Bufferbloat detection measures network responsiveness under load. This is critical for diagnosing WFH network issues that cause video calls to freeze.
+
+### Basic Bufferbloat Test
+
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+let result = try await tracer.testBufferbloat()
+
+print("Grade: \(result.grade.rawValue)")
+print("Latency increase: +\(String(format: "%.1f", result.latencyIncrease.absoluteMs))ms")
+
+if let rpm = result.rpm {
+    print("Working RPM: \(rpm.workingRPM) (\(rpm.grade.rawValue))")
+}
+
+print("Video Call Impact: \(result.videoCallImpact.severity.rawValue)")
+print(result.videoCallImpact.description)
+```
+
+### Custom Configuration
+
+```swift
+import SwiftFTR
+
+let config = BufferbloatConfig(
+    target: "8.8.8.8",
+    baselineDuration: 3.0,      // 3s idle measurement
+    loadDuration: 5.0,          // 5s load test
+    loadType: .upload,          // Upload only (vs .download or .bidirectional)
+    parallelStreams: 8,         // More streams = more load
+    pingInterval: 0.1,          // Ping every 100ms
+    calculateRPM: true
+)
+
+let result = try await SwiftFTR().testBufferbloat(config: config)
+
+// Analyze baseline vs loaded latency
+print("Baseline: avg=\(String(format: "%.1f", result.baseline.avgMs))ms, " +
+      "p95=\(String(format: "%.1f", result.baseline.p95Ms))ms")
+
+print("Under Load: avg=\(String(format: "%.1f", result.loaded.avgMs))ms, " +
+      "p95=\(String(format: "%.1f", result.loaded.p95Ms))ms")
+
+print("Jitter: \(String(format: "%.1f", result.loaded.jitterMs))ms")
+```
+
+### Interpreting Results
+
+```swift
+import SwiftFTR
+
+let result = try await SwiftFTR().testBufferbloat()
+
+// Check bufferbloat severity
+switch result.grade {
+case .a:
+    print("✅ Excellent - minimal bufferbloat")
+case .b:
+    print("👍 Good - slight latency increase")
+case .c:
+    print("⚠️ Acceptable - noticeable during video calls")
+case .d:
+    print("🔴 Poor - video calls will have issues")
+case .f:
+    print("💥 Critical - enable QoS/SQM on router")
+}
+
+// Check RPM score (responsiveness)
+if let rpm = result.rpm {
+    switch rpm.grade {
+    case .excellent:
+        print("🚀 Excellent responsiveness (>\(rpm.workingRPM) RPM)")
+    case .good:
+        print("✅ Good responsiveness (\(rpm.workingRPM) RPM)")
+    case .fair:
+        print("⚠️ Fair responsiveness (\(rpm.workingRPM) RPM)")
+    case .poor:
+        print("🔴 Poor responsiveness (\(rpm.workingRPM) RPM)")
+    }
+}
+
+// Video call readiness
+if !result.videoCallImpact.impactsVideoCalls {
+    print("📹 Video calls will work well")
+} else {
+    print("📹 Video calls may have issues: \(result.videoCallImpact.description)")
+}
+```
+
+### Analyzing Individual Pings
+
+```swift
+import SwiftFTR
+
+let result = try await SwiftFTR().testBufferbloat()
+
+// Group by phase
+let baseline = result.pingResults.filter { $0.phase == .baseline }
+let sustained = result.pingResults.filter { $0.phase == .sustained }
+
+print("Baseline phase: \(baseline.count) pings")
+print("Sustained load phase: \(sustained.count) pings")
+
+// Find worst latency spike
+if let worst = result.pingResults.compactMap({ $0.rtt }).max() {
+    print("Peak latency: \(String(format: "%.1f", worst * 1000))ms")
+}
+
+// Calculate packet loss
+let totalPings = result.pingResults.count
+let successfulPings = result.pingResults.filter { $0.rtt != nil }.count
+let packetLoss = 1.0 - (Double(successfulPings) / Double(totalPings))
+print("Packet loss: \(String(format: "%.1f", packetLoss * 100))%")
+```
+
+### JSON Export for Analysis
+
+```swift
+import SwiftFTR
+import Foundation
+
+let result = try await SwiftFTR().testBufferbloat()
+
+// Export to JSON
+let encoder = JSONEncoder()
+encoder.outputFormatting = .prettyPrinted
+encoder.dateEncodingStrategy = .iso8601
+
+let jsonData = try encoder.encode(result)
+try jsonData.write(to: URL(fileURLWithPath: "bufferbloat_result.json"))
+
+print("Results exported to bufferbloat_result.json")
+```
+
+### Load Type Comparison
+
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+
+// Test upload bufferbloat
+let uploadConfig = BufferbloatConfig(loadType: .upload, loadDuration: 10.0)
+let uploadResult = try await tracer.testBufferbloat(config: uploadConfig)
+
+// Test download bufferbloat
+let downloadConfig = BufferbloatConfig(loadType: .download, loadDuration: 10.0)
+let downloadResult = try await tracer.testBufferbloat(config: downloadConfig)
+
+// Test bidirectional
+let bidirConfig = BufferbloatConfig(loadType: .bidirectional, loadDuration: 10.0)
+let bidirResult = try await tracer.testBufferbloat(config: bidirConfig)
+
+print("Upload bufferbloat: \(uploadResult.grade.rawValue) " +
+      "(+\(String(format: "%.1f", uploadResult.latencyIncrease.absoluteMs))ms)")
+
+print("Download bufferbloat: \(downloadResult.grade.rawValue) " +
+      "(+\(String(format: "%.1f", downloadResult.latencyIncrease.absoluteMs))ms)")
+
+print("Bidirectional bufferbloat: \(bidirResult.grade.rawValue) " +
+      "(+\(String(format: "%.1f", bidirResult.latencyIncrease.absoluteMs))ms)")
+```
+
+### Understanding RPM (Round-trips Per Minute)
+
+```swift
+import SwiftFTR
+
+let result = try await SwiftFTR().testBufferbloat()
+
+if let rpm = result.rpm {
+    // RPM = 60 / avg_rtt_seconds
+    // Higher is better - measures responsiveness under load
+
+    print("Working RPM: \(rpm.workingRPM)")
+    print("Idle RPM: \(rpm.idleRPM)")
+
+    // RPM thresholds (IETF spec):
+    // Excellent: >6000 RPM (<10ms RTT)
+    // Good: 1000-6000 RPM (10-60ms RTT)
+    // Fair: 300-1000 RPM (60-200ms RTT)
+    // Poor: <300 RPM (>200ms RTT)
+
+    let degradation = Double(rpm.idleRPM - rpm.workingRPM) / Double(rpm.idleRPM) * 100
+    print("Responsiveness degradation: \(String(format: "%.1f", degradation))%")
+}
+```
+
+### WFH Network Troubleshooting
+
+```swift
+import SwiftFTR
+
+// Diagnose why video calls freeze during uploads
+let tracer = SwiftFTR()
+
+print("Testing network for video call quality...")
+let result = try await tracer.testBufferbloat(
+    config: BufferbloatConfig(loadType: .bidirectional, loadDuration: 10.0)
+)
+
+// Check Zoom/Teams requirements:
+// - <150ms latency
+// - <50ms jitter
+// - Stable connection
+
+let meetsZoomReqs = result.loaded.avgMs < 150 && result.loaded.jitterMs < 50
+
+if meetsZoomReqs {
+    print("✅ Network meets Zoom/Teams requirements")
+} else {
+    print("❌ Network fails video call requirements:")
+    if result.loaded.avgMs >= 150 {
+        print("  - Latency too high: \(String(format: "%.1f", result.loaded.avgMs))ms (need <150ms)")
+    }
+    if result.loaded.jitterMs >= 50 {
+        print("  - Jitter too high: \(String(format: "%.1f", result.loaded.jitterMs))ms (need <50ms)")
+    }
+
+    // Suggest remediation
+    if result.grade >= .d {
+        print("\n💡 Recommendation: Enable Smart Queue Management (SQM) or QoS on your router")
+        print("   This will eliminate bufferbloat and fix video call freezing")
+    }
+}
 ```
 
 ## SwiftUI Integration
