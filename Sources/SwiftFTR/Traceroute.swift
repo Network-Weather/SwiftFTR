@@ -705,6 +705,43 @@ public actor SwiftFTR {
     return try await executor.ping(to: target, config: config)
   }
 
+  /// Test for bufferbloat / network responsiveness under load
+  ///
+  /// This test measures latency-under-load to detect bufferbloat, which causes
+  /// video calls to freeze when the network is busy. The test:
+  /// 1. Measures baseline latency (idle network)
+  /// 2. Generates saturating load (multiple parallel TCP streams)
+  /// 3. Measures latency under load
+  /// 4. Calculates bufferbloat grade (A-F) and RPM score
+  ///
+  /// Video conferencing is highly sensitive to latency spikes. Zoom/Teams require
+  /// <150ms latency and <50ms jitter for good quality.
+  ///
+  /// **Test Duration:** ~15 seconds (5s baseline + 10s load by default)
+  ///
+  /// - Parameter config: Bufferbloat test configuration
+  /// - Returns: Bufferbloat test results with grading and video call impact assessment
+  /// - Throws: `TracerouteError` if ping operations fail
+  ///
+  /// # Example
+  /// ```swift
+  /// let ftr = SwiftFTR()
+  /// let result = try await ftr.testBufferbloat()
+  ///
+  /// print("Grade: \(result.grade.rawValue)")
+  /// print("Latency increase: \(result.latencyIncrease.absoluteMs) ms")
+  /// if let rpm = result.rpm {
+  ///     print("Working RPM: \(rpm.workingRPM) (\(rpm.grade.rawValue))")
+  /// }
+  /// print("Video Call Impact: \(result.videoCallImpact.severity.rawValue)")
+  /// ```
+  public func testBufferbloat(config: BufferbloatConfig = BufferbloatConfig()) async throws
+    -> BufferbloatResult
+  {
+    // Implementation in extension in Bufferbloat.swift
+    return try await _testBufferbloat(config: config)
+  }
+
   /// Discover public IP via STUN
   internal func discoverPublicIP() async throws -> String {
     try stunGetPublicIPv4(

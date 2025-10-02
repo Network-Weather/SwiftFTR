@@ -11,14 +11,15 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       Provides fast, parallel traceroute using ICMP datagram sockets and ping capabilities.
 
       Use subcommands:
-        trace     - Perform traceroute with ASN classification
-        ping      - Send ICMP echo requests to measure latency
-        multipath - Discover ECMP paths using Dublin Traceroute
+        trace      - Perform traceroute with ASN classification
+        ping       - Send ICMP echo requests to measure latency
+        multipath  - Discover ECMP paths using Dublin Traceroute
+        bufferbloat - Test for bufferbloat (latency under load)
 
       Or run trace directly (default behavior):
         swift-ftr example.com
       """,
-    subcommands: [Trace.self, Ping.self, Multipath.self],
+    subcommands: [Trace.self, Ping.self, Multipath.self, Bufferbloat.self],
     defaultSubcommand: Trace.self
   )
 }
@@ -585,6 +586,121 @@ extension SwiftFTRCommand {
       let encoder = JSONEncoder()
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
       let data = try! encoder.encode(topology)
+      print(String(data: data, encoding: .utf8)!)
+    }
+  }
+
+  // MARK: - Bufferbloat Subcommand
+
+  struct Bufferbloat: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+      commandName: "bufferbloat",
+      abstract: "Test for bufferbloat (latency under load)",
+      discussion: """
+        Detects bufferbloat by measuring latency increase under saturating network load.
+
+        Bufferbloat causes video calls to freeze when the network is busy. This test:
+        1. Measures baseline latency (idle network)
+        2. Generates upload/download load
+        3. Measures latency under load
+        4. Reports bufferbloat grade (A-F) and RPM score
+
+        Test duration: ~15 seconds (5s baseline + 10s load by default)
+
+        Examples:
+          swift-ftr bufferbloat
+          swift-ftr bufferbloat --target 8.8.8.8 --load-type upload
+          swift-ftr bufferbloat --baseline 3 --load 5 --streams 8
+          swift-ftr bufferbloat --json
+        """
+    )
+
+    @Option(name: [.short, .customLong("target")], help: "Target to ping (default: 1.1.1.1)")
+    var target: String = "1.1.1.1"
+
+    @Option(
+      name: .customLong("baseline"),
+      help: "Baseline measurement duration in seconds (default: 5.0)"
+    )
+    var baselineDuration: Double = 5.0
+
+    @Option(
+      name: .customLong("load"),
+      help: "Load generation duration in seconds (default: 10.0)"
+    )
+    var loadDuration: Double = 10.0
+
+    @Option(
+      name: .customLong("load-type"),
+      help: "Load type: upload, download, or bidirectional (default: bidirectional)"
+    )
+    var loadType: String = "bidirectional"
+
+    @Option(
+      name: .customLong("streams"),
+      help: "Number of parallel TCP streams per direction (default: 4)"
+    )
+    var parallelStreams: Int = 4
+
+    @Flag(name: .customLong("no-rpm"), help: "Skip RPM calculation")
+    var noRPM: Bool = false
+
+    @Flag(name: .customLong("json"), help: "Output JSON format")
+    var json: Bool = false
+
+    @Flag(name: .customLong("verbose"), help: "Enable verbose logging")
+    var verbose: Bool = false
+
+    func run() async throws {
+      // Parse load type
+      let load: LoadType
+      switch loadType.lowercased() {
+      case "upload":
+        load = .upload
+      case "download":
+        load = .download
+      case "bidirectional", "both":
+        load = .bidirectional
+      default:
+        fputs(
+          "Error: Invalid load type '\(loadType)'. Use: upload, download, or bidirectional\n",
+          stderr)
+        Foundation.exit(1)
+      }
+
+      let config = BufferbloatConfig(
+        target: target,
+        baselineDuration: baselineDuration,
+        loadDuration: loadDuration,
+        loadType: load,
+        parallelStreams: parallelStreams,
+        pingInterval: 0.1,
+        calculateRPM: !noRPM
+      )
+
+      let ftrConfig = SwiftFTRConfig(enableLogging: verbose)
+      let tracer = SwiftFTR(config: ftrConfig)
+
+      do {
+        let result = try await tracer.testBufferbloat(config: config)
+
+        if json {
+          printJSON(result)
+        } else {
+          // Pretty output already printed by the test
+          // Just print a summary if needed
+        }
+      } catch {
+        fputs("Error: \(error)\n", stderr)
+        Foundation.exit(1)
+      }
+    }
+
+    private func printJSON(_ result: BufferbloatResult) {
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+      encoder.dateEncodingStrategy = .iso8601
+      let data = try! encoder.encode(result)
       print(String(data: data, encoding: .utf8)!)
     }
   }
