@@ -158,7 +158,7 @@ actor ResponseCollector {
 }
 
 /// Internal ping implementation
-actor PingExecutor {
+struct PingExecutor {
   private let swiftFTRConfig: SwiftFTRConfig
 
   init(config: SwiftFTRConfig) {

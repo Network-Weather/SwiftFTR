@@ -160,7 +160,7 @@ public struct SwiftFTRConfig: Sendable {
 /// built-in caching for rDNS lookups and STUN public IP discovery.
 @available(macOS 13.0, *)
 public actor SwiftFTR {
-  internal var config: SwiftFTRConfig
+  internal nonisolated let config: SwiftFTRConfig
 
   // Cache storage
   internal var cachedPublicIP: String?
@@ -684,7 +684,8 @@ public actor SwiftFTR {
   /// This method is more efficient than traceroute for monitoring known hops, as it sends
   /// direct echo requests rather than probing every TTL.
   ///
-  /// Safe to call concurrently for multiple targets - each ping operation uses its own socket.
+  /// **Nonisolated for parallelism**: Multiple concurrent calls run in parallel, not serially.
+  /// Each ping operation uses its own socket and executor, enabling true concurrent execution.
   ///
   /// - Parameters:
   ///   - target: Hostname or IP address to ping
@@ -695,11 +696,13 @@ public actor SwiftFTR {
   /// ## Example
   /// ```swift
   /// let tracer = SwiftFTR(config: SwiftFTRConfig())
-  /// let result = try await tracer.ping(to: "8.8.8.8", config: PingConfig(count: 10))
-  /// print("Packet loss: \(result.statistics.packetLoss * 100)%")
-  /// print("Avg latency: \(result.statistics.avgRTT! * 1000) ms")
+  ///
+  /// // Concurrent pings run in parallel
+  /// async let ping1 = tracer.ping(to: "1.1.1.1")
+  /// async let ping2 = tracer.ping(to: "8.8.8.8")
+  /// let (result1, result2) = try await (ping1, ping2)
   /// ```
-  public func ping(to target: String, config: PingConfig = PingConfig()) async throws -> PingResult
+  public nonisolated func ping(to target: String, config: PingConfig = PingConfig()) async throws -> PingResult
   {
     let executor = PingExecutor(config: self.config)
     return try await executor.ping(to: target, config: config)

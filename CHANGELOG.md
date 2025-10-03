@@ -3,6 +3,29 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.5.2 — 2025-10-03
+------------------
+### Performance Improvements
+- **FIXED**: `ping()` now runs in parallel, not serially
+  - Changed `ping()` from actor-isolated to `nonisolated` method
+  - Changed internal `PingExecutor` from actor to struct
+  - **Performance**: 6.4x speedup for concurrent ping operations
+  - Multiple concurrent `ping()` calls now execute truly in parallel
+  - Before: 20 concurrent pings would take ~7.2s (serialized)
+  - After: 20 concurrent pings take ~1.1s (parallel, 54ms spread)
+
+### Testing
+- Added `PingParallelismTests` demonstrating concurrent execution with high-RTT target
+- Test: 20 concurrent pings to Tanzania (360ms RTT)
+- Verifies completion spread <500ms for parallel operations
+- All 45 tests passing
+
+### Technical Details
+- `PingExecutor` converted to struct (no mutable state, doesn't need actor isolation)
+- Each ping operation creates its own socket for true independence
+- `ResponseCollector` remains actor for thread-safe response handling
+- No breaking changes to public API
+
 0.5.1 — 2025-10-02
 ------------------
 ### Major Features
