@@ -9,6 +9,16 @@ All notable changes to this project are documented here. This project follows Se
 - Fixed linter warnings (line length, import ordering)
 - Improved test code formatting
 
+### Testing
+- **ENHANCED**: Major test coverage improvements
+  - Added comprehensive Bufferbloat test suite (16 structure tests, 2 integration tests)
+  - Added STUN test suite (10 error handling tests, 5 network integration tests)
+  - Coverage improvements: Bufferbloat 10.5% → 84.8% (+74.3%), STUN 61.5% → 63.3% (+1.8%)
+  - Overall project coverage: 73.0% → 84.7% (+11.7%)
+  - All network-dependent tests now conditional via `SKIP_NETWORK_TESTS` env var
+  - CI skips network tests (fast, isolated), local runs include them (comprehensive)
+  - Test count: 71 → 78 tests
+
 ### Documentation
 - Added concurrent ping execution examples to DocC
 - Updated README with parallel ping usage pattern

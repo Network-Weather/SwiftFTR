@@ -19,7 +19,10 @@ struct PingParallelismTests {
   /// Uses high-RTT target (Tanzania, ~360ms) to make parallelism dramatic:
   /// - Serial: 20 × 360ms = 7200ms (7.2 seconds)
   /// - Parallel: ~360ms (<1 second)
-  @Test("Concurrent pings run in parallel")
+  @Test(
+    "Concurrent pings run in parallel",
+    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS"))
+  )
   func testConcurrentPingsAreParallel() async throws {
     let tracer = SwiftFTR()
     let config = PingConfig(count: 1, interval: 0.0, timeout: 1.0)
