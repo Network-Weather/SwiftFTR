@@ -9,3 +9,7 @@ xcuserdata/
 *.xcworkspace/
 Package.resolved
 docc/
+
+# Ephemeral planning docs
+docs/development/PLAN_*.md
+docs/development/BUFFERBLOAT_IMPLEMENTATION.md
