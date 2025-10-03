@@ -1,5 +1,5 @@
-import Testing
 import Foundation
+import Testing
 
 @testable import SwiftFTR
 
@@ -61,14 +61,22 @@ struct PingParallelismTests {
     let maxCompletion = completionTimes.max()!
     let completionSpread = maxCompletion - minCompletion
 
-    print("Concurrent pings: \(String(format: "%.2f", elapsed))s total, spread: \(String(format: "%.3f", completionSpread))s")
+    print(
+      "Concurrent pings: \(String(format: "%.2f", elapsed))s total, "
+        + "spread: \(String(format: "%.3f", completionSpread))s")
 
     // All 20 pings should complete within 500ms of each other if parallel
     // (Before fix: spread was ~7+ seconds for serial execution)
-    #expect(completionSpread < 0.5, "Pings should complete within 500ms if parallel. Spread: \(String(format: "%.3f", completionSpread))s")
+    let spreadMsg =
+      "Pings should complete within 500ms if parallel. "
+      + "Spread: \(String(format: "%.3f", completionSpread))s"
+    #expect(completionSpread < 0.5, Comment(rawValue: spreadMsg))
 
     // Total time should be close to one ping (~360ms), not 20× (~7.2s)
     // Allow 1.5s for network variance
-    #expect(elapsed < 1.5, "20 parallel pings should take <1s, not 7.2s. Actual: \(String(format: "%.2f", elapsed))s")
+    let timeMsg =
+      "20 parallel pings should take <1s, not 7.2s. "
+      + "Actual: \(String(format: "%.2f", elapsed))s"
+    #expect(elapsed < 1.5, Comment(rawValue: timeMsg))
   }
 }

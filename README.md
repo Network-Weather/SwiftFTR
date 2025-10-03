@@ -72,8 +72,12 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
 
-New in v0.5.0
+New in v0.5.2
 -------------
+- **Parallel Ping Execution**: `ping()` is now nonisolated for true concurrent execution (6.4x speedup)
+- **Code Quality**: Fixed linter warnings, improved documentation
+
+Previous v0.5.0 features:
 - **Ping API**: Efficient ICMP echo monitoring with comprehensive statistics (min/avg/max RTT, packet loss, jitter)
 - **Multipath Discovery**: Dublin Traceroute-style ECMP path enumeration with smart deduplication
 - **Flow Identifier Control**: Optional flow ID parameter for stable, reproducible traces
@@ -138,6 +142,12 @@ print("Packet loss: \(Int(pingResult.statistics.packetLoss * 100))%")
 if let avg = pingResult.statistics.avgRTT {
     print("Avg RTT: \(String(format: "%.2f ms", avg * 1000))")
 }
+
+// Concurrent pings (v0.5.2+): Multiple pings execute in parallel, not serially
+async let cf = tracer.ping(to: "1.1.1.1", config: pingConfig)
+async let goog = tracer.ping(to: "8.8.8.8", config: pingConfig)
+let (cloudflare, google) = try await (cf, goog)
+// 20 concurrent pings: ~1.1s (parallel) vs ~7.2s (if serialized) = 6.4x speedup
 
 // NEW in v0.5.0: Multipath Discovery (ECMP enumeration)
 let multipathConfig = MultipathConfig(flowVariations: 8, maxPaths: 16)

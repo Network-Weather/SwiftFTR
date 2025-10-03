@@ -92,6 +92,30 @@ let isReachable = result.statistics.received > 0
 print(isReachable ? "✓ Host reachable" : "✗ Host unreachable")
 ```
 
+## Concurrent Ping Operations
+
+The `ping()` method is nonisolated and runs concurrently without serialization. Multiple ping operations execute in parallel with independent sockets:
+
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+let config = PingConfig(count: 3, interval: 0.1, timeout: 1.0)
+
+// Ping multiple hosts concurrently
+async let cloudflare = tracer.ping(to: "1.1.1.1", config: config)
+async let google = tracer.ping(to: "8.8.8.8", config: config)
+async let quad9 = tracer.ping(to: "9.9.9.9", config: config)
+
+let (cf, goog, q9) = try await (cloudflare, google, quad9)
+
+print("Cloudflare: \(cf.statistics.avgRTT! * 1000) ms")
+print("Google: \(goog.statistics.avgRTT! * 1000) ms")
+print("Quad9: \(q9.statistics.avgRTT! * 1000) ms")
+```
+
+**Performance**: 20 concurrent pings to a high-latency target complete in ~1.1s (vs ~7.2s if serialized), achieving 6.4x speedup.
+
 ## Topics
 
 ### Configuration

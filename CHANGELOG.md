@@ -3,6 +3,17 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.5.3 — 2025-10-03
+------------------
+### Code Quality
+- Fixed linter warnings (line length, import ordering)
+- Improved test code formatting
+
+### Documentation
+- Added concurrent ping execution examples to DocC
+- Updated README with parallel ping usage pattern
+- Documented 6.4x speedup performance characteristics
+
 0.5.2 — 2025-10-03
 ------------------
 ### Performance Improvements

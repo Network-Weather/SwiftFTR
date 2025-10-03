@@ -702,8 +702,10 @@ public actor SwiftFTR {
   /// async let ping2 = tracer.ping(to: "8.8.8.8")
   /// let (result1, result2) = try await (ping1, ping2)
   /// ```
-  public nonisolated func ping(to target: String, config: PingConfig = PingConfig()) async throws -> PingResult
-  {
+  public nonisolated func ping(
+    to target: String,
+    config: PingConfig = PingConfig()
+  ) async throws -> PingResult {
     let executor = PingExecutor(config: self.config)
     return try await executor.ping(to: target, config: config)
   }
