@@ -189,7 +189,7 @@ struct PingExecutor {
     let receiverTask = Task {
       var recvBuffer = [UInt8](repeating: 0, count: 1500)
       let startTime = monotonicTime()
-      let deadline = startTime + Double(config.count) * config.interval + config.timeout + 1.0
+      let deadline = startTime + Double(config.count) * config.interval + config.timeout
 
       while monotonicTime() < deadline {
         guard !Task.isCancelled else { break }
@@ -233,11 +233,8 @@ struct PingExecutor {
       }
     }
 
-    // Wait a bit longer for remaining responses
-    try await Task.sleep(nanoseconds: UInt64(config.timeout * 1_000_000_000))
-
-    // Cancel receiver and collect results
-    receiverTask.cancel()
+    // Wait for receiver to complete OR timeout (receiver handles both)
+    // Receiver will exit early if all responses received
     _ = await receiverTask.value
 
     let (sentTimes, receiveTimes, ttls) = await actor.getResults()
