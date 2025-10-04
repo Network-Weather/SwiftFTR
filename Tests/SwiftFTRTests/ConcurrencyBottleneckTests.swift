@@ -373,7 +373,7 @@ struct ConcurrencyBottleneckTests {
         group.addTask {
           let taskStart = Date()
           let resolver = CachingASNResolver(base: CymruDNSResolver())
-          _ = try resolver.resolve(ipv4Addrs: ips, timeout: 2.0)
+          _ = try await resolver.resolve(ipv4Addrs: ips, timeout: 2.0)
           return Date().timeIntervalSince(taskStart)
         }
       }

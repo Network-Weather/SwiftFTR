@@ -102,7 +102,7 @@ public struct TraceClassifier: Sendable {
     interface: String? = nil,
     sourceIP: String? = nil,
     enableLogging: Bool = false
-  ) throws -> ClassifiedTrace {
+  ) async throws -> ClassifiedTrace {
     // Gather IPs
     let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
     var allIPs = Set(hopIPs)
@@ -121,7 +121,7 @@ public struct TraceClassifier: Sendable {
     }
 
     // Lookup ASNs in batch
-    let asnMap = try? resolver.resolve(ipv4Addrs: Array(allIPs), timeout: timeout)
+    let asnMap = try? await resolver.resolve(ipv4Addrs: Array(allIPs), timeout: timeout)
     let clientAS = resolvedPublicIP.flatMap { asnMap?[$0] }
     let clientASN = clientAS?.asn
     let clientASName = clientAS?.name

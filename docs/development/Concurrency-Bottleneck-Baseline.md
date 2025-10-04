@@ -216,15 +216,50 @@ This document captures baseline performance metrics for concurrency bottlenecks 
 
 ---
 
+---
+
+## Phase 5 Results (2025-10-04)
+
+### ✅ Actor-Based Cache Modernization
+
+**Changes**: Converted ASN cache and resolver infrastructure to use Swift 6 actors
+
+**Implementation**:
+- Converted `_ASNMemoryCache` from `final class` with NSLock to `actor`
+- Made `ASNResolver` protocol async
+- Updated `TraceClassifier.classify()` to async
+- Updated all ASNResolver implementations (CymruDNSResolver, CachingASNResolver, MockASNResolver, etc.)
+- Updated all call sites throughout codebase
+
+**Benefits**:
+- ✅ Eliminates `@unchecked Sendable` from cache
+- ✅ Removes manual NSLock-based synchronization
+- ✅ Provides Swift 6 compiler-enforced thread safety
+- ✅ Modernizes code to Swift 6 best practices
+
+**Performance**: No change (as expected from Phase 3 testing)
+- Cache test: ✅ PASSED
+- All classification tests: ✅ PASSED
+
+**Code Locations**:
+- `Sources/SwiftFTR/ASN.swift:37-64` (actor cache)
+- `Sources/SwiftFTR/ASN.swift:27-33` (async protocol)
+- `Sources/SwiftFTR/Segmentation.swift:96-105` (async classify)
+
+---
+
 ## Conclusion
 
-The concurrency modernization effort successfully identified and fixed the primary bottleneck:
+The concurrency modernization effort successfully completed all planned phases:
 
 **Primary Achievement**: **5x speedup** in multipath discovery (6.06s → 1.20s)
 
-**Key Insight**: SwiftFTR's actor-based architecture already provides good concurrency for individual trace operations. The actor doesn't serialize concurrent traces, and I/O operations don't block the actor. The multipath flow serialization was the only significant bottleneck, now resolved.
+**Secondary Achievement**: Full Swift 6 actor-based architecture
+- Eliminated all `@unchecked Sendable` and NSLock patterns
+- Async/await throughout ASN resolution pipeline
+- Compiler-enforced thread safety
 
-**Optional Future Work**: Converting caches to actors (Phase 5) would modernize the code but won't improve performance based on our testing.
+**Key Insight**: SwiftFTR's actor-based architecture already provides good concurrency for individual trace operations. The only significant bottleneck was multipath flow serialization, now resolved. Cache modernization improves safety without performance impact.
 
 ---
 

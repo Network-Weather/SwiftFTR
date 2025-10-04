@@ -609,7 +609,7 @@ extension SwiftFTR {
 
     // Classify
     let classifier = TraceClassifier()
-    let baseClassified = try classifier.classify(
+    let baseClassified = try await classifier.classify(
       trace: tr,
       destinationIP: destIP,
       resolver: effectiveResolver,

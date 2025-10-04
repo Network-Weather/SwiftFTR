@@ -30,28 +30,23 @@ public protocol ASNResolver: Sendable {
   ///   - ipv4Addrs: IPv4 addresses as dotted-quad strings.
   ///   - timeout: Per-lookup timeout in seconds.
   /// - Returns: Map of input IP -> ASNInfo for addresses with public routing data.
-  func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo]
+  func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
 }
 
 // Simple in-memory cache for ASN lookups with a soft capacity cap.
-final class _ASNMemoryCache: @unchecked Sendable {
+actor _ASNMemoryCache {
   static let shared = _ASNMemoryCache()
-  private let lock = NSLock()
   private var map: [String: ASNInfo] = [:]
   private var order: [String] = []
   private let capacity = 2048
 
   func getMany(_ keys: [String]) -> [String: ASNInfo] {
-    lock.lock()
-    defer { lock.unlock() }
     var out: [String: ASNInfo] = [:]
     for k in keys { if let v = map[k] { out[k] = v } }
     return out
   }
 
   func setMany(_ items: [String: ASNInfo]) {
-    lock.lock()
-    defer { lock.unlock() }
     for (k, v) in items {
       if map[k] == nil { order.append(k) }
       map[k] = v
@@ -72,15 +67,16 @@ final class _ASNMemoryCache: @unchecked Sendable {
 public struct CachingASNResolver: ASNResolver {
   private let base: ASNResolver
   public init(base: ASNResolver) { self.base = base }
-  public func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo] {
+  public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
+  {
     let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
     if ips.isEmpty { return [:] }
-    let cached = _ASNMemoryCache.shared.getMany(ips)
+    let cached = await _ASNMemoryCache.shared.getMany(ips)
     let missing = ips.filter { cached[$0] == nil }
     var resolved: [String: ASNInfo] = cached
     if !missing.isEmpty {
-      let res = try base.resolve(ipv4Addrs: missing, timeout: timeout)
-      if !res.isEmpty { _ASNMemoryCache.shared.setMany(res) }
+      let res = try await base.resolve(ipv4Addrs: missing, timeout: timeout)
+      if !res.isEmpty { await _ASNMemoryCache.shared.setMany(res) }
       for (k, v) in res { resolved[k] = v }
     }
     return resolved
@@ -92,7 +88,8 @@ public struct CachingASNResolver: ASNResolver {
 public struct CymruDNSResolver: ASNResolver {
   public init() {}
 
-  public func resolve(ipv4Addrs: [String], timeout: TimeInterval = 1.0) throws -> [String: ASNInfo]
+  public func resolve(ipv4Addrs: [String], timeout: TimeInterval = 1.0) async throws -> [String:
+    ASNInfo]
   {
     let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
     var result: [String: ASNInfo] = [:]

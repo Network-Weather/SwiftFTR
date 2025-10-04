@@ -351,8 +351,8 @@ public enum TracerouteError: Error, CustomStringConvertible {
 Protocol for ASN resolution implementations.
 
 ```swift
-public protocol ASNResolver {
-    func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo]
+public protocol ASNResolver: Sendable {
+    func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
 }
 ```
 
@@ -375,7 +375,7 @@ ASN resolver with in-memory caching.
 ```swift
 public struct CachingASNResolver: ASNResolver {
     public init(base: ASNResolver)
-    public func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo]
+    public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
 }
 ```
 
@@ -385,7 +385,7 @@ DNS-based ASN resolver using Team Cymru.
 ```swift
 public struct CymruDNSResolver: ASNResolver {
     public init()
-    public func resolve(ipv4Addrs: [String], timeout: TimeInterval = 1.0) throws -> [String: ASNInfo]
+    public func resolve(ipv4Addrs: [String], timeout: TimeInterval = 1.0) async throws -> [String: ASNInfo]
 }
 ```
 

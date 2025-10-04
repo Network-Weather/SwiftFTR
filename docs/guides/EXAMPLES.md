@@ -1050,17 +1050,14 @@ import SwiftFTR
 
 // Implement custom resolver
 struct MyCustomResolver: ASNResolver {
-    func resolve(ipv4Addr: String, timeout: TimeInterval) -> ASNInfo? {
+    func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
         // Your custom resolution logic
         // Could use a local database, API, etc.
-        return ASNInfo(asn: 13335, name: "CLOUDFLARENET", prefix: "1.1.1.0/24")
-    }
-    
-    func resolve(ipv4Addrs: [String], timeout: TimeInterval) -> [String: ASNInfo] {
         var results: [String: ASNInfo] = [:]
         for addr in ipv4Addrs {
-            if let info = resolve(ipv4Addr: addr, timeout: timeout) {
-                results[addr] = info
+            // Example: lookup from local database or API
+            if addr == "1.1.1.1" {
+                results[addr] = ASNInfo(asn: 13335, name: "CLOUDFLARENET", prefix: "1.1.1.0/24")
             }
         }
         return results

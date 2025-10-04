@@ -4,7 +4,7 @@ import XCTest
 
 private struct MockASNResolver: ASNResolver {
   let mapping: [String: ASNInfo]
-  func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo] {
+  func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
     var out: [String: ASNInfo] = [:]
     for ip in ipv4Addrs {
       if let v = mapping[ip] { out[ip] = v }
@@ -19,7 +19,7 @@ final class SwiftFTRClassificationTests: XCTestCase {
     setenv("PTR_SKIP_STUN", "1", 1)
   }
 
-  func testClassificationRulesAndHoleFilling() throws {
+  func testClassificationRulesAndHoleFilling() async throws {
     // Synthetic trace: private -> CGNAT -> transit -> timeout -> destination
     let hops: [TraceHop] = [
       .init(ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false),
@@ -39,7 +39,7 @@ final class SwiftFTRClassificationTests: XCTestCase {
     ]
     let resolver = MockASNResolver(mapping: mapping)
     // Provide public IP directly to classifier
-    let classified = try TraceClassifier().classify(
+    let classified = try await TraceClassifier().classify(
       trace: tr, destinationIP: destIP, resolver: resolver, timeout: 0.1, publicIP: "198.51.100.50")
 
     XCTAssertEqual(classified.destinationIP, destIP)
@@ -57,7 +57,7 @@ final class SwiftFTRClassificationTests: XCTestCase {
     XCTAssertEqual(classified.hops[4].category, .destination)
   }
 
-  func testISPWhenClientASNMatchesHop() throws {
+  func testISPWhenClientASNMatchesHop() async throws {
     let hops: [TraceHop] = [
       .init(ttl: 1, ipAddress: "198.51.100.1", rtt: 0.001, reachedDestination: false),
       .init(ttl: 2, ipAddress: "203.0.113.2", rtt: 0.003, reachedDestination: false),
@@ -69,26 +69,26 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "198.51.100.50": ASNInfo(asn: 64501, name: "ISPNet"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    let classified = try TraceClassifier().classify(
+    let classified = try await TraceClassifier().classify(
       trace: tr, destinationIP: "203.0.113.200", resolver: resolver, timeout: 0.1,
       publicIP: "198.51.100.50")
     XCTAssertEqual(classified.hops[0].category, .isp)
     XCTAssertEqual(classified.hops[1].category, .transit)
   }
 
-  func testCGNATClassifiedAsISP() throws {
+  func testCGNATClassifiedAsISP() async throws {
     let hops: [TraceHop] = [
       .init(ttl: 1, ipAddress: "100.64.12.34", rtt: 0.001, reachedDestination: false)
     ]
     let tr = TraceResult(destination: "dst", maxHops: 1, reached: false, hops: hops)
     let resolver = MockASNResolver(mapping: [:])
-    let classified = try TraceClassifier().classify(
+    let classified = try await TraceClassifier().classify(
       trace: tr, destinationIP: "203.0.113.1", resolver: resolver, timeout: 0.1)
     XCTAssertEqual(classified.hops[0].category, .isp)
     XCTAssertNil(classified.hops[0].asn)
   }
 
-  func testDestinationCategoryWhenASMatchesDestination() throws {
+  func testDestinationCategoryWhenASMatchesDestination() async throws {
     let hops: [TraceHop] = [
       .init(ttl: 1, ipAddress: "203.0.113.10", rtt: 0.001, reachedDestination: false),
       .init(ttl: 2, ipAddress: "93.184.216.34", rtt: 0.010, reachedDestination: true),
@@ -99,13 +99,13 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "203.0.113.10": ASNInfo(asn: 15133, name: "ExampleNet"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    let classified = try TraceClassifier().classify(
+    let classified = try await TraceClassifier().classify(
       trace: tr, destinationIP: "93.184.216.34", resolver: resolver, timeout: 0.1)
     XCTAssertEqual(classified.hops[1].category, .destination)
     XCTAssertEqual(classified.hops[0].category, .destination)  // same ASN as destination
   }
 
-  func testHoleFillingSameCategorySameASN() throws {
+  func testHoleFillingSameCategorySameASN() async throws {
     // TRANSIT -> timeout -> TRANSIT, same ASN on both sides => fill category + ASN
     let hops: [TraceHop] = [
       .init(ttl: 1, ipAddress: "203.0.113.1", rtt: 0.001, reachedDestination: false),
@@ -118,13 +118,13 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "203.0.113.2": ASNInfo(asn: 64500, name: "TransitNet", prefix: "203.0.113.0/24"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    let classified = try TraceClassifier().classify(
+    let classified = try await TraceClassifier().classify(
       trace: tr, destinationIP: "198.51.100.10", resolver: resolver, timeout: 0.1)
     XCTAssertEqual(classified.hops[1].category, .transit)
     XCTAssertEqual(classified.hops[1].asn, 64500)
   }
 
-  func testHoleFillingSameCategoryDifferentASN() throws {
+  func testHoleFillingSameCategoryDifferentASN() async throws {
     // TRANSIT -> timeout -> TRANSIT, different ASN on each side => fill category only
     let hops: [TraceHop] = [
       .init(ttl: 1, ipAddress: "198.51.100.1", rtt: 0.001, reachedDestination: false),
@@ -137,7 +137,7 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "198.51.100.2": ASNInfo(asn: 64501, name: "TransitB", prefix: "198.51.100.0/24"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    let classified = try TraceClassifier().classify(
+    let classified = try await TraceClassifier().classify(
       trace: tr, destinationIP: "203.0.113.10", resolver: resolver, timeout: 0.1)
     XCTAssertEqual(classified.hops[1].category, .transit)
     XCTAssertNil(classified.hops[1].asn)

@@ -105,14 +105,14 @@ func testICMPParsing() throws {
 
 struct StubResolver: ASNResolver {
   let map: [String: ASNInfo]
-  func resolve(ipv4Addrs: [String], timeout: TimeInterval) throws -> [String: ASNInfo] {
+  func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
     var out: [String: ASNInfo] = [:]
     for ip in ipv4Addrs { if let v = map[ip] { out[ip] = v } }
     return out
   }
 }
 
-func testClassification() throws {
+func testClassification() async throws {
   // Build synthetic trace with gaps and mix of IPs
   let hops: [TraceHop] = [
     .init(ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false),  // LOCAL
@@ -133,7 +133,7 @@ func testClassification() throws {
     "203.0.113.45": ASNInfo(asn: 12345, name: "ISP-AS"),  // public IP override ASN
   ])
   // Use publicIP parameter instead of environment variables
-  let cls = try TraceClassifier().classify(
+  let cls = try await TraceClassifier().classify(
     trace: tr, destinationIP: destIP, resolver: stub, timeout: 0.2, publicIP: "203.0.113.45")
   // Expectations
   try assert(cls.hops[0].category == HopCategory.local, "TTL1 should be LOCAL")
@@ -150,7 +150,7 @@ func testClassification() throws {
 
 @main
 struct Runner {
-  static func main() {
+  static func main() async {
     var passed = 0
     var failed = 0
     func run(_ name: String, _ f: () throws -> Void) {
@@ -163,8 +163,18 @@ struct Runner {
         failed += 1
       }
     }
+    func runAsync(_ name: String, _ f: () async throws -> Void) async {
+      do {
+        try await f()
+        print("[PASS]", name)
+        passed += 1
+      } catch {
+        print("[FAIL]", name, "-", error)
+        failed += 1
+      }
+    }
     run("ICMP parsing", testICMPParsing)
-    run("Classification", testClassification)
+    await runAsync("Classification", testClassification)
     print("Summary: passed=\(passed) failed=\(failed)")
     if failed > 0 { exit(1) }
   }

@@ -104,7 +104,8 @@ extension SwiftFTRCommand {
       allIPs.append(classified.destinationIP)
       if let pip = classified.publicIP { allIPs.append(pip) }
       let resolver = CymruDNSResolver()
-      let asnMap = (try? resolver.resolve(ipv4Addrs: allIPs, timeout: max(0.8, timeout))) ?? [:]
+      let asnMap =
+        (try? await resolver.resolve(ipv4Addrs: allIPs, timeout: max(0.8, timeout))) ?? [:]
       struct ISPObj: Codable {
         let asn: String
         let name: String
