@@ -3,8 +3,15 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-0.5.3 — 2025-10-03
+0.5.3 — 2025-10-04
 ------------------
+### Bug Fixes
+- **FIXED**: Ping operations now exit immediately when all responses received
+  - Removed unconditional timeout sleep that delayed returns even when all packets arrived
+  - Removed unnecessary +1s deadline buffer in receiver task
+  - Significant performance improvement for multi-destination monitoring (e.g., hop-monitor)
+  - PingParallelismTests completion spread: 2s → 63ms
+
 ### Code Quality
 - Fixed linter warnings (line length, import ordering)
 - Improved test code formatting
