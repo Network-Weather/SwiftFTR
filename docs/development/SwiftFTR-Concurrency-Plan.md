@@ -1,5 +1,8 @@
 # SwiftFTR Concurrency Modernization Plan
 
+**Status**: ✅ **COMPLETED** (October 2025)
+**Results**: See `Concurrency-Bottleneck-Baseline.md` for actual implementation and performance results
+
 ## Goals
 
 - Keep shared state safe while enabling true parallel execution for traceroute, classified trace, ping, bufferbloat, and multipath work.

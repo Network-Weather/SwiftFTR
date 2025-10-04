@@ -1,6 +1,6 @@
 # SwiftFTR Roadmap
 
-## Current Version: 0.5.0 (September 2025)
+## Current Version: 0.5.3 (October 2025)
 - ✅ Core traceroute functionality with ICMP datagram sockets
 - ✅ Swift 6.1 concurrency compliance
 - ✅ Thread-safe, nonisolated API
@@ -23,6 +23,8 @@
 - ✅ Ping API for ICMP echo monitoring (completed in v0.5.0)
 - ✅ Multipath discovery with ECMP enumeration (completed in v0.5.0)
 - ✅ Flow identifier control for reproducible traces (completed in v0.5.0)
+- ✅ Concurrency modernization: Actor-based ASN cache, async ASNResolver protocol (v0.5.3)
+- ✅ Multipath parallelism: 5x speedup via batched parallel flow execution (v0.5.3)
 
 ## Version 0.6.0 - Q1 2026: Enhanced Network Classification
 ### Sophisticated Network Type Detection
