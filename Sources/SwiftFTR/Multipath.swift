@@ -281,55 +281,81 @@ actor MultipathDiscovery {
     var canonicalPaths: [ClassifiedTrace] = []  // Unique paths with holes filled
     var recentlyUnique: [Bool] = []  // For early stopping
 
-    // Sequential flow variation (simpler, adequate performance)
-    for variation in 0..<multipathConfig.flowVariations {
-      // Generate flow identifier for this variation
-      let flowID = FlowIdentifier.generate(variation: variation)
+    // Parallel flow variations with early stopping support
+    // Process flows in batches to enable early termination while maintaining parallelism
+    let batchSize = 5  // Balance parallelism vs early stopping responsiveness
+    var variation = 0
 
-      // Run classified trace with this flow ID (Paris consistency within flow)
-      let trace = try await swiftFTR.traceClassifiedWithFlowID(
-        to: target,
-        flowID: flowID,
-        maxHops: multipathConfig.maxHops,
-        timeoutMs: multipathConfig.timeoutMs
-      )
+    while variation < multipathConfig.flowVariations {
+      let batchEnd = min(variation + batchSize, multipathConfig.flowVariations)
+      var batchResults: [(FlowIdentifier, ClassifiedTrace)] = []
 
-      // Check if this path matches any existing canonical path
-      var matchedIndex: Int? = nil
-      for (index, canonical) in canonicalPaths.enumerated() {
-        if pathsMatch(trace, canonical) {
-          matchedIndex = index
-          break
+      // Launch batch of flows in parallel
+      try await withThrowingTaskGroup(
+        of: (FlowIdentifier, ClassifiedTrace).self
+      ) { group in
+        for v in variation..<batchEnd {
+          let flowID = FlowIdentifier.generate(variation: v)
+
+          group.addTask {
+            let trace = try await self.swiftFTR.traceClassifiedWithFlowID(
+              to: target,
+              flowID: flowID,
+              maxHops: multipathConfig.maxHops,
+              timeoutMs: multipathConfig.timeoutMs
+            )
+            return (flowID, trace)
+          }
+        }
+
+        // Collect batch results
+        for try await result in group {
+          batchResults.append(result)
         }
       }
 
-      let isUnique: Bool
-      let fingerprint = computeFingerprint(trace)
+      // Process batch results
+      for (flowID, trace) in batchResults {
+        // Check if this path matches any existing canonical path
+        var matchedIndex: Int? = nil
+        for (index, canonical) in canonicalPaths.enumerated() {
+          if pathsMatch(trace, canonical) {
+            matchedIndex = index
+            break
+          }
+        }
 
-      if let index = matchedIndex {
-        // Path matches existing canonical - merge them
-        canonicalPaths[index] = mergePaths(canonicalPaths[index], trace)
-        isUnique = false
-      } else {
-        // New unique path
-        canonicalPaths.append(trace)
-        isUnique = true
+        let isUnique: Bool
+        let fingerprint = computeFingerprint(trace)
+
+        if let index = matchedIndex {
+          // Path matches existing canonical - merge them
+          canonicalPaths[index] = mergePaths(canonicalPaths[index], trace)
+          isUnique = false
+        } else {
+          // New unique path
+          canonicalPaths.append(trace)
+          isUnique = true
+        }
+
+        discoveredPaths.append(
+          DiscoveredPath(
+            flowIdentifier: flowID,
+            trace: trace,
+            fingerprint: fingerprint,
+            isUnique: isUnique
+          ))
+
+        // Early stopping check - track recent uniqueness
+        recentlyUnique.append(isUnique)
+        if recentlyUnique.count > multipathConfig.earlyStopThreshold {
+          recentlyUnique.removeFirst()
+        }
       }
 
-      discoveredPaths.append(
-        DiscoveredPath(
-          flowIdentifier: flowID,
-          trace: trace,
-          fingerprint: fingerprint,
-          isUnique: isUnique
-        ))
+      variation = batchEnd
 
-      // Early stopping check - look at recent uniqueness
-      recentlyUnique.append(isUnique)
-      if recentlyUnique.count > multipathConfig.earlyStopThreshold {
-        recentlyUnique.removeFirst()
-      }
-
+      // Check early stopping conditions
       if recentlyUnique.count == multipathConfig.earlyStopThreshold
         && !recentlyUnique.contains(true)
       {
@@ -337,8 +363,8 @@ actor MultipathDiscovery {
         break
       }
 
-      // Stop if max unique paths reached
       if canonicalPaths.count >= multipathConfig.maxPaths {
+        // Reached max unique paths limit
         break
       }
     }

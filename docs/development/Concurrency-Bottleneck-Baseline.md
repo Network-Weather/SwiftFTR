@@ -128,20 +128,40 @@ This document captures baseline performance metrics for concurrency bottlenecks 
 
 ---
 
+## Phase 2 Results (2025-10-04)
+
+### ✅ Multipath Parallelism Implemented
+
+**Changes**: Converted sequential loop to batched parallel execution using `withThrowingTaskGroup`
+
+**Implementation**:
+- Launch flows in batches of 5 (parallel within batch)
+- Process batches sequentially for early stopping support
+- Maintains all existing early stopping logic
+
+**Results**:
+- **Test 3**: 6.06s → 1.20s (**5x speedup!**)
+- All 22 multipath tests: ✅ PASS
+- Early stopping still works
+- Multipath performance test: 10.4s → 7.1s (30% improvement)
+
+**Code Location**: `Sources/SwiftFTR/Multipath.swift:285-370`
+
+---
+
 ## Recommendations
 
-### Immediate Next Steps (Phase 1)
+### Completed
+
+1. ✅ **Phase 2: Multipath Parallelism** - DONE (5x speedup achieved)
+
+### Remaining Work
 
 1. **Fix Test 1**: Add variant with longer traces and STUN enabled to detect actor serialization
 2. **Fix Test 2**: Replace with concurrent `traceClassified()` calls to detect blocking I/O
-3. **Implement multipath parallelism** (Test 3): Convert sequential loop to `withThrowingTaskGroup`
-
-### Priority Order
-
-1. **Phase 2: Multipath Parallelism** (confirmed 10x bottleneck)
-2. **Phase 3: Session Extraction** (if improved tests show serialization)
-3. **Phase 4: Async I/O Wrappers** (if improved tests show blocking)
-4. **Phase 5: Cache Actor** (safety improvement, not performance)
+3. **Phase 3: Session Extraction** (if improved tests show serialization)
+4. **Phase 4: Async I/O Wrappers** (if improved tests show blocking)
+5. **Phase 5: Cache Actor** (safety improvement, not performance)
 
 ---
 
