@@ -9,8 +9,9 @@ let package = Package(
     products: [
         // Primary library product
         .library(name: "SwiftFTR", targets: ["SwiftFTR"]),
-        // CLI tool
-        .executable(name: "swift-ftr", targets: ["swift-ftr"])
+        // CLI tools
+        .executable(name: "swift-ftr", targets: ["swift-ftr"]),
+        .executable(name: "hop-monitor", targets: ["hop-monitor"])
         // Note: Test and fuzzing executables are internal targets only
     ],
     dependencies: [
@@ -27,6 +28,14 @@ let package = Package(
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
             path: "Sources/swift-ftr"
+        ),
+        .executableTarget(
+            name: "hop-monitor",
+            dependencies: [
+                "SwiftFTR",
+                .product(name: "ArgumentParser", package: "swift-argument-parser")
+            ],
+            path: "Sources/hop-monitor"
         ),
         .executableTarget(name: "icmpfuzz", dependencies: ["SwiftFTR"]),
         .executableTarget(
