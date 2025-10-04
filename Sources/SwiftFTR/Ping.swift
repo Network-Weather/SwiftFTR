@@ -131,17 +131,22 @@ struct ParsedEchoReply {
   let ttl: Int?
 }
 
-/// Actor to collect send/receive times from concurrent tasks
-actor ResponseCollector {
+/// Thread-safe collector for send/receive times (lock-based for true parallelism)
+final class ResponseCollector: @unchecked Sendable {
   private var sentTimes: [Int: TimeInterval] = [:]
   private var receiveTimes: [Int: TimeInterval] = [:]
   private var ttls: [Int: Int] = [:]
+  private let lock = NSLock()
 
   func recordSend(seq: Int, sendTime: TimeInterval) {
+    lock.lock()
+    defer { lock.unlock() }
     sentTimes[seq] = sendTime
   }
 
   func recordResponse(seq: Int, receiveTime: TimeInterval, ttl: Int?) {
+    lock.lock()
+    defer { lock.unlock() }
     receiveTimes[seq] = receiveTime
     if let ttl = ttl {
       ttls[seq] = ttl
@@ -149,11 +154,15 @@ actor ResponseCollector {
   }
 
   func getResponseCount() -> Int {
-    receiveTimes.count
+    lock.lock()
+    defer { lock.unlock() }
+    return receiveTimes.count
   }
 
   func getResults() -> ([Int: TimeInterval], [Int: TimeInterval], [Int: Int]) {
-    (sentTimes, receiveTimes, ttls)
+    lock.lock()
+    defer { lock.unlock() }
+    return (sentTimes, receiveTimes, ttls)
   }
 }
 
@@ -180,6 +189,16 @@ struct PingExecutor {
     // 4. Set non-blocking mode
     try setNonBlocking(sockfd: sockfd)
 
+    // 4b. Increase receive buffer to handle concurrent ping bursts
+    var recvBufSize: Int32 = 256 * 1024  // 256KB
+    let setBufResult = setsockopt(
+      sockfd, SOL_SOCKET, SO_RCVBUF,
+      &recvBufSize, socklen_t(MemoryLayout<Int32>.size))
+    if setBufResult < 0 {
+      // Non-fatal - continue with default buffer size
+      // (some systems may reject large buffer sizes)
+    }
+
     // 5. Generate stable identifier for this ping session
     let identifier = generateIdentifier()
 
@@ -204,12 +223,12 @@ struct PingExecutor {
           identifier: identifier
         ) {
           let receiveTime = monotonicTime()
-          await actor.recordResponse(
+          actor.recordResponse(
             seq: Int(parsed.sequence), receiveTime: receiveTime, ttl: parsed.ttl)
         }
 
         // Check if we've received all responses
-        let count = await actor.getResponseCount()
+        let count = actor.getResponseCount()
         if count >= config.count {
           break
         }
@@ -225,7 +244,7 @@ struct PingExecutor {
         payloadSize: config.payloadSize
       )
       try sendPacket(sockfd: sockfd, packet: packet, to: resolved)
-      await actor.recordSend(seq: seq, sendTime: sendTime)
+      actor.recordSend(seq: seq, sendTime: sendTime)
 
       // Wait interval before next (except last)
       if seq < config.count {
@@ -237,7 +256,7 @@ struct PingExecutor {
     // Receiver will exit early if all responses received
     _ = await receiverTask.value
 
-    let (sentTimes, receiveTimes, ttls) = await actor.getResults()
+    let (sentTimes, receiveTimes, ttls) = actor.getResults()
 
     // 7. Build response list
     var responses: [PingResponse] = []
@@ -521,12 +540,29 @@ struct PingExecutor {
 
   // MARK: - Utilities
 
-  private func generateIdentifier() -> UInt16 {
-    // Generate stable but unique identifier per ping session
-    // Use timestamp + random to avoid collisions
-    let timestamp = UInt16(truncatingIfNeeded: UInt64(Date().timeIntervalSince1970 * 1000))
-    let random = UInt16.random(in: 0...0xFFF)
-    return timestamp ^ random
+  private nonisolated func generateIdentifier() -> UInt16 {
+    // Generate unique identifier using process ID + atomic counter
+    // This ensures no collisions even with many concurrent ping sessions
+    final class IdentifierState: @unchecked Sendable {
+      private var counter: UInt16 = 0
+      private let lock = NSLock()
+
+      static let shared = IdentifierState()
+
+      func next() -> UInt16 {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = counter
+        counter = counter &+ 1  // Wrapping increment
+        return value
+      }
+    }
+
+    let value = IdentifierState.shared.next()
+
+    // Mix in process ID to avoid collisions across process restarts
+    let pid = UInt16(truncatingIfNeeded: getpid())
+    return value ^ pid
   }
 
   private func resolveIPv4(host: String) throws -> String {
