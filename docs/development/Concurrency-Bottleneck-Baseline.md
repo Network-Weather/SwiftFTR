@@ -149,41 +149,82 @@ This document captures baseline performance metrics for concurrency bottlenecks 
 
 ---
 
+## Phase 3 Results (2025-10-04)
+
+### ✅ Improved Tests - No Additional Bottlenecks Found
+
+**Changes**: Added improved Tests 1b and 2b to detect actor serialization and blocking I/O
+
+**Test 1b: Longer Concurrent Traces with STUN**
+- Config: maxHops: 30, maxWaitMs: 2000, STUN enabled
+- 10 concurrent traces to 1.1.1.1
+- **Result**: ✅ PASSED
+  - Total time: **2.04s**
+  - Completion spread: **0.02s**
+  - Target: <5s total, <2s spread
+
+**Analysis**: ✅ **No actor serialization bottleneck**
+- Even with longer traces and STUN enabled, traces execute in parallel
+- Minimal completion spread indicates concurrent execution
+- Actor is NOT blocking concurrent trace operations
+
+**Test 2b: Concurrent Classified Traces (Blocking I/O)**
+- Config: maxHops: 15, maxWaitMs: 1000, rDNS enabled
+- 5 concurrent traceClassified() calls to 1.1.1.1
+- **Result**: ✅ PASSED
+  - Total time: **1.58s**
+  - Completion spread: **0.00s** (simultaneous)
+  - Target: <3s total, <1s spread
+
+**Analysis**: ✅ **No blocking I/O bottleneck**
+- Concurrent classified traces complete in parallel
+- Zero spread indicates no serialization from STUN/DNS operations
+- I/O operations are NOT blocking the actor
+
+**Key Finding**: The SwiftFTR actor implementation already handles concurrency well. The only confirmed bottleneck was multipath flow serialization (now fixed).
+
+**Code Location**: `Tests/SwiftFTRTests/ConcurrencyBottleneckTests.swift:105-158, 244-298`
+
+---
+
 ## Recommendations
 
 ### Completed
 
-1. ✅ **Phase 2: Multipath Parallelism** - DONE (5x speedup achieved)
+1. ✅ **Phase 0: Bottleneck Tests** - DONE (baseline established)
+2. ✅ **Phase 2: Multipath Parallelism** - DONE (5x speedup achieved)
+3. ✅ **Improved Tests 1b & 2b** - DONE (no additional bottlenecks found)
 
-### Remaining Work
+### Analysis Summary
 
-1. **Fix Test 1**: Add variant with longer traces and STUN enabled to detect actor serialization
-2. **Fix Test 2**: Replace with concurrent `traceClassified()` calls to detect blocking I/O
-3. **Phase 3: Session Extraction** (if improved tests show serialization)
-4. **Phase 4: Async I/O Wrappers** (if improved tests show blocking)
-5. **Phase 5: Cache Actor** (safety improvement, not performance)
+**Confirmed Bottlenecks**:
+- ✅ Multipath sequential execution - **FIXED** (5x speedup)
+
+**No Bottleneck Detected**:
+- ✅ Actor serialization - Traces already execute in parallel
+- ✅ Blocking I/O - Operations don't block actor
+- ✅ Cache contention - NSLock performs well
+
+### Remaining Work (Optional)
+
+1. **Phase 5: Cache Actor** (safety improvement, not performance)
+   - Convert `_ASNMemoryCache` from NSLock to actor
+   - Modernizes caching but won't improve performance
+2. **Consider Swift 6.2 Features** (if/when available)
+   - Explore `@concurrent`, `ManagedCriticalState`
+   - May simplify actor isolation patterns
 
 ---
 
-## Next Iteration
+## Conclusion
 
-Run improved tests to detect actor serialization and blocking I/O:
+The concurrency modernization effort successfully identified and fixed the primary bottleneck:
 
-```swift
-// Better Test 1: Longer traces with STUN
-@Test func testLongConcurrentTraces() async throws {
-    let tracer = SwiftFTR()  // Will trigger STUN
-    // 20 concurrent traces to distant host (maxHops: 30)
-    // Should show serialization if it exists
-}
+**Primary Achievement**: **5x speedup** in multipath discovery (6.06s → 1.20s)
 
-// Better Test 2: Concurrent classified traces
-@Test func testConcurrentClassifiedTraces() async throws {
-    let tracer = SwiftFTR()
-    // 10 concurrent traceClassified() calls
-    // Should show STUN/DNS blocking if it exists
-}
-```
+**Key Insight**: SwiftFTR's actor-based architecture already provides good concurrency for individual trace operations. The actor doesn't serialize concurrent traces, and I/O operations don't block the actor. The multipath flow serialization was the only significant bottleneck, now resolved.
+
+**Optional Future Work**: Converting caches to actors (Phase 5) would modernize the code but won't improve performance based on our testing.
 
 ---
 

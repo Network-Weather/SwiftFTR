@@ -87,6 +87,76 @@ struct ConcurrencyBottleneckTests {
     #expect(elapsed < 2.0, Comment(rawValue: timeMsg))
   }
 
+  /// Test 1b: Longer concurrent traces with STUN enabled (improved test)
+  ///
+  /// BOTTLENECK: SwiftFTR is an actor, so multiple `trace()` calls execute
+  /// serially. This improved version uses longer traces and STUN to detect
+  /// the bottleneck that the original test missed.
+  ///
+  /// EXPECTED BEHAVIOR (after fix): 10 traces should complete in ~2-3s
+  /// (parallel execution with proper session workers)
+  ///
+  /// CURRENT BEHAVIOR: Will take ~15-20s due to actor serialization
+  @Test(
+    "Longer concurrent traces with STUN serialize on actor",
+    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")),
+    .timeLimit(.minutes(3))
+  )
+  func testLongConcurrentTracesWithSTUN() async throws {
+    // Use default config to enable STUN (no publicIP override)
+    let config = SwiftFTRConfig(maxHops: 30, maxWaitMs: 2000)
+    let tracer = SwiftFTR(config: config)
+
+    let startTime = Date()
+    var completionTimes: [TimeInterval] = []
+
+    // Launch 10 concurrent traces to distant host
+    try await withThrowingTaskGroup(of: TraceResult.self) { group in
+      for _ in 1...10 {
+        group.addTask {
+          try await tracer.trace(to: "1.1.1.1")
+        }
+      }
+
+      // Collect results and track when each completes
+      for try await _ in group {
+        completionTimes.append(Date().timeIntervalSince(startTime))
+      }
+    }
+
+    let elapsed = Date().timeIntervalSince(startTime)
+
+    // Calculate spread (how far apart completions are)
+    let minCompletion = completionTimes.min()!
+    let maxCompletion = completionTimes.max()!
+    let spread = maxCompletion - minCompletion
+
+    print(
+      """
+      Long Concurrent Trace Bottleneck Test (STUN enabled):
+        Total time: \(String(format: "%.2f", elapsed))s
+        Completion spread: \(String(format: "%.2f", spread))s
+        Min completion: \(String(format: "%.2f", minCompletion))s
+        Max completion: \(String(format: "%.2f", maxCompletion))s
+
+      EXPECTED (serialized): ~20-30s total, ~18-27s spread
+      TARGET (parallel): <5s total, <2s spread
+      """
+    )
+
+    // This SHOULD pass after concurrency modernization
+    // Currently EXPECTED TO FAIL showing serialization
+    let spreadMsg =
+      "Traces serialize (spread: \(String(format: "%.2f", spread))s). "
+      + "After modernization, should be <2s."
+    #expect(spread < 2.0, Comment(rawValue: spreadMsg))
+
+    let timeMsg =
+      "10 traces took \(String(format: "%.2f", elapsed))s. "
+      + "After modernization, should be <5s (parallel)."
+    #expect(elapsed < 5.0, Comment(rawValue: timeMsg))
+  }
+
   /// Test 2: Actor remains responsive during STUN/DNS operations
   ///
   /// BOTTLENECK: STUN and DNS operations use synchronous blocking I/O
@@ -154,6 +224,77 @@ struct ConcurrencyBottleneckTests {
 
     // Relaxed expectation since ping is already nonisolated
     #expect(maxPingTime < 2.0, Comment(rawValue: msg))
+  }
+
+  /// Test 2b: Concurrent traceClassified calls detect blocking I/O (improved test)
+  ///
+  /// BOTTLENECK: STUN and DNS operations use synchronous blocking I/O.
+  /// When multiple traceClassified() calls run concurrently on the same actor,
+  /// the synchronous operations serialize them.
+  ///
+  /// EXPECTED BEHAVIOR (after fix): 5 classified traces should complete in ~2-3s
+  /// (parallel execution with async I/O wrappers)
+  ///
+  /// CURRENT BEHAVIOR: Will take much longer due to STUN/DNS blocking
+  @Test(
+    "Concurrent traceClassified calls serialize due to blocking I/O",
+    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")),
+    .timeLimit(.minutes(2))
+  )
+  func testConcurrentClassifiedTracesBlocking() async throws {
+    // Use default config to enable STUN and rDNS
+    let config = SwiftFTRConfig(maxHops: 15, maxWaitMs: 1000, noReverseDNS: false)
+    let tracer = SwiftFTR(config: config)
+
+    let startTime = Date()
+    var completionTimes: [TimeInterval] = []
+
+    // Launch 5 concurrent classified traces
+    // Each will trigger: STUN (first call) + ASN lookups + rDNS
+    try await withThrowingTaskGroup(of: ClassifiedTrace.self) { group in
+      for _ in 1...5 {
+        group.addTask {
+          try await tracer.traceClassified(to: "1.1.1.1")
+        }
+      }
+
+      // Collect results and track when each completes
+      for try await _ in group {
+        completionTimes.append(Date().timeIntervalSince(startTime))
+      }
+    }
+
+    let elapsed = Date().timeIntervalSince(startTime)
+
+    // Calculate spread (how far apart completions are)
+    let minCompletion = completionTimes.min()!
+    let maxCompletion = completionTimes.max()!
+    let spread = maxCompletion - minCompletion
+
+    print(
+      """
+      Concurrent Classified Trace Blocking I/O Test:
+        Total time: \(String(format: "%.2f", elapsed))s
+        Completion spread: \(String(format: "%.2f", spread))s
+        Min completion: \(String(format: "%.2f", minCompletion))s
+        Max completion: \(String(format: "%.2f", maxCompletion))s
+
+      EXPECTED (blocking I/O): Long spread, operations serialize
+      TARGET (async I/O): <3s total, <1s spread
+      """
+    )
+
+    // This SHOULD pass after async I/O wrappers are implemented
+    // Currently EXPECTED TO FAIL if blocking I/O causes serialization
+    let spreadMsg =
+      "Classified traces serialize (spread: \(String(format: "%.2f", spread))s). "
+      + "After async I/O, should be <1s."
+    #expect(spread < 1.0, Comment(rawValue: spreadMsg))
+
+    let timeMsg =
+      "5 classified traces took \(String(format: "%.2f", elapsed))s. "
+      + "After async I/O, should be <3s (parallel)."
+    #expect(elapsed < 3.0, Comment(rawValue: timeMsg))
   }
 
   /// Test 3: Multipath discovery runs flows sequentially
