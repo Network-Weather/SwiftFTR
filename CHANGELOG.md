@@ -3,6 +3,38 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+### Breaking Changes
+- **BREAKING**: `ASNResolver` protocol is now async
+  - `func resolve(ipv4Addrs:timeout:)` now requires `async throws`
+  - All custom ASNResolver implementations must be updated
+  - `TraceClassifier.classify()` is now async
+
+### Performance Improvements
+- **PERFORMANCE**: Multipath flow discovery now runs in parallel
+  - Batched parallel execution using `withThrowingTaskGroup`
+  - **5x speedup**: 10 flows complete in 1.20s vs 6.06s (sequential)
+  - Maintains early stopping support with batch size of 5
+  - 30% improvement in multipath performance tests (10.4s → 7.1s)
+
+### Refactoring
+- **MODERNIZED**: ASN cache converted to Swift 6 actor-based architecture
+  - Replaced `_ASNMemoryCache` class+NSLock with actor
+  - Eliminated `@unchecked Sendable` patterns
+  - Compiler-enforced thread safety throughout ASN resolution pipeline
+  - No performance impact (safety improvement only)
+
+### Testing
+- **ENHANCED**: Added concurrency bottleneck reproduction tests
+  - Test suite to measure and verify concurrency improvements
+  - Baseline metrics documented in `docs/development/Concurrency-Bottleneck-Baseline.md`
+
+### Documentation
+- Updated API reference with async signatures
+- Updated examples for async ASNResolver implementations
+- Documented concurrency modernization results
+
 0.5.3 — 2025-10-04
 ------------------
 ### Bug Fixes
