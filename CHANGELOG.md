@@ -35,6 +35,64 @@ Unreleased
 - Updated examples for async ASNResolver implementations
 - Documented concurrency modernization results
 
+0.6.0 — 2025-10-14
+------------------
+### Major Features
+- **NEW**: Multi-protocol probing for network reachability testing
+  - TCP SYN probe: Tests TCP port reachability without full connection
+  - UDP probe: Connected-socket approach detects ICMP Port Unreachable (no root required)
+  - DNS probe: Direct DNS query testing to verify DNS server availability
+  - HTTP/HTTPS probe: Web server reachability testing with any response code = success
+  - All probes return structured results with RTT, error details, and response types
+
+### Implementation Details
+- **TCP Probe (`tcpProbe()`)**:
+  - Non-blocking socket with `select()` for timeout handling
+  - Returns success for both connection success AND RST (port reachable, connection refused)
+  - Use case: Nodes that block ICMP but respond to TCP
+- **UDP Probe (`udpProbe()`)**:
+  - Uses connected UDP socket to receive ICMP errors via `errno`
+  - No raw sockets required - works without sudo on macOS
+  - Detects ICMP Port Unreachable (ECONNREFUSED) as positive signal
+  - Comprehensive error handling: EAGAIN, EHOSTUNREACH, ENETUNREACH, EHOSTDOWN
+  - Use case: Testing if node processes UDP traffic
+- **DNS Probe (`dnsProbe()`)**:
+  - Manual DNS packet construction with proper encoding
+  - Returns success for ANY response (NOERROR, NXDOMAIN, SERVFAIL)
+  - Timeout on no response only
+  - Use case: Testing if node acts as DNS server
+- **HTTP/HTTPS Probe (`httpProbe()`)**:
+  - URLSession-based with configurable timeout
+  - Treats any HTTP response code (200, 404, 500) as success
+  - SSL/TLS errors count as reachable (certificate invalid but server responds)
+  - Use case: Web servers, proxies, gateways with web UI
+
+### Testing
+- Comprehensive test suite with Swift Testing framework (not XCTest)
+- Network tests gated with `SKIP_NETWORK_TESTS` for CI/CD compatibility
+- Tests organized into focused suites: TCPProbeTests, UDPProbeTests, DNSProbeTests, HTTPProbeTests
+- Concurrency tests verify parallel probe execution
+- All tests pass locally with real network targets
+
+### Technical Details
+- All probes use async/await patterns
+- No blocking I/O - probes stay fully async
+- Proper timeout handling with non-blocking sockets
+- Structured error types with detailed messages
+- All result types are `Codable` and `Sendable` (Swift 6 compliant)
+
+### Use Cases
+- **Multi-protocol node monitoring**: Discover which protocols each network node responds to
+- **ICMP-blocking nodes**: Use TCP/UDP/HTTP probes when ICMP is filtered
+- **Service-specific testing**: Test DNS servers, web servers, or custom UDP services
+- **Gateway detection**: Probe gateway with HTTP to fingerprint vendor/model
+
+### Compatibility
+- No breaking changes to existing traceroute API
+- All new features are additive (new probe functions)
+- Swift 6.1 strict concurrency compliance maintained
+- Works on macOS 13+ without sudo/root privileges
+
 0.5.3 — 2025-10-04
 ------------------
 ### Bug Fixes

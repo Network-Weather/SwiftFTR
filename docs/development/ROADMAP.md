@@ -1,6 +1,6 @@
 # SwiftFTR Roadmap
 
-## Current Version: 0.5.3 (October 2025)
+## Current Version: 0.6.0 (October 2025)
 - ✅ Core traceroute functionality with ICMP datagram sockets
 - ✅ Swift 6.1 concurrency compliance
 - ✅ Thread-safe, nonisolated API
@@ -25,8 +25,122 @@
 - ✅ Flow identifier control for reproducible traces (completed in v0.5.0)
 - ✅ Concurrency modernization: Actor-based ASN cache, async ASNResolver protocol (v0.5.3)
 - ✅ Multipath parallelism: 5x speedup via batched parallel flow execution (v0.5.3)
+- ✅ Multi-protocol probing: TCP, UDP, DNS, HTTP/HTTPS reachability testing (completed in v0.6.0)
 
-## Version 0.6.0 - Q1 2026: Enhanced Network Classification
+## Version 0.6.1 - Q4 2025: UDP Traceroute ⚡ HIGH PRIORITY
+### Traditional UDP Traceroute Support
+- [ ] UDP traceroute with varying TTL (like traditional `traceroute` command)
+- [ ] Support for custom destination ports
+- [ ] Proper handling of ICMP Time Exceeded messages
+- [ ] Optional raw packet crafting via /dev/bpf (if sudo available)
+- [ ] Graceful fallback when raw sockets unavailable
+
+**Why This is Important:**
+- Many firewalls block ICMP but allow UDP
+- Industry-standard `traceroute` uses UDP by default
+- Better traversal through NAT and firewalls
+- Complementary to ICMP traceroute for comprehensive path discovery
+
+**Implementation Approaches:**
+1. **Connected UDP Socket** (no root, simpler):
+   - Similar to UDP probe implementation
+   - Set TTL via IP_TTL socket option
+   - Limited by kernel behavior for ICMP error delivery
+
+2. **Raw Socket** (requires root, full control):
+   - Craft UDP packets with custom TTL
+   - Full control over packet structure
+   - Better compatibility with traditional traceroute
+
+3. **BPF (Berkeley Packet Filter)** (experimental):
+   - Write packets to /dev/bpf
+   - May work without root on macOS
+   - Requires experimentation
+
+**Use Cases:**
+- Firewalls that block ICMP but allow UDP
+- NAT traversal testing
+- Comparison with ICMP paths
+- Matching behavior of standard `traceroute` command
+
+**Technical Details:**
+```swift
+// Future API
+let config = TraceConfig(
+    protocol: .udp,           // .icmp (default), .udp, .tcp
+    destinationPort: 33434,   // For UDP
+    maxHops: 30
+)
+
+let result = try await ftr.trace(to: "example.com", config: config)
+```
+
+**Success Criteria:**
+- UDP traceroute discovers paths blocked to ICMP
+- Performance comparable to ICMP traceroute
+- Clear documentation of privilege requirements
+- Works on macOS without sudo (if possible)
+
+## Version 0.6.2 - Q4 2025: QUIC Probe Support
+### HTTP/3 and QUIC Handshake Probing
+- [ ] QUIC handshake probe for HTTP/3 server detection
+- [ ] Initial packet construction (Version Negotiation)
+- [ ] Handshake completion detection
+- [ ] Connection ID validation
+- [ ] QUIC version support detection (v1, draft-29, etc.)
+
+**Why This is Important:**
+- QUIC/HTTP/3 is rapidly becoming the dominant web protocol (30%+ of top 1M sites)
+- Firewalls may treat QUIC differently than traditional UDP
+- CDNs and cloud providers heavily use QUIC (Cloudflare, Google, Facebook)
+- QUIC probes reveal modern web infrastructure that HTTP/1.1 probes miss
+
+**Use Cases:**
+- Detect HTTP/3 support on web servers
+- Identify QUIC-capable CDN edges
+- Test firewall QUIC traversal (some filter QUIC, allow traditional UDP)
+- Monitor QUIC connection establishment latency
+- Validate QUIC version compatibility
+
+**Implementation:**
+```swift
+// Future API
+public func quicProbe(
+  host: String,
+  port: Int = 443,
+  timeout: TimeInterval = 3.0
+) async throws -> QUICProbeResult
+
+// Result includes QUIC-specific details
+struct QUICProbeResult {
+  let isReachable: Bool
+  let rtt: TimeInterval?
+  let versions: [QUICVersion]?  // Supported versions
+  let connectionID: Data?
+  let error: String?
+}
+```
+
+**Technical Details:**
+- Send QUIC Initial packet (type 0x00) with Version Negotiation
+- Parse Server Hello or Version Negotiation response
+- UDP-based (similar to existing UDP probe)
+- No TLS stack required for handshake detection
+- Can detect QUIC even if HTTP/3 negotiation fails
+
+**Benefits:**
+- Detect next-generation web infrastructure
+- Complementary to HTTP/HTTPS probes
+- Identify CDN routing behavior (some CDNs prefer QUIC)
+- Test enterprise QUIC filtering policies
+
+**Challenges:**
+- QUIC packets have complex header format (variable-length fields)
+- Version negotiation may require multiple round-trips
+- Connection ID generation must follow spec
+- Some networks aggressively filter UDP/443
+
+## Version 0.7.0 - Q1 2026: Enhanced Network Classification
 ### Sophisticated Network Type Detection
 - [ ] VPN/Overlay network detection (Tailscale, WireGuard, ZeroTier)
 - [ ] SASE/SSE infrastructure identification
@@ -167,7 +281,7 @@ print("UDP found \(topology.uniquePathCount) paths")
 - Clear documentation of privilege requirements
 - Graceful fallback to ICMP when UDP unavailable
 
-## Version 0.7.0 - Q2 2026: Offline ASN Support
+## Version 0.8.0 - Q2 2026: Offline ASN Support
 ### Swift-IP2ASN Integration
 - [ ] Integrate Swift-IP2ASN library for offline IP-to-ASN mapping
 - [ ] Hybrid resolution: offline first, fallback to DNS
@@ -190,19 +304,20 @@ let config = SwiftFTRConfig(
 )
 ```
 
-## Version 0.8.0 - Q3 2026: Enhanced Protocol Support
-### Multiple Probe Methods
-- [ ] UDP probe support (like traditional traceroute)
-- [ ] TCP SYN probe support (for firewall traversal)
-- [ ] Configurable probe protocol selection
-- [ ] Parallel multi-protocol probing
+## Version 0.9.0 - Q3 2026: TCP Traceroute
+### TCP-Based Path Discovery
+- [ ] TCP SYN traceroute with varying TTL
+- [ ] TCP-based path discovery for firewall traversal
+- [ ] Configurable destination ports (80, 443, etc.)
+- [ ] Parallel multi-protocol path discovery (ICMP + UDP + TCP)
 
 **Benefits:**
-- Better firewall/filter traversal
-- More complete path discovery
+- Better firewall/filter traversal (TCP port 80/443 rarely blocked)
+- Most complete path discovery (combine ICMP, UDP, TCP)
 - Protocol-specific path detection
+- Enterprise network compatibility
 
-## Version 0.9.0 - Q4 2026: IPv6 Support
+## Version 0.9.5 - Q4 2026: IPv6 Support
 ### Full Dual-Stack Support
 - [ ] ICMPv6 implementation
 - [ ] IPv6 address resolution
@@ -214,7 +329,7 @@ let config = SwiftFTRConfig(
 - IPv6 path discovery complexity
 - Dual-stack result merging
 
-## Version 0.10.0 - Q1 2027: Advanced Analytics
+## Version 0.11.0 - Q1 2027: Advanced Analytics
 ### Path Analysis Features
 - [ ] Path change detection over time
 - [ ] Latency variance analysis
@@ -263,12 +378,12 @@ let config = SwiftFTRConfig(
 ## Contributing
 
 We welcome contributions! Priority areas:
-1. **UDP-based multipath discovery** (Q4 2025) ⚡ **HIGHEST PRIORITY**
-2. VPN/Zero Trust/SASE testing and detection (immediate)
-3. Swift-IP2ASN integration (Q1 2026)
-4. Enterprise network compatibility
-5. Performance benchmarking with tunneled traffic
-6. Platform compatibility testing
+1. **UDP traceroute** (Q4 2025) ⚡ **HIGHEST PRIORITY**
+2. **UDP-based multipath discovery** (Q4 2025) ⚡ **HIGH PRIORITY**
+3. VPN/Zero Trust/SASE testing and detection (Q1 2026)
+4. Swift-IP2ASN integration (Q2 2026)
+5. Enterprise network compatibility testing
+6. BPF experimentation for raw packet writing without root
 
 ## Dependencies & Integration Points
 
