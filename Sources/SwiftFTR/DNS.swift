@@ -4,6 +4,240 @@ import Foundation
   import Darwin
 #endif
 
+// MARK: - Public DNS Probe API
+
+/// Configuration for DNS probe
+public struct DNSProbeConfig: Sendable {
+  /// DNS server to query
+  public let server: String
+
+  /// Query name (default: "example.com")
+  public let query: String
+
+  /// Query type (1 = A, 16 = TXT, 28 = AAAA)
+  public let queryType: UInt16
+
+  /// Timeout in seconds
+  public let timeout: TimeInterval
+
+  public init(
+    server: String,
+    query: String = "example.com",
+    queryType: UInt16 = 1,  // A record
+    timeout: TimeInterval = 2.0
+  ) {
+    self.server = server
+    self.query = query
+    self.queryType = queryType
+    self.timeout = timeout
+  }
+}
+
+/// Result from DNS probe
+public struct DNSProbeResult: Sendable, Codable {
+  /// DNS server queried
+  public let server: String
+
+  /// Query name
+  public let query: String
+
+  /// Whether server responded (success even if NXDOMAIN)
+  public let isReachable: Bool
+
+  /// Round-trip time (nil if timeout)
+  public let rtt: TimeInterval?
+
+  /// Response code (0 = NOERROR, 3 = NXDOMAIN, etc.)
+  public let responseCode: Int?
+
+  /// Error message (if any)
+  public let error: String?
+
+  /// Timestamp
+  public let timestamp: Date
+
+  public init(
+    server: String,
+    query: String,
+    isReachable: Bool,
+    rtt: TimeInterval?,
+    responseCode: Int?,
+    error: String?,
+    timestamp: Date = Date()
+  ) {
+    self.server = server
+    self.query = query
+    self.isReachable = isReachable
+    self.rtt = rtt
+    self.responseCode = responseCode
+    self.error = error
+    self.timestamp = timestamp
+  }
+}
+
+/// DNS probe - tests if DNS server responds
+/// Returns success if ANY response received (even NXDOMAIN or errors)
+/// Returns failure only on timeout
+public func dnsProbe(
+  server: String,
+  query: String = "example.com",
+  timeout: TimeInterval = 2.0
+) async throws -> DNSProbeResult {
+  let config = DNSProbeConfig(server: server, query: query, timeout: timeout)
+  return try await dnsProbe(config: config)
+}
+
+public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult {
+  let startTime = Date()
+
+  // Perform DNS query
+  let result = await performDNSProbe(
+    server: config.server,
+    query: config.query,
+    queryType: config.queryType,
+    timeout: config.timeout
+  )
+
+  let rtt = result.isReachable ? Date().timeIntervalSince(startTime) : nil
+
+  return DNSProbeResult(
+    server: config.server,
+    query: config.query,
+    isReachable: result.isReachable,
+    rtt: rtt,
+    responseCode: result.responseCode,
+    error: result.error,
+    timestamp: startTime
+  )
+}
+
+private struct DNSProbeResultInternal {
+  let isReachable: Bool
+  let responseCode: Int?
+  let error: String?
+}
+
+private func performDNSProbe(
+  server: String,
+  query: String,
+  queryType: UInt16,
+  timeout: TimeInterval
+) async -> DNSProbeResultInternal {
+  let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+  guard fd >= 0 else {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      responseCode: nil,
+      error: "Failed to create socket"
+    )
+  }
+  defer { close(fd) }
+
+  // Set timeout
+  var tv = timeval(
+    tv_sec: Int(timeout),
+    tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000)
+  )
+  _ = withUnsafePointer(to: &tv) { p in
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
+  }
+  _ = withUnsafePointer(to: &tv) { p in
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
+  }
+
+  // Prepare destination
+  var dst = sockaddr_in()
+  dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+  dst.sin_family = sa_family_t(AF_INET)
+  dst.sin_port = in_port_t(53).bigEndian
+  let ok = server.withCString { cs in inet_pton(AF_INET, cs, &dst.sin_addr) }
+  guard ok == 1 else {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      responseCode: nil,
+      error: "Invalid server IP"
+    )
+  }
+
+  // Build DNS query message
+  var msg = Data()
+  let id = UInt16.random(in: 0...UInt16.max)
+
+  func append16(_ v: UInt16) {
+    var b = v.bigEndian
+    withUnsafeBytes(of: &b) { msg.append(contentsOf: $0) }
+  }
+
+  // Header
+  append16(id)  // ID
+  append16(0x0100)  // RD (recursion desired)
+  append16(1)  // QDCOUNT
+  append16(0)  // ANCOUNT
+  append16(0)  // NSCOUNT
+  append16(0)  // ARCOUNT
+
+  // Question
+  msg.append(contentsOf: _encodeQName(query))
+  append16(queryType)  // QTYPE
+  append16(1)  // QCLASS IN
+
+  // Send query
+  let sent: ssize_t = msg.withUnsafeBytes { raw in
+    withUnsafePointer(to: &dst) { aptr in
+      aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+        sendto(fd, raw.baseAddress!, raw.count, 0, saptr, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+  }
+
+  guard sent > 0 else {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      responseCode: nil,
+      error: "Failed to send query"
+    )
+  }
+
+  // Receive response
+  var buf = [UInt8](repeating: 0, count: 2048)
+  var from = sockaddr_in()
+  var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_in>.size)
+  let n = withUnsafeMutablePointer(to: &from) { aptr -> ssize_t in
+    aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+      recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
+    }
+  }
+
+  guard n > 0 else {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      responseCode: nil,
+      error: "Timeout - no response"
+    )
+  }
+
+  // Parse response code from header (success even if NXDOMAIN!)
+  guard n >= 12 else {
+    return DNSProbeResultInternal(
+      isReachable: true,  // Got response, even if malformed
+      responseCode: nil,
+      error: "Malformed response"
+    )
+  }
+
+  // Extract RCODE from flags (bits 0-3 of byte 3)
+  let flags = UInt16(buf[2]) << 8 | UInt16(buf[3])
+  let rcode = Int(flags & 0x000F)
+
+  return DNSProbeResultInternal(
+    isReachable: true,
+    responseCode: rcode,
+    error: nil
+  )
+}
+
+// MARK: - Existing DNS Client
+
 // Fileprivate helper so tests can call an SPI wrapper without exposing the type.
 private func _encodeQName(_ name: String) -> [UInt8] {
   var out: [UInt8] = []
