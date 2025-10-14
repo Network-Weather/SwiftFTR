@@ -81,6 +81,65 @@ let result = try await ftr.trace(to: "example.com", config: config)
 - Clear documentation of privilege requirements
 - Works on macOS without sudo (if possible)
 
+## Version 0.6.2 - Q4 2025: QUIC Probe Support
+### HTTP/3 and QUIC Handshake Probing
+- [ ] QUIC handshake probe for HTTP/3 server detection
+- [ ] Initial packet construction (Version Negotiation)
+- [ ] Handshake completion detection
+- [ ] Connection ID validation
+- [ ] QUIC version support detection (v1, draft-29, etc.)
+
+**Why This is Important:**
+- QUIC/HTTP/3 is rapidly becoming the dominant web protocol (30%+ of top 1M sites)
+- Firewalls may treat QUIC differently than traditional UDP
+- CDNs and cloud providers heavily use QUIC (Cloudflare, Google, Facebook)
+- QUIC probes reveal modern web infrastructure that HTTP/1.1 probes miss
+
+**Use Cases:**
+- Detect HTTP/3 support on web servers
+- Identify QUIC-capable CDN edges
+- Test firewall QUIC traversal (some filter QUIC, allow traditional UDP)
+- Monitor QUIC connection establishment latency
+- Validate QUIC version compatibility
+
+**Implementation:**
+```swift
+// Future API
+public func quicProbe(
+  host: String,
+  port: Int = 443,
+  timeout: TimeInterval = 3.0
+) async throws -> QUICProbeResult
+
+// Result includes QUIC-specific details
+struct QUICProbeResult {
+  let isReachable: Bool
+  let rtt: TimeInterval?
+  let versions: [QUICVersion]?  // Supported versions
+  let connectionID: Data?
+  let error: String?
+}
+```
+
+**Technical Details:**
+- Send QUIC Initial packet (type 0x00) with Version Negotiation
+- Parse Server Hello or Version Negotiation response
+- UDP-based (similar to existing UDP probe)
+- No TLS stack required for handshake detection
+- Can detect QUIC even if HTTP/3 negotiation fails
+
+**Benefits:**
+- Detect next-generation web infrastructure
+- Complementary to HTTP/HTTPS probes
+- Identify CDN routing behavior (some CDNs prefer QUIC)
+- Test enterprise QUIC filtering policies
+
+**Challenges:**
+- QUIC packets have complex header format (variable-length fields)
+- Version negotiation may require multiple round-trips
+- Connection ID generation must follow spec
+- Some networks aggressively filter UDP/443
+
 ## Version 0.7.0 - Q1 2026: Enhanced Network Classification
 ### Sophisticated Network Type Detection
 - [ ] VPN/Overlay network detection (Tailscale, WireGuard, ZeroTier)

@@ -19,17 +19,30 @@ struct TCPProbeTests {
     #expect(result.rtt! < 5.0)
   }
 
-  @Test(
-    "TCP probe to closed port",
-    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
+  @Test("TCP probe to closed port (localhost)")
   func testClosedPort() async throws {
-    // Test against Google DNS on likely closed port
+    // Test against localhost closed port - guaranteed RST response
     // Connection refused (RST) still counts as reachable
-    let result = try await tcpProbe(host: "8.8.8.8", port: 12345, timeout: 3.0)
+    let result = try await tcpProbe(host: "127.0.0.1", port: 9999, timeout: 2.0)
 
     // Expect success (RST = host reachable, port closed)
     #expect(result.isReachable)
     #expect(result.rtt != nil)
+    #expect(result.rtt! < 0.1)  // Localhost should be instant
+  }
+
+  @Test(
+    "TCP probe to filtered port (real-world behavior)",
+    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
+  func testFilteredPort() async throws {
+    // Test against remote host with filtered port
+    // Many modern firewalls filter (drop) rather than reject (RST)
+    // Filtered ports timeout, which counts as unreachable
+    let result = try await tcpProbe(host: "8.8.8.8", port: 12345, timeout: 2.0)
+
+    // Filtered ports timeout (no response) = unreachable
+    #expect(!result.isReachable)
+    #expect(result.error != nil)
   }
 
   @Test("TCP probe to unreachable host")
