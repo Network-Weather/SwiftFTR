@@ -3,8 +3,26 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-Unreleased
-----------
+0.7.0 — 2025-10-16
+------------------
+### Major Features
+- **NEW**: Per-operation interface and source IP binding
+  - Added `interface` and `sourceIP` parameters to `PingConfig`, `TCPProbeConfig`, `DNSProbeConfig`, and `BufferbloatConfig`
+  - Operation-level config overrides global `SwiftFTRConfig` settings
+  - Maximum flexibility for multi-interface monitoring (WiFi + Ethernet + VPN scenarios)
+  - **Use case**: NWX hop monitoring can now bind pings to specific interface per-operation
+  - **Benefits**: Eliminates 83% packet loss during interface transitions
+  - **API**: `ping(to: "1.1.1.1", config: PingConfig(interface: "en14"))` - per-operation override
+  - **Backward compatible**: nil values default to global SwiftFTRConfig settings
+
+### Implementation Details
+- **Ping**: `PingExecutor.applyBindings()` now reads operation-level config with fallback to global
+- **TCP Probe**: Added interface/source IP binding after socket creation using `IP_BOUND_IF` and `bind()`
+- **DNS Probe**: Added interface/source IP binding after socket creation for UDP DNS queries
+- **Bufferbloat**: Passes interface/sourceIP through to underlying ping operations
+- **Override semantics**: Operation config takes precedence, then global config, then system default
+- **Platform support**: macOS uses `IP_BOUND_IF`, returns clear error on unsupported platforms
+
 ### Breaking Changes
 - **BREAKING**: `ASNResolver` protocol is now async
   - `func resolve(ipv4Addrs:timeout:)` now requires `async throws`

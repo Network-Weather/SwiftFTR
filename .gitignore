@@ -9,7 +9,9 @@ xcuserdata/
 *.xcworkspace/
 Package.resolved
 docc/
+docs/
 
-# Ephemeral planning docs
-docs/development/PLAN_*.md
-docs/development/BUFFERBLOAT_IMPLEMENTATION.md
+# Ephemeral planning docs at root
+*_PLAN.md
+*_SUMMARY.md
+compare_bufferbloat.swift

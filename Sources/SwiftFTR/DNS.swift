@@ -20,16 +20,45 @@ public struct DNSProbeConfig: Sendable {
   /// Timeout in seconds
   public let timeout: TimeInterval
 
+  /// Network interface to bind to for this DNS probe.
+  ///
+  /// When specified, this probe uses only this interface. If `nil`, uses system routing.
+  ///
+  /// Example:
+  /// ```swift
+  /// // Test DNS resolution via specific interface
+  /// let result = try await dnsProbe(
+  ///   config: DNSProbeConfig(
+  ///     server: "8.8.8.8",
+  ///     query: "example.com",
+  ///     interface: "en0"
+  ///   )
+  /// )
+  /// ```
+  public let interface: String?
+
+  /// Source IP address to bind to for this DNS probe.
+  ///
+  /// When specified, outgoing packets use this IP as the source address.
+  /// The IP must be assigned to the selected interface.
+  ///
+  /// **Note**: Most users only need to set ``interface``.
+  public let sourceIP: String?
+
   public init(
     server: String,
     query: String = "example.com",
     queryType: UInt16 = 1,  // A record
-    timeout: TimeInterval = 2.0
+    timeout: TimeInterval = 2.0,
+    interface: String? = nil,
+    sourceIP: String? = nil
   ) {
     self.server = server
     self.query = query
     self.queryType = queryType
     self.timeout = timeout
+    self.interface = interface
+    self.sourceIP = sourceIP
   }
 }
 
@@ -95,7 +124,9 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult {
     server: config.server,
     query: config.query,
     queryType: config.queryType,
-    timeout: config.timeout
+    timeout: config.timeout,
+    interface: config.interface,
+    sourceIP: config.sourceIP
   )
 
   let rtt = result.isReachable ? Date().timeIntervalSince(startTime) : nil
@@ -121,7 +152,9 @@ private func performDNSProbe(
   server: String,
   query: String,
   queryType: UInt16,
-  timeout: TimeInterval
+  timeout: TimeInterval,
+  interface: String?,
+  sourceIP: String?
 ) async -> DNSProbeResultInternal {
   let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
   guard fd >= 0 else {
@@ -132,6 +165,69 @@ private func performDNSProbe(
     )
   }
   defer { close(fd) }
+
+  // Bind to interface if specified
+  if let iface = interface {
+    #if canImport(Darwin)
+      let ifaceIndex = if_nametoindex(iface)
+      guard ifaceIndex != 0 else {
+        return DNSProbeResultInternal(
+          isReachable: false,
+          responseCode: nil,
+          error: "Interface '\(iface)' not found"
+        )
+      }
+
+      var index = ifaceIndex
+      let result = setsockopt(
+        fd, IPPROTO_IP, IP_BOUND_IF,
+        &index, socklen_t(MemoryLayout<UInt32>.size))
+
+      guard result >= 0 else {
+        return DNSProbeResultInternal(
+          isReachable: false,
+          responseCode: nil,
+          error: "Failed to bind to interface '\(iface)'"
+        )
+      }
+    #else
+      return DNSProbeResultInternal(
+        isReachable: false,
+        responseCode: nil,
+        error: "Interface binding not supported on this platform"
+      )
+    #endif
+  }
+
+  // Bind to source IP if specified
+  if let srcIP = sourceIP {
+    var sourceAddr = sockaddr_in()
+    sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    sourceAddr.sin_family = sa_family_t(AF_INET)
+    sourceAddr.sin_port = 0  // Any port
+
+    guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
+      return DNSProbeResultInternal(
+        isReachable: false,
+        responseCode: nil,
+        error: "Invalid source IP address '\(srcIP)'"
+      )
+    }
+
+    let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+        bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+
+    guard bindResult >= 0 else {
+      return DNSProbeResultInternal(
+        isReachable: false,
+        responseCode: nil,
+        error: "Failed to bind to source IP '\(srcIP)'"
+      )
+    }
+  }
 
   // Set timeout
   var tv = timeval(

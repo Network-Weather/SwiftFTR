@@ -125,10 +125,37 @@ public struct SwiftFTRConfig: Sendable {
   public let rdnsCacheSize: Int?
   /// Network interface to use for sending probes (e.g. "en0"). If nil, uses system default.
   public let interface: String?
-  /// Source IP address to bind to (e.g. "192.168.1.100"). If nil, uses system default.
-  /// Note: The source IP must be assigned to the selected interface (if specified) or any interface.
+
+  /// Source IP address to bind to for all operations.
+  ///
+  /// When specified, outgoing packets will use this IP as the source address.
+  /// The IP must be assigned to the network interface (either globally configured
+  /// via ``interface`` or per-operation).
+  ///
+  /// - Note: This is an advanced option. Most users should only set ``interface``.
+  ///
+  /// Example:
+  /// ```swift
+  /// let config = SwiftFTRConfig(
+  ///   interface: "en0",
+  ///   sourceIP: "192.168.1.100"  // Must be assigned to en0
+  /// )
+  /// ```
   public let sourceIP: String?
 
+  /// Creates a new SwiftFTR configuration.
+  ///
+  /// - Parameters:
+  ///   - maxHops: Maximum TTL/hops to probe (default: 30)
+  ///   - maxWaitMs: Maximum wait time per probe in milliseconds (default: 1000ms)
+  ///   - payloadSize: Size in bytes of the Echo payload (default: 56)
+  ///   - publicIP: Override the public IP address (bypasses STUN discovery if set)
+  ///   - enableLogging: Enable verbose logging for debugging
+  ///   - noReverseDNS: Disable reverse DNS lookups (default: false)
+  ///   - rdnsCacheTTL: TTL for rDNS cache entries in seconds (default: 86400 = 1 day)
+  ///   - rdnsCacheSize: Maximum rDNS cache size (default: 1000 entries)
+  ///   - interface: Network interface to use for sending probes (e.g. "en0"). If nil, uses system default.
+  ///   - sourceIP: Source IP address to bind to (e.g. "192.168.1.100"). Must be assigned to the interface. If nil, uses system default.
   public init(
     maxHops: Int = 30,
     maxWaitMs: Int = 1000,

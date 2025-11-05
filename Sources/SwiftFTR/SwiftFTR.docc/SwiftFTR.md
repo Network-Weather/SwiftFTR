@@ -71,3 +71,9 @@ for hop in classified.hops {
 - ``SwiftFTR/NetworkTopology``
 - ``SwiftFTR/DiscoveredPath``
 - <doc:Multipath>
+
+### Interface Binding (v0.7.0+)
+
+- ``SwiftFTR/SwiftFTRConfig/interface``
+- ``SwiftFTR/SwiftFTRConfig/sourceIP``
+- <doc:InterfaceBinding>

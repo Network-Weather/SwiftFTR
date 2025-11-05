@@ -213,7 +213,8 @@ private func performProbe<D: URLSessionTaskDelegate>(
 /// Returns (networkRTT, tcpHandshakeRTT)
 /// - networkRTT: responseStartDate - requestEndDate (request sent → response arrives)
 /// - tcpHandshakeRTT: connectEnd - connectStart (TCP 3-way handshake = ~1 RTT)
-private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterval?, TimeInterval?) {
+private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterval?, TimeInterval?)
+{
   // Try to access taskMetrics via reflection
   guard let metricsDelegate = delegate as? (any URLSessionTaskDelegate),
     let taskMetrics = (metricsDelegate as? NoRedirectDelegate)?.taskMetrics
@@ -230,19 +231,21 @@ private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterv
   // Calculate TCP handshake RTT (SYN → SYN-ACK → ACK)
   var tcpHandshakeRTT: TimeInterval? = nil
   if let connectStart = transaction.connectStartDate,
-     let connectEnd = transaction.connectEndDate {
+    let connectEnd = transaction.connectEndDate
+  {
     tcpHandshakeRTT = connectEnd.timeIntervalSince(connectStart)
   }
 
   // Log detailed timing breakdown for debugging
   if let domainLookupStart = transaction.domainLookupStartDate,
-     let domainLookupEnd = transaction.domainLookupEndDate,
-     let connectStart = transaction.connectStartDate,
-     let connectEnd = transaction.connectEndDate,
-     let requestStart = transaction.requestStartDate,
-     let requestEnd = transaction.requestEndDate,
-     let responseStart = transaction.responseStartDate,
-     let responseEnd = transaction.responseEndDate {
+    let domainLookupEnd = transaction.domainLookupEndDate,
+    let connectStart = transaction.connectStartDate,
+    let connectEnd = transaction.connectEndDate,
+    let requestStart = transaction.requestStartDate,
+    let requestEnd = transaction.requestEndDate,
+    let responseStart = transaction.responseStartDate,
+    let responseEnd = transaction.responseEndDate
+  {
 
     let dnsTime = domainLookupEnd.timeIntervalSince(domainLookupStart) * 1000
     let tcpTime = connectEnd.timeIntervalSince(connectStart) * 1000
@@ -256,13 +259,16 @@ private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterv
 
     // TLS timing (if HTTPS)
     if let secureConnectionStart = transaction.secureConnectionStartDate,
-       let secureConnectionEnd = transaction.secureConnectionEndDate {
+      let secureConnectionEnd = transaction.secureConnectionEndDate
+    {
       let tlsTime = secureConnectionEnd.timeIntervalSince(secureConnectionStart) * 1000
       print("  TLS handshake:   \(String(format: "%6.1fms", tlsTime))")
     }
 
     print("  Request:         \(String(format: "%6.1fms", requestTime))")
-    print("  NetworkRTT:      \(String(format: "%6.1fms", networkRTTTime)) (req→resp, includes server processing)")
+    print(
+      "  NetworkRTT:      \(String(format: "%6.1fms", networkRTTTime)) (req→resp, includes server processing)"
+    )
     print("  Response:        \(String(format: "%6.1fms", responseTime))")
   }
 
@@ -270,7 +276,8 @@ private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterv
   // This includes network latency + server processing time
   var networkRTT: TimeInterval? = nil
   if let requestEndDate = transaction.requestEndDate,
-     let responseStartDate = transaction.responseStartDate {
+    let responseStartDate = transaction.responseStartDate
+  {
     let rtt = responseStartDate.timeIntervalSince(requestEndDate)
     // Sanity check: should be positive and reasonable
     if rtt > 0 && rtt < 60.0 {

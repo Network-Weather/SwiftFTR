@@ -168,7 +168,10 @@ private func resolveHostnameUDP(_ host: String) async throws -> String {
     NI_NUMERICHOST
   )
 
-  return String(cString: hostname)
+  // Convert to String, truncating at null terminator
+  let nullIndex = hostname.firstIndex(of: 0) ?? hostname.count
+  let bytes = hostname[..<nullIndex].map { UInt8(bitPattern: $0) }
+  return String(decoding: bytes, as: UTF8.self)
 }
 
 private func isIPAddressUDP(_ string: String) -> Bool {
@@ -334,7 +337,7 @@ private func performUDPProbe(
 
 #if canImport(Darwin)
   private func udpFdZero(_ set: inout fd_set) {
-    withUnsafeMutableBytes(of: &set) { ptr in
+    _ = withUnsafeMutableBytes(of: &set) { ptr in
       ptr.baseAddress?.initializeMemory(
         as: UInt8.self, repeating: 0, count: MemoryLayout<fd_set>.size)
     }
@@ -363,7 +366,7 @@ private func performUDPProbe(
   }
 #else
   private func udpFdZero(_ set: inout fd_set) {
-    withUnsafeMutableBytes(of: &set) { ptr in
+    _ = withUnsafeMutableBytes(of: &set) { ptr in
       ptr.baseAddress?.initializeMemory(
         as: UInt8.self, repeating: 0, count: MemoryLayout<fd_set>.size)
     }

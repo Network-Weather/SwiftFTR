@@ -35,7 +35,8 @@ let package = Package(
                 "SwiftFTR",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
-            path: "Sources/hop-monitor"
+            path: "Sources/hop-monitor",
+            exclude: ["README.md"]
         ),
         .executableTarget(name: "icmpfuzz", dependencies: ["SwiftFTR"]),
         .executableTarget(

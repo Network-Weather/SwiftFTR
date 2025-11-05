@@ -18,16 +18,58 @@ public struct PingConfig: Sendable {
   /// ICMP payload size in bytes (default: 56)
   public let payloadSize: Int
 
+  /// Network interface to bind to for this operation.
+  ///
+  /// When specified, this ping operation uses only this interface, overriding any global
+  /// ``SwiftFTRConfig/interface`` setting. If `nil`, falls back to global interface, then system routing.
+  ///
+  /// **Resolution Order**: Operation → Global → System Default
+  ///
+  /// Example:
+  /// ```swift
+  /// // Override global WiFi binding to use Ethernet for this ping
+  /// let result = try await ftr.ping(
+  ///   to: "1.1.1.1",
+  ///   config: PingConfig(interface: "en14")
+  /// )
+  /// ```
+  public let interface: String?
+
+  /// Source IP address to bind to for this operation.
+  ///
+  /// When specified, outgoing packets use this IP as the source address. The IP must be
+  /// assigned to the selected interface. If `nil`, falls back to global sourceIP, then system default.
+  ///
+  /// **Resolution Order**: Operation → Global → System Default
+  ///
+  /// **Note**: Most users only need to set ``interface``. Use this for multi-IP interfaces.
+  ///
+  /// Example:
+  /// ```swift
+  /// let result = try await ftr.ping(
+  ///   to: "1.1.1.1",
+  ///   config: PingConfig(
+  ///     interface: "en0",
+  ///     sourceIP: "192.168.1.100"
+  ///   )
+  /// )
+  /// ```
+  public let sourceIP: String?
+
   public init(
     count: Int = 5,
     interval: TimeInterval = 1.0,
     timeout: TimeInterval = 2.0,
-    payloadSize: Int = 56
+    payloadSize: Int = 56,
+    interface: String? = nil,
+    sourceIP: String? = nil
   ) {
     self.count = count
     self.interval = interval
     self.timeout = timeout
     self.payloadSize = payloadSize
+    self.interface = interface
+    self.sourceIP = sourceIP
   }
 }
 
@@ -183,8 +225,8 @@ struct PingExecutor {
     let sockfd = try createICMPSocket()
     defer { close(sockfd) }
 
-    // 3. Apply interface/sourceIP bindings from swiftFTRConfig
-    try applyBindings(sockfd: sockfd)
+    // 3. Apply interface/sourceIP bindings (operation config overrides global)
+    try applyBindings(sockfd: sockfd, pingConfig: config)
 
     // 4. Set non-blocking mode
     try setNonBlocking(sockfd: sockfd)
@@ -363,9 +405,13 @@ struct PingExecutor {
     }
   }
 
-  private func applyBindings(sockfd: Int32) throws {
+  private func applyBindings(sockfd: Int32, pingConfig: PingConfig) throws {
+    // Resolve effective interface: operation config overrides global config
+    let effectiveInterface = pingConfig.interface ?? swiftFTRConfig.interface
+    let effectiveSourceIP = pingConfig.sourceIP ?? swiftFTRConfig.sourceIP
+
     // Apply interface binding if specified
-    if let iface = swiftFTRConfig.interface {
+    if let iface = effectiveInterface {
       #if canImport(Darwin)
         let ifaceIndex = if_nametoindex(iface)
         guard ifaceIndex != 0 else {
@@ -392,7 +438,7 @@ struct PingExecutor {
     }
 
     // Apply source IP binding if specified
-    if let sourceIPStr = swiftFTRConfig.sourceIP {
+    if let sourceIPStr = effectiveSourceIP {
       var addr = sockaddr_in()
       addr.sin_family = sa_family_t(AF_INET)
       addr.sin_port = 0

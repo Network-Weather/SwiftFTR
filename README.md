@@ -57,7 +57,7 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.5.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.7.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
@@ -72,8 +72,23 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
 
-New in v0.5.2
+New in v0.7.0
 -------------
+- **Per-Operation Interface Binding**: Override global interface/sourceIP for individual operations
+  - Add `interface`/`sourceIP` to PingConfig, TCPProbeConfig, DNSProbeConfig, BufferbloatConfig
+  - Resolution order: Operation → Global → System Default
+  - Enables multi-interface monitoring (WiFi + Ethernet + VPN)
+  - Eliminates packet loss during interface transitions
+
+Previous v0.6.0 features:
+- **Multi-Protocol Probing**: Test network reachability using multiple protocols
+  - TCP SYN probe (port reachability without full connection)
+  - UDP probe (connected-socket approach detects ICMP Port Unreachable)
+  - DNS probe (direct DNS query to verify DNS server availability)
+  - HTTP/HTTPS probe (web server reachability, any response = success)
+  - Comprehensive test suite with Swift Testing framework
+
+Previous v0.5.2 features:
 - **Parallel Ping Execution**: `ping()` is now nonisolated for true concurrent execution (6.4x speedup)
 - **Code Quality**: Fixed linter warnings, improved documentation
 
@@ -156,9 +171,27 @@ print("Found \(topology.uniquePathCount) unique paths")
 for hop in topology.uniqueHops() {
     print("Discovered hop at TTL \(hop.ttl): \(hop.ip ?? "*")")
 }
-```
 
-📚 **[See comprehensive examples](docs/guides/EXAMPLES.md)** including SwiftUI integration, error handling, concurrent traces, ping monitoring, multipath discovery, and more.
+// NEW in v0.7.0: Per-Operation Interface Binding
+// Override global interface for specific operations
+let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))  // Global: WiFi
+
+// Use global interface (en0)
+let wifiPing = try await tracer.ping(to: "1.1.1.1")
+
+// Override to use Ethernet for this operation only
+let ethPing = try await tracer.ping(
+    to: "1.1.1.1",
+    config: PingConfig(interface: "en14")
+)
+
+// Concurrent multi-interface monitoring
+async let wifi = tracer.ping(to: "1.1.1.1", config: PingConfig(interface: "en0"))
+async let ethernet = tracer.ping(to: "1.1.1.1", config: PingConfig(interface: "en14"))
+let (wifiResult, ethResult) = try await (wifi, ethernet)
+print("WiFi loss: \(Int(wifiResult.statistics.packetLoss * 100))%")
+print("Ethernet loss: \(Int(ethResult.statistics.packetLoss * 100))%")
+```
 
 Notes for Embedding
 -------------------

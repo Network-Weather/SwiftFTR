@@ -35,6 +35,33 @@ public struct BufferbloatConfig: Sendable {
   /// Custom download URL (default: Cloudflare speed test)
   public let downloadURL: String?
 
+  /// Network interface to bind to for ping measurements during bufferbloat test.
+  ///
+  /// When specified, all ping measurements (baseline and loaded) use only this interface.
+  /// If `nil`, uses system routing.
+  ///
+  /// **Note**: Load generation (HTTP upload/download) is not bound to the interface - only latency measurements.
+  ///
+  /// Example:
+  /// ```swift
+  /// // Test bufferbloat via specific interface
+  /// let result = try await ftr.testBufferbloat(
+  ///   config: BufferbloatConfig(
+  ///     target: "1.1.1.1",
+  ///     interface: "en0"
+  ///   )
+  /// )
+  /// ```
+  public let interface: String?
+
+  /// Source IP address to bind to for ping measurements during bufferbloat test.
+  ///
+  /// When specified, ping packets use this IP as the source address.
+  /// The IP must be assigned to the selected interface.
+  ///
+  /// **Note**: Most users only need to set ``interface``.
+  public let sourceIP: String?
+
   public init(
     target: String = "1.1.1.1",
     baselineDuration: TimeInterval = 5.0,
@@ -44,7 +71,9 @@ public struct BufferbloatConfig: Sendable {
     pingInterval: TimeInterval = 0.1,
     calculateRPM: Bool = true,
     uploadURL: String? = nil,
-    downloadURL: String? = nil
+    downloadURL: String? = nil,
+    interface: String? = nil,
+    sourceIP: String? = nil
   ) {
     self.target = target
     self.baselineDuration = baselineDuration
@@ -55,6 +84,8 @@ public struct BufferbloatConfig: Sendable {
     self.calculateRPM = calculateRPM
     self.uploadURL = uploadURL
     self.downloadURL = downloadURL
+    self.interface = interface
+    self.sourceIP = sourceIP
   }
 }
 
@@ -401,7 +432,9 @@ extension SwiftFTR {
       target: config.target,
       duration: config.baselineDuration,
       interval: config.pingInterval,
-      swiftFTRConfig: self.config
+      swiftFTRConfig: self.config,
+      interface: config.interface,
+      sourceIP: config.sourceIP
     )
     allPingResults.append(contentsOf: baselineResults)
 
@@ -427,7 +460,9 @@ extension SwiftFTR {
       loadType: config.loadType,
       interval: config.pingInterval,
       config: config,
-      swiftFTRConfig: self.config
+      swiftFTRConfig: self.config,
+      interface: config.interface,
+      sourceIP: config.sourceIP
     )
     allPingResults.append(contentsOf: loadedResults)
 
@@ -517,7 +552,9 @@ private func measureBaseline(
   target: String,
   duration: TimeInterval,
   interval: TimeInterval,
-  swiftFTRConfig: SwiftFTRConfig
+  swiftFTRConfig: SwiftFTRConfig,
+  interface: String?,
+  sourceIP: String?
 ) async throws -> [BufferbloatPingResult] {
   guard duration > 0 else { return [] }
 
@@ -527,7 +564,13 @@ private func measureBaseline(
   // Use PingExecutor with count > 1 to do all pings in a single session
   // This creates only ONE socket and ONE receiver Task for all pings
   let executor = PingExecutor(config: swiftFTRConfig)
-  let pingConfig = PingConfig(count: count, interval: interval, timeout: 2.0)
+  let pingConfig = PingConfig(
+    count: count,
+    interval: interval,
+    timeout: 2.0,
+    interface: interface,
+    sourceIP: sourceIP
+  )
 
   let pingResult = try await executor.ping(to: target, config: pingConfig)
 
@@ -550,7 +593,9 @@ private func measureUnderLoad(
   loadType: LoadType,
   interval: TimeInterval,
   config: BufferbloatConfig,
-  swiftFTRConfig: SwiftFTRConfig
+  swiftFTRConfig: SwiftFTRConfig,
+  interface: String?,
+  sourceIP: String?
 ) async throws -> [BufferbloatPingResult] {
   guard loadDuration > 0 else { return [] }
 
@@ -566,7 +611,13 @@ private func measureUnderLoad(
   // Use PingExecutor with count > 1 to do all pings in a single session
   // This creates only ONE socket and ONE receiver Task for all pings
   let executor = PingExecutor(config: swiftFTRConfig)
-  let pingConfig = PingConfig(count: count, interval: interval, timeout: 2.0)
+  let pingConfig = PingConfig(
+    count: count,
+    interval: interval,
+    timeout: 2.0,
+    interface: interface,
+    sourceIP: sourceIP
+  )
 
   let pingResult = try await executor.ping(to: target, config: pingConfig)
 

@@ -17,14 +17,43 @@ public struct TCPProbeConfig: Sendable {
   /// Timeout for connection attempt in seconds (default: 2.0)
   public let timeout: TimeInterval
 
+  /// Network interface to bind to for this TCP probe.
+  ///
+  /// When specified, this probe uses only this interface. If `nil`, uses system routing.
+  ///
+  /// Example:
+  /// ```swift
+  /// // Test TCP connectivity via specific interface
+  /// let result = try await tcpProbe(
+  ///   config: TCPProbeConfig(
+  ///     host: "example.com",
+  ///     port: 443,
+  ///     interface: "en14"
+  ///   )
+  /// )
+  /// ```
+  public let interface: String?
+
+  /// Source IP address to bind to for this TCP probe.
+  ///
+  /// When specified, outgoing packets use this IP as the source address.
+  /// The IP must be assigned to the selected interface.
+  ///
+  /// **Note**: Most users only need to set ``interface``.
+  public let sourceIP: String?
+
   public init(
     host: String,
     port: Int,
-    timeout: TimeInterval = 2.0
+    timeout: TimeInterval = 2.0,
+    interface: String? = nil,
+    sourceIP: String? = nil
   ) {
     self.host = host
     self.port = port
     self.timeout = timeout
+    self.interface = interface
+    self.sourceIP = sourceIP
   }
 }
 
@@ -104,7 +133,9 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
     ip: resolvedIP,
     port: config.port,
     timeout: config.timeout,
-    startTime: startTime
+    startTime: startTime,
+    interface: config.interface,
+    sourceIP: config.sourceIP
   )
 
   return TCPProbeResult(
@@ -151,7 +182,10 @@ private func resolveHostname(_ host: String) async throws -> String {
     NI_NUMERICHOST
   )
 
-  return String(cString: hostname)
+  // Convert to String, truncating at null terminator
+  let nullIndex = hostname.firstIndex(of: 0) ?? hostname.count
+  let bytes = hostname[..<nullIndex].map { UInt8(bitPattern: $0) }
+  return String(decoding: bytes, as: UTF8.self)
 }
 
 private func isIPAddress(_ string: String) -> Bool {
@@ -171,7 +205,9 @@ private func performTCPProbe(
   ip: String,
   port: Int,
   timeout: TimeInterval,
-  startTime: Date
+  startTime: Date,
+  interface: String?,
+  sourceIP: String?
 ) async throws -> ProbeResult {
   // Create socket
   let sockfd = socket(AF_INET, SOCK_STREAM, 0)
@@ -183,6 +219,68 @@ private func performTCPProbe(
     )
   }
   defer { close(sockfd) }
+
+  // Bind to interface if specified
+  if let iface = interface {
+    #if canImport(Darwin)
+      let ifaceIndex = if_nametoindex(iface)
+      guard ifaceIndex != 0 else {
+        return ProbeResult(
+          isReachable: false,
+          rtt: nil,
+          error: "Interface '\(iface)' not found"
+        )
+      }
+
+      var index = ifaceIndex
+      let result = setsockopt(
+        sockfd, IPPROTO_IP, IP_BOUND_IF,
+        &index, socklen_t(MemoryLayout<UInt32>.size))
+
+      guard result >= 0 else {
+        return ProbeResult(
+          isReachable: false,
+          rtt: nil,
+          error: "Failed to bind to interface '\(iface)': \(String(cString: strerror(errno)))"
+        )
+      }
+    #else
+      return ProbeResult(
+        isReachable: false,
+        rtt: nil,
+        error: "Interface binding not supported on this platform"
+      )
+    #endif
+  }
+
+  // Bind to source IP if specified
+  if let srcIP = sourceIP {
+    var sourceAddr = sockaddr_in()
+    sourceAddr.sin_family = sa_family_t(AF_INET)
+    sourceAddr.sin_port = 0  // Let system choose port
+
+    guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
+      return ProbeResult(
+        isReachable: false,
+        rtt: nil,
+        error: "Invalid source IP address '\(srcIP)'"
+      )
+    }
+
+    let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        Darwin.bind(sockfd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+
+    guard bindResult >= 0 else {
+      return ProbeResult(
+        isReachable: false,
+        rtt: nil,
+        error: "Failed to bind to source IP '\(srcIP)': \(String(cString: strerror(errno)))"
+      )
+    }
+  }
 
   // Set socket to non-blocking
   var flags = fcntl(sockfd, F_GETFL, 0)
@@ -261,7 +359,7 @@ private func performTCPProbe(
 #if canImport(Darwin)
   private func fdZero(_ set: inout fd_set) {
     // Zero out the entire fd_set structure
-    withUnsafeMutableBytes(of: &set) { ptr in
+    _ = withUnsafeMutableBytes(of: &set) { ptr in
       ptr.baseAddress?.initializeMemory(
         as: UInt8.self, repeating: 0, count: MemoryLayout<fd_set>.size)
     }
@@ -279,7 +377,7 @@ private func performTCPProbe(
   }
 #else
   private func fdZero(_ set: inout fd_set) {
-    withUnsafeMutableBytes(of: &set) { ptr in
+    _ = withUnsafeMutableBytes(of: &set) { ptr in
       ptr.baseAddress?.initializeMemory(
         as: UInt8.self, repeating: 0, count: MemoryLayout<fd_set>.size)
     }

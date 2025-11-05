@@ -329,7 +329,7 @@ struct PingIntegrationTests {
   }
 
   @Test(
-    "Ping respects interface binding",
+    "Ping respects per-operation interface binding (v0.7.0)",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
   func testPingWithInterface() async throws {
     // Try to get a valid interface
@@ -349,9 +349,17 @@ struct PingIntegrationTests {
       return
     }
 
-    let config = SwiftFTRConfig(interface: interface)
-    let tracer = SwiftFTR(config: config)
-    let pingConfig = PingConfig(count: 2, interval: 0.5, timeout: 2.0)
+    // Test per-operation binding (v0.7.0 feature)
+    // Create tracer WITHOUT global interface
+    let tracer = SwiftFTR()
+
+    // Bind at operation level
+    let pingConfig = PingConfig(
+      count: 2,
+      interval: 0.5,
+      timeout: 2.0,
+      interface: interface  // Operation-level interface override
+    )
 
     // Should not throw with valid interface
     let result = try await tracer.ping(to: "1.1.1.1", config: pingConfig)
