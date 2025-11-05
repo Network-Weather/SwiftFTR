@@ -9,7 +9,6 @@ xcuserdata/
 *.xcworkspace/
 Package.resolved
 docc/
-docs/
 
 # Ephemeral planning docs at root
 *_PLAN.md
