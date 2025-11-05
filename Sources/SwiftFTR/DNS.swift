@@ -534,9 +534,11 @@ public struct __TXTAnswer: Sendable {
 }
 
 @_spi(Test)
+// swift-format-ignore: AlwaysUseLowerCamelCase
 public func __dnsEncodeQName(_ name: String) -> [UInt8] { _encodeQName(name) }
 
 @_spi(Test)
+// swift-format-ignore: AlwaysUseLowerCamelCase
 public func __dnsParseTXTAnswers(message: Data) -> [__TXTAnswer]? {
   // Minimal independent parser for TXT answers (sufficient for tests).
   // This mirrors parseAnswers enough for tests.

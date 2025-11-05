@@ -34,7 +34,33 @@ struct InterfaceBindingTests {
     ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil
   }
 
-  /// Discover available network interfaces (excluding loopback and virtual)
+  /// Check if interface has an active IPv4 address
+  func interfaceHasIPv4(_ name: String) -> Bool {
+    #if canImport(Darwin)
+      let process = Process()
+      process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
+      process.arguments = [name]
+
+      let pipe = Pipe()
+      process.standardOutput = pipe
+
+      try? process.run()
+      process.waitUntilExit()
+
+      guard let data = try? pipe.fileHandleForReading.readToEnd(),
+        let output = String(data: data, encoding: .utf8)
+      else {
+        return false
+      }
+
+      // Check for "inet " line (IPv4 address)
+      return output.contains("inet ") && !output.contains("status: inactive")
+    #else
+      return false
+    #endif
+  }
+
+  /// Discover available network interfaces (excluding loopback and virtual, must have IPv4)
   func discoverNetworkInterfaces() -> [String] {
     #if canImport(Darwin)
       let process = Process()
@@ -63,6 +89,7 @@ struct InterfaceBindingTests {
             && !iface.starts(with: "ap") && !iface.starts(with: "awdl")
             && !iface.starts(with: "llw") && !iface.starts(with: "utun")
             && interfaceAvailable(iface)
+            && interfaceHasIPv4(iface)  // NEW: Must have active IPv4
         }
 
       return interfaces

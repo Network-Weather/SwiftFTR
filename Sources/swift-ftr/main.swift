@@ -106,22 +106,27 @@ extension SwiftFTRCommand {
       let resolver = CymruDNSResolver()
       let asnMap =
         (try? await resolver.resolve(ipv4Addrs: allIPs, timeout: max(0.8, timeout))) ?? [:]
+      // JSON output structs use snake_case for CLI conventions (e.g., country_code, asn_info)
+      // swift-format-ignore: AlwaysUseLowerCamelCase
       struct ISPObj: Codable {
         let asn: String
         let name: String
         let hostname: String
       }
+      // swift-format-ignore: AlwaysUseLowerCamelCase
       struct DestASNObj: Codable {
         let asn: Int
         let name: String
         let country_code: String?
       }
+      // swift-format-ignore: AlwaysUseLowerCamelCase
       struct HopASN: Codable {
         let asn: Int
         let prefix: String
         let country_code: String
         let name: String
       }
+      // swift-format-ignore: AlwaysUseLowerCamelCase
       struct HopObj: Codable {
         let ttl: Int
         let segment: String?
@@ -130,6 +135,7 @@ extension SwiftFTRCommand {
         let asn_info: HopASN?
         let rtt_ms: Double?
       }
+      // swift-format-ignore: AlwaysUseLowerCamelCase
       struct Root: Codable {
         let version: String
         let target: String

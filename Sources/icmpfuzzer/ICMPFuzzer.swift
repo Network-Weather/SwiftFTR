@@ -3,6 +3,7 @@ import Foundation
 
 #if WITH_LIBFUZZER
   @_cdecl("LLVMFuzzerTestOneInput")
+  // swift-format-ignore: AlwaysUseLowerCamelCase
   public func LLVMFuzzerTestOneInput(_ dataPtr: UnsafePointer<UInt8>, _ size: Int) -> Int32 {
     let buf = UnsafeRawBufferPointer(start: UnsafeRawPointer(dataPtr), count: size)
     var ss = sockaddr_storage()

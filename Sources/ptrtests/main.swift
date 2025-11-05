@@ -120,7 +120,8 @@ func testClassification() async throws {
     .init(ttl: 3, ipAddress: nil, rtt: nil, reachedDestination: false),  // gap
     .init(ttl: 4, ipAddress: nil, rtt: nil, reachedDestination: false),  // gap
     .init(ttl: 5, ipAddress: "9.9.9.9", rtt: 0.010, reachedDestination: false),  // ISP (AS12345)
-    .init(ttl: 6, ipAddress: "203.0.113.1", rtt: 0.020, reachedDestination: false),  // no ASN -> TRANSIT
+    // no ASN -> TRANSIT
+    .init(ttl: 6, ipAddress: "203.0.113.1", rtt: 0.020, reachedDestination: false),
     .init(ttl: 7, ipAddress: "5.5.5.4", rtt: 0.030, reachedDestination: false),  // DEST ASN (AS555)
     .init(ttl: 8, ipAddress: "5.5.5.5", rtt: 0.040, reachedDestination: true),  // destination
   ]

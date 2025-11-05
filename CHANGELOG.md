@@ -3,7 +3,7 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-0.7.0 — 2025-10-16
+0.7.0 — 2025-11-05
 ------------------
 ### Major Features
 - **NEW**: Per-operation interface and source IP binding
