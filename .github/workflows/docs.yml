@@ -9,6 +9,7 @@ on:
       - '.github/workflows/docs.yml'
       - '.github/workflows/docc-generate.yml'
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
