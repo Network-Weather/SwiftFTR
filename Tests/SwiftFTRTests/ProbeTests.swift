@@ -173,8 +173,9 @@ struct DNSProbeTests {
 
   @Test("DNS probe to unreachable server")
   func testUnreachableServer() async throws {
-    // Test against TEST-NET-1
-    let result = try await dnsProbe(server: "192.0.2.1", query: "example.com", timeout: 2.0)
+    // Use 0.0.0.0 ("this network" - not routable, will timeout)
+    // Other reserved ranges may be intercepted by DNS forwarders
+    let result = try await dnsProbe(server: "0.0.0.0", query: "example.com", timeout: 2.0)
 
     #expect(!result.isReachable)
     #expect(result.rtt == nil)
