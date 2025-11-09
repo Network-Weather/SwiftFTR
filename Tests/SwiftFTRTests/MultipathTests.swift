@@ -722,8 +722,9 @@ struct MultipathIntegrationTests {
     let elapsed = Date().timeIntervalSince(startTime)
 
     // Discovery should complete in reasonable time
-    // 5 flows * 1.5s timeout = 7.5s max, but early stopping should help
-    #expect(elapsed < 10.0)
+    // 5 flows * 1.5s timeout = 7.5s min (sequential execution)
+    // Allow 15s for actual network time + overhead
+    #expect(elapsed < 15.0)
 
     // Internal duration tracking should be close to actual
     #expect(abs(topology.discoveryDuration - elapsed) < 1.0)

@@ -92,7 +92,17 @@ struct BufferbloatComparisonTests {
       pingInterval: 0.2,
       interface: iface1
     )
-    let result1 = try await ftr.testBufferbloat(config: config1)
+    let result1: BufferbloatResult
+    do {
+      result1 = try await ftr.testBufferbloat(config: config1)
+    } catch {
+      // Skip test if interface doesn't have route to target
+      if error.localizedDescription.contains("No route to host") {
+        print("⏭️  Skipping: \(iface1) has no route to target")
+        return
+      }
+      throw error
+    }
 
     // Test second interface
     print("📡 Testing \(iface2)...")
@@ -103,7 +113,17 @@ struct BufferbloatComparisonTests {
       pingInterval: 0.2,
       interface: iface2
     )
-    let result2 = try await ftr.testBufferbloat(config: config2)
+    let result2: BufferbloatResult
+    do {
+      result2 = try await ftr.testBufferbloat(config: config2)
+    } catch {
+      // Skip test if interface doesn't have route to target
+      if error.localizedDescription.contains("No route to host") {
+        print("⏭️  Skipping: \(iface2) has no route to target")
+        return
+      }
+      throw error
+    }
 
     // Print detailed comparison
     print("\n" + String(repeating: "=", count: 70))

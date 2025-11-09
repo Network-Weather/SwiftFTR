@@ -75,11 +75,12 @@ struct PingParallelismTests {
       + "Spread: \(String(format: "%.3f", completionSpread))s"
     #expect(completionSpread < 0.5, Comment(rawValue: spreadMsg))
 
-    // Total time should be close to one ping (~360ms), not 20× (~7.2s)
-    // Allow 1.5s for network variance
+    // Total time should be close to one ping (~300ms RTT), not 20× (~6s)
+    // With 1s timeout, each ping can take up to 1s. If parallel, all 20 should complete in ~1s.
+    // If serial, would take ~20s. Allow 2s for network variance.
     let timeMsg =
-      "20 parallel pings should take <1s, not 7.2s. "
+      "20 parallel pings should take <2s (all concurrent), not >10s (serialized). "
       + "Actual: \(String(format: "%.2f", elapsed))s"
-    #expect(elapsed < 1.5, Comment(rawValue: timeMsg))
+    #expect(elapsed < 2.0, Comment(rawValue: timeMsg))
   }
 }
