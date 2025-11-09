@@ -197,6 +197,22 @@ public actor SwiftFTR {
   // Active trace tracking
   internal var activeTraces: Set<TraceHandle> = []
 
+  /// DNS query interface
+  ///
+  /// Provides access to DNS queries for various record types (A, AAAA, PTR, TXT, etc.)
+  /// with high-precision timing and detailed metadata.
+  ///
+  /// Example:
+  /// ```swift
+  /// let tracer = SwiftFTR()
+  /// let result = try await tracer.dns.a(hostname: "example.com")
+  /// print("IP: \(result.records.first?.data)")
+  /// print("RTT: \(result.rttMs)ms")
+  /// ```
+  public nonisolated var dns: DNSQueries {
+    DNSQueries(tracer: self)
+  }
+
   /// Creates a tracer instance with optional configuration.
   /// - Parameter config: Configuration for traceroute behavior
   public init(config: SwiftFTRConfig = SwiftFTRConfig()) {

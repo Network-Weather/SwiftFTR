@@ -3,6 +3,7 @@
 ## Table of Contents
 - [Basic Usage](#basic-usage)
 - [Configuration Options](#configuration-options)
+- [DNS Queries (v0.7.1+)](#dns-queries-v071)
 - [Ping (v0.5.0+)](#ping-v050)
 - [Multipath Discovery (v0.5.0+)](#multipath-discovery-v050)
 - [Bufferbloat Detection (v0.5.1+)](#bufferbloat-detection-v051)
@@ -120,6 +121,219 @@ do {
     print("Failed to bind to interface \(iface): \(details ?? "")")
 } catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
     print("Failed to bind to source IP \(ip): \(details ?? "")")
+}
+```
+
+## DNS Queries (v0.7.1+)
+
+SwiftFTR provides low-level DNS query capabilities with full control over the DNS server used. This is particularly useful for network diagnostics, reverse DNS lookups, and querying specific DNS servers (like gateways).
+
+### Reverse DNS Lookup (PTR Records)
+
+Query a DNS server for the hostname of an IP address. This is especially useful for identifying network devices like gateways.
+
+```swift
+import SwiftFTR
+
+// Query gateway for its own hostname (common pattern for vendor detection)
+if let hostname = try await reverseDNS(
+  ip: "10.1.10.1",
+  server: "10.1.10.1"  // Query the gateway itself!
+) {
+  print("Gateway hostname: \(hostname)")
+  // Example output: "Docsis-Gateway.hsd1.ca.comcast.net"
+
+  // Detect vendor from hostname
+  if hostname.contains("docsis") {
+    print("Cable modem detected")
+  } else if hostname.contains("unifi") {
+    print("UniFi gateway detected")
+  }
+} else {
+  print("No PTR record found")
+}
+
+// Query public DNS server for reverse lookup
+if let hostname = try await reverseDNS(
+  ip: "8.8.8.8",
+  server: "1.1.1.1"
+) {
+  print("8.8.8.8 resolves to: \(hostname)")
+  // Output: "dns.google"
+}
+```
+
+### IPv6 Address Lookup (AAAA Records)
+
+Query for IPv6 addresses associated with a hostname.
+
+```swift
+import SwiftFTR
+
+// Query for IPv6 addresses
+let ipv6Addresses = try await queryAAAA(
+  hostname: "google.com",
+  server: "8.8.8.8"
+)
+
+if !ipv6Addresses.isEmpty {
+  print("IPv6 addresses for google.com:")
+  for addr in ipv6Addresses {
+    print("  \(addr)")
+  }
+  // Example output:
+  //   2607:f8b0:4004:c07::64
+  //   2607:f8b0:4004:c07::71
+} else {
+  print("No IPv6 addresses found")
+}
+
+// Check if a service supports IPv6
+let hasIPv6 = try await queryAAAA(
+  hostname: "example.com",
+  server: "1.1.1.1"
+)
+print("IPv6 support: \(hasIPv6.isEmpty ? "No" : "Yes")")
+```
+
+### IPv4 Address Lookup (A Records)
+
+Query for IPv4 addresses associated with a hostname.
+
+```swift
+import SwiftFTR
+
+// Query for IPv4 addresses
+let ipv4Addresses = try await queryA(
+  hostname: "example.com",
+  server: "8.8.8.8"
+)
+
+print("IPv4 addresses for example.com:")
+for addr in ipv4Addresses {
+  print("  \(addr)")
+}
+// Example output:
+//   93.184.216.34
+
+// Query multiple hostnames in parallel
+async let cloudflare = queryA(hostname: "cloudflare.com", server: "1.1.1.1")
+async let google = queryA(hostname: "google.com", server: "1.1.1.1")
+
+let (cfAddrs, gAddrs) = try await (cloudflare, google)
+print("Cloudflare IPs: \(cfAddrs)")
+print("Google IPs: \(gAddrs)")
+```
+
+### DNS Queries with Interface Binding
+
+All DNS query functions support network interface and source IP binding.
+
+```swift
+import SwiftFTR
+
+// Query via specific network interface (e.g., WiFi)
+let hostnameViaWiFi = try await reverseDNS(
+  ip: "10.1.10.1",
+  server: "10.1.10.1",
+  interface: "en0"  // WiFi interface
+)
+
+// Query via specific source IP
+let hostnameViaCellular = try await reverseDNS(
+  ip: "10.1.10.1",
+  server: "10.1.10.1",
+  sourceIP: "192.168.1.100"  // Specific source address
+)
+
+// Query IPv6 via specific interface
+let ipv6ViaEthernet = try await queryAAAA(
+  hostname: "google.com",
+  server: "2001:4860:4860::8888",  // Google's IPv6 DNS
+  interface: "en1"  // Ethernet interface
+)
+```
+
+### Network Device Identification Pattern
+
+A common pattern for identifying network devices (routers, gateways, modems):
+
+```swift
+import SwiftFTR
+
+struct NetworkDevice {
+  let ip: String
+  let hostname: String?
+  let vendor: String?
+}
+
+func identifyGateway(ip: String) async throws -> NetworkDevice {
+  // Try to get hostname by querying the gateway for its own PTR record
+  let hostname = try await reverseDNS(
+    ip: ip,
+    server: ip,  // Ask gateway about itself
+    timeout: 2.0
+  )
+
+  // Detect vendor from hostname patterns
+  let vendor: String? = if let hostname = hostname {
+    switch {
+    case hostname.lowercased().contains("docsis"):
+      "Cable Modem"
+    case hostname.lowercased().contains("unifi"):
+      "Ubiquiti UniFi"
+    case hostname.lowercased().contains("netgear"):
+      "NETGEAR"
+    case hostname.lowercased().contains("tp-link"):
+      "TP-Link"
+    case hostname.lowercased().contains("airport"):
+      "Apple AirPort"
+    default:
+      nil
+    }
+  } else {
+    nil
+  }
+
+  return NetworkDevice(ip: ip, hostname: hostname, vendor: vendor)
+}
+
+// Usage
+let gateway = try await identifyGateway(ip: "10.1.10.1")
+print("Gateway: \(gateway.ip)")
+if let hostname = gateway.hostname {
+  print("  Hostname: \(hostname)")
+}
+if let vendor = gateway.vendor {
+  print("  Vendor: \(vendor)")
+}
+```
+
+### Error Handling
+
+DNS queries throw `DNSError` for various failure conditions:
+
+```swift
+import SwiftFTR
+
+do {
+  let hostname = try await reverseDNS(
+    ip: "10.1.10.1",
+    server: "10.1.10.1"
+  )
+  print("Hostname: \(hostname ?? "No PTR record")")
+} catch DNSError.timeout {
+  print("DNS query timed out")
+} catch DNSError.invalidIP(let ip) {
+  print("Invalid IP address: \(ip)")
+} catch DNSError.invalidHostname(let hostname) {
+  print("Invalid hostname: \(hostname)")
+} catch DNSError.bindFailed(let msg) {
+  print("Failed to bind socket: \(msg)")
+} catch DNSError.serverError(let rcode) {
+  print("DNS server returned error code: \(rcode)")
+} catch {
+  print("Unexpected error: \(error)")
 }
 ```
 

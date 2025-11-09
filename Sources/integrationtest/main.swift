@@ -96,6 +96,109 @@ struct IntegrationTest {
       Foundation.exit(1)
     }
 
+    // Test 6: DNS AAAA query for www.google.com (0.8.0 API)
+    print("\n6. Testing DNS AAAA query for www.google.com (v0.8.0 API)...")
+    do {
+      let result = try await tracer.dns.aaaa(hostname: "www.google.com")
+
+      if result.records.isEmpty {
+        print("  - No IPv6 addresses found")
+      } else {
+        print("✓ Found \(result.records.count) IPv6 address(es) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+        for record in result.records {
+          if case .ipv6(let addr) = record.data {
+            print("  - \(addr) (TTL: \(record.ttl)s)")
+          }
+        }
+      }
+    } catch {
+      print("✗ DNS AAAA query failed: \(error)")
+      Foundation.exit(1)
+    }
+
+    // Test 7: DNS A query (0.8.0 API)
+    print("\n7. Testing DNS A query for google.com (v0.8.0 API)...")
+    do {
+      let result = try await tracer.dns.a(hostname: "google.com")
+      print("✓ Found \(result.records.count) IPv4 address(es) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+      for record in result.records.prefix(2) {
+        if case .ipv4(let addr) = record.data {
+          print("  - \(addr)")
+        }
+      }
+    } catch {
+      print("✗ DNS A query failed: \(error)")
+      Foundation.exit(1)
+    }
+
+    // Test 8: Reverse DNS query (0.8.0 API)
+    print("\n8. Testing reverse DNS for 8.8.8.8 (v0.8.0 API)...")
+    do {
+      let result = try await tracer.dns.reverseIPv4(ip: "8.8.8.8")
+      print("✓ Found \(result.records.count) PTR record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+      for record in result.records {
+        if case .hostname(let hostname) = record.data {
+          print("  - \(hostname)")
+        }
+      }
+    } catch {
+      print("✗ Reverse DNS query failed: \(error)")
+      Foundation.exit(1)
+    }
+
+    // Test 9: MX query (0.8.0 API)
+    print("\n9. Testing MX query for google.com (v0.8.0 API)...")
+    do {
+      let result = try await tracer.dns.query(name: "google.com", type: .mx)
+      print("✓ Found \(result.records.count) MX record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+      for record in result.records.prefix(3) {
+        if case .mx(let priority, let exchange) = record.data {
+          print("  - Priority \(priority): \(exchange)")
+        }
+      }
+    } catch {
+      print("✗ MX query failed: \(error)")
+      Foundation.exit(1)
+    }
+
+    // Test 10: CAA query (0.8.0 API)
+    print("\n10. Testing CAA query for google.com (v0.8.0 API)...")
+    do {
+      let result = try await tracer.dns.query(name: "google.com", type: .caa)
+      if result.records.isEmpty {
+        print("  - No CAA records found (domain allows any CA)")
+      } else {
+        print("✓ Found \(result.records.count) CAA record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+        for record in result.records.prefix(3) {
+          if case .caa(let flags, let tag, let value) = record.data {
+            print("  - Flags: \(flags), Tag: \(tag), Value: \(value)")
+          }
+        }
+      }
+    } catch {
+      print("✗ CAA query failed: \(error)")
+      Foundation.exit(1)
+    }
+
+    // Test 11: HTTPS query (0.8.0 API)
+    print("\n11. Testing HTTPS query for cloudflare.com (v0.8.0 API)...")
+    do {
+      let result = try await tracer.dns.query(name: "cloudflare.com", type: .https)
+      if result.records.isEmpty {
+        print("  - No HTTPS records found")
+      } else {
+        print("✓ Found \(result.records.count) HTTPS record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+        for record in result.records.prefix(3) {
+          if case .https(let priority, let target, let svcParams) = record.data {
+            print("  - Priority \(priority): \(target) (params: \(svcParams.count) bytes)")
+          }
+        }
+      }
+    } catch {
+      print("✗ HTTPS query failed: \(error)")
+      Foundation.exit(1)
+    }
+
     print("\n=== All Tests Passed ===")
   }
 }
