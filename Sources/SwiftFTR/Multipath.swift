@@ -144,7 +144,8 @@ public struct NetworkTopology: Sendable, Codable {
   /// Timeouts (nil IPs) are treated as distinct values.
   /// Returns nil if all paths are identical or only one path exists.
   public func divergencePoint() -> Int? {
-    guard paths.count > 1 else { return nil }
+    // No divergence if only one unique path
+    guard uniquePathCount > 1 else { return nil }
 
     let maxTTL = paths.map { $0.trace.hops.count }.max() ?? 0
 
