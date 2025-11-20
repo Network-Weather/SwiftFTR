@@ -145,7 +145,9 @@ struct DNSProbeTests {
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
   func testValidServer() async throws {
     // Test against Cloudflare DNS
-    let result = try await dnsProbe(server: "1.1.1.1", query: "example.com", timeout: 3.0)
+    let result = try await NetworkTestGate.shared.withPermit {
+      try await dnsProbe(server: "1.1.1.1", query: "example.com", timeout: 3.0)
+    }
 
     #expect(result.isReachable)
     #expect(result.rtt != nil)
@@ -160,11 +162,13 @@ struct DNSProbeTests {
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
   func testNXDOMAIN() async throws {
     // Query for non-existent domain
-    let result = try await dnsProbe(
-      server: "8.8.8.8",
-      query: "this-domain-definitely-does-not-exist-12345.invalid",
-      timeout: 3.0
-    )
+    let result = try await NetworkTestGate.shared.withPermit {
+      try await dnsProbe(
+        server: "8.8.8.8",
+        query: "this-domain-definitely-does-not-exist-12345.invalid",
+        timeout: 3.0
+      )
+    }
 
     #expect(result.isReachable)
     #expect(result.responseCode != nil)
@@ -175,7 +179,9 @@ struct DNSProbeTests {
   func testUnreachableServer() async throws {
     // Use 0.0.0.0 ("this network" - not routable, will timeout)
     // Other reserved ranges may be intercepted by DNS forwarders
-    let result = try await dnsProbe(server: "0.0.0.0", query: "example.com", timeout: 2.0)
+    let result = try await NetworkTestGate.shared.withPermit {
+      try await dnsProbe(server: "0.0.0.0", query: "example.com", timeout: 2.0)
+    }
 
     #expect(!result.isReachable)
     #expect(result.rtt == nil)
@@ -199,8 +205,9 @@ struct HTTPProbeTests {
     "HTTP probe successful request",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
   func testSuccessfulRequest() async throws {
-    // Test against example.com (HTTP)
-    let result = try await httpProbe(url: "http://example.com", timeout: 5.0)
+    let result = try await NetworkTestGate.shared.withPermit {
+      try await httpProbe(url: "https://httpbingo.org/status/200", timeout: 5.0)
+    }
 
     #expect(result.isReachable)
     #expect(result.statusCode != nil)
@@ -213,8 +220,9 @@ struct HTTPProbeTests {
     "HTTPS probe successful request",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
   func testHTTPSSuccessfulRequest() async throws {
-    // Test against example.com (HTTPS)
-    let result = try await httpProbe(url: "https://example.com", timeout: 5.0)
+    let result = try await NetworkTestGate.shared.withPermit {
+      try await httpProbe(url: "https://httpbingo.org/status/200", timeout: 5.0)
+    }
 
     #expect(result.isReachable)
     #expect(result.statusCode != nil)
@@ -226,11 +234,12 @@ struct HTTPProbeTests {
     "HTTP probe 404 response",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
   func test404Response() async throws {
-    // Test against URL that returns 404
-    let result = try await httpProbe(
-      url: "http://example.com/this-page-does-not-exist-12345",
-      timeout: 5.0
-    )
+    let result = try await NetworkTestGate.shared.withPermit {
+      try await httpProbe(
+        url: "https://httpbingo.org/status/404",
+        timeout: 5.0
+      )
+    }
 
     // 404 still counts as success (server is reachable)
     #expect(result.isReachable)
@@ -280,7 +289,7 @@ struct ProbeConcurrencyTests {
     // Test running multiple probes concurrently
     async let tcp = tcpProbe(host: "1.1.1.1", port: 53, timeout: 3.0)
     async let dns = dnsProbe(server: "8.8.8.8", query: "example.com", timeout: 3.0)
-    async let http = httpProbe(url: "http://example.com", timeout: 5.0)
+    async let http = httpProbe(url: "https://example.com", timeout: 5.0)
 
     let (tcpResult, dnsResult, httpResult) = try await (tcp, dns, http)
 

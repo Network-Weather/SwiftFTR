@@ -25,8 +25,8 @@ How It Works
 3) For TTL = 1…maxHops:
    - Set `IP_TTL` to the current TTL and send an ICMP Echo Request with a stable identifier and sequence (seq = TTL).
    - Record send time in a small map keyed by `sequence`.
-4) Enter a single receive loop until a global deadline:
-   - Poll the socket and parse each incoming datagram as one of: Echo Reply, Time Exceeded, or Destination Unreachable.
+4) Register a `DispatchSourceRead` (kqueue-backed on macOS) and handle packets until a global deadline:
+   - Parse each incoming datagram as one of: Echo Reply, Time Exceeded, or Destination Unreachable.
    - Match replies back to the original probe using the identifier/sequence embedded in the payload.
    - Compute RTT with a monotonic clock and place the hop at `ttl - 1`.
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
@@ -40,7 +40,7 @@ How Fast Is It?
 Classic traceroute often probes sequentially and waits per hop; SwiftFTR probes all hops in one burst and waits once.
 
 - Time complexity: O(1) with respect to hop count. Wall‑clock time is bounded by your chosen `timeout` (for example, `timeout = 1.0` typically completes in about ~1 second rather than ~30 seconds for 30 sequential probes).
-- Efficient I/O: Single socket, non‑blocking `poll(2)`, reused receive buffer, and monotonic timing reduce overhead and jitter.
+- Efficient I/O: Single socket, kqueue-backed `DispatchSourceRead`, reused receive buffer, and monotonic timing reduce overhead and jitter.
 
 If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e.g., `20`). You can also tune `payloadSize` in advanced scenarios.
 
@@ -57,7 +57,7 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.7.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.8.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
@@ -337,7 +337,7 @@ Configuration and Flags
 
 Design Details
 --------------
-- Socket: ICMP `SOCK_DGRAM` on macOS (no privileges) with `O_NONBLOCK` and `poll(2)`.
+- Socket: ICMP `SOCK_DGRAM` on macOS (no privileges) with `O_NONBLOCK` and `DispatchSource` readiness handling.
 - Probing: One Echo Request per TTL; identifier is constant per run, sequence equals TTL for easy correlation.
 - Matching: Echo Reply and Time Exceeded handlers pull out embedded id/seq from the packet to map to the original probe.
 - Timing: RTT is measured with `CLOCK_MONOTONIC` to avoid wall‑clock jumps.

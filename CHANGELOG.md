@@ -7,6 +7,14 @@ All notable changes to this project are documented here. This project follows Se
 ------------------
 ### What's New
 
+**Massive Ping Scalability**
+- Refactored `ping()` to use event-driven I/O (kqueue/epoll) via `DispatchSource`
+- Eliminated thread starvation issues when running many concurrent pings
+- **Performance**: 35x throughput improvement (573 pings/sec vs 16 pings/sec in v0.7.0)
+- **Efficiency**: Efficient resource usage (~17KB per ping) with zero thread starvation
+- Zero external dependencies (uses `libdispatch` standard library)
+- Fully thread-safe and robust against race conditions
+
 **DNS Queries with Rich Metadata**
 - Query DNS records with `tracer.dns.a()`, `tracer.dns.aaaa()`, `tracer.dns.reverseIPv4()`
 - Get structured results with TTL, RTT (0.1ms precision), server, and timestamp

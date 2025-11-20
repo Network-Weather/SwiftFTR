@@ -30,7 +30,9 @@ struct ConcurrencyBottleneckTests {
   /// CURRENT BEHAVIOR: Will take ~15-20s due to actor serialization
   @Test(
     "Concurrent traces serialize on single actor instance",
-    .disabled("Known bottleneck - requires concurrency refactor. See docs/development/SwiftFTR-Concurrency-Audit.md"),
+    .disabled(
+      "Known bottleneck - requires concurrency refactor. See docs/development/SwiftFTR-Concurrency-Audit.md"
+    ),
     .timeLimit(.minutes(2))
   )
   func testConcurrentTracesSerialize() async throws {
@@ -99,7 +101,9 @@ struct ConcurrencyBottleneckTests {
   /// CURRENT BEHAVIOR: Will take ~15-20s due to actor serialization
   @Test(
     "Longer concurrent traces with STUN serialize on actor",
-    .disabled("Known bottleneck - requires concurrency refactor. See docs/development/SwiftFTR-Concurrency-Audit.md"),
+    .disabled(
+      "Known bottleneck - requires concurrency refactor. See docs/development/SwiftFTR-Concurrency-Audit.md"
+    ),
     .timeLimit(.minutes(3))
   )
   func testLongConcurrentTracesWithSTUN() async throws {
@@ -169,7 +173,9 @@ struct ConcurrencyBottleneckTests {
   /// CURRENT BEHAVIOR: Ping may be delayed waiting for actor availability
   @Test(
     "Actor blocked by synchronous STUN/DNS operations",
-    .disabled("Known bottleneck - requires async I/O refactor. See docs/development/SwiftFTR-Concurrency-Audit.md"),
+    .disabled(
+      "Known bottleneck - requires async I/O refactor. See docs/development/SwiftFTR-Concurrency-Audit.md"
+    ),
     .timeLimit(.minutes(1))
   )
   func testBlockingIOStallsActor() async throws {
@@ -238,7 +244,9 @@ struct ConcurrencyBottleneckTests {
   /// CURRENT BEHAVIOR: Will take much longer due to STUN/DNS blocking
   @Test(
     "Concurrent traceClassified calls serialize due to blocking I/O",
-    .disabled("Known bottleneck - requires async I/O refactor. See docs/development/SwiftFTR-Concurrency-Audit.md"),
+    .disabled(
+      "Known bottleneck - requires async I/O refactor. See docs/development/SwiftFTR-Concurrency-Audit.md"
+    ),
     .timeLimit(.minutes(2))
   )
   func testConcurrentClassifiedTracesBlocking() async throws {
@@ -309,7 +317,9 @@ struct ConcurrencyBottleneckTests {
   /// CURRENT BEHAVIOR: Will take ~N*2s (fully sequential)
   @Test(
     "Multipath flows execute sequentially not in parallel",
-    .disabled("Known bottleneck - requires parallel flow execution. See docs/development/SwiftFTR-Concurrency-Audit.md"),
+    .disabled(
+      "Known bottleneck - requires parallel flow execution. See docs/development/SwiftFTR-Concurrency-Audit.md"
+    ),
     .timeLimit(.minutes(2))
   )
   func testMultipathFlowsRunSequentially() async throws {

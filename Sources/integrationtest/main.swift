@@ -104,7 +104,9 @@ struct IntegrationTest {
       if result.records.isEmpty {
         print("  - No IPv6 addresses found")
       } else {
-        print("✓ Found \(result.records.count) IPv6 address(es) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+        print(
+          "✓ Found \(result.records.count) IPv6 address(es) (RTT: \(String(format: "%.1f", result.rttMs))ms):"
+        )
         for record in result.records {
           if case .ipv6(let addr) = record.data {
             print("  - \(addr) (TTL: \(record.ttl)s)")
@@ -120,7 +122,9 @@ struct IntegrationTest {
     print("\n7. Testing DNS A query for google.com (v0.8.0 API)...")
     do {
       let result = try await tracer.dns.a(hostname: "google.com")
-      print("✓ Found \(result.records.count) IPv4 address(es) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+      print(
+        "✓ Found \(result.records.count) IPv4 address(es) (RTT: \(String(format: "%.1f", result.rttMs))ms):"
+      )
       for record in result.records.prefix(2) {
         if case .ipv4(let addr) = record.data {
           print("  - \(addr)")
@@ -135,7 +139,9 @@ struct IntegrationTest {
     print("\n8. Testing reverse DNS for 8.8.8.8 (v0.8.0 API)...")
     do {
       let result = try await tracer.dns.reverseIPv4(ip: "8.8.8.8")
-      print("✓ Found \(result.records.count) PTR record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+      print(
+        "✓ Found \(result.records.count) PTR record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):"
+      )
       for record in result.records {
         if case .hostname(let hostname) = record.data {
           print("  - \(hostname)")
@@ -150,7 +156,9 @@ struct IntegrationTest {
     print("\n9. Testing MX query for google.com (v0.8.0 API)...")
     do {
       let result = try await tracer.dns.query(name: "google.com", type: .mx)
-      print("✓ Found \(result.records.count) MX record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+      print(
+        "✓ Found \(result.records.count) MX record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):"
+      )
       for record in result.records.prefix(3) {
         if case .mx(let priority, let exchange) = record.data {
           print("  - Priority \(priority): \(exchange)")
@@ -168,7 +176,9 @@ struct IntegrationTest {
       if result.records.isEmpty {
         print("  - No CAA records found (domain allows any CA)")
       } else {
-        print("✓ Found \(result.records.count) CAA record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+        print(
+          "✓ Found \(result.records.count) CAA record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):"
+        )
         for record in result.records.prefix(3) {
           if case .caa(let flags, let tag, let value) = record.data {
             print("  - Flags: \(flags), Tag: \(tag), Value: \(value)")
@@ -187,7 +197,9 @@ struct IntegrationTest {
       if result.records.isEmpty {
         print("  - No HTTPS records found")
       } else {
-        print("✓ Found \(result.records.count) HTTPS record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):")
+        print(
+          "✓ Found \(result.records.count) HTTPS record(s) (RTT: \(String(format: "%.1f", result.rttMs))ms):"
+        )
         for record in result.records.prefix(3) {
           if case .https(let priority, let target, let svcParams) = record.data {
             print("  - Priority \(priority): \(target) (params: \(svcParams.count) bytes)")

@@ -67,6 +67,9 @@ actor _ASNMemoryCache {
 public struct CachingASNResolver: ASNResolver {
   private let base: ASNResolver
   public init(base: ASNResolver) { self.base = base }
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
   {
     let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
@@ -88,6 +91,9 @@ public struct CachingASNResolver: ASNResolver {
 public struct CymruDNSResolver: ASNResolver {
   public init() {}
 
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public func resolve(ipv4Addrs: [String], timeout: TimeInterval = 1.0) async throws -> [String:
     ASNInfo]
   {

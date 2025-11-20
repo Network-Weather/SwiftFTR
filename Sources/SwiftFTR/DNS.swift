@@ -156,6 +156,9 @@ public struct DNSQueries: Sendable {
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with A records
   /// - Throws: DNSError on query failure
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public func a(
     hostname: String,
     server: String? = nil,
@@ -177,14 +180,16 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query A record
-    let answers = try await performDNSQueryInternal(
-      server: resolvedServer,
-      query: hostname,
-      queryType: DNSRecordType.a.rawValue,
-      timeout: resolvedTimeout,
-      interface: resolvedInterface,
-      sourceIP: resolvedSourceIP
-    )
+    let answers = try await runDetachedBlockingIO {
+      try performDNSQueryInternal(
+        server: resolvedServer,
+        query: hostname,
+        queryType: DNSRecordType.a.rawValue,
+        timeout: resolvedTimeout,
+        interface: resolvedInterface,
+        sourceIP: resolvedSourceIP
+      )
+    }
 
     let rttMs = timer.elapsedMs()
 
@@ -223,6 +228,9 @@ public struct DNSQueries: Sendable {
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with AAAA records
   /// - Throws: DNSError on query failure
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public func aaaa(
     hostname: String,
     server: String? = nil,
@@ -244,14 +252,16 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query AAAA record
-    let answers = try await performDNSQueryInternal(
-      server: resolvedServer,
-      query: hostname,
-      queryType: DNSRecordType.aaaa.rawValue,
-      timeout: resolvedTimeout,
-      interface: resolvedInterface,
-      sourceIP: resolvedSourceIP
-    )
+    let answers = try await runDetachedBlockingIO {
+      try performDNSQueryInternal(
+        server: resolvedServer,
+        query: hostname,
+        queryType: DNSRecordType.aaaa.rawValue,
+        timeout: resolvedTimeout,
+        interface: resolvedInterface,
+        sourceIP: resolvedSourceIP
+      )
+    }
 
     let rttMs = timer.elapsedMs()
 
@@ -290,6 +300,9 @@ public struct DNSQueries: Sendable {
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with PTR records
   /// - Throws: DNSError on query failure
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public func reverseIPv4(
     ip: String,
     server: String? = nil,
@@ -312,14 +325,16 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await performDNSQueryInternal(
-      server: resolvedServer,
-      query: arpaQuery,
-      queryType: DNSRecordType.ptr.rawValue,
-      timeout: resolvedTimeout,
-      interface: resolvedInterface,
-      sourceIP: resolvedSourceIP
-    )
+    let answers = try await runDetachedBlockingIO {
+      try performDNSQueryInternal(
+        server: resolvedServer,
+        query: arpaQuery,
+        queryType: DNSRecordType.ptr.rawValue,
+        timeout: resolvedTimeout,
+        interface: resolvedInterface,
+        sourceIP: resolvedSourceIP
+      )
+    }
 
     let rttMs = timer.elapsedMs()
 
@@ -362,6 +377,9 @@ public struct DNSQueries: Sendable {
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with TXT records
   /// - Throws: DNSError on query failure
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public func txt(
     hostname: String,
     server: String? = nil,
@@ -383,14 +401,16 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query TXT record
-    let answers = try await performDNSQueryInternal(
-      server: resolvedServer,
-      query: hostname,
-      queryType: DNSRecordType.txt.rawValue,
-      timeout: resolvedTimeout,
-      interface: resolvedInterface,
-      sourceIP: resolvedSourceIP
-    )
+    let answers = try await runDetachedBlockingIO {
+      try performDNSQueryInternal(
+        server: resolvedServer,
+        query: hostname,
+        queryType: DNSRecordType.txt.rawValue,
+        timeout: resolvedTimeout,
+        interface: resolvedInterface,
+        sourceIP: resolvedSourceIP
+      )
+    }
 
     let rttMs = timer.elapsedMs()
 
@@ -430,6 +450,9 @@ public struct DNSQueries: Sendable {
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with records of the requested type
   /// - Throws: DNSError on query failure
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public func query(
     name: String,
     type: DNSRecordType,
@@ -452,14 +475,16 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Perform query
-    let answers = try await performDNSQueryInternal(
-      server: resolvedServer,
-      query: name,
-      queryType: type.rawValue,
-      timeout: resolvedTimeout,
-      interface: resolvedInterface,
-      sourceIP: resolvedSourceIP
-    )
+    let answers = try await runDetachedBlockingIO {
+      try performDNSQueryInternal(
+        server: resolvedServer,
+        query: name,
+        queryType: type.rawValue,
+        timeout: resolvedTimeout,
+        interface: resolvedInterface,
+        sourceIP: resolvedSourceIP
+      )
+    }
 
     let rttMs = timer.elapsedMs()
 
@@ -577,8 +602,7 @@ public struct DNSQueries: Sendable {
         } else {
           data = .raw(answer.rdata)
         }
-      default:
-        // Unknown types return raw data
+      @unknown default:
         data = .raw(answer.rdata)
       }
 
@@ -704,6 +728,9 @@ public struct DNSProbeResult: Sendable, Codable {
 /// DNS probe - tests if DNS server responds
 /// Returns success if ANY response received (even NXDOMAIN or errors)
 /// Returns failure only on timeout
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func dnsProbe(
   server: String,
   query: String = "example.com",
@@ -713,6 +740,9 @@ public func dnsProbe(
   return try await dnsProbe(config: config)
 }
 
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult {
   let startTime = Date()
 
@@ -758,7 +788,9 @@ public struct ReverseDNSResult: Sendable, Codable {
   /// Timestamp
   public let timestamp: Date
 
-  public init(ip: String, server: String, hostname: String?, rtt: TimeInterval, timestamp: Date = Date()) {
+  public init(
+    ip: String, server: String, hostname: String?, rtt: TimeInterval, timestamp: Date = Date()
+  ) {
     self.ip = ip
     self.server = server
     self.hostname = hostname
@@ -784,7 +816,10 @@ public struct AAAAQueryResult: Sendable, Codable {
   /// Timestamp
   public let timestamp: Date
 
-  public init(hostname: String, server: String, addresses: [String], rtt: TimeInterval, timestamp: Date = Date()) {
+  public init(
+    hostname: String, server: String, addresses: [String], rtt: TimeInterval,
+    timestamp: Date = Date()
+  ) {
     self.hostname = hostname
     self.server = server
     self.addresses = addresses
@@ -810,7 +845,10 @@ public struct AQueryResult: Sendable, Codable {
   /// Timestamp
   public let timestamp: Date
 
-  public init(hostname: String, server: String, addresses: [String], rtt: TimeInterval, timestamp: Date = Date()) {
+  public init(
+    hostname: String, server: String, addresses: [String], rtt: TimeInterval,
+    timestamp: Date = Date()
+  ) {
     self.hostname = hostname
     self.server = server
     self.addresses = addresses
@@ -847,6 +885,9 @@ public struct AQueryResult: Sendable, Codable {
 ///   - sourceIP: Source IP address to bind to (optional)
 /// - Returns: ReverseDNSResult containing hostname (or nil) and timing information
 /// - Throws: DNSError on network failures or invalid input
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func reverseDNS(
   ip: String,
   server: String,
@@ -862,14 +903,16 @@ public func reverseDNS(
   }
 
   // Query PTR record
-  let answers = try await performDNSQueryInternal(
-    server: server,
-    query: reverseName,
-    queryType: 12,  // PTR
-    timeout: timeout,
-    interface: interface,
-    sourceIP: sourceIP
-  )
+  let answers = try await runDetachedBlockingIO {
+    try performDNSQueryInternal(
+      server: server,
+      query: reverseName,
+      queryType: 12,  // PTR
+      timeout: timeout,
+      interface: interface,
+      sourceIP: sourceIP
+    )
+  }
 
   let rtt = Date().timeIntervalSince(startTime)
 
@@ -923,6 +966,9 @@ public func reverseDNS(
 ///   - sourceIP: Source IP address to bind to (optional)
 /// - Returns: AAAAQueryResult containing IPv6 addresses and timing information
 /// - Throws: DNSError on network failures or invalid input
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func queryAAAA(
   hostname: String,
   server: String,
@@ -937,14 +983,16 @@ public func queryAAAA(
   }
 
   // Query AAAA record
-  let answers = try await performDNSQueryInternal(
-    server: server,
-    query: hostname,
-    queryType: 28,  // AAAA
-    timeout: timeout,
-    interface: interface,
-    sourceIP: sourceIP
-  )
+  let answers = try await runDetachedBlockingIO {
+    try performDNSQueryInternal(
+      server: server,
+      query: hostname,
+      queryType: 28,  // AAAA
+      timeout: timeout,
+      interface: interface,
+      sourceIP: sourceIP
+    )
+  }
 
   let rtt = Date().timeIntervalSince(startTime)
 
@@ -989,6 +1037,9 @@ public func queryAAAA(
 ///   - sourceIP: Source IP address to bind to (optional)
 /// - Returns: AQueryResult containing IPv4 addresses and timing information
 /// - Throws: DNSError on network failures or invalid input
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func queryA(
   hostname: String,
   server: String,
@@ -1003,14 +1054,16 @@ public func queryA(
   }
 
   // Query A record
-  let answers = try await performDNSQueryInternal(
-    server: server,
-    query: hostname,
-    queryType: 1,  // A
-    timeout: timeout,
-    interface: interface,
-    sourceIP: sourceIP
-  )
+  let answers = try await runDetachedBlockingIO {
+    try performDNSQueryInternal(
+      server: server,
+      query: hostname,
+      queryType: 1,  // A
+      timeout: timeout,
+      interface: interface,
+      sourceIP: sourceIP
+    )
+  }
 
   let rtt = Date().timeIntervalSince(startTime)
 
@@ -1056,7 +1109,7 @@ private func performDNSQueryInternal(
   timeout: TimeInterval,
   interface: String?,
   sourceIP: String?
-) async throws -> [DNSClient.Answer] {
+) throws -> [DNSClient.Answer] {
   let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
   guard fd >= 0 else {
     throw DNSError.socketCreationFailed
@@ -1212,14 +1265,16 @@ private func performDNSProbe(
 ) async -> DNSProbeResultInternal {
   do {
     // Try to perform query - success means RCODE=0
-    _ = try await performDNSQueryInternal(
-      server: server,
-      query: query,
-      queryType: queryType,
-      timeout: timeout,
-      interface: interface,
-      sourceIP: sourceIP
-    )
+    _ = try await runDetachedBlockingIO {
+      try performDNSQueryInternal(
+        server: server,
+        query: query,
+        queryType: queryType,
+        timeout: timeout,
+        interface: interface,
+        sourceIP: sourceIP
+      )
+    }
     return DNSProbeResultInternal(
       isReachable: true,
       responseCode: 0,
@@ -1749,12 +1804,12 @@ public struct __TXTAnswer: Sendable {
   public let rdata: Data
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsEncodeQName(_ name: String) -> [UInt8] { _encodeQName(name) }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseTXTAnswers(message: Data) -> [__TXTAnswer]? {
   // Minimal independent parser for TXT answers (sufficient for tests).
   // This mirrors parseAnswers enough for tests.
@@ -1815,20 +1870,20 @@ public func __dnsParseTXTAnswers(message: Data) -> [__TXTAnswer]? {
 
 // MARK: - 0.7.1 Test Wrappers
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseA(rdata: Data) -> String? {
   DNSClient.parseA(rdata: rdata)
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseAAAA(rdata: Data) -> String? {
   DNSClient.parseAAAA(rdata: rdata)
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParsePTR(
   rdata: Data,
   rdataOffsetInMessage: Int,
@@ -1841,20 +1896,20 @@ public func __dnsParsePTR(
   )
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsFormatReverseDNS(_ ipv4: String) -> String? {
   _formatReverseDNS(ipv4)
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseTXT(rdata: Data) -> [String]? {
   DNSClient.parseTXT(rdata: rdata)
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseMX(
   rdata: Data,
   rdataOffsetInMessage: Int,
@@ -1867,8 +1922,8 @@ public func __dnsParseMX(
   )
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseNS(
   rdata: Data,
   rdataOffsetInMessage: Int,
@@ -1881,8 +1936,8 @@ public func __dnsParseNS(
   )
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseCNAME(
   rdata: Data,
   rdataOffsetInMessage: Int,
@@ -1895,13 +1950,16 @@ public func __dnsParseCNAME(
   )
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseSOA(
   rdata: Data,
   rdataOffsetInMessage: Int,
   fullMessage: Data
-) -> (primaryNS: String, adminEmail: String, serial: UInt32, refresh: UInt32, retry: UInt32, expire: UInt32, minimumTTL: UInt32)? {
+) -> (
+  primaryNS: String, adminEmail: String, serial: UInt32, refresh: UInt32, retry: UInt32,
+  expire: UInt32, minimumTTL: UInt32
+)? {
   DNSClient.parseSOA(
     rdata: rdata,
     rdataOffsetInMessage: rdataOffsetInMessage,
@@ -1909,8 +1967,8 @@ public func __dnsParseSOA(
   )
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseSRV(
   rdata: Data,
   rdataOffsetInMessage: Int,
@@ -1923,14 +1981,14 @@ public func __dnsParseSRV(
   )
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseCAA(rdata: Data) -> (flags: UInt8, tag: String, value: String)? {
   DNSClient.parseCAA(rdata: rdata)
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __dnsParseHTTPS(
   rdata: Data,
   rdataOffsetInMessage: Int,

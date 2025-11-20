@@ -192,8 +192,8 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
 }
 
 // SPI: expose a tiny wrapper for fuzzing/external validation without making internals public.
-@_spi(Fuzz)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Fuzz)
 public func __fuzz_parseICMP(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr_storage)
   -> Bool
 {
@@ -212,8 +212,8 @@ public struct TestParsedICMP: Sendable {
   public let source: String
 }
 
-@_spi(Test)
 // swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
 public func __parseICMPMessage(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr_storage)
   -> TestParsedICMP?
 {

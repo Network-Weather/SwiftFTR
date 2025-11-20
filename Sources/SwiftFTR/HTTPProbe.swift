@@ -75,6 +75,9 @@ public struct HTTPProbeResult: Sendable, Codable {
 /// HTTP/HTTPS probe - tests if web server responds
 /// Returns success if ANY HTTP response received (even 4xx/5xx)
 /// Returns failure only on timeout or connection error
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func httpProbe(
   url: String,
   timeout: TimeInterval = 2.0
@@ -83,6 +86,9 @@ public func httpProbe(
   return try await httpProbe(config: config)
 }
 
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func httpProbe(config: HTTPProbeConfig) async throws -> HTTPProbeResult {
   let startTime = Date()
 
@@ -236,41 +242,44 @@ private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterv
     tcpHandshakeRTT = connectEnd.timeIntervalSince(connectStart)
   }
 
-  // Log detailed timing breakdown for debugging
-  if let domainLookupStart = transaction.domainLookupStartDate,
-    let domainLookupEnd = transaction.domainLookupEndDate,
-    let connectStart = transaction.connectStartDate,
-    let connectEnd = transaction.connectEndDate,
-    let requestStart = transaction.requestStartDate,
-    let requestEnd = transaction.requestEndDate,
-    let responseStart = transaction.responseStartDate,
-    let responseEnd = transaction.responseEndDate
-  {
-
-    let dnsTime = domainLookupEnd.timeIntervalSince(domainLookupStart) * 1000
-    let tcpTime = connectEnd.timeIntervalSince(connectStart) * 1000
-    let requestTime = requestEnd.timeIntervalSince(requestStart) * 1000
-    let networkRTTTime = responseStart.timeIntervalSince(requestEnd) * 1000
-    let responseTime = responseEnd.timeIntervalSince(responseStart) * 1000
-
-    print("📊 HTTP Timing Breakdown:")
-    print("  DNS:             \(String(format: "%6.1fms", dnsTime))")
-    print("  TCP handshake:   \(String(format: "%6.1fms", tcpTime)) ← PURE network RTT!")
-
-    // TLS timing (if HTTPS)
-    if let secureConnectionStart = transaction.secureConnectionStartDate,
-      let secureConnectionEnd = transaction.secureConnectionEndDate
+  #if DEBUG
+    if ProcessInfo.processInfo.environment["SWIFTFTR_VERBOSE_HTTP_TIMING"] == "1",
+      let domainLookupStart = transaction.domainLookupStartDate,
+      let domainLookupEnd = transaction.domainLookupEndDate,
+      let connectStart = transaction.connectStartDate,
+      let connectEnd = transaction.connectEndDate,
+      let requestStart = transaction.requestStartDate,
+      let requestEnd = transaction.requestEndDate,
+      let responseStart = transaction.responseStartDate,
+      let responseEnd = transaction.responseEndDate
     {
-      let tlsTime = secureConnectionEnd.timeIntervalSince(secureConnectionStart) * 1000
-      print("  TLS handshake:   \(String(format: "%6.1fms", tlsTime))")
-    }
 
-    print("  Request:         \(String(format: "%6.1fms", requestTime))")
-    print(
-      "  NetworkRTT:      \(String(format: "%6.1fms", networkRTTTime)) (req→resp, includes server processing)"
-    )
-    print("  Response:        \(String(format: "%6.1fms", responseTime))")
-  }
+      let dnsTime = domainLookupEnd.timeIntervalSince(domainLookupStart) * 1000
+      let tcpTime = connectEnd.timeIntervalSince(connectStart) * 1000
+      let requestTime = requestEnd.timeIntervalSince(requestStart) * 1000
+      let networkRTTTime = responseStart.timeIntervalSince(requestEnd) * 1000
+      let responseTime = responseEnd.timeIntervalSince(responseStart) * 1000
+      let tlsTime: Double? =
+        if let secureConnectionStart = transaction.secureConnectionStartDate,
+          let secureConnectionEnd = transaction.secureConnectionEndDate
+        {
+          secureConnectionEnd.timeIntervalSince(secureConnectionStart) * 1000
+        } else {
+          nil
+        }
+
+      let summary = [
+        "dns=\(String(format: "%.1f", dnsTime))ms",
+        "tcp=\(String(format: "%.1f", tcpTime))ms",
+        tlsTime.map { "tls=\(String(format: "%.1f", $0))ms" },
+        "req=\(String(format: "%.1f", requestTime))ms",
+        "networkRTT=\(String(format: "%.1f", networkRTTTime))ms",
+        "resp=\(String(format: "%.1f", responseTime))ms",
+      ].compactMap { $0 }.joined(separator: " ")
+
+      print("📊 HTTP timing \(summary)")
+    }
+  #endif
 
   // Calculate network RTT: responseStartDate - requestEndDate
   // This includes network latency + server processing time

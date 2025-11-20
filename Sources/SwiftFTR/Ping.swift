@@ -19,41 +19,9 @@ public struct PingConfig: Sendable {
   public let payloadSize: Int
 
   /// Network interface to bind to for this operation.
-  ///
-  /// When specified, this ping operation uses only this interface, overriding any global
-  /// ``SwiftFTRConfig/interface`` setting. If `nil`, falls back to global interface, then system routing.
-  ///
-  /// **Resolution Order**: Operation → Global → System Default
-  ///
-  /// Example:
-  /// ```swift
-  /// // Override global WiFi binding to use Ethernet for this ping
-  /// let result = try await ftr.ping(
-  ///   to: "1.1.1.1",
-  ///   config: PingConfig(interface: "en14")
-  /// )
-  /// ```
   public let interface: String?
 
   /// Source IP address to bind to for this operation.
-  ///
-  /// When specified, outgoing packets use this IP as the source address. The IP must be
-  /// assigned to the selected interface. If `nil`, falls back to global sourceIP, then system default.
-  ///
-  /// **Resolution Order**: Operation → Global → System Default
-  ///
-  /// **Note**: Most users only need to set ``interface``. Use this for multi-IP interfaces.
-  ///
-  /// Example:
-  /// ```swift
-  /// let result = try await ftr.ping(
-  ///   to: "1.1.1.1",
-  ///   config: PingConfig(
-  ///     interface: "en0",
-  ///     sourceIP: "192.168.1.100"
-  ///   )
-  /// )
-  /// ```
   public let sourceIP: String?
 
   public init(
@@ -75,16 +43,9 @@ public struct PingConfig: Sendable {
 
 /// Result from a ping operation
 public struct PingResult: Sendable, Codable {
-  /// Target hostname or IP
   public let target: String
-
-  /// Resolved IP address
   public let resolvedIP: String
-
-  /// Individual ping responses (ordered by sequence)
   public let responses: [PingResponse]
-
-  /// Computed statistics
   public let statistics: PingStatistics
 
   public init(
@@ -102,19 +63,11 @@ public struct PingResult: Sendable, Codable {
 
 /// Individual ping response
 public struct PingResponse: Sendable, Codable {
-  /// Sequence number (1-indexed)
   public let sequence: Int
-
-  /// Round-trip time in seconds (nil if timeout)
   public let rtt: TimeInterval?
-
-  /// TTL from response packet (nil if timeout)
   public let ttl: Int?
-
-  /// Timestamp when ping was sent
   public let timestamp: Date
 
-  /// Whether this ping timed out
   public var didTimeout: Bool { rtt == nil }
 
   public init(sequence: Int, rtt: TimeInterval?, ttl: Int?, timestamp: Date) {
@@ -127,25 +80,12 @@ public struct PingResponse: Sendable, Codable {
 
 /// Computed ping statistics
 public struct PingStatistics: Sendable, Codable {
-  /// Total packets sent
   public let sent: Int
-
-  /// Total packets received
   public let received: Int
-
-  /// Packet loss ratio (0.0 - 1.0)
   public let packetLoss: Double
-
-  /// Minimum RTT in seconds (nil if no responses)
   public let minRTT: TimeInterval?
-
-  /// Average RTT in seconds (nil if no responses)
   public let avgRTT: TimeInterval?
-
-  /// Maximum RTT in seconds (nil if no responses)
   public let maxRTT: TimeInterval?
-
-  /// Standard deviation of RTT (jitter), nil if <2 responses
   public let jitter: TimeInterval?
 
   public init(
@@ -167,13 +107,14 @@ public struct PingStatistics: Sendable, Codable {
   }
 }
 
-/// Parsed Echo Reply from ICMP response
-struct ParsedEchoReply {
-  let sequence: UInt16
-  let ttl: Int?
+/// Parsed ICMP message relevant to a ping operation
+enum ParsedPingMessage {
+  case echoReply(sequence: UInt16, ttl: Int?)
+  case timeExceeded(originalSequence: UInt16, ttl: Int?, code: UInt8)
+  case destinationUnreachable(originalSequence: UInt16, ttl: Int?, code: UInt8)
 }
 
-/// Thread-safe collector for send/receive times (lock-based for true parallelism)
+/// Thread-safe collector (Kept for tests compatibility, though mostly superseded by PingOperation logic)
 final class ResponseCollector: @unchecked Sendable {
   private var sentTimes: [Int: TimeInterval] = [:]
   private var receiveTimes: [Int: TimeInterval] = [:]
@@ -209,13 +150,16 @@ final class ResponseCollector: @unchecked Sendable {
 }
 
 /// Internal ping implementation
-struct PingExecutor {
+struct PingExecutor: Sendable {
   private let swiftFTRConfig: SwiftFTRConfig
 
   init(config: SwiftFTRConfig) {
     self.swiftFTRConfig = config
   }
 
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   /// Perform ping operation
   func ping(to target: String, config: PingConfig) async throws -> PingResult {
     // 1. Resolve target to IPv4
@@ -223,7 +167,6 @@ struct PingExecutor {
 
     // 2. Create ICMP datagram socket
     let sockfd = try createICMPSocket()
-    defer { close(sockfd) }
 
     // 3. Apply interface/sourceIP bindings (operation config overrides global)
     try applyBindings(sockfd: sockfd, pingConfig: config)
@@ -231,147 +174,30 @@ struct PingExecutor {
     // 4. Set non-blocking mode
     try setNonBlocking(sockfd: sockfd)
 
-    // 4b. Increase receive buffer to handle concurrent ping bursts
-    var recvBufSize: Int32 = 256 * 1024  // 256KB
-    let setBufResult = setsockopt(
-      sockfd, SOL_SOCKET, SO_RCVBUF,
-      &recvBufSize, socklen_t(MemoryLayout<Int32>.size))
-    if setBufResult < 0 {
-      // Non-fatal - continue with default buffer size
-      // (some systems may reject large buffer sizes)
-    }
+    // 4b. Increase receive buffer
+    var recvBufSize: Int32 = 256 * 1024
+    _ = setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &recvBufSize, socklen_t(MemoryLayout<Int32>.size))
 
-    // 5. Generate stable identifier for this ping session
+    // 4c. Unique identifier per ping session to avoid cross-socket collisions.
     let identifier = generateIdentifier()
 
-    // 6. Use structured concurrency: receiver task runs continuously while sender sends on schedule
-    let actor = ResponseCollector()
-
-    let receiverTask = Task {
-      var recvBuffer = [UInt8](repeating: 0, count: 1500)
-      let startTime = monotonicTime()
-      let deadline = startTime + Double(config.count) * config.interval + config.timeout
-
-      while monotonicTime() < deadline {
-        guard !Task.isCancelled else { break }
-
-        let timeLeft = deadline - monotonicTime()
-        if timeLeft <= 0 { break }
-
-        if let parsed = try? pollAndReceive(
-          sockfd: sockfd,
-          buffer: &recvBuffer,
-          timeout: min(0.1, timeLeft),  // Short poll for responsiveness
-          identifier: identifier
-        ) {
-          let receiveTime = monotonicTime()
-          actor.recordResponse(
-            seq: Int(parsed.sequence), receiveTime: receiveTime, ttl: parsed.ttl)
-        }
-
-        // Check if we've received all responses
-        let count = actor.getResponseCount()
-        if count >= config.count {
-          break
-        }
-      }
-    }
-
-    // Send pings on schedule
-    for seq in 1...config.count {
-      let sendTime = monotonicTime()
-      let packet = makeICMPEchoRequest(
-        identifier: identifier,
-        sequence: UInt16(seq),
-        payloadSize: config.payloadSize
-      )
-      try sendPacket(sockfd: sockfd, packet: packet, to: resolved)
-      actor.recordSend(seq: seq, sendTime: sendTime)
-
-      // Wait interval before next (except last)
-      if seq < config.count {
-        try await Task.sleep(nanoseconds: UInt64(config.interval * 1_000_000_000))
-      }
-    }
-
-    // Wait for receiver to complete OR timeout (receiver handles both)
-    // Receiver will exit early if all responses received
-    _ = await receiverTask.value
-
-    let (sentTimes, receiveTimes, ttls) = actor.getResults()
-
-    // 7. Build response list
-    var responses: [PingResponse] = []
-    for seq in 1...config.count {
-      if let receiveTime = receiveTimes[seq], let sendTime = sentTimes[seq] {
-        let rtt = receiveTime - sendTime
-        responses.append(
-          PingResponse(
-            sequence: seq,
-            rtt: rtt,
-            ttl: ttls[seq],
-            timestamp: Date(timeIntervalSinceNow: -rtt)
-          ))
-      } else {
-        responses.append(
-          PingResponse(
-            sequence: seq,
-            rtt: nil,
-            ttl: nil,
-            timestamp: Date()
-          ))
-      }
-    }
-
-    // 8. Sort by sequence and compute statistics
-    responses.sort { $0.sequence < $1.sequence }
-    let stats = computeStatistics(responses: responses, sent: config.count)
-
-    return PingResult(
+    // 5. Delegate to PingOperation
+    let operation = PingOperation(
+      sockfd: sockfd,
       target: target,
-      resolvedIP: resolved,
-      responses: responses,
-      statistics: stats
+      resolved: resolved,
+      config: config,
+      identifier: identifier,
+      executor: self
     )
-  }
 
-  /// Compute statistics from ping responses
-  private func computeStatistics(responses: [PingResponse], sent: Int) -> PingStatistics {
-    let rtts = responses.compactMap { $0.rtt }
-    let received = rtts.count
-    let packetLoss = 1.0 - (Double(received) / Double(sent))
-
-    guard !rtts.isEmpty else {
-      return PingStatistics(
-        sent: sent,
-        received: 0,
-        packetLoss: 1.0,
-        minRTT: nil,
-        avgRTT: nil,
-        maxRTT: nil,
-        jitter: nil
-      )
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        operation.start(continuation: continuation)
+      }
+    } onCancel: {
+      operation.cancel()
     }
-
-    let minRTT = rtts.min()!
-    let maxRTT = rtts.max()!
-    let avgRTT = rtts.reduce(0, +) / Double(rtts.count)
-
-    let jitter: TimeInterval? = {
-      guard rtts.count >= 2 else { return nil }
-      let variance = rtts.map { pow($0 - avgRTT, 2) }.reduce(0, +) / Double(rtts.count)
-      return sqrt(variance)
-    }()
-
-    return PingStatistics(
-      sent: sent,
-      received: received,
-      packetLoss: packetLoss,
-      minRTT: minRTT,
-      avgRTT: avgRTT,
-      maxRTT: maxRTT,
-      jitter: jitter
-    )
   }
 
   // MARK: - Socket Operations
@@ -380,187 +206,420 @@ struct PingExecutor {
     #if canImport(Darwin)
       let sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
       guard sockfd >= 0 else {
-        let err = errno
         throw TracerouteError.socketCreateFailed(
-          errno: err,
-          details: "Failed to create ICMP datagram socket. Ensure macOS 13+ and proper permissions."
-        )
+          errno: errno, details: "Failed to create ICMP socket")
+      }
+
+      // Set TTL to a reasonable value (e.g., 64) to ensure packets reach destination
+      var ttl: CInt = 64
+      if setsockopt(sockfd, IPPROTO_IP, IP_TTL, &ttl, socklen_t(MemoryLayout<CInt>.size)) < 0 {
+        // Log or handle error, but don't fail, as default TTL might still work
+        print("[" + String(sockfd) + "] Warning: Failed to set IP_TTL on socket: " + String(errno))
       }
       return sockfd
     #else
-      throw TracerouteError.platformNotSupported(
-        details: "Ping requires ICMP datagram sockets (macOS 13+)")
+      throw TracerouteError.platformNotSupported(details: "Ping requires ICMP datagram sockets")
     #endif
   }
 
   private func setNonBlocking(sockfd: Int32) throws {
     let flags = fcntl(sockfd, F_GETFL, 0)
     guard flags >= 0 else {
-      throw TracerouteError.socketCreateFailed(
-        errno: errno, details: "fcntl F_GETFL failed")
+      throw TracerouteError.socketCreateFailed(errno: errno, details: "fcntl F_GETFL failed")
     }
     guard fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
-      throw TracerouteError.socketCreateFailed(
-        errno: errno, details: "fcntl F_SETFL O_NONBLOCK failed")
+      throw TracerouteError.socketCreateFailed(errno: errno, details: "fcntl F_SETFL failed")
     }
   }
 
   private func applyBindings(sockfd: Int32, pingConfig: PingConfig) throws {
-    // Resolve effective interface: operation config overrides global config
     let effectiveInterface = pingConfig.interface ?? swiftFTRConfig.interface
     let effectiveSourceIP = pingConfig.sourceIP ?? swiftFTRConfig.sourceIP
 
-    // Apply interface binding if specified
     if let iface = effectiveInterface {
       #if canImport(Darwin)
         let ifaceIndex = if_nametoindex(iface)
         guard ifaceIndex != 0 else {
           throw TracerouteError.interfaceBindFailed(
-            interface: iface,
-            errno: errno,
-            details: "Interface '\(iface)' not found. Use 'ifconfig' to list available interfaces."
-          )
+            interface: iface, errno: errno, details: "Interface not found")
         }
-
         var index = ifaceIndex
-        let result = setsockopt(
-          sockfd, IPPROTO_IP, IP_BOUND_IF,
-          &index, socklen_t(MemoryLayout<UInt32>.size))
-
-        guard result >= 0 else {
-          throw TracerouteError.interfaceBindFailed(
-            interface: iface,
-            errno: errno,
-            details: nil
-          )
+        if setsockopt(sockfd, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout<UInt32>.size))
+          < 0
+        {
+          throw TracerouteError.interfaceBindFailed(interface: iface, errno: errno, details: nil)
         }
       #endif
     }
 
-    // Apply source IP binding if specified
     if let sourceIPStr = effectiveSourceIP {
       var addr = sockaddr_in()
       addr.sin_family = sa_family_t(AF_INET)
-      addr.sin_port = 0
-
-      guard inet_pton(AF_INET, sourceIPStr, &addr.sin_addr) == 1 else {
+      if inet_pton(AF_INET, sourceIPStr, &addr.sin_addr) != 1 {
         throw TracerouteError.sourceIPBindFailed(
-          sourceIP: sourceIPStr,
-          errno: errno,
-          details: "Invalid IPv4 address format"
-        )
+          sourceIP: sourceIPStr, errno: errno, details: "Invalid IPv4")
       }
-
       let bindResult = withUnsafePointer(to: &addr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-          Darwin.bind(sockfd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          Darwin.bind(sockfd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
       }
-
-      guard bindResult >= 0 else {
+      if bindResult < 0 {
         throw TracerouteError.sourceIPBindFailed(
-          sourceIP: sourceIPStr,
-          errno: errno,
-          details:
-            "Ensure the IP is assigned to the interface and not already in use"
-        )
+          sourceIP: sourceIPStr, errno: errno, details: "bind() failed")
       }
     }
   }
 
-  private func sendPacket(sockfd: Int32, packet: [UInt8], to ipAddr: String) throws {
+  // Fileprivate to allow access from PingOperation
+  fileprivate func sendPacket(sockfd: Int32, packet: [UInt8], to ipAddr: String) throws {
     var destAddr = sockaddr_in()
     destAddr.sin_family = sa_family_t(AF_INET)
-    destAddr.sin_port = 0
-
-    guard inet_pton(AF_INET, ipAddr, &destAddr.sin_addr) == 1 else {
-      throw TracerouteError.resolutionFailed(host: ipAddr, details: "Invalid IP address")
+    if inet_pton(AF_INET, ipAddr, &destAddr.sin_addr) != 1 {
+      throw TracerouteError.resolutionFailed(host: ipAddr, details: "Invalid IP")
     }
 
     let sent = withUnsafePointer(to: &destAddr) { destPtr in
       destPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
         packet.withUnsafeBytes { bufPtr in
           sendto(
-            sockfd,
-            bufPtr.baseAddress,
-            packet.count,
-            0,
-            sa,
-            socklen_t(MemoryLayout<sockaddr_in>.size)
-          )
+            sockfd, bufPtr.baseAddress, packet.count, 0, sa,
+            socklen_t(MemoryLayout<sockaddr_in>.size))
         }
       }
     }
-
-    guard sent == packet.count else {
-      throw TracerouteError.sendFailed(errno: errno)
-    }
+    if sent != packet.count { throw TracerouteError.sendFailed(errno: errno) }
   }
 
-  private func pollAndReceive(
+  fileprivate func monotonicTime() -> TimeInterval {
+    var info = mach_timebase_info_data_t()
+    mach_timebase_info(&info)
+    let rawTime = TimeInterval(mach_absolute_time())
+    return (rawTime * TimeInterval(info.numer) / TimeInterval(info.denom)) / 1_000_000_000.0
+  }
+
+  // MARK: - Identifier generation
+
+  private func generateIdentifier() -> UInt16 {
+    final class IdentifierState: @unchecked Sendable {
+      private var counter: UInt16 = 0
+      private let lock = NSLock()
+      static let shared = IdentifierState()
+
+      func next() -> UInt16 {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = counter
+        counter = counter &+ 1  // wrapping increment
+        return value
+      }
+    }
+
+    let value = IdentifierState.shared.next()
+    let pid = UInt16(truncatingIfNeeded: getpid())
+    return value ^ pid
+  }
+
+  // MARK: - Utilities
+
+  private func resolveIPv4(host: String) throws -> String {
+    var testAddr = in_addr()
+    if inet_pton(AF_INET, host, &testAddr) == 1 { return host }
+
+    var hints = addrinfo()
+    hints.ai_family = AF_INET
+    hints.ai_socktype = SOCK_DGRAM
+    var result: UnsafeMutablePointer<addrinfo>?
+    if getaddrinfo(host, nil, &hints, &result) == 0, let res = result {
+      defer { freeaddrinfo(result) }
+      if let addr = res.pointee.ai_addr {
+        var sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        if inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil {
+          // Convert C string to Swift String safely
+          return buf.withUnsafeBufferPointer { ptr in
+            String(cString: ptr.baseAddress!)
+          }
+        }
+      }
+    }
+    throw TracerouteError.resolutionFailed(host: host, details: "Resolution failed")
+  }
+}
+
+/// Manages a single ping operation using DispatchSource for efficient I/O
+private final class PingOperation: @unchecked Sendable {
+  let sockfd: Int32
+  let target: String
+  let resolved: String
+  let config: PingConfig
+  let executor: PingExecutor
+  let identifier: UInt16
+
+  private var continuation: CheckedContinuation<PingResult, Error>?
+  private var readSource: DispatchSourceRead?
+  private var timerSource: DispatchSourceTimer?
+
+  // Guarded by lock
+  private var sentTimes: [Int: TimeInterval] = [:]
+  private var receiveTimes: [Int: TimeInterval] = [:]
+  private var ttls: [Int: Int] = [:]
+
+  // Thread-local or protected by serial execution guarantees?
+  // recvBuffer is only used in handleRead. handleRead is serial with respect to itself.
+  // BUT we are on a concurrent queue now.
+  // DispatchSource guarantees that the event handler is not re-entered concurrently.
+  // So recvBuffer is safe.
+  private var recvBuffer = [UInt8](repeating: 0, count: 1500)
+
+  // Private serial queue for this operation to ensure race-free execution and reliable event delivery
+  private let queue: DispatchQueue
+  private let lock = NSLock()
+  private var isFinished = false
+  private var isStarted = false
+
+  init(
     sockfd: Int32,
-    buffer: inout [UInt8],
-    timeout: TimeInterval,
-    identifier: UInt16
-  ) throws -> ParsedEchoReply? {
-    var pollfd = pollfd()
-    pollfd.fd = sockfd
-    pollfd.events = Int16(POLLIN)
+    target: String,
+    resolved: String,
+    config: PingConfig,
+    identifier: UInt16,
+    executor: PingExecutor
+  ) {
+    self.sockfd = sockfd
+    self.target = target
+    self.resolved = resolved
+    self.config = config
+    self.identifier = identifier
+    self.executor = executor
+    // Use a serial queue for safety and reliability
+    // Use a random label since we don't have identifier anymore
+    self.queue = DispatchQueue(
+      label: "com.swiftftr.ping.\(UInt64.random(in: 0...UInt64.max))", qos: .userInitiated)
+  }
 
-    let timeoutMs = Int32(max(0, timeout * 1000))
-    let pollResult = poll(&pollfd, 1, timeoutMs)
-
-    guard pollResult > 0 else {
-      return nil  // Timeout or error
+  func start(continuation: CheckedContinuation<PingResult, Error>) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      continuation.resume(throwing: TracerouteError.cancelled)
+      return
     }
+    self.continuation = continuation
+    self.isStarted = true
+    lock.unlock()
 
-    var fromAddr = sockaddr_storage()
-    var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    queue.async {
+      self.setupSources()
+      self.startSending()
+    }
+  }
 
-    let bufferSize = buffer.count
-    let received = buffer.withUnsafeMutableBytes { bufPtr in
-      withUnsafeMutablePointer(to: &fromAddr) { addrPtr in
-        addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-          recvfrom(sockfd, bufPtr.baseAddress, bufferSize, 0, sa, &fromLen)
+  func cancel() {
+    finish()
+  }
+
+  private func setupSources() {
+    let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
+    // Strong self capture to keep operation alive until finish()
+    source.setEventHandler { self.handleRead() }
+    // Socket closure handled in finish()
+    source.setCancelHandler {}
+    source.activate()
+    self.readSource = source
+
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    let totalTimeout = (Double(max(config.count - 1, 0)) * max(config.interval, 0)) + config.timeout
+    timer.schedule(deadline: .now() + totalTimeout)
+    // Strong self capture
+    timer.setEventHandler { self.finish() }
+    timer.activate()
+    self.timerSource = timer
+  }
+
+  private func startSending() {
+    Task.detached {
+      for seq in 1...self.config.count {
+        if await self.checkFinished() { break }
+
+        let sendTime = self.executor.monotonicTime()
+        let packet = makeICMPEchoRequest(
+          identifier: self.identifier,
+          sequence: UInt16(seq),
+          payloadSize: self.config.payloadSize
+        )
+
+        // Dispatch send to serial queue
+        self.queue.async {
+          if self.checkFinishedSync() { return }
+          do {
+            try self.executor.sendPacket(
+              sockfd: self.sockfd, packet: packet, to: self.resolved)
+
+            self.lock.lock()
+            self.sentTimes[seq] = sendTime
+            self.lock.unlock()
+          } catch {
+            // Ignore send errors
+          }
+        }
+
+        if seq < self.config.count && self.config.interval > 0 {
+          try? await Task.sleep(nanoseconds: UInt64(self.config.interval * 1_000_000_000))
         }
       }
     }
-
-    guard received > 0 else {
-      return nil
-    }
-
-    // Parse Echo Reply
-    return parseEchoReply(
-      buffer: UnsafeRawBufferPointer(
-        start: buffer.withUnsafeBytes { $0.baseAddress },
-        count: Int(received)
-      ),
-      expectedIdentifier: identifier
-    )
   }
 
-  private func parseEchoReply(buffer: UnsafeRawBufferPointer, expectedIdentifier: UInt16)
-    -> ParsedEchoReply?
+  private func handleRead() {
+    if checkFinishedSync() { return }
+
+    while true {
+      var fromAddr = sockaddr_storage()
+      var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      let received = recvBuffer.withUnsafeMutableBytes { bufPtr in
+        withUnsafeMutablePointer(to: &fromAddr) { addrPtr in
+          addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            recvfrom(sockfd, bufPtr.baseAddress, 1500, 0, $0, &fromLen)
+          }
+        }
+      }
+
+      if received < 0 { break }  // EAGAIN
+
+      // Extra defensive check for negative count to prevent crash
+      guard received >= 0 else { break }
+
+      let parsedMessage = recvBuffer.withUnsafeBytes { bufPtr in
+        self.parsePingMessage(
+          buffer: UnsafeRawBufferPointer(start: bufPtr.baseAddress, count: Int(received)),
+          expectedIdentifier: self.identifier
+        )
+      }
+
+      if let parsed = parsedMessage {
+        let receiveTime = executor.monotonicTime()
+
+        lock.lock()
+        switch parsed {
+        case .echoReply(let sequence, let ttl):
+          receiveTimes[Int(sequence)] = receiveTime
+          if let ttl = ttl { ttls[Int(sequence)] = ttl }
+        case .timeExceeded(let originalSequence, let ttl, _):
+          // A Time Exceeded message implies the packet was lost at an intermediate hop.
+          // We record a timeout for the original sequence for statistical purposes,
+          // but we don't count it as a successful 'receive'.
+          // The actual timeout will be handled by the overall operation timer.
+          // Still, record the TTL if available for diagnostic purposes.
+          // Only set if not already set by a prior Time Exceeded.
+          if ttls[Int(originalSequence)] == nil {
+            if let ttl = ttl { ttls[Int(originalSequence)] = ttl }
+          }
+        // Do not record a receive time for Time Exceeded, as it's not a successful reply.
+
+        case .destinationUnreachable(let originalSequence, let ttl, _):
+          // Similar to Time Exceeded, record TTL for diagnostic purposes.
+          // Only set if not already set by a prior destination unreachable.
+          if ttls[Int(originalSequence)] == nil {
+            if let ttl = ttl { ttls[Int(originalSequence)] = ttl }
+          }
+        // Do not record a receive time for Destination Unreachable.
+        }
+        let count = receiveTimes.count
+        lock.unlock()
+
+        if count >= config.count {
+          finish()
+          return
+        }
+      }
+    }
+  }
+
+  private func finish() {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
+    }
+    isFinished = true
+    let currentContinuation = self.continuation
+    self.continuation = nil
+
+    // Capture data under lock for result building
+    let finalSentTimes = self.sentTimes
+    let finalReceiveTimes = self.receiveTimes
+    let finalTtls = self.ttls
+
+    lock.unlock()
+
+    timerSource?.cancel()
+    readSource?.cancel()
+    timerSource = nil
+    readSource = nil
+
+    // Close socket AFTER sources are cancelled and we're done with them.
+    close(self.sockfd)
+
+    guard let continuation = currentContinuation else { return }
+
+    // Build result without lock (we have copies) on private serial queue
+    queue.async {
+      self.buildAndResume(
+        continuation: continuation,
+        sentTimes: finalSentTimes,
+        receiveTimes: finalReceiveTimes,
+        ttls: finalTtls
+      )
+    }
+  }
+
+  private func buildAndResume(
+    continuation: CheckedContinuation<PingResult, Error>,
+    sentTimes: [Int: TimeInterval],
+    receiveTimes: [Int: TimeInterval],
+    ttls: [Int: Int]
+  ) {
+    var responses: [PingResponse] = []
+    for seq in 1...config.count {
+      if let receiveTime = receiveTimes[seq], let sendTime = sentTimes[seq] {
+        let rtt = receiveTime - sendTime
+        responses.append(
+          PingResponse(
+            sequence: seq, rtt: rtt, ttl: ttls[seq], timestamp: Date(timeIntervalSinceNow: -rtt)))
+      } else {
+        responses.append(PingResponse(sequence: seq, rtt: nil, ttl: nil, timestamp: Date()))
+      }
+    }
+    responses.sort { $0.sequence < $1.sequence }
+    let stats = PingStatistics.compute(responses: responses, sent: config.count)
+    let result = PingResult(
+      target: target, resolvedIP: resolved, responses: responses, statistics: stats)
+    continuation.resume(returning: result)
+  }
+
+  private func checkFinished() async -> Bool { checkFinishedSync() }
+  private func checkFinishedSync() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return isFinished
+  }
+
+  private func parsePingMessage(buffer: UnsafeRawBufferPointer, expectedIdentifier: UInt16)
+    -> ParsedPingMessage?
   {
     guard buffer.count >= 8 else { return nil }
-
     let bytes = buffer.bindMemory(to: UInt8.self)
     var icmpOffset = 0
-
-    // Detect and skip IPv4 header if present
     let first = bytes[0]
     if (first >> 4) == 4 {
       let ihl = Int(first & 0x0F) * 4
-      if ihl >= 20 && ihl < buffer.count {
-        icmpOffset = ihl
-      }
+      if ihl >= 20 && ihl < buffer.count { icmpOffset = ihl }
     }
 
     guard buffer.count - icmpOffset >= 8 else { return nil }
-
     let type = bytes[icmpOffset]
-    guard type == ICMPv4Type.echoReply.rawValue else { return nil }
+    let code = bytes[icmpOffset + 1]
 
     func read16(_ off: Int) -> UInt16 {
       let hi = UInt16(bytes[off])
@@ -568,97 +627,67 @@ struct PingExecutor {
       return (hi << 8) | lo
     }
 
-    let id = read16(icmpOffset + 4)
-    guard id == expectedIdentifier else { return nil }
+    let ttl: Int? =
+      (icmpOffset > 0 && icmpOffset + 9 < buffer.count) ? Int(bytes[icmpOffset + 8]) : nil
 
-    let seq = read16(icmpOffset + 6)
+    switch type {
+    case ICMPv4Type.echoReply.rawValue:
+      // Validate identifier to ensure the reply belongs to this socket.
+      let id = read16(icmpOffset + 4)
+      guard id == expectedIdentifier else { return nil }
+      let seq = read16(icmpOffset + 6)
+      return .echoReply(sequence: seq, ttl: ttl)
 
-    // Extract TTL from IP header if present
-    let ttl: Int? = {
-      if icmpOffset > 0 && icmpOffset >= 9 {
-        return Int(bytes[8])  // TTL is at byte 8 in IPv4 header
+    case ICMPv4Type.timeExceeded.rawValue, ICMPv4Type.destinationUnreachable.rawValue:
+      // For Time Exceeded and Dest Unreachable, the original IP header + ICMP header
+      // of the packet that caused the error is embedded. We need to parse that.
+      let embedStart = icmpOffset + 8  // After the ICMP error header
+      guard buffer.count - embedStart >= 28 else { return nil }  // 20 (IP) + 8 (ICMP)
+
+      let embeddedIPHeaderStart = embedStart
+      let embeddedFirstByte = bytes[embeddedIPHeaderStart]
+      guard (embeddedFirstByte >> 4) == 4 else { return nil }  // Must be IPv4
+      let embeddedIHL = Int(embeddedFirstByte & 0x0F) * 4
+
+      let embeddedICMPHeaderStart = embeddedIPHeaderStart + embeddedIHL
+      guard buffer.count - embeddedICMPHeaderStart >= 8 else { return nil }
+
+      let embeddedID = read16(embeddedICMPHeaderStart + 4)
+      guard embeddedID == expectedIdentifier else { return nil }
+      let originalSeq = read16(embeddedICMPHeaderStart + 6)
+
+      if type == ICMPv4Type.timeExceeded.rawValue {
+        return .timeExceeded(originalSequence: originalSeq, ttl: ttl, code: code)
+      } else {
+        return .destinationUnreachable(originalSequence: originalSeq, ttl: ttl, code: code)
       }
+
+    default:
       return nil
-    }()
-
-    return ParsedEchoReply(sequence: seq, ttl: ttl)
-  }
-
-  // MARK: - Utilities
-
-  private nonisolated func generateIdentifier() -> UInt16 {
-    // Generate unique identifier using process ID + atomic counter
-    // This ensures no collisions even with many concurrent ping sessions
-    final class IdentifierState: @unchecked Sendable {
-      private var counter: UInt16 = 0
-      private let lock = NSLock()
-
-      static let shared = IdentifierState()
-
-      func next() -> UInt16 {
-        lock.lock()
-        defer { lock.unlock() }
-        let value = counter
-        counter = counter &+ 1  // Wrapping increment
-        return value
-      }
     }
-
-    let value = IdentifierState.shared.next()
-
-    // Mix in process ID to avoid collisions across process restarts
-    let pid = UInt16(truncatingIfNeeded: getpid())
-    return value ^ pid
   }
+}
 
-  private func resolveIPv4(host: String) throws -> String {
-    // Check if already an IP address
-    var testAddr = in_addr()
-    if inet_pton(AF_INET, host, &testAddr) == 1 {
-      return host
-    }
-
-    // Perform DNS resolution
-    var hints = addrinfo()
-    hints.ai_family = AF_INET
-    hints.ai_socktype = SOCK_DGRAM
-
-    var result: UnsafeMutablePointer<addrinfo>?
-    let status = getaddrinfo(host, nil, &hints, &result)
-
-    guard status == 0, let addrInfo = result else {
-      throw TracerouteError.resolutionFailed(
-        host: host,
-        details: String(cString: gai_strerror(status))
+extension PingStatistics {
+  static func compute(responses: [PingResponse], sent: Int) -> PingStatistics {
+    let rtts = responses.compactMap { $0.rtt }
+    let received = rtts.count
+    let packetLoss = 1.0 - (Double(received) / Double(sent))
+    guard !rtts.isEmpty else {
+      return PingStatistics(
+        sent: sent, received: 0, packetLoss: 1.0, minRTT: nil, avgRTT: nil, maxRTT: nil, jitter: nil
       )
     }
-
-    defer { freeaddrinfo(result) }
-
-    guard let sockaddr = addrInfo.pointee.ai_addr else {
-      throw TracerouteError.resolutionFailed(host: host, details: "No address returned")
-    }
-
-    let sinPtr = sockaddr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0 }
-    var sin = sinPtr.pointee
-    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-
-    guard inet_ntop(AF_INET, &sin.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN)) != nil else {
-      throw TracerouteError.resolutionFailed(host: host, details: "inet_ntop failed")
-    }
-
-    // Find null terminator and convert CChar to UInt8
-    let count = buf.firstIndex(of: 0) ?? buf.count
-    let bytes = buf.prefix(count).map { UInt8(bitPattern: $0) }
-    return String(decoding: bytes, as: UTF8.self)
-  }
-
-  private func monotonicTime() -> TimeInterval {
-    var info = mach_timebase_info_data_t()
-    mach_timebase_info(&info)
-    let numer = TimeInterval(info.numer)
-    let denom = TimeInterval(info.denom)
-    let rawTime = TimeInterval(mach_absolute_time())
-    return (rawTime * numer / denom) / 1_000_000_000.0
+    let minRTT = rtts.min()!
+    let maxRTT = rtts.max()!
+    let avgRTT = rtts.reduce(0, +) / Double(rtts.count)
+    let jitter: TimeInterval? = {
+      guard rtts.count >= 2 else { return nil }
+      let variance = rtts.map { pow($0 - avgRTT, 2) }.reduce(0, +) / Double(rtts.count)
+      return sqrt(variance)
+    }()
+    return PingStatistics(
+      sent: sent, received: received, packetLoss: packetLoss, minRTT: minRTT, avgRTT: avgRTT,
+      maxRTT: maxRTT, jitter: jitter)
   }
 }

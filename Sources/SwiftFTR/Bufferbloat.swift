@@ -407,62 +407,75 @@ actor LoadGenerator {
   }
 }
 
-// MARK: - SwiftFTR Bufferbloat Extension
+// MARK: - Bufferbloat Runner
 
-extension SwiftFTR {
-  /// Internal implementation of bufferbloat test
-  /// Runs on the SwiftFTR actor, can call self.ping() without actor re-entrancy issues
-  internal func _testBufferbloat(config: BufferbloatConfig) async throws -> BufferbloatResult {
+/// Runs the bufferbloat orchestration off the SwiftFTR actor so synchronous log output and
+/// ping loops never monopolize the actor executor.
+struct BufferbloatRunner: Sendable {
+  let testConfig: BufferbloatConfig
+  let swiftConfig: SwiftFTRConfig
 
+  /// Execute the test on a detached task to ensure truly concurrent behavior.
+  func runDetached() async throws -> BufferbloatResult {
+    try await Task.detached(priority: .userInitiated) {
+      try await self.run()
+    }.value
+  }
+
+  func run() async throws -> BufferbloatResult {
     var allPingResults: [BufferbloatPingResult] = []
 
-    if config.baselineDuration > 0 {
+    if testConfig.baselineDuration > 0 {
       print("📊 Bufferbloat Test Started")
-      print("Target: \(config.target)")
-      print("Load Type: \(config.loadType.rawValue)")
+      print("Target: \(testConfig.target)")
+      print("Load Type: \(testConfig.loadType.rawValue)")
       print("")
     }
 
     // Phase 1: Baseline measurement (idle network)
-    if config.baselineDuration > 0 {
+    if testConfig.baselineDuration > 0 {
       print("Phase 1/2: Measuring baseline latency (idle network)...")
     }
 
     let baselineResults = try await measureBaseline(
-      target: config.target,
-      duration: config.baselineDuration,
-      interval: config.pingInterval,
-      swiftFTRConfig: self.config,
-      interface: config.interface,
-      sourceIP: config.sourceIP
+      target: testConfig.target,
+      duration: testConfig.baselineDuration,
+      interval: testConfig.pingInterval,
+      swiftFTRConfig: swiftConfig,
+      interface: testConfig.interface,
+      sourceIP: testConfig.sourceIP
     )
     allPingResults.append(contentsOf: baselineResults)
 
     let baselineStats = computeStatistics(baselineResults)
 
-    if config.baselineDuration > 0 {
-      print(
-        "✓ Baseline: avg=\(String(format: "%.1f", baselineStats.avgMs))ms, "
-          + "p95=\(String(format: "%.1f", baselineStats.p95Ms))ms")
+    if testConfig.baselineDuration > 0 {
+      if baselineStats.sampleCount > 0 {
+        print(
+          "✓ Baseline: avg=\(String(format: "%.1f", baselineStats.avgMs))ms, "
+            + "p95=\(String(format: "%.1f", baselineStats.p95Ms))ms")
+      } else {
+        print("⚠️ Baseline: Failed (0 samples received)")
+      }
       print("")
     }
 
     // Phase 2: Load generation + latency measurement
-    if config.loadDuration > 0 {
+    if testConfig.loadDuration > 0 {
       print(
-        "Phase 2/2: Generating \(config.loadType.rawValue.lowercased()) load "
-          + "(\(config.parallelStreams) streams per direction)...")
+        "Phase 2/2: Generating \(testConfig.loadType.rawValue.lowercased()) load "
+          + "(\(testConfig.parallelStreams) streams per direction)...")
     }
 
     let loadedResults = try await measureUnderLoad(
-      target: config.target,
-      loadDuration: config.loadDuration,
-      loadType: config.loadType,
-      interval: config.pingInterval,
-      config: config,
-      swiftFTRConfig: self.config,
-      interface: config.interface,
-      sourceIP: config.sourceIP
+      target: testConfig.target,
+      loadDuration: testConfig.loadDuration,
+      loadType: testConfig.loadType,
+      interval: testConfig.pingInterval,
+      config: testConfig,
+      swiftFTRConfig: swiftConfig,
+      interface: testConfig.interface,
+      sourceIP: testConfig.sourceIP
     )
     allPingResults.append(contentsOf: loadedResults)
 
@@ -470,33 +483,62 @@ extension SwiftFTR {
     let sustainedResults = loadedResults.filter { $0.phase == .sustained }
     let loadedStats = computeStatistics(sustainedResults)
 
-    if config.loadDuration > 0 {
-      print(
-        "✓ Under Load: avg=\(String(format: "%.1f", loadedStats.avgMs))ms, "
-          + "p95=\(String(format: "%.1f", loadedStats.p95Ms))ms")
+    if testConfig.loadDuration > 0 {
+      if loadedStats.sampleCount > 0 {
+        print(
+          "✓ Under Load: avg=\(String(format: "%.1f", loadedStats.avgMs))ms, "
+            + "p95=\(String(format: "%.1f", loadedStats.p95Ms))ms")
+      } else {
+        print("⚠️ Under Load: Failed (0 samples received)")
+      }
       print("")
     }
 
     // Phase 3: Analysis
-    if config.loadDuration > 0 {
+    if testConfig.loadDuration > 0 {
       print("Analyzing results...")
     }
 
-    let latencyIncrease = LatencyIncrease(
-      absoluteMs: loadedStats.avgMs - baselineStats.avgMs,
-      percentageIncrease: ((loadedStats.avgMs - baselineStats.avgMs)
-        / max(baselineStats.avgMs, 0.001)) * 100,
-      p99IncreaseMs: loadedStats.p99Ms - baselineStats.p99Ms
-    )
+    let latencyIncrease: LatencyIncrease
+    if baselineStats.sampleCount > 0 && loadedStats.sampleCount > 0 {
+      latencyIncrease = LatencyIncrease(
+        absoluteMs: loadedStats.avgMs - baselineStats.avgMs,
+        percentageIncrease: ((loadedStats.avgMs - baselineStats.avgMs)
+          / max(baselineStats.avgMs, 0.001)) * 100,
+        p99IncreaseMs: loadedStats.p99Ms - baselineStats.p99Ms
+      )
+    } else {
+      // If samples are missing, we can't calculate a valid increase.
+      // Treat as "Infinite" or "Failure".
+      latencyIncrease = LatencyIncrease(
+        absoluteMs: 0.0,  // Placeholder
+        percentageIncrease: 0.0,
+        p99IncreaseMs: 0.0
+      )
+    }
 
     // Calculate RPM
     var rpm: RPMScore? = nil
-    if config.calculateRPM {
-      rpm = calculateRPM(baseline: baselineStats, loaded: loadedStats)
+    if testConfig.calculateRPM {
+      if baselineStats.sampleCount > 0 && loadedStats.sampleCount > 0 {
+        rpm = calculateRPM(baseline: baselineStats, loaded: loadedStats)
+      } else {
+        // If we have no samples (100% packet loss), that's effectively 0 RPM (Poor)
+        rpm = RPMScore(workingRPM: 0, idleRPM: 0, grade: .poor)
+      }
     }
 
     // Grade bufferbloat
-    let grade = gradeBufferbloat(latencyIncrease: latencyIncrease)
+    let grade: BufferbloatGrade
+    if loadedStats.sampleCount == 0 {
+      // 100% packet loss during load is a critical failure (Grade F)
+      grade = .f
+    } else if baselineStats.sampleCount == 0 {
+      // Baseline failed? Also F.
+      grade = .f
+    } else {
+      grade = gradeBufferbloat(latencyIncrease: latencyIncrease)
+    }
 
     // Assess video call impact
     let videoImpact = assessVideoCallImpact(
@@ -508,14 +550,14 @@ extension SwiftFTR {
 
     // Load details
     let loadDetails = LoadGenerationDetails(
-      streamsPerDirection: config.parallelStreams,
+      streamsPerDirection: testConfig.parallelStreams,
       bytesUploaded: nil,
       bytesDownloaded: nil,
       avgThroughputMbps: nil
     )
 
     // Print summary
-    if config.loadDuration > 0 {
+    if testConfig.loadDuration > 0 {
       print("")
       print("=== Results ===")
       print("Grade: \(grade.rawValue)")
@@ -530,8 +572,8 @@ extension SwiftFTR {
     }
 
     return BufferbloatResult(
-      target: config.target,
-      loadType: config.loadType,
+      target: testConfig.target,
+      loadType: testConfig.loadType,
       baseline: baselineStats,
       loaded: loadedStats,
       latencyIncrease: latencyIncrease,
@@ -548,6 +590,9 @@ extension SwiftFTR {
 
 /// Measure baseline latency (idle network)
 /// Non-actor-isolated to avoid Swift 6.2 actor scheduling issues
+#if compiler(>=6.2)
+  @concurrent
+#endif
 private func measureBaseline(
   target: String,
   duration: TimeInterval,
@@ -587,6 +632,9 @@ private func measureBaseline(
 
 /// Measure latency under network load
 /// Non-actor-isolated to avoid Swift 6.2 actor scheduling issues
+#if compiler(>=6.2)
+  @concurrent
+#endif
 private func measureUnderLoad(
   target: String,
   loadDuration: TimeInterval,

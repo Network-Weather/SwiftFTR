@@ -301,7 +301,7 @@ final class SwiftFTRDNSTests: XCTestCase {
 
     msg.append(contentsOf: primaryNS)
     msg.append(contentsOf: adminEmail)
-    a32(2024010101)  // Serial
+    a32(2_024_010_101)  // Serial
     a32(3600)  // Refresh
     a32(1800)  // Retry
     a32(604800)  // Expire
@@ -315,7 +315,7 @@ final class SwiftFTRDNSTests: XCTestCase {
     XCTAssertNotNil(result)
     XCTAssertEqual(result?.primaryNS, "ns1.example.com")
     XCTAssertEqual(result?.adminEmail, "admin.example.com")
-    XCTAssertEqual(result?.serial, 2024010101)
+    XCTAssertEqual(result?.serial, 2_024_010_101)
     XCTAssertEqual(result?.refresh, 3600)
     XCTAssertEqual(result?.retry, 1800)
     XCTAssertEqual(result?.expire, 604800)
@@ -354,7 +354,8 @@ final class SwiftFTRDNSTests: XCTestCase {
     XCTAssertEqual(result?.target, "sipserver.example.com")
 
     // Invalid: too short
-    XCTAssertNil(__dnsParseSRV(rdata: Data([1, 2, 3]), rdataOffsetInMessage: 0, fullMessage: Data()))
+    XCTAssertNil(
+      __dnsParseSRV(rdata: Data([1, 2, 3]), rdataOffsetInMessage: 0, fullMessage: Data()))
   }
 
   func testParseCAA() {
