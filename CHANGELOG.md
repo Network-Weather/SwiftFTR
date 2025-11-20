@@ -3,6 +3,69 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.8.0 — 2025-11-09
+------------------
+### What's New
+
+**Massive Ping Scalability**
+- Refactored `ping()` to use event-driven I/O (kqueue/epoll) via `DispatchSource`
+- Eliminated thread starvation issues when running many concurrent pings
+- **Performance**: 35x throughput improvement (573 pings/sec vs 16 pings/sec in v0.7.0)
+- **Efficiency**: Efficient resource usage (~17KB per ping) with zero thread starvation
+- Zero external dependencies (uses `libdispatch` standard library)
+- Fully thread-safe and robust against race conditions
+
+**DNS Queries with Rich Metadata**
+- Query DNS records with `tracer.dns.a()`, `tracer.dns.aaaa()`, `tracer.dns.reverseIPv4()`
+- Get structured results with TTL, RTT (0.1ms precision), server, and timestamp
+- Support for 11 record types: A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS
+- Query your gateway for its hostname to detect network devices (UniFi, NETGEAR, cable modems)
+
+**Example**:
+```swift
+let tracer = SwiftFTR()
+
+// Get IPv4 addresses with metadata
+let result = try await tracer.dns.a(hostname: "google.com")
+print("RTT: \(result.rttMs)ms")
+for record in result.records {
+  if case .ipv4(let addr) = record.data {
+    print("\(addr) (TTL: \(record.ttl)s)")
+  }
+}
+
+// Reverse DNS your gateway
+let ptr = try await tracer.dns.reverseIPv4(ip: "10.1.10.1")
+// Might return: "Docsis-Gateway.hsd1.ca.comcast.net"
+
+// Check mail servers
+let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
+for record in mx.records {
+  if case .mx(let priority, let exchange) = record.data {
+    print("Priority \(priority): \(exchange)")
+  }
+}
+
+// Certificate authority authorization
+let caa = try await tracer.dns.query(name: "google.com", type: .caa)
+// Returns which CAs can issue certificates
+
+// HTTP/3 service discovery
+let https = try await tracer.dns.query(name: "cloudflare.com", type: .https)
+// Returns ALPN protocols and connection hints
+```
+
+### Migration from 0.7.0
+
+Since 0.7.1 was never shipped, this is the first DNS API for SwiftFTR.
+
+### What You Get
+- **No subprocesses**: Pure Swift DNS queries, no `Process()` or `/usr/bin/host` hacks
+- **High precision**: 0.1ms RTT measurement using `mach_absolute_time()`
+- **Full metadata**: TTL, timestamps, record priorities, not just bare IP strings
+- **Modern records**: CAA for certificate authorities, HTTPS for HTTP/3 discovery
+- **Type safety**: Structured `DNSRecordData` enum, not string parsing
+
 0.7.0 — 2025-11-05
 ------------------
 ### Major Features

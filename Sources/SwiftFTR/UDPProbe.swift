@@ -87,6 +87,9 @@ public struct UDPProbeResult: Sendable, Codable {
 ///
 /// Implementation: Uses connect() on UDP socket so kernel delivers ICMP errors
 /// as ECONNREFUSED on recv(), avoiding need for raw ICMP socket
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func udpProbe(
   host: String,
   port: Int,
@@ -97,6 +100,9 @@ public func udpProbe(
   return try await udpProbe(config: config)
 }
 
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
   let startTime = Date()
 

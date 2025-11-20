@@ -75,3 +75,25 @@ func monotonicNow() -> TimeInterval {
   #endif
   return TimeInterval(ts.tv_sec) + TimeInterval(ts.tv_nsec) / 1_000_000_000
 }
+
+/// Runs a blocking syscall (socket I/O, STUN, legacy DNS clients) on a detached task so we do not
+/// monopolize the cooperative executor backing the caller (usually `SwiftFTR`'s actor).
+/// Callers should pass lightweight closures that capture only the values required by the syscall.
+#if compiler(>=6.2)
+  @concurrent
+#endif
+@inline(__always)
+func runDetachedBlockingIO<T>(
+  priority: TaskPriority = .userInitiated,
+  _ operation: @Sendable @escaping () throws -> T
+) async throws -> T {
+  let boxed = try await Task.detached(priority: priority) {
+    try _UncheckedSendable(value: operation())
+  }.value
+  return boxed.value
+}
+
+@usableFromInline
+struct _UncheckedSendable<T>: @unchecked Sendable {
+  let value: T
+}

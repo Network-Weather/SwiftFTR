@@ -197,6 +197,22 @@ public actor SwiftFTR {
   // Active trace tracking
   internal var activeTraces: Set<TraceHandle> = []
 
+  /// DNS query interface
+  ///
+  /// Provides access to DNS queries for various record types (A, AAAA, PTR, TXT, etc.)
+  /// with high-precision timing and detailed metadata.
+  ///
+  /// Example:
+  /// ```swift
+  /// let tracer = SwiftFTR()
+  /// let result = try await tracer.dns.a(hostname: "example.com")
+  /// print("IP: \(result.records.first?.data)")
+  /// print("RTT: \(result.rttMs)ms")
+  /// ```
+  public nonisolated var dns: DNSQueries {
+    DNSQueries(tracer: self)
+  }
+
   /// Creates a tracer instance with optional configuration.
   /// - Parameter config: Configuration for traceroute behavior
   public init(config: SwiftFTRConfig = SwiftFTRConfig()) {
@@ -206,6 +222,19 @@ public actor SwiftFTR {
       maxSize: config.rdnsCacheSize ?? 1000
     )
     self.asnResolver = CachingASNResolver(base: CymruDNSResolver())
+  }
+
+  /// Internal initializer used to spin up lightweight worker instances that share caches.
+  internal init(
+    config: SwiftFTRConfig,
+    rdnsCache: RDNSCache,
+    asnResolver: ASNResolver,
+    cachedPublicIP: String?
+  ) {
+    self.config = config
+    self.rdnsCache = rdnsCache
+    self.asnResolver = asnResolver
+    self.cachedPublicIP = cachedPublicIP
   }
 
   /// Perform a fast traceroute by sending one ICMP Echo per TTL and waiting once.
@@ -729,6 +758,9 @@ public actor SwiftFTR {
   /// async let ping2 = tracer.ping(to: "8.8.8.8")
   /// let (result1, result2) = try await (ping1, ping2)
   /// ```
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public nonisolated func ping(
     to target: String,
     config: PingConfig = PingConfig()
@@ -767,19 +799,30 @@ public actor SwiftFTR {
   /// }
   /// print("Video Call Impact: \(result.videoCallImpact.severity.rawValue)")
   /// ```
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
   public func testBufferbloat(config: BufferbloatConfig = BufferbloatConfig()) async throws
     -> BufferbloatResult
   {
-    // Implementation in extension in Bufferbloat.swift
-    return try await _testBufferbloat(config: config)
+    // Run the orchestrator on a detached executor so synchronous phases never block SwiftFTR.
+    let runner = BufferbloatRunner(testConfig: config, swiftConfig: self.config)
+    return try await runner.runDetached()
   }
 
   /// Discover public IP via STUN
   internal func discoverPublicIP() async throws -> String {
-    try stunGetPublicIPv4(
-      timeout: 0.8, interface: config.interface, sourceIP: config.sourceIP,
-      enableLogging: config.enableLogging
-    ).ip
+    let interface = config.interface
+    let sourceIP = config.sourceIP
+    let enableLogging = config.enableLogging
+    return try await runDetachedBlockingIO {
+      try stunGetPublicIPv4(
+        timeout: 0.8,
+        interface: interface,
+        sourceIP: sourceIP,
+        enableLogging: enableLogging
+      ).ip
+    }
   }
 
   // MARK: - Cache Management

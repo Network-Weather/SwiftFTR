@@ -37,6 +37,34 @@ for hop in classified.hops {
 }
 ```
 
+### DNS queries (v0.8.0+)
+
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+
+// IPv4 lookup with metadata
+let result = try await tracer.dns.a(hostname: "google.com")
+print("RTT: \(result.rttMs)ms")
+for record in result.records {
+    if case .ipv4(let addr) = record.data {
+        print("\(addr) (TTL: \(record.ttl)s)")
+    }
+}
+
+// Reverse DNS
+let ptr = try await tracer.dns.reverseIPv4(ip: "8.8.8.8")
+for record in ptr.records {
+    if case .hostname(let name) = record.data {
+        print(name)
+    }
+}
+
+// Mail servers
+let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
+```
+
 ## Configuration
 
 - Use ``SwiftFTRConfig(publicIP:)`` to override/bypass STUN public IP discovery.
@@ -71,6 +99,14 @@ for hop in classified.hops {
 - ``SwiftFTR/NetworkTopology``
 - ``SwiftFTR/DiscoveredPath``
 - <doc:Multipath>
+
+### DNS Queries (v0.8.0+)
+
+- ``SwiftFTR/DNSClient``
+- ``SwiftFTR/DNSQueryResult``
+- ``SwiftFTR/DNSRecord``
+- ``SwiftFTR/DNSRecordType``
+- ``SwiftFTR/DNSRecordData``
 
 ### Interface Binding (v0.7.0+)
 

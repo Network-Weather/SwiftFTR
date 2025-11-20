@@ -54,6 +54,11 @@ let package = Package(
             name: "SwiftFTRTests",
             dependencies: ["SwiftFTR"],
             path: "Tests/SwiftFTRTests"
+        ),
+        .executableTarget(
+            name: "ResourceBenchmark",
+            dependencies: ["SwiftFTR"],
+            path: "Tests/TestSupport"
         )
     ],
     // Swift 6 language mode with strict concurrency checking

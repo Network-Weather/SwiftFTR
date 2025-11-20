@@ -25,8 +25,8 @@ How It Works
 3) For TTL = 1…maxHops:
    - Set `IP_TTL` to the current TTL and send an ICMP Echo Request with a stable identifier and sequence (seq = TTL).
    - Record send time in a small map keyed by `sequence`.
-4) Enter a single receive loop until a global deadline:
-   - Poll the socket and parse each incoming datagram as one of: Echo Reply, Time Exceeded, or Destination Unreachable.
+4) Register a `DispatchSourceRead` (kqueue-backed on macOS) and handle packets until a global deadline:
+   - Parse each incoming datagram as one of: Echo Reply, Time Exceeded, or Destination Unreachable.
    - Match replies back to the original probe using the identifier/sequence embedded in the payload.
    - Compute RTT with a monotonic clock and place the hop at `ttl - 1`.
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
@@ -40,7 +40,7 @@ How Fast Is It?
 Classic traceroute often probes sequentially and waits per hop; SwiftFTR probes all hops in one burst and waits once.
 
 - Time complexity: O(1) with respect to hop count. Wall‑clock time is bounded by your chosen `timeout` (for example, `timeout = 1.0` typically completes in about ~1 second rather than ~30 seconds for 30 sequential probes).
-- Efficient I/O: Single socket, non‑blocking `poll(2)`, reused receive buffer, and monotonic timing reduce overhead and jitter.
+- Efficient I/O: Single socket, kqueue-backed `DispatchSourceRead`, reused receive buffer, and monotonic timing reduce overhead and jitter.
 
 If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e.g., `20`). You can also tune `payloadSize` in advanced scenarios.
 
@@ -57,7 +57,7 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.7.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.8.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
@@ -71,6 +71,18 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ API works without `@MainActor` requirements
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
+
+New in v0.8.0
+-------------
+- **Complete DNS API Redesign**: Modern `tracer.dns` namespace with rich metadata
+  - `tracer.dns.a()`, `tracer.dns.aaaa()`, `tracer.dns.reverseIPv4()`, `tracer.dns.txt()`
+  - Generic `tracer.dns.query(name:type:)` for any DNS record type
+  - Returns structured `DNSQueryResult` with server, RTT, timestamp, and records
+- **High-Precision Timing**: 0.1ms resolution using `mach_absolute_time()`
+- **11 DNS Record Types**: A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS
+- **CAA Records**: Certificate Authority Authorization (RFC 6844)
+- **HTTPS Records**: HTTP/3 Service Binding (RFC 9460)
+- **Breaking**: Replaces 0.7.1 DNS functions with namespace API for better ergonomics
 
 New in v0.7.0
 -------------
@@ -191,6 +203,69 @@ async let ethernet = tracer.ping(to: "1.1.1.1", config: PingConfig(interface: "e
 let (wifiResult, ethResult) = try await (wifi, ethernet)
 print("WiFi loss: \(Int(wifiResult.statistics.packetLoss * 100))%")
 print("Ethernet loss: \(Int(ethResult.statistics.packetLoss * 100))%")
+
+// NEW in v0.8.0: DNS API with rich metadata
+// IPv4 address lookup
+let aResult = try await tracer.dns.a(hostname: "google.com")
+print("Server: \(aResult.server), RTT: \(aResult.rttMs)ms")
+for record in aResult.records {
+  if case .ipv4(let addr) = record.data {
+    print("  \(addr) (TTL: \(record.ttl)s)")
+  }
+}
+
+// IPv6 address lookup
+let aaaaResult = try await tracer.dns.aaaa(hostname: "google.com")
+for record in aaaaResult.records {
+  if case .ipv6(let addr) = record.data {
+    print("  \(addr)")
+  }
+}
+
+// Reverse DNS lookup
+let ptrResult = try await tracer.dns.reverseIPv4(ip: "8.8.8.8")
+for record in ptrResult.records {
+  if case .hostname(let name) = record.data {
+    print("  8.8.8.8 → \(name)")
+  }
+}
+
+// MX records (mail exchange)
+let mxResult = try await tracer.dns.query(name: "google.com", type: .mx)
+for record in mxResult.records {
+  if case .mx(let priority, let exchange) = record.data {
+    print("  Priority \(priority): \(exchange)")
+  }
+}
+
+// TXT records (SPF, DKIM, etc.)
+let txtResult = try await tracer.dns.txt(hostname: "google.com")
+for record in txtResult.records {
+  if case .text(let strings) = record.data {
+    for str in strings {
+      print("  \(str)")
+    }
+  }
+}
+
+// CAA records (certificate authority authorization)
+let caaResult = try await tracer.dns.query(name: "google.com", type: .caa)
+for record in caaResult.records {
+  if case .caa(let flags, let tag, let value) = record.data {
+    print("  \(tag): \(value)")
+  }
+}
+
+// HTTPS records (HTTP/3 service binding)
+let httpsResult = try await tracer.dns.query(name: "cloudflare.com", type: .https)
+for record in httpsResult.records {
+  if case .https(let priority, let target, _) = record.data {
+    print("  Priority \(priority): \(target)")
+  }
+}
+
+// Supports 11 DNS record types:
+// A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS
 ```
 
 Notes for Embedding
@@ -262,7 +337,7 @@ Configuration and Flags
 
 Design Details
 --------------
-- Socket: ICMP `SOCK_DGRAM` on macOS (no privileges) with `O_NONBLOCK` and `poll(2)`.
+- Socket: ICMP `SOCK_DGRAM` on macOS (no privileges) with `O_NONBLOCK` and `DispatchSource` readiness handling.
 - Probing: One Echo Request per TTL; identifier is constant per run, sequence equals TTL for easy correlation.
 - Matching: Echo Reply and Time Exceeded handlers pull out embedded id/seq from the packet to map to the original probe.
 - Timing: RTT is measured with `CLOCK_MONOTONIC` to avoid wall‑clock jumps.

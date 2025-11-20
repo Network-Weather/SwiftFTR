@@ -103,6 +103,9 @@ public struct TCPProbeResult: Sendable, Codable {
 /// Attempts to establish a TCP connection to test host/port reachability
 /// Returns success if connection succeeds OR port is explicitly closed (RST)
 /// Returns failure only on timeout or network unreachable
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func tcpProbe(
   host: String,
   port: Int,
@@ -112,6 +115,9 @@ public func tcpProbe(
   return try await tcpProbe(config: config)
 }
 
+#if compiler(>=6.2)
+  @concurrent
+#endif
 public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
   let startTime = Date()
 

@@ -531,7 +531,9 @@ struct MultipathIntegrationTests {
       maxHops: 15
     )
 
-    let topology = try await tracer.discoverPaths(to: "1.1.1.1", config: config)
+    let topology = try await NetworkTestGate.shared.withPermit {
+      try await tracer.discoverPaths(to: "1.1.1.1", config: config)
+    }
 
     // Basic validation
     #expect(topology.destination == "1.1.1.1")
@@ -680,21 +682,17 @@ struct MultipathIntegrationTests {
     let config = MultipathConfig(
       flowVariations: 3,
       maxPaths: 5,
-      timeoutMs: 1500,
+      timeoutMs: 900,
       maxHops: 10
     )
 
     let topology = try await tracer.discoverPaths(to: "1.1.1.1", config: config)
 
-    // Encode to JSON
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
     let data = try encoder.encode(topology)
-
-    // Should be valid JSON
     #expect(data.count > 0)
 
-    // Decode back
     let decoder = JSONDecoder()
     let decoded = try decoder.decode(NetworkTopology.self, from: data)
 
@@ -706,29 +704,55 @@ struct MultipathIntegrationTests {
 
   @Test(
     "Multipath performance is reasonable",
-    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
+    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS"))
+  )
   func testPerformance() async throws {
     let tracer = SwiftFTR(config: SwiftFTRConfig())
     let config = MultipathConfig(
       flowVariations: 5,
       maxPaths: 10,
       earlyStopThreshold: 3,
-      timeoutMs: 1500,
+      timeoutMs: 1000,
       maxHops: 15
     )
 
-    let startTime = Date()
-    let topology = try await tracer.discoverPaths(to: "1.1.1.1", config: config)
-    let elapsed = Date().timeIntervalSince(startTime)
+    let (topology, elapsed) = try await NetworkTestGate.shared.withPermit {
+      let startTime = Date()
+      let topology = try await tracer.discoverPaths(to: "1.1.1.1", config: config)
+      let elapsed = Date().timeIntervalSince(startTime)
+      return (topology, elapsed)
+    }
 
-    // Discovery should complete in reasonable time
-    // 5 flows * 1.5s timeout = 7.5s max, but early stopping should help
-    #expect(elapsed < 10.0)
-
-    // Internal duration tracking should be close to actual
+    // Detached multipath workers should finish close to a single timeout budget; >6s hints at serialization.
+    #expect(elapsed < 6.0)
     #expect(abs(topology.discoveryDuration - elapsed) < 1.0)
+    #expect(topology.discoveryDuration > 0.5)
+  }
 
-    // Should not be unreasonably slow
-    #expect(topology.discoveryDuration > 0.5)  // At least some network time
+  @Test(
+    "Multipath batches finish near timeout budget",
+    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS"))
+  )
+  func testBatchCompletesNearTimeout() async throws {
+    let tracer = SwiftFTR(config: SwiftFTRConfig())
+    let config = MultipathConfig(
+      flowVariations: 4,
+      maxPaths: 6,
+      earlyStopThreshold: 4,
+      timeoutMs: 800,
+      maxHops: 12
+    )
+
+    let elapsed = try await NetworkTestGate.shared.withPermit {
+      let start = Date()
+      _ = try await tracer.discoverPaths(to: "1.1.1.1", config: config)
+      return Date().timeIntervalSince(start)
+    }
+
+    // Each batch fires in parallel, so total elapsed time should stay in the same ballpark as one timeout window.
+    #expect(
+      elapsed < 5.0,
+      "Batched multipath discovery should stay near a single timeout window (elapsed=\(elapsed))"
+    )
   }
 }

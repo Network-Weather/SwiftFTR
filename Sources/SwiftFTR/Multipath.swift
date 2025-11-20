@@ -144,7 +144,8 @@ public struct NetworkTopology: Sendable, Codable {
   /// Timeouts (nil IPs) are treated as distinct values.
   /// Returns nil if all paths are identical or only one path exists.
   public func divergencePoint() -> Int? {
-    guard paths.count > 1 else { return nil }
+    // No divergence if only one unique path
+    guard uniquePathCount > 1 else { return nil }
 
     let maxTTL = paths.map { $0.trace.hops.count }.max() ?? 0
 
@@ -262,13 +263,16 @@ public struct DiscoveredPath: Sendable, Codable {
 ///
 /// For monitoring ICMP reachability (ping), ICMP-based discovery is more accurate.
 /// For monitoring TCP/UDP application traffic, UDP-based discovery would be preferred.
-actor MultipathDiscovery {
-  private let swiftFTR: SwiftFTR
+struct MultipathDiscovery: Sendable {
+  private let workerSpawner: SwiftFTR.MultipathWorkerSpawner
   private let config: SwiftFTRConfig
+  private let debugTracing: Bool
 
-  init(swiftFTR: SwiftFTR, config: SwiftFTRConfig) {
-    self.swiftFTR = swiftFTR
+  init(workerSpawner: SwiftFTR.MultipathWorkerSpawner, config: SwiftFTRConfig) {
+    self.workerSpawner = workerSpawner
     self.config = config
+    self.debugTracing =
+      ProcessInfo.processInfo.environment["SWIFTFTR_DEBUG_MULTIPATH"] != nil
   }
 
   /// Discover all ECMP paths to target
@@ -276,6 +280,7 @@ actor MultipathDiscovery {
     -> NetworkTopology
   {
     let startTime = monotonicTime()
+    let parentStart = startTime
 
     var discoveredPaths: [DiscoveredPath] = []
     var canonicalPaths: [ClassifiedTrace] = []  // Unique paths with holes filled
@@ -285,6 +290,7 @@ actor MultipathDiscovery {
     // Process flows in batches to enable early termination while maintaining parallelism
     let batchSize = 5  // Balance parallelism vs early stopping responsiveness
     var variation = 0
+    let spawner = workerSpawner
 
     while variation < multipathConfig.flowVariations {
       let batchEnd = min(variation + batchSize, multipathConfig.flowVariations)
@@ -298,13 +304,23 @@ actor MultipathDiscovery {
           let flowID = FlowIdentifier.generate(variation: v)
 
           group.addTask {
-            let trace = try await self.swiftFTR.traceClassifiedWithFlowID(
-              to: target,
+            let launch = self.debugTracing ? self.monotonicTime() : 0.0
+            let task = spawner.scheduleMultipathFlowTask(
+              target: target,
               flowID: flowID,
               maxHops: multipathConfig.maxHops,
               timeoutMs: multipathConfig.timeoutMs
             )
-            return (flowID, trace)
+            let result = try await task.value
+            if self.debugTracing {
+              let done = self.monotonicTime()
+              let offset = launch - parentStart
+              let duration = done - launch
+              print(
+                "[multipath] flow \(v) launched +\(String(format: "%.3f", offset))s duration \(String(format: "%.3f", duration))s"
+              )
+            }
+            return result
           }
         }
 
@@ -495,8 +511,63 @@ extension SwiftFTR {
     to target: String,
     config: MultipathConfig = MultipathConfig()
   ) async throws -> NetworkTopology {
-    let discovery = MultipathDiscovery(swiftFTR: self, config: self.config)
-    return try await discovery.discoverPaths(to: target, multipathConfig: config)
+    let swiftConfig = self.config
+    let spawner = MultipathWorkerSpawner(
+      baseConfig: swiftConfig,
+      rdnsCache: self.rdnsCache,
+      asnResolver: self.asnResolver,
+      cachedPublicIP: self.cachedPublicIP
+    )
+    let discovery = MultipathDiscovery(workerSpawner: spawner, config: swiftConfig)
+
+    // Run the multipath orchestration detached so scheduling cannot re-enter SwiftFTR.
+    return try await Task.detached(priority: .userInitiated) {
+      try await discovery.discoverPaths(to: target, multipathConfig: config)
+    }.value
+  }
+
+  /// Provides detached worker tasks that reuse caches but never hop back to the main actor.
+  struct MultipathWorkerSpawner: Sendable {
+    let baseConfig: SwiftFTRConfig
+    let rdnsCache: RDNSCache
+    let asnResolver: ASNResolver
+    let cachedPublicIP: String?
+
+    func scheduleMultipathFlowTask(
+      target: String,
+      flowID: FlowIdentifier,
+      maxHops: Int,
+      timeoutMs: Int
+    ) -> Task<(FlowIdentifier, ClassifiedTrace), Error> {
+      let workerConfig = SwiftFTRConfig(
+        maxHops: maxHops,
+        maxWaitMs: timeoutMs,
+        payloadSize: baseConfig.payloadSize,
+        publicIP: baseConfig.publicIP,
+        enableLogging: baseConfig.enableLogging,
+        noReverseDNS: baseConfig.noReverseDNS,
+        interface: baseConfig.interface,
+        sourceIP: baseConfig.sourceIP
+      )
+
+      let cachedIP = baseConfig.publicIP ?? cachedPublicIP
+      let rdns = rdnsCache
+      let resolver = asnResolver
+
+      return Task.detached(priority: .userInitiated) {
+        let worker = SwiftFTR(
+          config: workerConfig,
+          rdnsCache: rdns,
+          asnResolver: resolver,
+          cachedPublicIP: cachedIP
+        )
+        let trace = try await worker.performClassifiedTraceWithFlowID(
+          to: target,
+          flowIdentifier: flowID.icmpID
+        )
+        return (flowID, trace)
+      }
+    }
   }
 
   /// Internal method to run classified trace with specific flow identifier
@@ -521,27 +592,21 @@ extension SwiftFTR {
       sourceIP: self.config.sourceIP
     )
 
-    let tempTracer = SwiftFTR(config: multipathConfig)
+    let tempTracer = SwiftFTR(
+      config: multipathConfig,
+      rdnsCache: self.rdnsCache,
+      asnResolver: self.asnResolver,
+      cachedPublicIP: self.cachedPublicIP
+    )
 
-    // Share caches to avoid redundant lookups
-    if let cachedIP = cachedPublicIP {
-      await tempTracer.setCachedPublicIP(cachedIP)
-    }
-
-    // Run trace with flow ID through internal method
     return try await tempTracer.performClassifiedTraceWithFlowID(
       to: target,
       flowIdentifier: flowID.icmpID
     )
   }
 
-  /// Set cached public IP (for sharing between instances)
-  private func setCachedPublicIP(_ ip: String) {
-    cachedPublicIP = ip
-  }
-
   /// Internal implementation of classified trace with flow ID
-  private func performClassifiedTraceWithFlowID(
+  fileprivate func performClassifiedTraceWithFlowID(
     to host: String,
     flowIdentifier: UInt16
   ) async throws -> ClassifiedTrace {
