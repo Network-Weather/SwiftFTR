@@ -7,7 +7,9 @@ actor NetworkTestGate {
   private var permits: Int = 1
   private var waiters: [CheckedContinuation<Void, Never>] = []
 
-  func withPermit<T>(_ operation: @escaping () async throws -> T) async rethrows -> T {
+  func withPermit<T: Sendable>(_ operation: @escaping @Sendable () async throws -> T)
+    async rethrows -> T
+  {
     await acquire()
     defer { release() }
     return try await operation()

@@ -127,7 +127,7 @@ struct STUNTests {
 
     // After network change, cache should be cleared
     // (Can't easily test without actual STUN call, but method exists)
-    #expect(true)  // Placeholder - method exists and compiles
+    #expect(Bool(true))  // Placeholder - method exists and compiles
   }
 
   // MARK: - STUN Network Tests
