@@ -3,6 +3,27 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.8.1 — 2025-11-24
+------------------
+### Performance Improvements
+
+**Parallel ASN Resolution**
+- `CymruDNSResolver.resolve()` now executes DNS queries in parallel with bounded concurrency (max 8)
+- Two-phase resolution: parallel origin ASN lookups, then deduplicated AS name lookups
+- **Performance**: 5-10x faster ASN resolution for typical traces (40s worst case → 5s)
+- Uses actor-based semaphore for rate limiting to avoid overwhelming DNS servers
+- Blocking DNS calls wrapped in `Task.detached` to prevent cooperative thread pool starvation
+
+**Improved Reverse DNS Handling**
+- `RDNSCache` now uses `runDetachedBlockingIO` for consistency with other blocking I/O patterns
+
+### Documentation
+
+**Cleanup**
+- Consolidated AI assistant context files (AGENTS.md, GEMINI.md) into CLAUDE.md
+- Removed obsolete planning documents
+- Updated SECURITY.md with current supported versions (0.7.x, 0.8.x)
+
 0.8.0 — 2025-11-09
 ------------------
 ### What's New

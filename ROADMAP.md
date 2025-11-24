@@ -2,13 +2,14 @@
 
 This roadmap outlines the development direction for SwiftFTR. It is prioritized by value and impact rather than strict timelines or version numbers.
 
-## 📍 Current Stable State (v0.8.0)
+## 📍 Current Stable State (v0.8.1)
 - **Core**: Parallel traceroute with ICMP datagram sockets (no sudo required on macOS).
 - **Scalability**: Massively parallel `ping` architecture using `kqueue`/`epoll` (C10k ready).
 - **DNS**: Full-featured DNS client supporting 11 record types (A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS) with high-precision timing.
 - **Reachability**: Multi-protocol probing (TCP SYN, UDP connected, HTTP/S).
 - **Monitoring**: Bufferbloat testing, Multipath (ECMP) discovery, and network interface binding.
 - **Architecture**: Fully async/await, Swift 6 strict concurrency compliant, actor-based.
+- **Performance**: Parallel ASN resolution with bounded concurrency (v0.8.1).
 
 ---
 

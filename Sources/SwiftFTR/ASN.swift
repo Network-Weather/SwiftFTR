@@ -86,6 +86,41 @@ public struct CachingASNResolver: ASNResolver {
   }
 }
 
+// Actor-based semaphore for limiting concurrent DNS queries.
+private actor _ConcurrencySemaphore {
+  private var available: Int
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  init(maxConcurrent: Int) { self.available = maxConcurrent }
+
+  func wait() async {
+    if available > 0 {
+      available -= 1
+    } else {
+      await withCheckedContinuation { continuation in
+        waiters.append(continuation)
+      }
+    }
+  }
+
+  func signal() {
+    if !waiters.isEmpty {
+      let waiter = waiters.removeFirst()
+      waiter.resume()
+    } else {
+      available += 1
+    }
+  }
+}
+
+// Intermediate result from origin ASN lookup.
+private struct _OriginASNResult: Sendable {
+  let asn: Int
+  let prefix: String?
+  let cc: String?
+  let registry: String?
+}
+
 // Team Cymru DNS-based resolver using TXT queries.
 /// Team Cymru DNS-based resolver using TXT queries for origin ASN and AS names.
 public struct CymruDNSResolver: ASNResolver {
@@ -98,48 +133,109 @@ public struct CymruDNSResolver: ASNResolver {
     ASNInfo]
   {
     let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
-    var result: [String: ASNInfo] = [:]
-    var asnNameCache: [Int: String] = [:]
-    for ip in ips {
-      // Skip non-public ranges; origin service maps only public routes
-      if isPrivateIPv4(ip) || isCGNATIPv4(ip) { continue }
-      // origin ASN
-      let octs = ip.split(separator: ".")
-      let rev = octs.reversed().joined(separator: ".")
-      let q = "\(rev).origin.asn.cymru.com"
-      guard let txts = DNSClient.queryTXT(name: q, timeout: timeout) else { continue }
-      // Pick first TXT string and parse
-      if let first = txts.first {
-        // Format: "AS | BGP Prefix | CC | Registry | Allocated"
-        let parts = first.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
-        if parts.count >= 4, let asField = parts.first {
-          // Some responses might contain multiple ASNs separated by spaces; take the first token
-          let tokens = asField.split(whereSeparator: { $0 == " " || $0 == "," })
-          if let tok = tokens.first,
-            let asn = Int(tok) ?? Int(tok.replacingOccurrences(of: "AS", with: ""))
-          {
-            // Get AS Name via AS{asn}.asn.cymru.com
-            var name: String? = asnNameCache[asn]
-            if name == nil {
-              let qn = "AS\(asn).asn.cymru.com"
-              if let txts2 = DNSClient.queryTXT(name: qn, timeout: timeout), let f2 = txts2.first {
-                // Typical format: "AS | AS Name | CC | Registry | Allocated" (fields may vary).
-                // Extract a plausible AS name from the TXT payload.
-                let p2 = f2.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
-                name = pickASName(from: p2)
-                if let n = name, !n.isEmpty { asnNameCache[asn] = n }
-              }
-            }
-            let prefix = parts.count > 1 ? parts[1] : nil
-            let cc = parts.count > 2 ? parts[2] : nil
-            let reg = parts.count > 3 ? parts[3] : nil
-            result[ip] = ASNInfo(
-              asn: asn, name: name ?? "", prefix: prefix, countryCode: cc, registry: reg)
-          }
+    if ips.isEmpty { return [:] }
+
+    // Filter to only public IPs
+    let publicIPs = ips.filter { !isPrivateIPv4($0) && !isCGNATIPv4($0) }
+    if publicIPs.isEmpty { return [:] }
+
+    let semaphore = _ConcurrencySemaphore(maxConcurrent: 8)
+
+    // Phase 1: Parallel origin ASN lookups
+    let originResults: [String: _OriginASNResult] = await withTaskGroup(
+      of: (String, _OriginASNResult?).self
+    ) { group in
+      for ip in publicIPs {
+        group.addTask {
+          await semaphore.wait()
+          defer { Task { await semaphore.signal() } }
+          return (ip, await self.lookupOriginASN(ip: ip, timeout: timeout))
         }
       }
+
+      var results: [String: _OriginASNResult] = [:]
+      for await (ip, result) in group {
+        if let r = result { results[ip] = r }
+      }
+      return results
+    }
+
+    if originResults.isEmpty { return [:] }
+
+    // Phase 2: Parallel AS name lookups for unique ASNs only
+    let uniqueASNs = Array(Set(originResults.values.map { $0.asn }))
+    let asnNames: [Int: String] = await withTaskGroup(of: (Int, String?).self) { group in
+      for asn in uniqueASNs {
+        group.addTask {
+          await semaphore.wait()
+          defer { Task { await semaphore.signal() } }
+          return (asn, await self.lookupASName(asn: asn, timeout: timeout))
+        }
+      }
+
+      var names: [Int: String] = [:]
+      for await (asn, name) in group {
+        if let n = name { names[asn] = n }
+      }
+      return names
+    }
+
+    // Combine results
+    var result: [String: ASNInfo] = [:]
+    for (ip, origin) in originResults {
+      result[ip] = ASNInfo(
+        asn: origin.asn,
+        name: asnNames[origin.asn] ?? "",
+        prefix: origin.prefix,
+        countryCode: origin.cc,
+        registry: origin.registry
+      )
     }
     return result
+  }
+
+  /// Look up origin ASN for a single IP address.
+  private func lookupOriginASN(ip: String, timeout: TimeInterval) async -> _OriginASNResult? {
+    let octs = ip.split(separator: ".")
+    let rev = octs.reversed().joined(separator: ".")
+    let q = "\(rev).origin.asn.cymru.com"
+
+    // Wrap blocking DNS call in detached task
+    let txts = await Task.detached(priority: .userInitiated) {
+      DNSClient.queryTXT(name: q, timeout: timeout)
+    }.value
+    guard let txts = txts, let first = txts.first else { return nil }
+
+    // Format: "AS | BGP Prefix | CC | Registry | Allocated"
+    let parts = first.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    guard parts.count >= 4, let asField = parts.first else { return nil }
+
+    // Some responses contain multiple ASNs separated by spaces; take the first token
+    let tokens = asField.split(whereSeparator: { $0 == " " || $0 == "," })
+    guard let tok = tokens.first,
+      let asn = Int(tok) ?? Int(tok.replacingOccurrences(of: "AS", with: ""))
+    else { return nil }
+
+    let prefix = parts.count > 1 ? parts[1] : nil
+    let cc = parts.count > 2 ? parts[2] : nil
+    let reg = parts.count > 3 ? parts[3] : nil
+
+    return _OriginASNResult(asn: asn, prefix: prefix, cc: cc, registry: reg)
+  }
+
+  /// Look up AS name for a single ASN.
+  private func lookupASName(asn: Int, timeout: TimeInterval) async -> String? {
+    let qn = "AS\(asn).asn.cymru.com"
+
+    // Wrap blocking DNS call in detached task
+    let txts = await Task.detached(priority: .userInitiated) {
+      DNSClient.queryTXT(name: qn, timeout: timeout)
+    }.value
+    guard let txts = txts, let first = txts.first else { return nil }
+
+    // Typical format: "AS | AS Name | CC | Registry | Allocated"
+    let parts = first.split(separator: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+    return pickASName(from: parts)
   }
 }
 

@@ -36,10 +36,10 @@ actor RDNSCache {
       return entry.hostname
     }
 
-    // Perform lookup in background
-    let hostname = await Task.detached(priority: .background) {
+    // Perform lookup in background using utility that properly wraps blocking I/O
+    let hostname = try? await runDetachedBlockingIO(priority: .background) {
       reverseDNS(ip)
-    }.value
+    }
 
     // Cache the result
     cache[ip] = CacheEntry(hostname: hostname, timestamp: now)

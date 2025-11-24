@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to AI coding assistants working with code in this repository.
 
 ## Common Development Commands
 
@@ -90,3 +90,29 @@ This project requires Swift 6.1+ and builds with strict concurrency checking ena
 - All public types are `Sendable`
 - No `@MainActor` requirements for library APIs
 - Thread-safe from any actor or task context
+
+## Project Structure
+
+SwiftPM's `Package.swift` wires the `SwiftFTR` library plus CLI:
+- `Sources/SwiftFTR/`: Core library (tracer, DNS, ICMP, configuration)
+- `Sources/swift-ftr/`: CLI entry point and JSON emitters
+- `Sources/hop-monitor/`: Ancillary monitoring tool
+- `Tests/SwiftFTRTests/`: Unit and integration tests
+- `docs/`: Documentation and guides
+- `FuzzCorpus/`: Fuzzing inputs for packet parsing
+
+## Coding Conventions
+
+- **Formatting**: `swift-format` driven; check with `swift format lint -r Sources Tests`
+- **Naming**: Standard camelCase; exceptions documented in `docs/development/CODE_STYLE.md`:
+  - snake_case JSON properties in `Sources/swift-ftr/main.swift`
+  - `LLVMFuzzerTestOneInput` for libFuzzer entry points
+  - `@_spi(Testing)` double-underscore helpers
+- **Commits**: Conventional Commits (`feat(tracer):`, `fix(dns):`, `docs:`)
+- **Testing**: Tests must be deterministic/offline; inject resolvers or supply config
+
+## Security Notes
+
+- Keep tokens and ASN data out of git
+- Configure with `SwiftFTRConfig(publicIP:)`, `SwiftFTRConfig(interface:)`, or CLI flags
+- Use `git config core.hooksPath .githooks` for local format enforcement
