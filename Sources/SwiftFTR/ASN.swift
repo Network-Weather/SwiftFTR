@@ -61,6 +61,15 @@ actor _ASNMemoryCache {
       }
     }
   }
+
+  /// Clear all cached entries. Internal for testing via @testable import.
+  func clear() {
+    map.removeAll()
+    order.removeAll()
+  }
+
+  /// Current cache size. Internal for testing via @testable import.
+  var count: Int { map.count }
 }
 
 /// Decorator that caches results from an underlying ASNResolver in-memory.
