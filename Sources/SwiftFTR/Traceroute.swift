@@ -143,6 +143,29 @@ public struct SwiftFTRConfig: Sendable {
   /// ```
   public let sourceIP: String?
 
+  /// ASN resolver strategy for trace classification.
+  ///
+  /// Controls how IP-to-ASN lookups are performed during `traceClassified()`.
+  /// Defaults to `.dns` (Team Cymru DNS) for backward compatibility.
+  ///
+  /// Options:
+  /// - `.dns`: DNS-based lookups (default, always current, requires network)
+  /// - `.embedded`: Local database from SwiftIP2ASN (~10μs lookups, +6MB memory)
+  /// - `.remote(bundledPath:url:)`: Remote database with optional offline fallback
+  /// - `.hybrid(source, fallbackTimeout:)`: Local first, DNS fallback for missing
+  ///
+  /// Example:
+  /// ```swift
+  /// // Use local database for offline operation
+  /// let config = SwiftFTRConfig(asnResolverStrategy: .embedded)
+  ///
+  /// // Bundle database with auto-updates (recommended for apps)
+  /// let config = SwiftFTRConfig(asnResolverStrategy: .remote(
+  ///     bundledPath: Bundle.main.path(forResource: "ip2asn", ofType: "ultra")
+  /// ))
+  /// ```
+  public let asnResolverStrategy: ASNResolverStrategy
+
   /// Creates a new SwiftFTR configuration.
   ///
   /// - Parameters:
@@ -156,6 +179,7 @@ public struct SwiftFTRConfig: Sendable {
   ///   - rdnsCacheSize: Maximum rDNS cache size (default: 1000 entries)
   ///   - interface: Network interface to use for sending probes (e.g. "en0"). If nil, uses system default.
   ///   - sourceIP: Source IP address to bind to (e.g. "192.168.1.100"). Must be assigned to the interface. If nil, uses system default.
+  ///   - asnResolverStrategy: Strategy for ASN lookups during classification (default: .dns)
   public init(
     maxHops: Int = 30,
     maxWaitMs: Int = 1000,
@@ -166,7 +190,8 @@ public struct SwiftFTRConfig: Sendable {
     rdnsCacheTTL: TimeInterval? = nil,
     rdnsCacheSize: Int? = nil,
     interface: String? = nil,
-    sourceIP: String? = nil
+    sourceIP: String? = nil,
+    asnResolverStrategy: ASNResolverStrategy = .dns
   ) {
     self.maxHops = maxHops
     self.maxWaitMs = maxWaitMs
@@ -178,6 +203,7 @@ public struct SwiftFTRConfig: Sendable {
     self.rdnsCacheSize = rdnsCacheSize
     self.interface = interface
     self.sourceIP = sourceIP
+    self.asnResolverStrategy = asnResolverStrategy
   }
 }
 
@@ -221,7 +247,42 @@ public actor SwiftFTR {
       ttl: config.rdnsCacheTTL ?? 86400,
       maxSize: config.rdnsCacheSize ?? 1000
     )
-    self.asnResolver = CachingASNResolver(base: CymruDNSResolver())
+    self.asnResolver = Self.createResolver(for: config.asnResolverStrategy)
+  }
+
+  /// Creates an ASN resolver based on the configured strategy.
+  private static func createResolver(for strategy: ASNResolverStrategy) -> ASNResolver {
+    switch strategy {
+    case .dns:
+      return CachingASNResolver(base: CymruDNSResolver())
+    case .embedded:
+      return LocalASNResolver(source: .embedded)
+    case .remote(let bundledPath, let url):
+      return LocalASNResolver(source: .remote(bundledPath: bundledPath, url: url))
+    case .hybrid(let source, let fallbackTimeout):
+      return HybridASNResolver(source: source, fallbackTimeout: fallbackTimeout)
+    }
+  }
+
+  /// Preload the ASN database for faster first classification.
+  ///
+  /// Only relevant when using `.embedded`, `.remote`, or `.hybrid` strategies.
+  /// Call this early in your app lifecycle to avoid the 35-40ms database load
+  /// latency on the first `traceClassified()` call.
+  ///
+  /// Example:
+  /// ```swift
+  /// let tracer = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: .embedded))
+  /// await tracer.preloadASNDatabase()  // Load database now
+  /// // ... later, classification is instant
+  /// let trace = try await tracer.traceClassified(to: "example.com")
+  /// ```
+  public func preloadASNDatabase() async {
+    if let local = asnResolver as? LocalASNResolver {
+      await local.preload()
+    } else if let hybrid = asnResolver as? HybridASNResolver {
+      await hybrid.preload()
+    }
   }
 
   /// Internal initializer used to spin up lightweight worker instances that share caches.

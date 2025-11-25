@@ -549,9 +549,13 @@ struct MultipathIntegrationTests {
     let uniqueHops = topology.uniqueHops()
     #expect(uniqueHops.count > 0)
 
-    // First hop should typically be local gateway (private IP)
-    if let firstHop = uniqueHops.first {
-      #expect(firstHop.ttl == 1)
+    // First hop is typically the local gateway (TTL 1), but may be TTL 2+ if
+    // the gateway doesn't respond to ICMP or times out under heavy load.
+    // We only verify that hops are sorted by TTL (implementation detail of uniqueHops).
+    if uniqueHops.count >= 2 {
+      #expect(
+        uniqueHops[0].ttl <= uniqueHops[1].ttl,
+        "uniqueHops should be sorted by TTL")
     }
   }
 

@@ -1,6 +1,5 @@
-import XCTest
-
 @_spi(Testing) @testable import SwiftFTR
+import XCTest
 
 final class SwiftFTRCacheTests: XCTestCase {
   override func setUp() async throws {
@@ -182,7 +181,8 @@ final class SwiftFTRCacheTests: XCTestCase {
     let caching = CachingASNResolver(base: base)
 
     // First call
-    let result1 = try await caching.resolve(ipv4Addrs: ["203.0.113.1", "203.0.113.2"], timeout: 0.1)
+    let result1 = try await caching.resolve(
+      ipv4Addrs: ["203.0.113.1", "203.0.113.2"], timeout: 0.1)
     XCTAssertEqual(result1["203.0.113.1"]?.asn, 1)
     XCTAssertEqual(result1["203.0.113.2"]?.asn, 2)
 

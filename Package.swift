@@ -17,10 +17,18 @@ let package = Package(
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.6.1"),
         // Enables `swift package generate-documentation`
-        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.0")
+        .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.0"),
+        // Local ASN database for offline IP-to-ASN lookups
+        .package(url: "https://github.com/network-weather/swift-ip2asn", from: "0.2.1")
     ],
     targets: [
-        .target(name: "SwiftFTR", path: "Sources/SwiftFTR"),
+        .target(
+            name: "SwiftFTR",
+            dependencies: [
+                .product(name: "SwiftIP2ASN", package: "swift-ip2asn")
+            ],
+            path: "Sources/SwiftFTR"
+        ),
         .executableTarget(
             name: "swift-ftr",
             dependencies: [

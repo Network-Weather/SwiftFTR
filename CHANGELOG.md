@@ -3,6 +3,60 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.9.0 — 2025-11-24
+------------------
+### Major Features
+
+**Offline ASN Resolution**
+- NEW: Local IP-to-ASN lookups via Swift-IP2ASN integration (no network required)
+- Configurable via `SwiftFTRConfig(asnResolverStrategy:)`:
+  - `.dns` (default): Team Cymru DNS WHOIS queries (backward compatible)
+  - `.embedded`: Use bundled ~3.4MB database (ships with Swift-IP2ASN)
+  - `.remote(bundledPath:url:)`: Download database with bundled fallback for mobile apps
+  - `.hybrid(source:fallbackTimeout:)`: Local DB first, DNS fallback for missing IPs
+- New `LocalASNResolver` actor with lazy loading and task deduplication
+- New `HybridASNResolver` struct for best of both worlds
+- `preloadASNDatabase()` API to eliminate first-lookup latency
+
+**Performance Characteristics** (benchmarked on M1 Mac):
+| Strategy | Load Time | Lookup (10 IPs) | Memory | Notes |
+|----------|-----------|-----------------|--------|-------|
+| `.dns` | N/A | 2.7ms cold | +1.4 MB | Network per query |
+| `.embedded` | 51ms | 0.07ms | +30 MB | 40x faster lookups |
+| `.hybrid` | 48ms | 0.05ms | +30 MB | Best coverage |
+| `.remote` | 332ms (download) | 0.02ms | +30 MB | One-time download |
+
+**Tradeoffs**:
+- Local DB adds ~30MB memory but provides 40x faster lookups
+- DNS misses some IPs (no Cymru record); local DB has 100% coverage
+- For memory-constrained apps, use `.dns` (default)
+
+**Usage Example**:
+```swift
+// Offline mode - fast, private, no network
+let config = SwiftFTRConfig(asnResolverStrategy: .embedded)
+let tracer = SwiftFTR(config: config)
+
+// Hybrid mode - local DB with DNS fallback
+let config = SwiftFTRConfig(asnResolverStrategy: .hybrid(.embedded, fallbackTimeout: 1.0))
+let tracer = SwiftFTR(config: config)
+
+// Mobile app - download database with bundled fallback
+let bundlePath = Bundle.main.path(forResource: "ip2asn", ofType: "ultra")
+let config = SwiftFTRConfig(asnResolverStrategy: .remote(bundledPath: bundlePath, url: nil))
+let tracer = SwiftFTR(config: config)
+await tracer.preloadASNDatabase() // Preload for instant lookups
+```
+
+### Dependencies
+- Added Swift-IP2ASN v0.2.1 for local ASN database support
+
+### Testing
+- 10 new tests for LocalASNResolver and HybridASNResolver
+- Tests cover embedded DB lookups, performance, preload, IP filtering, and config strategies
+- Fixed flaky ActorSchedulingTests: changed from absolute timing thresholds to relative comparison (detached vs actor-bound) which is robust under parallel test execution
+- All 122 tests passing (verified with 10 consecutive runs)
+
 0.8.1 — 2025-11-24
 ------------------
 ### Performance Improvements

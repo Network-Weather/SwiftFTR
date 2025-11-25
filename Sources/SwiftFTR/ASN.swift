@@ -23,6 +23,35 @@ public struct ASNInfo: Sendable, Hashable, Codable {
   }
 }
 
+/// Configuration for ASN resolution strategy.
+public enum ASNResolverStrategy: Sendable {
+  /// Use DNS-based lookups (Team Cymru). Always current, requires network.
+  case dns
+
+  /// Use embedded local database from SwiftIP2ASN package resources.
+  /// Fast (~10μs), works offline. Adds ~6MB memory footprint.
+  case embedded
+
+  /// Use remote database with optional bundled fallback.
+  /// - bundledPath: Path to .ultra file bundled with app (offline fallback)
+  /// - url: URL to fetch updates (defaults to pkgs.networkweather.com)
+  /// Works offline immediately if bundledPath provided, auto-updates when online.
+  case remote(bundledPath: String? = nil, url: URL? = nil)
+
+  /// Try local/remote first, fall back to DNS on miss.
+  case hybrid(LocalASNSource, fallbackTimeout: TimeInterval = 1.0)
+}
+
+/// Source for local ASN database.
+public enum LocalASNSource: Sendable {
+  /// Bundled in SwiftIP2ASN package resources
+  case embedded
+  /// App-provided .ultra file path
+  case bundled(String)
+  /// Remote with optional offline fallback
+  case remote(bundledPath: String?, url: URL?)
+}
+
 /// Resolves origin ASNs and related metadata for IPv4 addresses.
 public protocol ASNResolver: Sendable {
   /// Resolve metadata for the given IPv4 addresses.

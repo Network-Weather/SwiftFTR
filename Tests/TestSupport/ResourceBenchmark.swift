@@ -1,5 +1,6 @@
 import Foundation
 import SwiftFTR
+import SwiftIP2ASN
 
 #if canImport(Darwin)
   import Darwin
@@ -8,107 +9,214 @@ import SwiftFTR
 @main
 struct ResourceBenchmark {
   static func main() async throws {
-    print("🔥 Debugging ICMP IDs...")
-    // Create a socket manually to test ID behavior
-    let sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
-    guard sockfd >= 0 else { fatalError("Socket creation failed") }
+    print("═══════════════════════════════════════════════════════════")
+    print("  SwiftFTR ASN Resolver Benchmark")
+    print("═══════════════════════════════════════════════════════════\n")
 
-    // Set non-blocking
-    let flags = fcntl(sockfd, F_GETFL, 0)
-    _ = fcntl(sockfd, F_SETFL, flags | O_NONBLOCK)
+    // Test IPs - mix of well-known services
+    let testIPs = [
+      "8.8.8.8", "8.8.4.4",  // Google DNS
+      "1.1.1.1", "1.0.0.1",  // Cloudflare
+      "9.9.9.9",  // Quad9
+      "208.67.222.222",  // OpenDNS
+      "4.2.2.1",  // Level3
+      "199.85.126.10",  // Norton
+      "185.228.168.9",  // CleanBrowsing
+      "76.76.19.19",  // Alternate DNS
+    ]
 
-    // Bind to something? Not strictly needed for sending, but maybe?
-    // SwiftFTR doesn't bind by default unless interface specified.
+    // Measure baseline memory
+    let baselineMemory = getMemoryUsage()
+    print("Baseline memory: \(formatBytes(baselineMemory))\n")
 
-    // Send a ping with ID = 12345, Seq = 1
-    let id: UInt16 = 12345
-    let seq: UInt16 = 1
-    var header = ICMPHeader(
-      type: 8, code: 0, checksum: 0, identifier: id.bigEndian, sequence: seq.bigEndian)
-    var packet = [UInt8](repeating: 0, count: 8 + 56)  // 64 bytes
-    withUnsafeMutableBytes(of: &header) { hdr in
-      packet.withUnsafeMutableBytes { $0.copyBytes(from: hdr) }
-    }
-    // Checksum
-    packet.withUnsafeMutableBytes { mptr in
-      mptr[2] = 0
-      mptr[3] = 0
-      let cksum = calculateChecksum(data: UnsafeRawBufferPointer(mptr))
-      mptr[2] = UInt8(cksum >> 8)
-      mptr[3] = UInt8(cksum & 0xFF)
-    }
+    // Test each strategy
+    await testDNSStrategy(testIPs: testIPs, baselineMemory: baselineMemory)
+    await testEmbeddedStrategy(testIPs: testIPs, baselineMemory: baselineMemory)
+    await testHybridStrategy(testIPs: testIPs, baselineMemory: baselineMemory)
+    await testRemoteStrategy(testIPs: testIPs, baselineMemory: baselineMemory)
 
-    var dest = sockaddr_in()
-    dest.sin_family = sa_family_t(AF_INET)
-    inet_pton(AF_INET, "1.1.1.1", &dest.sin_addr)
-
-    let sent = withUnsafePointer(to: &dest) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        sendto(sockfd, packet, packet.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-    print("Sent bytes: \(sent)")
-
-    // Wait for reply
-    var buffer = [UInt8](repeating: 0, count: 1500)
-    let start = Date()
-    while Date().timeIntervalSince(start) < 2.0 {
-      var from = sockaddr_in()
-      var fromLen = socklen_t(MemoryLayout<sockaddr_in>.size)
-      let received = withUnsafeMutablePointer(to: &from) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-          recvfrom(sockfd, &buffer, buffer.count, 0, sa, &fromLen)
-        }
-      }
-
-      if received > 0 {
-        print("Received \(received) bytes")
-        // Parse ID from offset
-        // IP header? Check first byte
-        let first = buffer[0]
-        var offset = 0
-        if (first >> 4) == 4 {
-          offset = Int(first & 0x0F) * 4
-          print("IP Header detected, size: \(offset)")
-        }
-
-        if received - offset >= 8 {
-          let type = buffer[offset]
-          let code = buffer[offset + 1]
-          let recvId = (UInt16(buffer[offset + 4]) << 8) | UInt16(buffer[offset + 5])
-          let recvSeq = (UInt16(buffer[offset + 6]) << 8) | UInt16(buffer[offset + 7])
-          print("Type: \(type), Code: \(code), ID: \(recvId), Seq: \(recvSeq)")
-
-          if recvId == id {
-            print("✅ ID MATCHES!")
-          } else {
-            print("❌ ID MISMATCH! Sent: \(id), Received: \(recvId)")
-          }
-        }
-        break
-      }
-      try? await Task.sleep(nanoseconds: 100_000_000)
-    }
-    close(sockfd)
+    print("\n═══════════════════════════════════════════════════════════")
+    print("  Benchmark Complete")
+    print("═══════════════════════════════════════════════════════════")
   }
 
-  struct ICMPHeader {
-    var type: UInt8
-    var code: UInt8
-    var checksum: UInt16
-    var identifier: UInt16
-    var sequence: UInt16
+  static func testDNSStrategy(testIPs: [String], baselineMemory: Int) async {
+    print("───────────────────────────────────────────────────────────")
+    print("Strategy: .dns (Team Cymru DNS WHOIS)")
+    print("───────────────────────────────────────────────────────────")
+
+    let resolver = CachingASNResolver(base: CymruDNSResolver())
+
+    // Cold lookup
+    let coldStart = CFAbsoluteTimeGetCurrent()
+    let results = try? await resolver.resolve(ipv4Addrs: testIPs, timeout: 5.0)
+    let coldTime = (CFAbsoluteTimeGetCurrent() - coldStart) * 1000
+
+    let memAfterCold = getMemoryUsage()
+    print("  Cold lookup (\(testIPs.count) IPs): \(String(format: "%.1f", coldTime))ms")
+    print(
+      "  Memory after cold: \(formatBytes(memAfterCold)) (+\(formatBytes(memAfterCold - baselineMemory)))"
+    )
+    print("  Results: \(results?.count ?? 0) resolved")
+
+    // Warm lookup (cached)
+    let warmStart = CFAbsoluteTimeGetCurrent()
+    _ = try? await resolver.resolve(ipv4Addrs: testIPs, timeout: 5.0)
+    let warmTime = (CFAbsoluteTimeGetCurrent() - warmStart) * 1000
+
+    print("  Warm lookup (cached): \(String(format: "%.2f", warmTime))ms")
+
+    // Verify results - show all
+    if let r = results {
+      print("  Resolved IPs:")
+      for ip in testIPs {
+        if let info = r[ip] {
+          print("    \(ip) → AS\(info.asn) \(info.name)")
+        } else {
+          print("    \(ip) → NOT FOUND")
+        }
+      }
+    }
+    print()
   }
 
-  static func calculateChecksum(data: UnsafeRawBufferPointer) -> UInt16 {
-    var sum: UInt32 = 0
-    var idx = 0
-    while idx + 1 < data.count {
-      sum &+= UInt32((UInt16(data[idx]) << 8) | UInt16(data[idx + 1]))
-      idx += 2
+  static func testEmbeddedStrategy(testIPs: [String], baselineMemory: Int) async {
+    print("───────────────────────────────────────────────────────────")
+    print("Strategy: .embedded (Local database)")
+    print("───────────────────────────────────────────────────────────")
+
+    let resolver = LocalASNResolver(source: .embedded)
+
+    // Preload timing
+    let preloadStart = CFAbsoluteTimeGetCurrent()
+    await resolver.preload()
+    let preloadTime = (CFAbsoluteTimeGetCurrent() - preloadStart) * 1000
+
+    let memAfterPreload = getMemoryUsage()
+    print("  Preload time: \(String(format: "%.1f", preloadTime))ms")
+    print(
+      "  Memory after preload: \(formatBytes(memAfterPreload)) (+\(formatBytes(memAfterPreload - baselineMemory)))"
+    )
+
+    // Lookup (DB already loaded via preload)
+    let coldStart = CFAbsoluteTimeGetCurrent()
+    let results = try? await resolver.resolve(ipv4Addrs: testIPs, timeout: 1.0)
+    let coldTime = (CFAbsoluteTimeGetCurrent() - coldStart) * 1000
+
+    print("  Lookup (\(testIPs.count) IPs): \(String(format: "%.3f", coldTime))ms")
+    print("  Results: \(results?.count ?? 0) resolved")
+
+    // Bulk lookup performance
+    let bulkIPs = (0..<1000).map { i in
+      "\(8 + (i / 256)).\((i * 17) % 256).\((i * 31) % 256).\((i * 7) % 256)"
     }
-    if idx < data.count { sum &+= UInt32(UInt16(data[idx]) << 8) }
-    while (sum >> 16) != 0 { sum = (sum & 0xFFFF) &+ (sum >> 16) }
-    return ~UInt16(sum & 0xFFFF)
+    let bulkStart = CFAbsoluteTimeGetCurrent()
+    _ = try? await resolver.resolve(ipv4Addrs: bulkIPs, timeout: 1.0)
+    let bulkTime = (CFAbsoluteTimeGetCurrent() - bulkStart) * 1000
+
+    print(
+      "  Bulk lookup (1000 IPs): \(String(format: "%.2f", bulkTime))ms (\(String(format: "%.1f", bulkTime))μs/IP)"
+    )
+
+    // Verify results - show all
+    if let r = results {
+      print("  Resolved IPs:")
+      for ip in testIPs {
+        if let info = r[ip] {
+          print("    \(ip) → AS\(info.asn) \(info.name)")
+        } else {
+          print("    \(ip) → NOT FOUND")
+        }
+      }
+    }
+    print()
+  }
+
+  static func testHybridStrategy(testIPs: [String], baselineMemory: Int) async {
+    print("───────────────────────────────────────────────────────────")
+    print("Strategy: .hybrid (Local + DNS fallback)")
+    print("───────────────────────────────────────────────────────────")
+
+    let resolver = HybridASNResolver(source: .embedded, fallbackTimeout: 1.0)
+
+    // Preload timing
+    let preloadStart = CFAbsoluteTimeGetCurrent()
+    await resolver.preload()
+    let preloadTime = (CFAbsoluteTimeGetCurrent() - preloadStart) * 1000
+
+    let memAfterPreload = getMemoryUsage()
+    print("  Preload time: \(String(format: "%.1f", preloadTime))ms")
+    print(
+      "  Memory after preload: \(formatBytes(memAfterPreload)) (+\(formatBytes(memAfterPreload - baselineMemory)))"
+    )
+
+    // Lookup
+    let coldStart = CFAbsoluteTimeGetCurrent()
+    let results = try? await resolver.resolve(ipv4Addrs: testIPs, timeout: 1.0)
+    let coldTime = (CFAbsoluteTimeGetCurrent() - coldStart) * 1000
+
+    print("  Lookup (\(testIPs.count) IPs): \(String(format: "%.2f", coldTime))ms")
+    print("  Results: \(results?.count ?? 0) resolved")
+
+    // Verify results
+    if let r = results {
+      print("  Sample: 8.8.8.8 → AS\(r["8.8.8.8"]?.asn ?? 0) \(r["8.8.8.8"]?.name ?? "?")")
+    }
+    print()
+  }
+
+  static func testRemoteStrategy(testIPs: [String], baselineMemory: Int) async {
+    print("───────────────────────────────────────────────────────────")
+    print("Strategy: .remote (Download from network)")
+    print("───────────────────────────────────────────────────────────")
+
+    // Clear cache using IP2ASN's API
+    try? await IP2ASN.clearCache()
+    print("  (Cleared IP2ASN cache)")
+
+    // Test without bundled path - will download fresh
+    let resolver = LocalASNResolver(source: .remote(bundledPath: nil, url: nil))
+
+    // First lookup triggers download
+    let coldStart = CFAbsoluteTimeGetCurrent()
+    let results = try? await resolver.resolve(ipv4Addrs: testIPs, timeout: 60.0)
+    let coldTime = (CFAbsoluteTimeGetCurrent() - coldStart) * 1000
+
+    let memAfterCold = getMemoryUsage()
+    print("  First lookup (incl. download): \(String(format: "%.1f", coldTime))ms")
+    print(
+      "  Memory after load: \(formatBytes(memAfterCold)) (+\(formatBytes(memAfterCold - baselineMemory)))"
+    )
+    print("  Results: \(results?.count ?? 0) resolved")
+
+    // Second lookup (cached in memory)
+    let warmStart = CFAbsoluteTimeGetCurrent()
+    _ = try? await resolver.resolve(ipv4Addrs: testIPs, timeout: 1.0)
+    let warmTime = (CFAbsoluteTimeGetCurrent() - warmStart) * 1000
+
+    print("  Cached lookup: \(String(format: "%.3f", warmTime))ms")
+
+    // Verify results
+    if let r = results {
+      print("  Sample: 8.8.8.8 → AS\(r["8.8.8.8"]?.asn ?? 0) \(r["8.8.8.8"]?.name ?? "?")")
+    }
+    print()
+  }
+
+  static func getMemoryUsage() -> Int {
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+    let result = withUnsafeMutablePointer(to: &info) {
+      $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+        task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+      }
+    }
+    return result == KERN_SUCCESS ? Int(info.resident_size) : 0
+  }
+
+  static func formatBytes(_ bytes: Int) -> String {
+    if bytes < 1024 { return "\(bytes) B" }
+    if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes) / 1024) }
+    return String(format: "%.1f MB", Double(bytes) / (1024 * 1024))
   }
 }
