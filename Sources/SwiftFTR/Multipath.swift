@@ -48,7 +48,7 @@ public struct MultipathConfig: Sendable {
   /// Timeout per flow variation in milliseconds (default: 2000)
   public let timeoutMs: Int
 
-  /// Maximum TTL/hops to probe (default: 30)
+  /// Maximum TTL/hops to probe (default: 40)
   public let maxHops: Int
 
   public init(
@@ -56,7 +56,7 @@ public struct MultipathConfig: Sendable {
     maxPaths: Int = 16,
     earlyStopThreshold: Int = 3,
     timeoutMs: Int = 2000,
-    maxHops: Int = 30
+    maxHops: Int = 40
   ) {
     self.flowVariations = flowVariations
     self.maxPaths = maxPaths

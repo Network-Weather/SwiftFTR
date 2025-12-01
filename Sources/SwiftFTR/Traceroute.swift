@@ -107,7 +107,7 @@ public enum TracerouteError: Error, CustomStringConvertible {
 
 /// Configuration options for SwiftFTR operations.
 public struct SwiftFTRConfig: Sendable {
-  /// Maximum TTL/hops to probe (default: 30)
+  /// Maximum TTL/hops to probe (default: 40)
   public let maxHops: Int
   /// Maximum wait time per probe in milliseconds (default: 1000ms)
   public let maxWaitMs: Int
@@ -169,7 +169,7 @@ public struct SwiftFTRConfig: Sendable {
   /// Creates a new SwiftFTR configuration.
   ///
   /// - Parameters:
-  ///   - maxHops: Maximum TTL/hops to probe (default: 30)
+  ///   - maxHops: Maximum TTL/hops to probe (default: 40)
   ///   - maxWaitMs: Maximum wait time per probe in milliseconds (default: 1000ms)
   ///   - payloadSize: Size in bytes of the Echo payload (default: 56)
   ///   - publicIP: Override the public IP address (bypasses STUN discovery if set)
@@ -181,7 +181,7 @@ public struct SwiftFTRConfig: Sendable {
   ///   - sourceIP: Source IP address to bind to (e.g. "192.168.1.100"). Must be assigned to the interface. If nil, uses system default.
   ///   - asnResolverStrategy: Strategy for ASN lookups during classification (default: .dns)
   public init(
-    maxHops: Int = 30,
+    maxHops: Int = 40,
     maxWaitMs: Int = 1000,
     payloadSize: Int = 56,
     publicIP: String? = nil,
@@ -685,13 +685,22 @@ public actor SwiftFTR {
   /// each hop as LOCAL, ISP, TRANSIT, or DESTINATION. Missing stretches between
   /// identical segments are interpolated for readability.
   ///
+  /// When tracing through a VPN interface (utun*, ipsec*, etc.), the classification will
+  /// automatically detect the VPN context and properly classify VPN hops:
+  /// - CGNAT addresses (100.64.0.0/10) → VPN (not ISP)
+  /// - Private addresses after VPN hop → VPN (exit node's network)
+  ///
+  /// You can also provide an explicit `VPNContext` for more control.
+  ///
   /// - Parameters:
   ///   - host: Destination hostname or IPv4 address.
+  ///   - vpnContext: Context for VPN-aware classification (optional, auto-detected from interface).
   ///   - resolver: ASN resolver implementation (default: uses internal cached resolver).
   /// - Returns: A ClassifiedTrace containing segment labels and (when available) ASN info.
   /// - Throws: `TracerouteError` if resolution or socket operations fail
   public func traceClassified(
     to host: String,
+    vpnContext: VPNContext? = nil,
     resolver: ASNResolver? = nil
   ) async throws -> ClassifiedTrace {
     // Validate interface early if specified (before any network operations)
@@ -753,6 +762,9 @@ public actor SwiftFTR {
     // Use provided resolver or internal one
     let effectiveResolver = resolver ?? asnResolver
 
+    // Determine VPN context - use provided or auto-detect from interface
+    let effectiveVPNContext = vpnContext ?? VPNContext.forInterface(config.interface)
+
     // Classify with enhanced data
     let classifier = TraceClassifier()
     let baseClassified = try await classifier.classify(
@@ -763,6 +775,7 @@ public actor SwiftFTR {
       publicIP: effectivePublicIP,
       interface: config.interface,
       sourceIP: config.sourceIP,
+      vpnContext: effectiveVPNContext,
       enableLogging: config.enableLogging
     )
 
@@ -884,6 +897,66 @@ public actor SwiftFTR {
         enableLogging: enableLogging
       ).ip
     }
+  }
+
+  // MARK: - Network Interface Discovery
+
+  /// Discover all network interfaces on the system.
+  ///
+  /// Returns a snapshot of all interfaces including physical adapters (WiFi, Ethernet)
+  /// and VPN tunnels (utun, ipsec, ppp). Use this to understand available network paths
+  /// and to bind traces to specific interfaces.
+  ///
+  /// ## Example
+  /// ```swift
+  /// let tracer = SwiftFTR()
+  /// let snapshot = await tracer.discoverInterfaces()
+  ///
+  /// // List VPN interfaces
+  /// for iface in snapshot.vpnInterfaces {
+  ///     print("\(iface.name): \(iface.ipv4Addresses)")
+  /// }
+  ///
+  /// // Trace through each physical interface
+  /// for iface in snapshot.physicalInterfaces {
+  ///     let config = SwiftFTRConfig(interface: iface.name)
+  ///     let tracer = SwiftFTR(config: config)
+  ///     let trace = try await tracer.traceClassified(to: "example.com")
+  /// }
+  /// ```
+  public nonisolated func discoverInterfaces() async -> NetworkInterfaceSnapshot {
+    await NetworkInterfaceDiscovery().discover()
+  }
+
+  /// Discover public IP via STUN through the configured (or default) interface.
+  ///
+  /// Returns both the public IP and its reverse DNS hostname if available.
+  /// Use this to understand which exit point your traffic uses for a given interface.
+  ///
+  /// For multi-path scenarios, create separate `SwiftFTR` instances with different
+  /// interface configurations to discover the public IP for each path.
+  ///
+  /// ## Example
+  /// ```swift
+  /// // Discover public IP through default interface
+  /// let tracer = SwiftFTR()
+  /// let (ip, hostname) = try await tracer.discoverPublicIPWithHostname()
+  /// print("Exit: \(ip) (\(hostname ?? "no rDNS"))")
+  ///
+  /// // Discover public IP through VPN
+  /// let vpnTracer = SwiftFTR(config: SwiftFTRConfig(interface: "utun3"))
+  /// let (vpnIP, vpnHost) = try await vpnTracer.discoverPublicIPWithHostname()
+  /// print("VPN exit: \(vpnIP) (\(vpnHost ?? "no rDNS"))")
+  /// ```
+  public func discoverPublicIPWithHostname() async throws -> (ip: String, hostname: String?) {
+    let ip = try await discoverPublicIP()
+    let hostname: String?
+    if !config.noReverseDNS {
+      hostname = await rdnsCache.lookup(ip)
+    } else {
+      hostname = nil
+    }
+    return (ip: ip, hostname: hostname)
   }
 
   // MARK: - Cache Management

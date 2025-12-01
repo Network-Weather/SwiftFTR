@@ -11,15 +11,16 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       Provides fast, parallel traceroute using ICMP datagram sockets and ping capabilities.
 
       Use subcommands:
-        trace      - Perform traceroute with ASN classification
-        ping       - Send ICMP echo requests to measure latency
-        multipath  - Discover ECMP paths using Dublin Traceroute
+        trace       - Perform traceroute with ASN classification
+        ping        - Send ICMP echo requests to measure latency
+        multipath   - Discover ECMP paths using Dublin Traceroute
         bufferbloat - Test for bufferbloat (latency under load)
+        interfaces  - List network interfaces (WiFi, Ethernet, VPN tunnels)
 
       Or run trace directly (default behavior):
         swift-ftr example.com
       """,
-    subcommands: [Trace.self, Ping.self, Multipath.self, Bufferbloat.self],
+    subcommands: [Trace.self, Ping.self, Multipath.self, Bufferbloat.self, Interfaces.self],
     defaultSubcommand: Trace.self
   )
 }
@@ -64,7 +65,7 @@ extension SwiftFTRCommand {
     var verbose: Bool = false
 
     @Option(name: [.short, .customLong("max-hops")], help: "Maximum TTL/hops to probe")
-    var maxHops: Int = 30
+    var maxHops: Int = 40
 
     @Option(
       name: [.short, .customLong("timeout")], help: "Overall wait after sending probes (seconds)")
@@ -160,6 +161,7 @@ extension SwiftFTRCommand {
         case .transit: return "TRANSIT"
         case .destination: return "DESTINATION"
         case .unknown: return nil
+        case .vpn: return "VPN"
         }
       }
       func oneDecimal(_ v: Double) -> Double { (v * 10).rounded() / 10 }
@@ -233,6 +235,7 @@ extension SwiftFTRCommand {
         case .transit: return "[TRANSIT]"
         case .destination: return "[DESTINATION]"
         case .unknown: return "[UNKNOWN]"
+        case .vpn: return "[VPN   ]"
         }
       }
       var hopHostnameMap: [String: String] = [:]
@@ -430,8 +433,8 @@ extension SwiftFTRCommand {
     var earlyStop: Int = 3
 
     @Option(
-      name: [.short, .customLong("max-hops")], help: "Maximum TTL/hops to probe (default: 30)")
-    var maxHops: Int = 30
+      name: [.short, .customLong("max-hops")], help: "Maximum TTL/hops to probe (default: 40)")
+    var maxHops: Int = 40
 
     @Option(
       name: [.short, .customLong("timeout")], help: "Timeout per flow in seconds (default: 2.0)")
@@ -586,6 +589,7 @@ extension SwiftFTRCommand {
       case .transit: return "[TRANSIT]"
       case .destination: return "[DESTINATION]"
       case .unknown: return "[UNKNOWN]"
+      case .vpn: return "[VPN   ]"
       }
     }
 
@@ -709,6 +713,126 @@ extension SwiftFTRCommand {
       encoder.dateEncodingStrategy = .iso8601
       let data = try! encoder.encode(result)
       print(String(data: data, encoding: .utf8)!)
+    }
+  }
+}
+
+// MARK: - Interfaces Subcommand
+
+extension SwiftFTRCommand {
+  struct Interfaces: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+      commandName: "interfaces",
+      abstract: "List network interfaces",
+      discussion: """
+        Discovers and lists all network interfaces on the system, including:
+        - Physical interfaces (WiFi, Ethernet)
+        - VPN tunnels (utun, ipsec, ppp)
+        - Bridge and other virtual interfaces
+
+        Use this to identify interfaces for binding traces to specific network paths.
+
+        Examples:
+          swift-ftr interfaces
+          swift-ftr interfaces --json
+          swift-ftr interfaces --vpn-only
+        """
+    )
+
+    @Flag(name: .customLong("json"), help: "Output as JSON")
+    var json: Bool = false
+
+    @Flag(name: .customLong("vpn-only"), help: "Show only VPN interfaces")
+    var vpnOnly: Bool = false
+
+    @Flag(name: .customLong("physical-only"), help: "Show only physical interfaces")
+    var physicalOnly: Bool = false
+
+    @Flag(name: .customLong("active-only"), help: "Show only active (up) interfaces")
+    var activeOnly: Bool = true
+
+    mutating func run() async throws {
+      let tracer = SwiftFTR()
+      let snapshot = await tracer.discoverInterfaces()
+
+      var interfaces = snapshot.interfaces
+
+      // Apply filters
+      if vpnOnly {
+        interfaces = interfaces.filter { $0.type.isVPN }
+      } else if physicalOnly {
+        interfaces = interfaces.filter { $0.type.isPhysical }
+      }
+
+      if activeOnly {
+        interfaces = interfaces.filter { $0.isUp }
+      }
+
+      if json {
+        printJSON(interfaces)
+      } else {
+        printPretty(interfaces, snapshot: snapshot)
+      }
+    }
+
+    private func printJSON(_ interfaces: [NetworkInterface]) {
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try! encoder.encode(interfaces)
+      print(String(data: data, encoding: .utf8)!)
+    }
+
+    private func printPretty(_ interfaces: [NetworkInterface], snapshot: NetworkInterfaceSnapshot) {
+      if interfaces.isEmpty {
+        print("No interfaces found matching criteria.")
+        return
+      }
+
+      print("Network Interfaces:")
+      print("")
+
+      for iface in interfaces {
+        let typeStr = typeLabel(iface.type)
+        let statusStr = iface.isUp ? "UP" : "DOWN"
+        let p2pStr = iface.isPointToPoint ? " (P2P)" : ""
+
+        print("  \(iface.name) [\(typeStr)] \(statusStr)\(p2pStr)")
+
+        if !iface.ipv4Addresses.isEmpty {
+          for ip in iface.ipv4Addresses {
+            print("    IPv4: \(ip)")
+          }
+        }
+
+        if !iface.ipv6Addresses.isEmpty {
+          // Only show first IPv6 to avoid clutter
+          if let ip = iface.ipv6Addresses.first {
+            let extra = iface.ipv6Addresses.count - 1
+            let suffix = extra > 0 ? " (+\(extra) more)" : ""
+            print("    IPv6: \(ip)\(suffix)")
+          }
+        }
+
+        print("")
+      }
+
+      // Summary
+      let vpnCount = snapshot.vpnInterfaces.count
+      let physicalCount = snapshot.physicalInterfaces.count
+      print("Summary: \(physicalCount) physical, \(vpnCount) VPN, \(interfaces.count) shown")
+    }
+
+    private func typeLabel(_ type: InterfaceType) -> String {
+      switch type {
+      case .wifi: return "WiFi"
+      case .ethernet: return "Ethernet"
+      case .vpnTunnel: return "VPN Tunnel"
+      case .vpnIPSec: return "VPN IPSec"
+      case .vpnPPP: return "VPN PPP"
+      case .bridge: return "Bridge"
+      case .loopback: return "Loopback"
+      case .other: return "Other"
+      }
     }
   }
 }

@@ -2,7 +2,7 @@
 
 This roadmap outlines the development direction for SwiftFTR. It is prioritized by value and impact rather than strict timelines or version numbers.
 
-## 📍 Current Stable State (v0.9.0)
+## 📍 Current Stable State (v0.10.0)
 - **Core**: Parallel traceroute with ICMP datagram sockets (no sudo required on macOS).
 - **Scalability**: Massively parallel `ping` architecture using `kqueue`/`epoll` (C10k ready).
 - **DNS**: Full-featured DNS client supporting 11 record types (A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS) with high-precision timing.
@@ -11,6 +11,7 @@ This roadmap outlines the development direction for SwiftFTR. It is prioritized 
 - **Architecture**: Fully async/await, Swift 6 strict concurrency compliant, actor-based.
 - **Performance**: Parallel ASN resolution with bounded concurrency (v0.8.1).
 - **Offline ASN**: Local IP-to-ASN lookups via Swift-IP2ASN (~10μs), configurable strategy (v0.9.0).
+- **VPN-Aware Classification**: VPN/overlay/corporate hop categories with interface discovery (v0.10.0).
 
 ---
 
@@ -47,10 +48,9 @@ These features are the primary focus for upcoming releases, ranked by priority.
 
 ### Enhanced Network Classification
 **Goal**: Go beyond simple ASN labeling to identify sophisticated network types.
-- **VPN/Overlay**: specific detection heuristics for WireGuard, Tailscale, ZeroTier, and OpenVPN tunnels.
 - **SASE/SSE**: Identify Zscaler, Netskope, and Prisma Access gateways.
 - **Cloud/CDN**: Distinguish between AWS/GCP/Azure backbone transit and edge delivery nodes.
-- **New Categories**: `.vpn`, `.overlay`, `.cdn`, `.cloud`, `.cgnat`, `.proxy`.
+- **New Categories**: `.cdn`, `.cloud`, `.proxy`.
 
 ### TCP Traceroute
 **Goal**: Maximum firewall traversal capability.

@@ -130,7 +130,7 @@ import SwiftFTR
 
 // Configure once, use everywhere
 let config = SwiftFTRConfig(
-    maxHops: 30,        // Max TTL to probe
+    maxHops: 40,        // Max TTL to probe
     maxWaitMs: 1000,    // Timeout in milliseconds
     payloadSize: 56,    // ICMP payload size
     publicIP: nil,      // Auto-detect via STUN
@@ -288,11 +288,11 @@ swift build -c release
 
 ### Traceroute (default command)
 ```bash
-.build/release/swift-ftr trace example.com -m 30 -w 1.0
+.build/release/swift-ftr trace example.com -m 40 -w 1.0
 ```
 
 Options:
-- `-m, --max-hops N`: Max TTL/hops to probe (default 30)
+- `-m, --max-hops N`: Max TTL/hops to probe (default 40)
 - `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
 - `-i, --interface IFACE`: Use specific network interface (e.g., en0)
 - `-s, --source IP`: Bind to specific source IP address
@@ -324,7 +324,7 @@ Options:
 - `--flows N`: Number of flow variations (default 8)
 - `--max-paths N`: Max unique paths to find (default 16)
 - `--early-stop N`: Stop after N flows with no new paths (default 3)
-- `-m, --max-hops N`: Max TTL to probe (default 30)
+- `-m, --max-hops N`: Max TTL to probe (default 40)
 - `-t, --timeout SEC`: Timeout per flow in seconds (default 2.0)
 - `--json`: Output JSON format
 

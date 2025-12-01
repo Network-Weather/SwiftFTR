@@ -66,7 +66,7 @@ struct MultipathConfigTests {
     #expect(config.maxPaths == 16)
     #expect(config.earlyStopThreshold == 3)
     #expect(config.timeoutMs == 2000)
-    #expect(config.maxHops == 30)
+    #expect(config.maxHops == 40)
   }
 
   @Test("Custom configuration values")

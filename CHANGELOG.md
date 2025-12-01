@@ -3,6 +3,71 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.10.0 — 2025-12-01
+-------------------
+### Major Features
+
+**VPN-Aware Trace Classification**
+- NEW: VPN interface detection and classification for accurate path analysis
+- NEW: `HopCategory.vpn` for all hops through a VPN tunnel
+- NEW: `VPNContext` struct for passing VPN state to classification
+- NEW: Automatic VPN context detection from interface name (utun*, ipsec*, ppp*, etc.)
+- NEW: Tailscale hostname detection via `.ts.net` suffix
+
+**Network Interface Discovery**
+- NEW: `NetworkInterfaceDiscovery` actor for enumerating system network interfaces
+- NEW: `NetworkInterface` struct with type, addresses, MTU, and status
+- NEW: `NetworkInterfaceSnapshot` with filtered views (physical, VPN, active)
+- NEW: `InterfaceType` enum: wifi, ethernet, vpnTunnel, vpnIPSec, vpnPPP, bridge, loopback, other
+- NEW: CLI `swift-ftr interfaces` subcommand with `--json`, `--vpn-only`, `--physical-only` options
+
+**Classification Improvements**
+- CGNAT IPs (100.64.0.0/10) classified as VPN when tracing through VPN interface
+- All private IPs after VPN hops classified as VPN (exit node LAN is part of VPN solution)
+- Tailscale hostnames (.ts.net) always classified as VPN
+- Simple category model: VPN segment covers everything until traffic exits to the public internet
+
+**Use Cases**
+- WFH diagnostics: Check BOTH VPN path AND direct residential path
+- Multi-interface monitoring: Enumerate WiFi, Ethernet, and VPN interfaces separately
+- Tailscale exit node tracing: Correctly identify VPN hops vs ISP CGNAT
+
+**Usage Example**:
+```swift
+let tracer = SwiftFTR()
+
+// Discover available interfaces
+let snapshot = await tracer.discoverInterfaces()
+for iface in snapshot.vpnInterfaces {
+  print("\(iface.name): \(iface.ipv4Addresses)")
+}
+
+// Trace with automatic VPN detection (uses config.interface)
+let trace = try await tracer.traceClassified(to: "example.com")
+
+// Or provide explicit VPN context
+let vpnContext = VPNContext(traceInterface: "utun3", isVPNTrace: true, vpnLocalIPs: [])
+let trace = try await tracer.traceClassified(to: "example.com", vpnContext: vpnContext)
+
+// VPN hops include tunnel endpoint + exit node's local network
+for hop in trace.hops where hop.category == .vpn {
+  print("VPN: \(hop.hostname ?? hop.ip ?? "?")")
+}
+```
+
+### Defaults
+- CHANGED: Default `maxHops` increased from 30 to 40 (parallel probes make this essentially free)
+
+### Testing
+- 22 new tests for network interface discovery and classification
+- 7 new tests for VPN-aware trace classification
+- All 143 tests passing
+
+### Compatibility
+- No breaking changes to existing APIs
+- New `vpnContext` parameter in `traceClassified()` is optional with default `nil`
+- VPN context auto-detected when `SwiftFTRConfig.interface` is set to a VPN interface
+
 0.9.0 — 2025-11-24
 ------------------
 ### Major Features

@@ -8,7 +8,7 @@ Use ``SwiftFTR/SwiftFTR`` to perform a parallel traceroute to an IPv4 host.
 import SwiftFTR
 
 let tracer = SwiftFTR()
-let result = try await tracer.trace(to: "8.8.8.8", maxHops: 30, timeout: 1.0)
+let result = try await tracer.trace(to: "8.8.8.8", maxHops: 40, timeout: 1.0)
 print(result.hops)
 ```
 
@@ -18,7 +18,7 @@ print(result.hops)
 import SwiftFTR
 
 let tracer = SwiftFTR()
-let classified = try await tracer.traceClassified(to: "www.example.com", maxHops: 30, timeout: 1.0)
+let classified = try await tracer.traceClassified(to: "www.example.com", maxHops: 40, timeout: 1.0)
 for hop in classified.hops {
     print(hop.ttl, hop.ip ?? "*", hop.category, hop.asn ?? -1)
 }

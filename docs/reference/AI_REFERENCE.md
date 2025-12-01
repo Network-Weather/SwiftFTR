@@ -56,7 +56,7 @@ Configuration for traceroute behavior and caching.
 
 ```swift
 public struct SwiftFTRConfig: Sendable {
-    public let maxHops: Int           // Maximum TTL to probe (default: 30)
+    public let maxHops: Int           // Maximum TTL to probe (default: 40)
     public let maxWaitMs: Int          // Timeout in milliseconds (default: 1000)
     public let payloadSize: Int        // ICMP payload size in bytes (default: 56)
     public let publicIP: String?       // Override public IP (default: nil, auto-detect)
@@ -68,7 +68,7 @@ public struct SwiftFTRConfig: Sendable {
     public let rdnsCacheSize: Int?     // Max rDNS cache entries (default: 1000)
 
     public init(
-        maxHops: Int = 30,
+        maxHops: Int = 40,
         maxWaitMs: Int = 1000,
         payloadSize: Int = 56,
         publicIP: String? = nil,

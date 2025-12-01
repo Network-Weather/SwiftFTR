@@ -32,6 +32,9 @@ public func isPrivateIPv4(_ ip: String) -> Bool {
 }
 
 /// Returns true if the IPv4 string is in RFC6598 CGNAT range (100.64.0.0/10).
+///
+/// Note: This range is used by both ISP CGNAT and overlay networks like Tailscale.
+/// Use `VPNContext` to distinguish between them during classification.
 @inline(__always)
 public func isCGNATIPv4(_ ip: String) -> Bool {
   // 100.64.0.0/10

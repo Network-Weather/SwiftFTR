@@ -7,6 +7,7 @@ public enum HopCategory: String, Sendable, Codable {
   case transit = "TRANSIT"
   case destination = "DESTINATION"
   case unknown = "UNKNOWN"
+  case vpn = "VPN"  // Any hop through a VPN tunnel (CGNAT, private IPs after tunnel, etc.)
 }
 
 /// A hop annotated with ASN and category information.
@@ -79,6 +80,47 @@ public struct ClassifiedTrace: Sendable, Codable {
   }
 }
 
+/// Context for VPN-aware hop classification.
+///
+/// When tracing through a VPN tunnel interface, CGNAT addresses (100.64.0.0/10)
+/// should be classified as VPN/OVERLAY rather than ISP CGNAT.
+public struct VPNContext: Sendable {
+  /// Interface being traced (if known)
+  public let traceInterface: String?
+
+  /// Whether the trace interface is a VPN tunnel
+  public let isVPNTrace: Bool
+
+  /// VPN-assigned local IPs (to help identify VPN hops)
+  public let vpnLocalIPs: Set<String>
+
+  public init(
+    traceInterface: String? = nil,
+    isVPNTrace: Bool = false,
+    vpnLocalIPs: Set<String> = []
+  ) {
+    self.traceInterface = traceInterface
+    self.isVPNTrace = isVPNTrace
+    self.vpnLocalIPs = vpnLocalIPs
+  }
+
+  /// Create context by auto-detecting from interface name.
+  ///
+  /// If the interface name matches VPN patterns (utun*, ipsec*, ppp*),
+  /// the context will be configured for VPN-aware classification.
+  public static func forInterface(_ name: String?) -> VPNContext {
+    guard let name = name else {
+      return VPNContext()
+    }
+    let isVPN = NetworkInterfaceDiscovery.isVPNInterface(name)
+    return VPNContext(
+      traceInterface: name,
+      isVPNTrace: isVPN,
+      vpnLocalIPs: []
+    )
+  }
+}
+
 /// Classifies plain traceroute results into segments and attaches ASN metadata.
 public struct TraceClassifier: Sendable {
   public init() {}
@@ -92,6 +134,7 @@ public struct TraceClassifier: Sendable {
   ///   - publicIP: Override public IP (bypasses STUN if provided).
   ///   - interface: Network interface to use for STUN discovery (if needed).
   ///   - sourceIP: Source IP address to bind to for STUN discovery (if needed).
+  ///   - vpnContext: Context for VPN-aware classification (optional).
   ///   - enableLogging: Enable verbose logging for debugging.
   /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
   public func classify(
@@ -102,6 +145,7 @@ public struct TraceClassifier: Sendable {
     publicIP: String? = nil,
     interface: String? = nil,
     sourceIP: String? = nil,
+    vpnContext: VPNContext? = nil,
     enableLogging: Bool = false
   ) async throws -> ClassifiedTrace {
     // Gather IPs
@@ -133,7 +177,9 @@ public struct TraceClassifier: Sendable {
     // Classify hops
     var out: [ClassifiedHop] = []
     var seenPublicIP = false  // Track if we've seen any public IP yet
+    var seenVPNHop = false  // Track if we've seen a VPN tunnel hop
     var lastPublicASN: Int? = nil  // Track the last public ASN we saw
+    let isVPNTrace = vpnContext?.isVPNTrace ?? false
 
     for hop in trace.hops {
       let ip = hop.ipAddress
@@ -148,7 +194,40 @@ public struct TraceClassifier: Sendable {
         asn = asnMap?[ip]?.asn
         name = asnMap?[ip]?.name
 
-        if isPrivate {
+        // VPN-aware classification
+        if isVPNTrace {
+          // CGNAT = VPN infrastructure (when tracing through VPN interface)
+          if isCGNAT {
+            cat = .vpn
+            seenVPNHop = true
+          }
+          // Private IP after VPN hop = still part of VPN (exit node's network)
+          else if isPrivate && seenVPNHop {
+            cat = .vpn
+          }
+          // Private IP before VPN hop (shouldn't happen in VPN trace, but handle it)
+          else if isPrivate && !seenVPNHop {
+            cat = .local
+          }
+          // Public IP = we've exited the VPN
+          else if !isPrivate && !isCGNAT {
+            seenPublicIP = true
+            if let asn = asn {
+              lastPublicASN = asn
+              if let cASN = clientASN, asn == cASN {
+                cat = .isp
+              } else if let dASN = destASN, asn == dASN {
+                cat = .destination
+              } else {
+                cat = .transit
+              }
+            } else {
+              cat = .transit
+            }
+          }
+        }
+        // Standard (non-VPN) classification
+        else if isPrivate {
           // Private IP classification depends on context
           if !seenPublicIP {
             // Private IP before any public IP = LOCAL (LAN)
@@ -164,7 +243,7 @@ public struct TraceClassifier: Sendable {
             }
           }
         } else if isCGNAT {
-          // CGNAT always indicates ISP
+          // CGNAT indicates ISP (in non-VPN context)
           cat = .isp
         } else {
           // Public IP

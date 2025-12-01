@@ -49,7 +49,7 @@ import SwiftFTR
 
 // Configure all options
 let config = SwiftFTRConfig(
-    maxHops: 20,           // Maximum TTL to probe (default: 30)
+    maxHops: 20,           // Maximum TTL to probe (default: 40)
     maxWaitMs: 2000,       // Max wait time in milliseconds (default: 1000)
     payloadSize: 32,       // ICMP payload size in bytes (default: 56)
     publicIP: "1.2.3.4",   // Override public IP (skips STUN)
@@ -74,7 +74,7 @@ let result = try await localTracer.trace(to: "192.168.1.1")
 ```swift
 // Optimized for production use
 let prodConfig = SwiftFTRConfig(
-    maxHops: 30,
+    maxHops: 40,
     maxWaitMs: 1500,
     payloadSize: 56,
     enableLogging: false  // Disable logging in production
@@ -86,28 +86,28 @@ let prodTracer = SwiftFTR(config: prodConfig)
 ```swift
 // Use specific network interface
 let wifiConfig = SwiftFTRConfig(
-    maxHops: 30,
+    maxHops: 40,
     interface: "en0"  // WiFi interface on macOS
 )
 let wifiTracer = SwiftFTR(config: wifiConfig)
 
 // Use ethernet interface
 let ethernetConfig = SwiftFTRConfig(
-    maxHops: 30,
+    maxHops: 40,
     interface: "en1"  // Ethernet interface
 )
 let ethernetTracer = SwiftFTR(config: ethernetConfig)
 
 // Bind to specific source IP
 let sourceIPConfig = SwiftFTRConfig(
-    maxHops: 30,
+    maxHops: 40,
     sourceIP: "192.168.1.100"  // Use specific local IP
 )
 let sourceTracer = SwiftFTR(config: sourceIPConfig)
 
 // Combine interface and source IP for precise control
 let preciseConfig = SwiftFTRConfig(
-    maxHops: 30,
+    maxHops: 40,
     interface: "en0",
     sourceIP: "192.168.1.100"  // Must be an IP on en0
 )
@@ -496,7 +496,7 @@ let config = MultipathConfig(
     maxPaths: 16,            // Max unique paths to discover (default: 16)
     earlyStopThreshold: 3,   // Stop after N consecutive duplicates (default: 3)
     timeoutMs: 2000,         // Timeout per flow in ms (default: 2000)
-    maxHops: 30              // Maximum TTL to probe (default: 30)
+    maxHops: 40              // Maximum TTL to probe (default: 40)
 )
 
 // Discover all ECMP paths
@@ -1326,7 +1326,7 @@ struct TraceMetrics {
 
 func traceWithMetrics(to destination: String) async throws -> TraceMetrics {
     let tracer = SwiftFTR(config: SwiftFTRConfig(
-        maxHops: 30,
+        maxHops: 40,
         maxWaitMs: 2000,
         enableLogging: false
     ))
@@ -1456,7 +1456,7 @@ class MockTracer {
         
         return TraceResult(
             destination: destination,
-            maxHops: 30,
+            maxHops: 40,
             reached: true,
             hops: hops,
             duration: 0.016
