@@ -302,17 +302,17 @@ struct PingIntegrationTests {
     let tracer = SwiftFTR(config: SwiftFTRConfig())
     let config = PingConfig(count: 5, interval: 0.2, timeout: 2.0)
 
-    let start = Date()
-    let result = try await NetworkTestGate.shared.withPermit {
-      try await tracer.ping(to: "8.8.8.8", config: config)
+    let (result, duration) = try await NetworkTestGate.shared.withPermit {
+      let start = Date()
+      let r = try await tracer.ping(to: "8.8.8.8", config: config)
+      return (r, Date().timeIntervalSince(start))
     }
-    let duration = Date().timeIntervalSince(start)
 
     #expect(result.responses.count == 5)
 
-    // Should complete in approximately four intervals plus RTT (roughly one second); the guard
-    // here just ensures we never drift back toward the multi-minute behavior fixed in 0.8.
-    #expect(duration < 15.0)
+    // Should complete in approximately four intervals (0.8s) plus RTT (~20ms).
+    // Allow 3s for system scheduling variance.
+    #expect(duration < 3.0)
   }
 
   @Test(
