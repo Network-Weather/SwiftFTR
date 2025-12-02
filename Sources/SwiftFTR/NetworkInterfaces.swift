@@ -187,7 +187,9 @@ public actor NetworkInterfaceDiscovery {
               var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
               var addrCopy = ptr.pointee.sin_addr
               inet_ntop(AF_INET, &addrCopy, &buf, socklen_t(INET_ADDRSTRLEN))
-              return String(cString: buf)
+              let nullIdx = buf.firstIndex(of: 0) ?? buf.endIndex
+              let bytes = buf[..<nullIdx].map { UInt8(bitPattern: $0) }
+              return String(decoding: bytes, as: UTF8.self)
             }
             if !builder.ipv4Addresses.contains(ipv4) {
               builder.ipv4Addresses.append(ipv4)
@@ -199,7 +201,9 @@ public actor NetworkInterfaceDiscovery {
               var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
               var addrCopy = ptr.pointee.sin6_addr
               inet_ntop(AF_INET6, &addrCopy, &buf, socklen_t(INET6_ADDRSTRLEN))
-              return String(cString: buf)
+              let nullIdx = buf.firstIndex(of: 0) ?? buf.endIndex
+              let bytes = buf[..<nullIdx].map { UInt8(bitPattern: $0) }
+              return String(decoding: bytes, as: UTF8.self)
             }
             if !builder.ipv6Addresses.contains(ipv6) {
               builder.ipv6Addresses.append(ipv6)
