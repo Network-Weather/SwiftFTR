@@ -11,8 +11,7 @@ All notable changes to this project are documented here. This project follows Se
 - NEW: VPN interface detection and classification for accurate path analysis
 - NEW: `HopCategory.vpn` for all hops through a VPN tunnel
 - NEW: `VPNContext` struct for passing VPN state to classification
-- NEW: Automatic VPN context detection from interface name (utun*, ipsec*, ppp*, etc.)
-- NEW: Tailscale hostname detection via `.ts.net` suffix
+- NEW: Automatic VPN context detection from interface name (utun*, ipsec*, ppp*, wg*, gpd*, ztun*)
 
 **Network Interface Discovery**
 - NEW: `NetworkInterfaceDiscovery` actor for enumerating system network interfaces
