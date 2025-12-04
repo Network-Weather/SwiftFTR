@@ -2,7 +2,7 @@
 
 This roadmap outlines the development direction for SwiftFTR. It is prioritized by value and impact rather than strict timelines or version numbers.
 
-## 📍 Current Stable State (v0.10.0)
+## 📍 Current Stable State (v0.11.1)
 - **Core**: Parallel traceroute with ICMP datagram sockets (no sudo required on macOS).
 - **Scalability**: Massively parallel `ping` architecture using `kqueue`/`epoll` (C10k ready).
 - **DNS**: Full-featured DNS client supporting 11 record types (A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS) with high-precision timing.
@@ -12,20 +12,14 @@ This roadmap outlines the development direction for SwiftFTR. It is prioritized 
 - **Performance**: Parallel ASN resolution with bounded concurrency (v0.8.1).
 - **Offline ASN**: Local IP-to-ASN lookups via Swift-IP2ASN (~10μs), configurable strategy (v0.9.0).
 - **VPN-Aware Classification**: VPN/overlay/corporate hop categories with interface discovery (v0.10.0).
+- **Streaming Traceroute**: Real-time hop updates via `AsyncThrowingStream` with automatic retry (v0.11.0).
+- **Improved VPN Classification**: Private/CGNAT IPs as VPN, public IPs as TRANSIT when tracing through VPN (v0.11.1).
 
 ---
 
 ## 🚀 Priority Queue (Next Up)
 
 These features are the primary focus for upcoming releases, ranked by priority.
-
-### Streaming Traceroute API ⚡ (Implemented)
-**Goal**: Real-time hop updates for UI responsiveness and automatic retry for unresponsive hops.
-- **AsyncSequence API**: New `traceStream(to:)` returning `AsyncThrowingStream<StreamingHop, Error>`
-- **Retry Logic**: After 4s, automatically re-probes TTLs that haven't responded (helps with rate-limited routers)
-- **Raw Hops**: Stream emits IP + RTT only; caller enriches with rDNS/ASN separately
-- **Arrival Order**: Hops emitted as received (not sorted by TTL) for minimum latency
-- **Files**: `StreamingTrace.swift` (types), `Traceroute.swift` (API), `StreamingTraceTests.swift`
 
 ### UDP Traceroute & Multipath ⚡
 **Goal**: Match industry-standard tools (like `traceroute` and `dublin-traceroute`) that use UDP by default for better firewall traversal and ECMP visibility.

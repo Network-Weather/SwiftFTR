@@ -1291,6 +1291,7 @@ struct ClassifiedHopRow: View {
         case .isp: return .green
         case .transit: return .orange
         case .destination: return .red
+        case .vpn: return .purple
         case .unknown: return .gray
         }
     }
