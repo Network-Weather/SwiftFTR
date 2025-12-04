@@ -19,6 +19,14 @@ This roadmap outlines the development direction for SwiftFTR. It is prioritized 
 
 These features are the primary focus for upcoming releases, ranked by priority.
 
+### Streaming Traceroute API ⚡ (Implemented)
+**Goal**: Real-time hop updates for UI responsiveness and automatic retry for unresponsive hops.
+- **AsyncSequence API**: New `traceStream(to:)` returning `AsyncThrowingStream<StreamingHop, Error>`
+- **Retry Logic**: After 4s, automatically re-probes TTLs that haven't responded (helps with rate-limited routers)
+- **Raw Hops**: Stream emits IP + RTT only; caller enriches with rDNS/ASN separately
+- **Arrival Order**: Hops emitted as received (not sorted by TTL) for minimum latency
+- **Files**: `StreamingTrace.swift` (types), `Traceroute.swift` (API), `StreamingTraceTests.swift`
+
 ### UDP Traceroute & Multipath ⚡
 **Goal**: Match industry-standard tools (like `traceroute` and `dublin-traceroute`) that use UDP by default for better firewall traversal and ECMP visibility.
 - **UDP Traceroute**: Send UDP probes with varying TTL. Handles ICMP Time Exceeded errors correctly.
