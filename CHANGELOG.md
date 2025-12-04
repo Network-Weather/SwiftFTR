@@ -3,6 +3,67 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.11.2 — 2025-12-04
+-------------------
+### Multi-Protocol Probing Enhancements
+
+**Modernized I/O Architecture**
+- TCP and UDP probes now use `DispatchSource` for non-blocking async I/O
+- Replaced blocking `select()` loops with event-driven `DispatchSourceWrite`/`DispatchSourceRead`
+- Uses `DispatchSourceTimer` for precise timeouts
+- Monotonic clock (`mach_absolute_time()`) for accurate RTT measurement
+- Follows the same pattern as the v0.8.0 ping refactor (kqueue/epoll via libdispatch)
+
+**TCP Probe: Connection State Visibility**
+- NEW: `TCPConnectionState` enum with four distinct states:
+  - `.open` — Port is listening (SYN-ACK received)
+  - `.closed` — Port is closed (RST received, host is up)
+  - `.filtered` — No response (timeout, possibly firewalled)
+  - `.error` — Other error (network unreachable, etc.)
+- NEW: `connectionState` field in `TCPProbeResult`
+- Distinguishes "host reachable with closed port" from "port is open"
+- Matches nmap-style port state terminology
+
+**CLI Probe Subcommand**
+- NEW: `swift-ftr probe <protocol> <args>` with four sub-subcommands:
+  - `swift-ftr probe tcp <host> <port>` — TCP port reachability
+  - `swift-ftr probe udp <host> <port>` — UDP port reachability
+  - `swift-ftr probe http <url>` — HTTP/HTTPS server reachability
+  - `swift-ftr probe dns <server> [query]` — DNS server reachability
+- All commands support `--timeout`, `--json`, and protocol-specific options
+- TCP probe shows port state in output (open/closed/filtered)
+- Interface binding support (`-i/--interface`, `-s/--source`)
+
+**Example Output**:
+```bash
+$ swift-ftr probe tcp 1.1.1.1 53
+TCP probe to 1.1.1.1:53
+  Resolved IP: 1.1.1.1
+  Status: ✓ Reachable
+  Port State: open (SYN-ACK)
+  RTT: 12.216 ms
+
+$ swift-ftr probe tcp 127.0.0.1 9999
+TCP probe to 127.0.0.1:9999
+  Resolved IP: 127.0.0.1
+  Status: ✓ Reachable
+  Port State: closed (RST)
+  RTT: 0.251 ms
+```
+
+### Technical Details
+- `TCPProbeOperation` class manages socket lifecycle with DispatchSource
+- `UDPProbeOperation` class handles connected UDP socket with read events
+- Both use `CheckedContinuation` to bridge DispatchSource callbacks to async/await
+- Serial `DispatchQueue` per operation ensures thread-safe event handling
+- Proper socket cleanup in `finish()` method (sources cancelled, socket closed)
+
+### Compatibility
+- No breaking changes to existing probe APIs
+- `TCPProbeResult` gains new `connectionState` field (additive)
+- All 19 probe tests passing
+- Works on macOS 13+ without sudo/root privileges
+
 0.11.1 — 2025-12-04
 -------------------
 ### VPN Classification Improvements
