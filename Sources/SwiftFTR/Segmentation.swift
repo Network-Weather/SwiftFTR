@@ -194,13 +194,28 @@ public struct TraceClassifier: Sendable {
         name = asnMap?[ip]?.name
 
         // VPN-aware classification: when tracing through a VPN interface,
-        // ALL hops are through the VPN tunnel until we reach the destination.
-        // There's no "local" gateway visible - the first hop is already the VPN peer.
+        // private IPs (including CGNAT) are VPN infrastructure. Public IPs
+        // are classified normally (they're the exit node's upstream ISP/transit).
         if isVPNTrace {
           if ip == destinationIP {
             cat = .destination
-          } else {
+          } else if isPrivate || isCGNAT {
+            // Private/CGNAT IPs in VPN trace = VPN infrastructure
             cat = .vpn
+          } else {
+            // Public IP in VPN trace = exit node's upstream, classify normally
+            seenPublicIP = true
+            if let asn = asn {
+              lastPublicASN = asn
+              if let dASN = destASN, asn == dASN {
+                cat = .destination
+              } else {
+                // Exit node's ISP or transit - mark as TRANSIT since it's not OUR ISP
+                cat = .transit
+              }
+            } else {
+              cat = .transit
+            }
           }
         }
         // Standard (non-VPN) classification
