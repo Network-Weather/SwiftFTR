@@ -66,6 +66,13 @@ These features are the primary focus for upcoming releases, ranked by priority.
 - **Scope**: ICMPv6 Echo, IPv6 traceroute, and AAAA record support in all tools.
 - **Challenges**: Different socket options and header structures compared to IPv4.
 
+### Traceroute I/O Modernization
+**Goal**: Replace blocking `poll(2)` in ICMP traceroute with async DispatchSource.
+- **Current State**: Traceroute.swift uses `poll()` for ICMP response collection (lines 537, 951).
+- **Target**: Migrate to `DispatchSourceRead` pattern used by Ping (v0.8.0) and TCP/UDP probes (v0.11.2).
+- **Benefit**: Fully non-blocking I/O throughout the codebase; better cancellation support.
+- **Complexity**: Higher than probes—traceroute sends burst probes and collects multiple TTL responses on one socket.
+
 ---
 
 ## 🔮 Future & Research
