@@ -146,10 +146,14 @@ final class SwiftFTRClassificationTests: XCTestCase {
   func testFullPathClassification() async throws {
     // Complete path: LAN -> ISP -> TRANSIT -> DESTINATION
     let hops: [TraceHop] = [
-      .init(ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false),  // LAN
-      .init(ttl: 2, ipAddress: "198.51.100.1", rtt: 0.005, reachedDestination: false),  // ISP (client ASN)
-      .init(ttl: 3, ipAddress: "203.0.113.1", rtt: 0.010, reachedDestination: false),  // Transit
-      .init(ttl: 4, ipAddress: "93.184.216.34", rtt: 0.020, reachedDestination: true),  // Destination
+      // LAN
+      .init(ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false),
+      // ISP (client ASN)
+      .init(ttl: 2, ipAddress: "198.51.100.1", rtt: 0.005, reachedDestination: false),
+      // Transit
+      .init(ttl: 3, ipAddress: "203.0.113.1", rtt: 0.010, reachedDestination: false),
+      // Destination
+      .init(ttl: 4, ipAddress: "93.184.216.34", rtt: 0.020, reachedDestination: true),
     ]
     let tr = TraceResult(destination: "example.com", maxHops: 4, reached: true, hops: hops)
     let mapping: [String: ASNInfo] = [
@@ -172,9 +176,12 @@ final class SwiftFTRClassificationTests: XCTestCase {
   func testPrivateIPAfterPublicClassifiedAsISP() async throws {
     // ISP internal routing: public -> private -> public (same ASN)
     let hops: [TraceHop] = [
-      .init(ttl: 1, ipAddress: "198.51.100.1", rtt: 0.005, reachedDestination: false),  // ISP public
-      .init(ttl: 2, ipAddress: "10.0.0.1", rtt: 0.006, reachedDestination: false),  // ISP internal
-      .init(ttl: 3, ipAddress: "198.51.100.2", rtt: 0.010, reachedDestination: false),  // ISP public
+      // ISP public
+      .init(ttl: 1, ipAddress: "198.51.100.1", rtt: 0.005, reachedDestination: false),
+      // ISP internal
+      .init(ttl: 2, ipAddress: "10.0.0.1", rtt: 0.006, reachedDestination: false),
+      // ISP public
+      .init(ttl: 3, ipAddress: "198.51.100.2", rtt: 0.010, reachedDestination: false),
     ]
     let tr = TraceResult(destination: "dst", maxHops: 3, reached: false, hops: hops)
     let mapping: [String: ASNInfo] = [
