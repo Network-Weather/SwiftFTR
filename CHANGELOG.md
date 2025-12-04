@@ -3,6 +3,33 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.11.1 — 2025-12-04
+-------------------
+### VPN Classification Improvements
+
+**VPN-Aware Hop Classification**
+- When tracing through a VPN interface (utun, ipsec, ppp, etc.), hops are now properly classified:
+  - Private/CGNAT IPs (100.64.x, 192.168.x, 10.x) → `VPN` (tunnel infrastructure)
+  - Public IPs → `TRANSIT` (exit node's upstream network)
+  - Destination → `DESTINATION`
+- Fixes misclassification of VPN exit node's ISP as "ISP" (it's transit from our perspective)
+
+**Example VPN Trace Classification**:
+```
+TTL 1: 100.120.205.29 (vpn-peer.ts.net)        → VPN      (CGNAT = tunnel)
+TTL 2: 192.168.1.1 (exit-router.local)         → VPN      (private = tunnel)
+TTL 3: 157.131.132.109 (isp.sonic.net)         → TRANSIT  (exit's upstream)
+TTL 4: 1.1.1.1 (one.one.one.one)               → DESTINATION
+```
+
+### Testing
+- 18 classification tests (9 VPN-specific + 9 standard)
+- New tests: full path classification, ISP internal routing, public IP without ASN
+
+### Internal
+- Simplified VPN classification logic (removed hostname-based detection)
+- Moved `VPN_CLASSIFICATION_PROPOSAL.md` to `docs/development/`
+
 0.11.0 — 2025-12-03
 -------------------
 ### Major Features
