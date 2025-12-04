@@ -72,8 +72,16 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
 
-New in v0.8.0
--------------
+New in v0.11.0
+--------------
+- **Streaming Traceroute API**: Real-time hop updates via `AsyncThrowingStream`
+  - `tracer.traceStream(to:)` emits hops as ICMP responses arrive
+  - Automatic retry of unresponsive TTLs after configurable threshold
+  - Smart filtering: hops beyond destination TTL not emitted
+  - Accurate RTT timing from probe transmission
+- **CLI Stream Subcommand**: `swift-ftr stream <host>` for real-time display
+
+Previous v0.8.0 features:
 - **Complete DNS API Redesign**: Modern `tracer.dns` namespace with rich metadata
   - `tracer.dns.a()`, `tracer.dns.aaaa()`, `tracer.dns.reverseIPv4()`, `tracer.dns.txt()`
   - Generic `tracer.dns.query(name:type:)` for any DNS record type
@@ -266,6 +274,30 @@ for record in httpsResult.records {
 
 // Supports 11 DNS record types:
 // A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS
+
+// NEW in v0.11.0: Streaming Traceroute API
+// Get hops as they arrive (not sorted by TTL)
+for try await hop in tracer.traceStream(to: "1.1.1.1") {
+    if let ip = hop.ipAddress, let rtt = hop.rtt {
+        print("TTL \(hop.ttl): \(ip) - \(String(format: "%.1f", rtt * 1000))ms")
+    } else {
+        print("TTL \(hop.ttl): *")
+    }
+    if hop.reachedDestination {
+        print("  <-- destination")
+    }
+}
+
+// With custom config
+let streamConfig = StreamingTraceConfig(
+    probeTimeout: 15.0,    // Total timeout
+    retryAfter: 5.0,       // Retry unresponsive TTLs after 5s
+    emitTimeouts: true,    // Emit timeout placeholders at end
+    maxHops: 30
+)
+for try await hop in tracer.traceStream(to: "example.com", config: streamConfig) {
+    // Process each hop as it arrives
+}
 ```
 
 Notes for Embedding
@@ -327,6 +359,17 @@ Options:
 - `-m, --max-hops N`: Max TTL to probe (default 40)
 - `-t, --timeout SEC`: Timeout per flow in seconds (default 2.0)
 - `--json`: Output JSON format
+
+### Streaming Traceroute (v0.11.0+)
+```bash
+.build/release/swift-ftr stream 1.1.1.1 -m 30 --timeout 15
+```
+
+Options:
+- `-m, --max-hops N`: Max TTL to probe (default 30)
+- `-t, --timeout SEC`: Total timeout for trace (default 10.0)
+- `--retry-after SEC`: Retry unresponsive TTLs after this time (default 4.0)
+- `--no-retry`: Disable automatic retry of unresponsive TTLs
 
 Configuration and Flags
 -----------------------
