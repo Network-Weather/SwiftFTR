@@ -136,10 +136,11 @@ struct VPNClassificationTests {
       vpnContext: vpnContext
     )
 
-    // All hops through VPN should be VPN
+    // VPN entry and intermediate hops should be VPN
     #expect(classified.hops[0].category == .vpn)
     #expect(classified.hops[1].category == .vpn)
-    #expect(classified.hops[2].category == .vpn)
+    // Final hop is the destination (even if accessed via VPN)
+    #expect(classified.hops[2].category == .destination)
   }
 
   @Test("Exit node LAN classified as VPN")
@@ -173,6 +174,160 @@ struct VPNClassificationTests {
 
     // 192.168.x after VPN should be VPN (exit node's LAN is part of VPN solution)
     #expect(classified.hops[1].category == .vpn)
+  }
+
+  // MARK: - Hostname-Based VPN Detection Tests
+
+  @Test("VPNHostnamePatterns detects Tailscale hostnames")
+  func testTailscaleHostnameDetection() {
+    // Tailscale MagicDNS hostnames
+    #expect(VPNHostnamePatterns.isVPNHostname("trogdor.tail3b5a2.ts.net") == true)
+    #expect(VPNHostnamePatterns.isVPNHostname("server.ts.net") == true)
+
+    // Tailscale public relays
+    #expect(VPNHostnamePatterns.isVPNHostname("derp1.tailscale.com") == true)
+
+    // Non-VPN hostnames
+    #expect(VPNHostnamePatterns.isVPNHostname("router.local") == false)
+    #expect(VPNHostnamePatterns.isVPNHostname("sonic.net") == false)
+    #expect(VPNHostnamePatterns.isVPNHostname(nil) == false)
+  }
+
+  @Test("VPNHostnamePatterns detects various VPN providers")
+  func testVPNProviderHostnameDetection() {
+    // WireGuard hosting
+    #expect(VPNHostnamePatterns.isVPNHostname("server.wg.run") == true)
+
+    // Mullvad
+    #expect(VPNHostnamePatterns.isVPNHostname("us-nyc-wg-001.mullvad.net") == true)
+
+    // NordVPN
+    #expect(VPNHostnamePatterns.isVPNHostname("us1234.nordvpn.com") == true)
+
+    // ExpressVPN
+    #expect(VPNHostnamePatterns.isVPNHostname("usa-sanfrancisco-1.expressvpn.com") == true)
+  }
+
+  @Test("Tailscale hostname triggers VPN entry detection")
+  func testTailscaleHostnameClassification() async throws {
+    // Create a trace through Tailscale with .ts.net hostname (no CGNAT)
+    let hops: [TraceHop] = [
+      TraceHop(
+        ttl: 1, ipAddress: "10.35.0.1", rtt: 0.001, reachedDestination: false,
+        hostname: nil),  // Local gateway (pre-VPN)
+      TraceHop(
+        ttl: 2, ipAddress: "100.120.205.29", rtt: 0.005, reachedDestination: false,
+        hostname: "trogdor.tail3b5a2.ts.net"),  // Tailscale peer with .ts.net hostname
+      TraceHop(
+        ttl: 3, ipAddress: "192.168.1.1", rtt: 0.010, reachedDestination: false,
+        hostname: "unifi.localdomain"),  // Exit node's LAN router
+      TraceHop(
+        ttl: 4, ipAddress: "157.131.132.109", rtt: 0.015, reachedDestination: false,
+        hostname: "lo0.bras2.rdcyca01.sonic.net"),  // Exit node's ISP
+      TraceHop(
+        ttl: 5, ipAddress: "1.1.1.1", rtt: 0.020, reachedDestination: true,
+        hostname: "one.one.one.one"),  // Destination
+    ]
+    let trace = TraceResult(destination: "1.1.1.1", maxHops: 5, reached: true, hops: hops)
+
+    let vpnContext = VPNContext(traceInterface: "utun15", isVPNTrace: true, vpnLocalIPs: [])
+
+    let classifier = TraceClassifier()
+    let classified = try await classifier.classify(
+      trace: trace,
+      destinationIP: "1.1.1.1",
+      resolver: VPNTestASNResolver(mapping: [:]),
+      vpnContext: vpnContext
+    )
+
+    // Local gateway (pre-VPN) should be LOCAL
+    #expect(classified.hops[0].category == .local)
+
+    // Tailscale peer with .ts.net hostname should trigger VPN entry
+    #expect(classified.hops[1].category == .vpn)
+
+    // Exit node's LAN should be VPN (not LOCAL!)
+    #expect(classified.hops[2].category == .vpn)
+
+    // Exit node's ISP should be VPN (still in VPN territory)
+    #expect(classified.hops[3].category == .vpn)
+
+    // Destination should be DESTINATION
+    #expect(classified.hops[4].category == .destination)
+  }
+
+  @Test("Non-VPN trace with CGNAT still classified as ISP")
+  func testNonVPNTraceBackwardCompatibility() async throws {
+    // Non-VPN trace with ISP CGNAT
+    let hops: [TraceHop] = [
+      TraceHop(
+        ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false,
+        hostname: "router.local"),
+      TraceHop(
+        ttl: 2, ipAddress: "100.64.0.1", rtt: 0.005, reachedDestination: false,
+        hostname: nil),  // ISP CGNAT
+      TraceHop(
+        ttl: 3, ipAddress: "203.0.113.1", rtt: 0.010, reachedDestination: false, hostname: nil),
+      TraceHop(
+        ttl: 4, ipAddress: "8.8.8.8", rtt: 0.015, reachedDestination: true,
+        hostname: "dns.google"),
+    ]
+    let trace = TraceResult(destination: "dns.google", maxHops: 4, reached: true, hops: hops)
+
+    // No VPN context
+    let classifier = TraceClassifier()
+    let classified = try await classifier.classify(
+      trace: trace,
+      destinationIP: "8.8.8.8",
+      resolver: VPNTestASNResolver(mapping: [:]),
+      vpnContext: nil
+    )
+
+    // Local gateway
+    #expect(classified.hops[0].category == .local)
+
+    // CGNAT without VPN context should be ISP
+    #expect(classified.hops[1].category == .isp)
+  }
+
+  @Test("Pre-VPN private IPs classified as LOCAL")
+  func testPreVPNPrivateIPsAreLocal() async throws {
+    // Trace with local gateway before VPN entry
+    let hops: [TraceHop] = [
+      TraceHop(
+        ttl: 1, ipAddress: "10.35.0.1", rtt: 0.001, reachedDestination: false,
+        hostname: "mikrotik.local"),  // Local gateway
+      TraceHop(
+        ttl: 2, ipAddress: "10.35.0.254", rtt: 0.002, reachedDestination: false,
+        hostname: nil),  // Another local hop (double NAT)
+      TraceHop(
+        ttl: 3, ipAddress: "100.120.205.29", rtt: 0.005, reachedDestination: false,
+        hostname: "peer.ts.net"),  // VPN entry
+      TraceHop(
+        ttl: 4, ipAddress: "8.8.8.8", rtt: 0.015, reachedDestination: true,
+        hostname: "dns.google"),
+    ]
+    let trace = TraceResult(destination: "dns.google", maxHops: 4, reached: true, hops: hops)
+
+    let vpnContext = VPNContext(traceInterface: "utun3", isVPNTrace: true, vpnLocalIPs: [])
+
+    let classifier = TraceClassifier()
+    let classified = try await classifier.classify(
+      trace: trace,
+      destinationIP: "8.8.8.8",
+      resolver: VPNTestASNResolver(mapping: [:]),
+      vpnContext: vpnContext
+    )
+
+    // Both pre-VPN private IPs should be LOCAL
+    #expect(classified.hops[0].category == .local)
+    #expect(classified.hops[1].category == .local)
+
+    // VPN entry
+    #expect(classified.hops[2].category == .vpn)
+
+    // Destination
+    #expect(classified.hops[3].category == .destination)
   }
 }
 
