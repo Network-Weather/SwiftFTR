@@ -606,20 +606,43 @@ public actor SwiftFTR {
         }
         guard let parsed = parsedOpt else { continue }
 
+        // Helper to emit intermediate hop if valid
+        func emitIntermediateHop(seq: UInt16) {
+          guard let info = outstanding[seq] else { return }
+          // Skip hops beyond known destination TTL
+          if let destTTL = reachedTTL, info.ttl > destTTL { return }
+          if receivedTTLs.contains(info.ttl) { return }
+
+          let rtt = monotonicNow() - info.sentAt
+          receivedTTLs.insert(info.ttl)
+          yield(
+            StreamingHop(
+              ttl: info.ttl,
+              ipAddress: parsed.sourceAddress,
+              rtt: rtt,
+              reachedDestination: false
+            ))
+        }
+
         switch parsed.kind {
         case .echoReply(let id, let seq):
           guard id == identifier else { continue }
           if let info = outstanding.removeValue(forKey: seq) {
+            // Skip if we already have the destination at a lower TTL
+            // (all probes with TTL >= destination will get Echo Replies)
+            if let destTTL = reachedTTL, info.ttl > destTTL {
+              continue
+            }
             let rtt = monotonicNow() - info.sentAt
             if !receivedTTLs.contains(info.ttl) {
               receivedTTLs.insert(info.ttl)
-              let hop = StreamingHop(
-                ttl: info.ttl,
-                ipAddress: parsed.sourceAddress,
-                rtt: rtt,
-                reachedDestination: true
-              )
-              yield(hop)
+              yield(
+                StreamingHop(
+                  ttl: info.ttl,
+                  ipAddress: parsed.sourceAddress,
+                  rtt: rtt,
+                  reachedDestination: true
+                ))
               if reachedTTL == nil || info.ttl < reachedTTL! {
                 reachedTTL = info.ttl
               }
@@ -628,34 +651,14 @@ public actor SwiftFTR {
 
         case .timeExceeded(let originalID, let originalSeq):
           guard originalID == nil || originalID == identifier else { continue }
-          if let seq = originalSeq, let info = outstanding[seq] {
-            let rtt = monotonicNow() - info.sentAt
-            if !receivedTTLs.contains(info.ttl) {
-              receivedTTLs.insert(info.ttl)
-              let hop = StreamingHop(
-                ttl: info.ttl,
-                ipAddress: parsed.sourceAddress,
-                rtt: rtt,
-                reachedDestination: false
-              )
-              yield(hop)
-            }
+          if let seq = originalSeq {
+            emitIntermediateHop(seq: seq)
           }
 
         case .destinationUnreachable(let originalID, let originalSeq):
           guard originalID == nil || originalID == identifier else { continue }
-          if let seq = originalSeq, let info = outstanding.removeValue(forKey: seq) {
-            let rtt = monotonicNow() - info.sentAt
-            if !receivedTTLs.contains(info.ttl) {
-              receivedTTLs.insert(info.ttl)
-              let hop = StreamingHop(
-                ttl: info.ttl,
-                ipAddress: parsed.sourceAddress,
-                rtt: rtt,
-                reachedDestination: false
-              )
-              yield(hop)
-            }
+          if let seq = originalSeq {
+            emitIntermediateHop(seq: seq)
           }
 
         case .other:
