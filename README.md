@@ -72,6 +72,13 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
 
+New in v0.11.1
+--------------
+- **VPN-Aware Classification**: Proper hop classification when tracing through VPN interfaces
+  - Private/CGNAT IPs (100.64.x, 192.168.x, 10.x) → `VPN` (tunnel infrastructure)
+  - Public IPs → `TRANSIT` (exit node's upstream network)
+  - Fixes misclassification of VPN exit node's ISP
+
 New in v0.11.0
 --------------
 - **Streaming Traceroute API**: Real-time hop updates via `AsyncThrowingStream`

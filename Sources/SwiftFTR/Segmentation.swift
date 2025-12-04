@@ -177,7 +177,6 @@ public struct TraceClassifier: Sendable {
     // Classify hops
     var out: [ClassifiedHop] = []
     var seenPublicIP = false  // Track if we've seen any public IP yet
-    var seenVPNHop = false  // Track if we've seen a VPN tunnel hop
     var lastPublicASN: Int? = nil  // Track the last public ASN we saw
     let isVPNTrace = vpnContext?.isVPNTrace ?? false
 
@@ -194,31 +193,24 @@ public struct TraceClassifier: Sendable {
         asn = asnMap?[ip]?.asn
         name = asnMap?[ip]?.name
 
-        // VPN-aware classification
+        // VPN-aware classification: when tracing through a VPN interface,
+        // private IPs (including CGNAT) are VPN infrastructure. Public IPs
+        // are classified normally (they're the exit node's upstream ISP/transit).
         if isVPNTrace {
-          // CGNAT = VPN infrastructure (when tracing through VPN interface)
-          if isCGNAT {
+          if ip == destinationIP {
+            cat = .destination
+          } else if isPrivate || isCGNAT {
+            // Private/CGNAT IPs in VPN trace = VPN infrastructure
             cat = .vpn
-            seenVPNHop = true
-          }
-          // Private IP after VPN hop = still part of VPN (exit node's network)
-          else if isPrivate && seenVPNHop {
-            cat = .vpn
-          }
-          // Private IP before VPN hop (shouldn't happen in VPN trace, but handle it)
-          else if isPrivate && !seenVPNHop {
-            cat = .local
-          }
-          // Public IP = we've exited the VPN
-          else if !isPrivate && !isCGNAT {
+          } else {
+            // Public IP in VPN trace = exit node's upstream, classify normally
             seenPublicIP = true
             if let asn = asn {
               lastPublicASN = asn
-              if let cASN = clientASN, asn == cASN {
-                cat = .isp
-              } else if let dASN = destASN, asn == dASN {
+              if let dASN = destASN, asn == dASN {
                 cat = .destination
               } else {
+                // Exit node's ISP or transit - mark as TRANSIT since it's not OUR ISP
                 cat = .transit
               }
             } else {

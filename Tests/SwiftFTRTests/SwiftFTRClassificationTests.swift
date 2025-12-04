@@ -142,4 +142,76 @@ final class SwiftFTRClassificationTests: XCTestCase {
     XCTAssertEqual(classified.hops[1].category, .transit)
     XCTAssertNil(classified.hops[1].asn)
   }
+
+  func testFullPathClassification() async throws {
+    // Complete path: LAN -> ISP -> TRANSIT -> DESTINATION
+    let hops: [TraceHop] = [
+      // LAN
+      .init(ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false),
+      // ISP (client ASN)
+      .init(ttl: 2, ipAddress: "198.51.100.1", rtt: 0.005, reachedDestination: false),
+      // Transit
+      .init(ttl: 3, ipAddress: "203.0.113.1", rtt: 0.010, reachedDestination: false),
+      // Destination
+      .init(ttl: 4, ipAddress: "93.184.216.34", rtt: 0.020, reachedDestination: true),
+    ]
+    let tr = TraceResult(destination: "example.com", maxHops: 4, reached: true, hops: hops)
+    let mapping: [String: ASNInfo] = [
+      "198.51.100.1": ASNInfo(asn: 64501, name: "ClientISP"),
+      "198.51.100.50": ASNInfo(asn: 64501, name: "ClientISP"),  // Public IP
+      "203.0.113.1": ASNInfo(asn: 64500, name: "TransitNet"),
+      "93.184.216.34": ASNInfo(asn: 15133, name: "ExampleNet"),
+    ]
+    let resolver = MockASNResolver(mapping: mapping)
+    let classified = try await TraceClassifier().classify(
+      trace: tr, destinationIP: "93.184.216.34", resolver: resolver, timeout: 0.1,
+      publicIP: "198.51.100.50")
+
+    XCTAssertEqual(classified.hops[0].category, .local)
+    XCTAssertEqual(classified.hops[1].category, .isp)
+    XCTAssertEqual(classified.hops[2].category, .transit)
+    XCTAssertEqual(classified.hops[3].category, .destination)
+  }
+
+  func testPrivateIPAfterPublicClassifiedAsISP() async throws {
+    // ISP internal routing: public -> private -> public (same ASN)
+    let hops: [TraceHop] = [
+      // ISP public
+      .init(ttl: 1, ipAddress: "198.51.100.1", rtt: 0.005, reachedDestination: false),
+      // ISP internal
+      .init(ttl: 2, ipAddress: "10.0.0.1", rtt: 0.006, reachedDestination: false),
+      // ISP public
+      .init(ttl: 3, ipAddress: "198.51.100.2", rtt: 0.010, reachedDestination: false),
+    ]
+    let tr = TraceResult(destination: "dst", maxHops: 3, reached: false, hops: hops)
+    let mapping: [String: ASNInfo] = [
+      "198.51.100.1": ASNInfo(asn: 64501, name: "ClientISP"),
+      "198.51.100.2": ASNInfo(asn: 64501, name: "ClientISP"),
+      "198.51.100.50": ASNInfo(asn: 64501, name: "ClientISP"),
+    ]
+    let resolver = MockASNResolver(mapping: mapping)
+    let classified = try await TraceClassifier().classify(
+      trace: tr, destinationIP: "203.0.113.10", resolver: resolver, timeout: 0.1,
+      publicIP: "198.51.100.50")
+
+    // Private IP after public IP in ISP context should be ISP internal routing
+    XCTAssertEqual(classified.hops[0].category, .isp)
+    XCTAssertEqual(classified.hops[1].category, .isp)  // Private after public = ISP internal
+    XCTAssertEqual(classified.hops[2].category, .isp)
+  }
+
+  func testPublicIPWithNoASNClassifiedAsTransit() async throws {
+    // Public IP without ASN info should be TRANSIT (not UNKNOWN)
+    let hops: [TraceHop] = [
+      .init(ttl: 1, ipAddress: "192.168.1.1", rtt: 0.001, reachedDestination: false),
+      .init(ttl: 2, ipAddress: "203.0.113.99", rtt: 0.010, reachedDestination: false),  // No ASN
+    ]
+    let tr = TraceResult(destination: "dst", maxHops: 2, reached: false, hops: hops)
+    let resolver = MockASNResolver(mapping: [:])  // No ASN data
+    let classified = try await TraceClassifier().classify(
+      trace: tr, destinationIP: "93.184.216.34", resolver: resolver, timeout: 0.1)
+
+    XCTAssertEqual(classified.hops[0].category, .local)
+    XCTAssertEqual(classified.hops[1].category, .transit)  // Public IP without ASN = TRANSIT
+  }
 }
