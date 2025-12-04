@@ -2,11 +2,12 @@
 
 This roadmap outlines the development direction for SwiftFTR. It is prioritized by value and impact rather than strict timelines or version numbers.
 
-## 📍 Current Stable State (v0.11.1)
+## 📍 Current Stable State (v0.11.2)
 - **Core**: Parallel traceroute with ICMP datagram sockets (no sudo required on macOS).
 - **Scalability**: Massively parallel `ping` architecture using `kqueue`/`epoll` (C10k ready).
 - **DNS**: Full-featured DNS client supporting 11 record types (A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS) with high-precision timing.
-- **Reachability**: Multi-protocol probing (TCP SYN, UDP connected, HTTP/S).
+- **Reachability**: Multi-protocol probing (TCP SYN, UDP connected, HTTP/S) with modern DispatchSource I/O.
+- **TCP Probe**: Port state visibility—distinguishes open (SYN-ACK) vs closed (RST) vs filtered (timeout).
 - **Monitoring**: Bufferbloat testing, Multipath (ECMP) discovery, and network interface binding.
 - **Architecture**: Fully async/await, Swift 6 strict concurrency compliant, actor-based.
 - **Performance**: Parallel ASN resolution with bounded concurrency (v0.8.1).
@@ -14,6 +15,7 @@ This roadmap outlines the development direction for SwiftFTR. It is prioritized 
 - **VPN-Aware Classification**: VPN/overlay/corporate hop categories with interface discovery (v0.10.0).
 - **Streaming Traceroute**: Real-time hop updates via `AsyncThrowingStream` with automatic retry (v0.11.0).
 - **Improved VPN Classification**: Private/CGNAT IPs as VPN, public IPs as TRANSIT when tracing through VPN (v0.11.1).
+- **CLI Probe Command**: `swift-ftr probe tcp/udp/http/dns` for interactive diagnostics (v0.11.2).
 
 ---
 

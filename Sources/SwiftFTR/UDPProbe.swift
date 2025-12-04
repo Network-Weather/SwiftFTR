@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 #if canImport(Darwin)
@@ -210,7 +211,6 @@ private func performUDPProbe(
       error: "Failed to create UDP socket"
     )
   }
-  defer { close(sockfd) }
 
   // Set socket to non-blocking
   var flags = fcntl(sockfd, F_GETFL, 0)
@@ -231,6 +231,7 @@ private func performUDPProbe(
   }
 
   guard connectResult == 0 else {
+    close(sockfd)
     return UDPProbeResultInternal(
       isReachable: false,
       rtt: nil,
@@ -239,6 +240,9 @@ private func performUDPProbe(
     )
   }
 
+  // Record start time using monotonic clock
+  let probeStartTime = udpMonotonicTime()
+
   // Send UDP packet using send() (not sendto() - socket is connected)
   let payloadBytes = payload.count > 0 ? Array(payload) : [0x00]
   let sendResult = payloadBytes.withUnsafeBufferPointer { buffer in
@@ -246,6 +250,7 @@ private func performUDPProbe(
   }
 
   guard sendResult >= 0 else {
+    close(sockfd)
     return UDPProbeResultInternal(
       isReachable: false,
       rtt: nil,
@@ -254,152 +259,190 @@ private func performUDPProbe(
     )
   }
 
-  // Wait for response using select() with timeout
-  let endTime = startTime.addingTimeInterval(timeout)
+  // Use DispatchSource for non-blocking async I/O
+  let operation = UDPProbeOperation(
+    sockfd: sockfd,
+    timeout: timeout,
+    probeStartTime: probeStartTime
+  )
 
-  while Date() < endTime {
-    let remaining = endTime.timeIntervalSinceNow
-    guard remaining > 0 else { break }
+  return await withCheckedContinuation { continuation in
+    operation.start(continuation: continuation)
+  }
+}
 
-    var readSet = fd_set()
-    udpFdZero(&readSet)
-    udpFdSet(sockfd, &readSet)
+// MARK: - Monotonic Time
 
-    var timeoutVal = timeval(
-      tv_sec: Int(remaining),
-      tv_usec: Int32((remaining.truncatingRemainder(dividingBy: 1.0)) * 1_000_000)
+/// Returns monotonic time in seconds for accurate RTT measurement
+private func udpMonotonicTime() -> TimeInterval {
+  var info = mach_timebase_info_data_t()
+  mach_timebase_info(&info)
+  let rawTime = TimeInterval(mach_absolute_time())
+  return (rawTime * TimeInterval(info.numer) / TimeInterval(info.denom)) / 1_000_000_000.0
+}
+
+// MARK: - UDP Probe Operation
+
+/// Manages a single UDP probe operation using DispatchSource for non-blocking I/O
+private final class UDPProbeOperation: @unchecked Sendable {
+  private let sockfd: Int32
+  private let timeout: TimeInterval
+  private let probeStartTime: TimeInterval
+
+  private var continuation: CheckedContinuation<UDPProbeResultInternal, Never>?
+  private var readSource: DispatchSourceRead?
+  private var timerSource: DispatchSourceTimer?
+
+  private let queue: DispatchQueue
+  private let lock = NSLock()
+  private var isFinished = false
+
+  // Receive buffer for UDP responses
+  private var recvBuffer = [UInt8](repeating: 0, count: 1024)
+
+  init(sockfd: Int32, timeout: TimeInterval, probeStartTime: TimeInterval) {
+    self.sockfd = sockfd
+    self.timeout = timeout
+    self.probeStartTime = probeStartTime
+    self.queue = DispatchQueue(
+      label: "com.swiftftr.udpprobe.\(UInt64.random(in: 0...UInt64.max))",
+      qos: .userInitiated
     )
+  }
 
-    let selectResult = select(sockfd + 1, &readSet, nil, nil, &timeoutVal)
-
-    if selectResult <= 0 {
-      // Timeout or error
-      break
+  func start(continuation: CheckedContinuation<UDPProbeResultInternal, Never>) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      continuation.resume(returning: UDPProbeResultInternal(
+        isReachable: false, rtt: nil, responseType: nil, error: "Operation already finished"))
+      return
     }
+    self.continuation = continuation
+    lock.unlock()
 
-    // Socket is readable - try to receive
-    var buffer = [UInt8](repeating: 0, count: 1024)
-    let bytesRead = recv(sockfd, &buffer, buffer.count, 0)
+    queue.async {
+      self.setupSources()
+    }
+  }
+
+  private func setupSources() {
+    // DispatchSourceRead fires when socket becomes readable (response arrives or ICMP error)
+    let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
+    source.setEventHandler { [weak self] in
+      self?.handleRead()
+    }
+    source.setCancelHandler { }
+    source.activate()
+    self.readSource = source
+
+    // Timer for timeout
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + timeout)
+    timer.setEventHandler { [weak self] in
+      self?.handleTimeout()
+    }
+    timer.activate()
+    self.timerSource = timer
+  }
+
+  private func handleRead() {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
+    }
+    lock.unlock()
+
+    // Try to receive data
+    let bytesRead = recv(sockfd, &recvBuffer, recvBuffer.count, 0)
 
     if bytesRead > 0 {
       // Got UDP reply
-      let rtt = Date().timeIntervalSince(startTime)
-      return UDPProbeResultInternal(
+      let rtt = udpMonotonicTime() - probeStartTime
+      finish(result: UDPProbeResultInternal(
         isReachable: true,
         rtt: rtt,
         responseType: "udp_reply",
         error: nil
-      )
-    } else if bytesRead < 0 {
-      // Check for ICMP errors delivered via connected socket
+      ))
+      return
+    }
+
+    if bytesRead < 0 {
       let err = errno
 
       // ECONNREFUSED = ICMP Port Unreachable (host is up!)
       if err == ECONNREFUSED {
-        let rtt = Date().timeIntervalSince(startTime)
-        return UDPProbeResultInternal(
+        let rtt = udpMonotonicTime() - probeStartTime
+        finish(result: UDPProbeResultInternal(
           isReachable: true,
           rtt: rtt,
           responseType: "icmp_port_unreachable",
           error: nil
-        )
+        ))
+        return
       }
 
-      // EAGAIN/EWOULDBLOCK = no data available (try again)
+      // EAGAIN/EWOULDBLOCK = no data available (spurious wakeup, keep waiting)
       if err == EAGAIN || err == EWOULDBLOCK {
-        continue  // Keep polling
+        return
       }
 
       // Network unreachable errors = host down
       if err == EHOSTUNREACH || err == ENETUNREACH || err == EHOSTDOWN {
-        return UDPProbeResultInternal(
+        finish(result: UDPProbeResultInternal(
           isReachable: false,
           rtt: nil,
           responseType: nil,
           error: "Network unreachable: \(String(cString: strerror(err)))"
-        )
+        ))
+        return
       }
 
-      // Other errors (ENOTCONN, EBADF, etc.)
-      return UDPProbeResultInternal(
+      // Other errors
+      finish(result: UDPProbeResultInternal(
         isReachable: false,
         rtt: nil,
         responseType: nil,
         error: "Receive error: \(String(cString: strerror(err)))"
-      )
+      ))
     }
   }
 
-  // Timeout - no response
-  return UDPProbeResultInternal(
-    isReachable: false,
-    rtt: nil,
-    responseType: "timeout",
-    error: "No response within timeout"
-  )
+  private func handleTimeout() {
+    finish(result: UDPProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseType: "timeout",
+      error: "No response within timeout"
+    ))
+  }
+
+  private func finish(result: UDPProbeResultInternal) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
+    }
+    isFinished = true
+    let currentContinuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+
+    // Cancel sources
+    readSource?.cancel()
+    timerSource?.cancel()
+    readSource = nil
+    timerSource = nil
+
+    // Close socket
+    close(sockfd)
+
+    // Resume continuation
+    currentContinuation?.resume(returning: result)
+  }
 }
-
-// MARK: - fd_set Helpers for UDP
-
-#if canImport(Darwin)
-  private func udpFdZero(_ set: inout fd_set) {
-    _ = withUnsafeMutableBytes(of: &set) { ptr in
-      ptr.baseAddress?.initializeMemory(
-        as: UInt8.self, repeating: 0, count: MemoryLayout<fd_set>.size)
-    }
-  }
-
-  private func udpFdSet(_ fd: Int32, _ set: inout fd_set) {
-    let intOffset = Int(fd) / 32
-    let bitOffset = Int(fd) % 32
-    let mask: Int32 = 1 << bitOffset
-
-    withUnsafeMutableBytes(of: &set.fds_bits) { ptr in
-      let base = ptr.baseAddress!.assumingMemoryBound(to: Int32.self)
-      base[intOffset] |= mask
-    }
-  }
-
-  private func udpFdIsSet(_ fd: Int32, _ set: inout fd_set) -> Bool {
-    let intOffset = Int(fd) / 32
-    let bitOffset = Int(fd) % 32
-    let mask: Int32 = 1 << bitOffset
-
-    return withUnsafeMutableBytes(of: &set.fds_bits) { ptr in
-      let base = ptr.baseAddress!.assumingMemoryBound(to: Int32.self)
-      return (base[intOffset] & mask) != 0
-    }
-  }
-#else
-  private func udpFdZero(_ set: inout fd_set) {
-    _ = withUnsafeMutableBytes(of: &set) { ptr in
-      ptr.baseAddress?.initializeMemory(
-        as: UInt8.self, repeating: 0, count: MemoryLayout<fd_set>.size)
-    }
-  }
-
-  private func udpFdSet(_ fd: Int32, _ set: inout fd_set) {
-    let intOffset = Int(fd) / (MemoryLayout<Int>.size * 8)
-    let bitOffset = Int(fd) % (MemoryLayout<Int>.size * 8)
-    let mask: Int = 1 << bitOffset
-
-    withUnsafeMutableBytes(of: &set.__fds_bits) { ptr in
-      let base = ptr.baseAddress!.assumingMemoryBound(to: Int.self)
-      base[intOffset] |= mask
-    }
-  }
-
-  private func udpFdIsSet(_ fd: Int32, _ set: inout fd_set) -> Bool {
-    let intOffset = Int(fd) / (MemoryLayout<Int>.size * 8)
-    let bitOffset = Int(fd) % (MemoryLayout<Int>.size * 8)
-    let mask: Int = 1 << bitOffset
-
-    return withUnsafeMutableBytes(of: &set.__fds_bits) { ptr in
-      let base = ptr.baseAddress!.assumingMemoryBound(to: Int.self)
-      return (base[intOffset] & mask) != 0
-    }
-  }
-#endif
 
 // MARK: - Errors
 

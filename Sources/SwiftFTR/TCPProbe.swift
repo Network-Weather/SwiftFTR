@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 
 #if canImport(Darwin)
@@ -57,6 +58,18 @@ public struct TCPProbeConfig: Sendable {
   }
 }
 
+/// TCP connection state after probing
+public enum TCPConnectionState: String, Sendable, Codable {
+  /// Port is open (SYN-ACK received, connection established)
+  case open
+  /// Port is closed (RST received - host is up but port not listening)
+  case closed
+  /// Port is filtered (timeout - no response, possibly firewalled)
+  case filtered
+  /// Other error (network unreachable, etc.)
+  case error
+}
+
 /// Result from a TCP probe
 public struct TCPProbeResult: Sendable, Codable {
   /// Target host
@@ -70,6 +83,9 @@ public struct TCPProbeResult: Sendable, Codable {
 
   /// Whether the probe succeeded (connection established or RST received)
   public let isReachable: Bool
+
+  /// TCP connection state: open (SYN-ACK), closed (RST), filtered (timeout), or error
+  public let connectionState: TCPConnectionState
 
   /// Round-trip time to establish connection (nil if timed out)
   public let rtt: TimeInterval?
@@ -85,6 +101,7 @@ public struct TCPProbeResult: Sendable, Codable {
     resolvedIP: String,
     port: Int,
     isReachable: Bool,
+    connectionState: TCPConnectionState,
     rtt: TimeInterval?,
     error: String?,
     timestamp: Date = Date()
@@ -93,6 +110,7 @@ public struct TCPProbeResult: Sendable, Codable {
     self.resolvedIP = resolvedIP
     self.port = port
     self.isReachable = isReachable
+    self.connectionState = connectionState
     self.rtt = rtt
     self.error = error
     self.timestamp = timestamp
@@ -128,6 +146,7 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
       resolvedIP: config.host,  // Assume it's already an IP
       port: config.port,
       isReachable: false,
+      connectionState: .error,
       rtt: nil,
       error: "Failed to resolve hostname",
       timestamp: startTime
@@ -149,6 +168,7 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
     resolvedIP: resolvedIP,
     port: config.port,
     isReachable: result.isReachable,
+    connectionState: result.connectionState,
     rtt: result.rtt,
     error: result.error,
     timestamp: startTime
@@ -203,6 +223,7 @@ private func isIPAddress(_ string: String) -> Bool {
 
 private struct ProbeResult {
   let isReachable: Bool
+  let connectionState: TCPConnectionState
   let rtt: TimeInterval?
   let error: String?
 }
@@ -220,19 +241,21 @@ private func performTCPProbe(
   guard sockfd >= 0 else {
     return ProbeResult(
       isReachable: false,
+      connectionState: .error,
       rtt: nil,
       error: "Failed to create socket: \(String(cString: strerror(errno)))"
     )
   }
-  defer { close(sockfd) }
 
   // Bind to interface if specified
   if let iface = interface {
     #if canImport(Darwin)
       let ifaceIndex = if_nametoindex(iface)
       guard ifaceIndex != 0 else {
+        close(sockfd)
         return ProbeResult(
           isReachable: false,
+          connectionState: .error,
           rtt: nil,
           error: "Interface '\(iface)' not found"
         )
@@ -244,15 +267,19 @@ private func performTCPProbe(
         &index, socklen_t(MemoryLayout<UInt32>.size))
 
       guard result >= 0 else {
+        close(sockfd)
         return ProbeResult(
           isReachable: false,
+          connectionState: .error,
           rtt: nil,
           error: "Failed to bind to interface '\(iface)': \(String(cString: strerror(errno)))"
         )
       }
     #else
+      close(sockfd)
       return ProbeResult(
         isReachable: false,
+        connectionState: .error,
         rtt: nil,
         error: "Interface binding not supported on this platform"
       )
@@ -266,8 +293,10 @@ private func performTCPProbe(
     sourceAddr.sin_port = 0  // Let system choose port
 
     guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
+      close(sockfd)
       return ProbeResult(
         isReachable: false,
+        connectionState: .error,
         rtt: nil,
         error: "Invalid source IP address '\(srcIP)'"
       )
@@ -280,8 +309,10 @@ private func performTCPProbe(
     }
 
     guard bindResult >= 0 else {
+      close(sockfd)
       return ProbeResult(
         isReachable: false,
+        connectionState: .error,
         rtt: nil,
         error: "Failed to bind to source IP '\(srcIP)': \(String(cString: strerror(errno)))"
       )
@@ -299,6 +330,9 @@ private func performTCPProbe(
   addr.sin_port = in_port_t(port).bigEndian
   inet_pton(AF_INET, ip, &addr.sin_addr)
 
+  // Record start time using monotonic clock
+  let probeStartTime = monotonicTime()
+
   // Attempt connection
   let connectResult = withUnsafePointer(to: &addr) {
     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -308,98 +342,169 @@ private func performTCPProbe(
 
   // If connection succeeded immediately (unlikely but possible)
   if connectResult == 0 {
-    let rtt = Date().timeIntervalSince(startTime)
-    return ProbeResult(isReachable: true, rtt: rtt, error: nil)
+    let rtt = monotonicTime() - probeStartTime
+    close(sockfd)
+    return ProbeResult(isReachable: true, connectionState: .open, rtt: rtt, error: nil)
   }
 
   // Check if connection is in progress
   guard errno == EINPROGRESS else {
-    let errorMsg = String(cString: strerror(errno))
+    let errorCode = errno
+    let errorMsg = String(cString: strerror(errorCode))
+    close(sockfd)
     // ECONNREFUSED means port is closed but host is up - still success!
-    if errno == ECONNREFUSED {
-      let rtt = Date().timeIntervalSince(startTime)
-      return ProbeResult(isReachable: true, rtt: rtt, error: nil)
+    if errorCode == ECONNREFUSED {
+      let rtt = monotonicTime() - probeStartTime
+      return ProbeResult(isReachable: true, connectionState: .closed, rtt: rtt, error: nil)
     }
-    return ProbeResult(isReachable: false, rtt: nil, error: errorMsg)
+    return ProbeResult(isReachable: false, connectionState: .error, rtt: nil, error: errorMsg)
   }
 
-  // Wait for connection to complete or timeout using select()
-  var writeSet = fd_set()
-  fdZero(&writeSet)
-  fdSet(sockfd, &writeSet)
-
-  var timeoutVal = timeval(
-    tv_sec: Int(timeout),
-    tv_usec: Int32((timeout.truncatingRemainder(dividingBy: 1.0)) * 1_000_000)
+  // Use DispatchSource for non-blocking async I/O
+  let operation = TCPProbeOperation(
+    sockfd: sockfd,
+    timeout: timeout,
+    probeStartTime: probeStartTime
   )
 
-  let selectResult = select(sockfd + 1, nil, &writeSet, nil, &timeoutVal)
-
-  if selectResult <= 0 {
-    // Timeout or error
-    return ProbeResult(isReachable: false, rtt: nil, error: "Connection timeout")
-  }
-
-  // Check if connection succeeded or failed
-  var error: Int32 = 0
-  var errorLen = socklen_t(MemoryLayout<Int32>.size)
-  getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &errorLen)
-
-  let rtt = Date().timeIntervalSince(startTime)
-
-  if error == 0 {
-    // Connection succeeded
-    return ProbeResult(isReachable: true, rtt: rtt, error: nil)
-  } else if error == ECONNREFUSED {
-    // Port closed but host reachable (RST received) - this is success!
-    return ProbeResult(isReachable: true, rtt: rtt, error: nil)
-  } else {
-    // Other error (network unreachable, etc.)
-    let errorMsg = String(cString: strerror(error))
-    return ProbeResult(isReachable: false, rtt: nil, error: errorMsg)
+  return await withCheckedContinuation { continuation in
+    operation.start(continuation: continuation)
   }
 }
 
-// MARK: - fd_set Helpers
+// MARK: - Monotonic Time
 
-#if canImport(Darwin)
-  private func fdZero(_ set: inout fd_set) {
-    // Zero out the entire fd_set structure
-    _ = withUnsafeMutableBytes(of: &set) { ptr in
-      ptr.baseAddress?.initializeMemory(
-        as: UInt8.self, repeating: 0, count: MemoryLayout<fd_set>.size)
+/// Returns monotonic time in seconds for accurate RTT measurement
+private func monotonicTime() -> TimeInterval {
+  var info = mach_timebase_info_data_t()
+  mach_timebase_info(&info)
+  let rawTime = TimeInterval(mach_absolute_time())
+  return (rawTime * TimeInterval(info.numer) / TimeInterval(info.denom)) / 1_000_000_000.0
+}
+
+// MARK: - TCP Probe Operation
+
+/// Manages a single TCP probe operation using DispatchSource for non-blocking I/O
+private final class TCPProbeOperation: @unchecked Sendable {
+  private let sockfd: Int32
+  private let timeout: TimeInterval
+  private let probeStartTime: TimeInterval
+
+  private var continuation: CheckedContinuation<ProbeResult, Never>?
+  private var writeSource: DispatchSourceWrite?
+  private var timerSource: DispatchSourceTimer?
+
+  private let queue: DispatchQueue
+  private let lock = NSLock()
+  private var isFinished = false
+
+  init(sockfd: Int32, timeout: TimeInterval, probeStartTime: TimeInterval) {
+    self.sockfd = sockfd
+    self.timeout = timeout
+    self.probeStartTime = probeStartTime
+    self.queue = DispatchQueue(
+      label: "com.swiftftr.tcpprobe.\(UInt64.random(in: 0...UInt64.max))",
+      qos: .userInitiated
+    )
+  }
+
+  func start(continuation: CheckedContinuation<ProbeResult, Never>) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      continuation.resume(returning: ProbeResult(
+        isReachable: false, connectionState: .error, rtt: nil,
+        error: "Operation already finished"))
+      return
+    }
+    self.continuation = continuation
+    lock.unlock()
+
+    queue.async {
+      self.setupSources()
     }
   }
 
-  private func fdSet(_ fd: Int32, _ set: inout fd_set) {
-    let intOffset = Int(fd) / 32
-    let bitOffset = Int(fd) % 32
-    let mask: Int32 = 1 << bitOffset
+  private func setupSources() {
+    // DispatchSourceWrite fires when socket becomes writable (connect completes)
+    let source = DispatchSource.makeWriteSource(fileDescriptor: sockfd, queue: queue)
+    source.setEventHandler { [weak self] in
+      self?.handleConnectComplete()
+    }
+    source.setCancelHandler { }
+    source.activate()
+    self.writeSource = source
 
-    withUnsafeMutableBytes(of: &set.fds_bits) { ptr in
-      let base = ptr.baseAddress!.assumingMemoryBound(to: Int32.self)
-      base[intOffset] |= mask
+    // Timer for timeout
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + timeout)
+    timer.setEventHandler { [weak self] in
+      self?.handleTimeout()
+    }
+    timer.activate()
+    self.timerSource = timer
+  }
+
+  private func handleConnectComplete() {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
+    }
+    lock.unlock()
+
+    // Check if connection succeeded or failed via SO_ERROR
+    var error: Int32 = 0
+    var errorLen = socklen_t(MemoryLayout<Int32>.size)
+    getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &errorLen)
+
+    let rtt = monotonicTime() - probeStartTime
+
+    if error == 0 {
+      // Connection succeeded (SYN-ACK received)
+      finish(result: ProbeResult(
+        isReachable: true, connectionState: .open, rtt: rtt, error: nil))
+    } else if error == ECONNREFUSED {
+      // Port closed but host reachable (RST received)
+      finish(result: ProbeResult(
+        isReachable: true, connectionState: .closed, rtt: rtt, error: nil))
+    } else {
+      // Other error (network unreachable, etc.)
+      let errorMsg = String(cString: strerror(error))
+      finish(result: ProbeResult(
+        isReachable: false, connectionState: .error, rtt: nil, error: errorMsg))
     }
   }
-#else
-  private func fdZero(_ set: inout fd_set) {
-    _ = withUnsafeMutableBytes(of: &set) { ptr in
-      ptr.baseAddress?.initializeMemory(
-        as: UInt8.self, repeating: 0, count: MemoryLayout<fd_set>.size)
-    }
+
+  private func handleTimeout() {
+    finish(result: ProbeResult(
+      isReachable: false, connectionState: .filtered, rtt: nil, error: "Connection timeout"))
   }
 
-  private func fdSet(_ fd: Int32, _ set: inout fd_set) {
-    let intOffset = Int(fd) / (MemoryLayout<Int>.size * 8)
-    let bitOffset = Int(fd) % (MemoryLayout<Int>.size * 8)
-    let mask: Int = 1 << bitOffset
-
-    withUnsafeMutableBytes(of: &set.__fds_bits) { ptr in
-      let base = ptr.baseAddress!.assumingMemoryBound(to: Int.self)
-      base[intOffset] |= mask
+  private func finish(result: ProbeResult) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
     }
+    isFinished = true
+    let currentContinuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+
+    // Cancel sources
+    writeSource?.cancel()
+    timerSource?.cancel()
+    writeSource = nil
+    timerSource = nil
+
+    // Close socket
+    close(sockfd)
+
+    // Resume continuation
+    currentContinuation?.resume(returning: result)
   }
-#endif
+}
 
 // MARK: - Errors
 
