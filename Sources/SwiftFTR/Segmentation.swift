@@ -121,30 +121,6 @@ public struct VPNContext: Sendable {
   }
 }
 
-/// Known hostname patterns for VPN overlay networks.
-/// Used to detect VPN entry points via reverse DNS.
-public struct VPNHostnamePatterns: Sendable {
-  /// Hostname suffixes that indicate VPN infrastructure
-  public static let suffixes: [String] = [
-    ".ts.net",  // Tailscale MagicDNS
-    ".tailscale.com",  // Tailscale public relays
-    ".wg.run",  // WireGuard hosting
-    ".mullvad.net",  // Mullvad VPN
-    ".nordvpn.com",  // NordVPN
-    ".expressvpn.com",  // ExpressVPN
-    ".privateinternetaccess.com",  // PIA
-  ]
-
-  /// Check if a hostname matches any known VPN pattern.
-  public static func isVPNHostname(_ hostname: String?) -> Bool {
-    guard let hostname = hostname?.lowercased() else { return false }
-    for suffix in suffixes {
-      if hostname.hasSuffix(suffix) { return true }
-    }
-    return false
-  }
-}
-
 /// Classifies plain traceroute results into segments and attaches ASN metadata.
 public struct TraceClassifier: Sendable {
   public init() {}
@@ -201,7 +177,6 @@ public struct TraceClassifier: Sendable {
     // Classify hops
     var out: [ClassifiedHop] = []
     var seenPublicIP = false  // Track if we've seen any public IP yet
-    var inVPNTerritory = false  // Track if we've entered VPN territory
     var lastPublicASN: Int? = nil  // Track the last public ASN we saw
     let isVPNTrace = vpnContext?.isVPNTrace ?? false
 
@@ -213,54 +188,19 @@ public struct TraceClassifier: Sendable {
       if let ip = ip {
         let isPrivate = isPrivateIPv4(ip)
         let isCGNAT = isCGNATIPv4(ip)
-        let hostname = hop.hostname
 
         // Get ASN info regardless of IP type
         asn = asnMap?[ip]?.asn
         name = asnMap?[ip]?.name
 
-        // Check for VPN entry point (multiple signals)
-        // 1. CGNAT in VPN trace context
-        // 2. Hostname matches known VPN patterns (e.g., .ts.net)
-        let isVPNEntryPoint =
-          isVPNTrace
-          && (isCGNAT || VPNHostnamePatterns.isVPNHostname(hostname)
-            || vpnContext?.vpnLocalIPs.contains(ip) == true)
-
-        if isVPNEntryPoint {
-          inVPNTerritory = true
-        }
-
-        // VPN-aware classification
+        // VPN-aware classification: when tracing through a VPN interface,
+        // ALL hops are through the VPN tunnel until we reach the destination.
+        // There's no "local" gateway visible - the first hop is already the VPN peer.
         if isVPNTrace {
-          // Once we enter VPN territory, everything is VPN until destination
-          if inVPNTerritory {
-            // Check if this is the destination
-            if ip == destinationIP {
-              cat = .destination
-            } else {
-              cat = .vpn
-            }
-          }
-          // Private IP before VPN entry = local network
-          else if isPrivate {
-            cat = .local
-          }
-          // Public IP before VPN entry (unusual but possible)
-          else {
-            seenPublicIP = true
-            if let asn = asn {
-              lastPublicASN = asn
-              if let cASN = clientASN, asn == cASN {
-                cat = .isp
-              } else if let dASN = destASN, asn == dASN {
-                cat = .destination
-              } else {
-                cat = .transit
-              }
-            } else {
-              cat = .transit
-            }
+          if ip == destinationIP {
+            cat = .destination
+          } else {
+            cat = .vpn
           }
         }
         // Standard (non-VPN) classification
