@@ -12,6 +12,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
 
       Use subcommands:
         trace       - Perform traceroute with ASN classification
+        stream      - Streaming traceroute with real-time hop updates
         ping        - Send ICMP echo requests to measure latency
         multipath   - Discover ECMP paths using Dublin Traceroute
         bufferbloat - Test for bufferbloat (latency under load)
@@ -20,7 +21,9 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       Or run trace directly (default behavior):
         swift-ftr example.com
       """,
-    subcommands: [Trace.self, Ping.self, Multipath.self, Bufferbloat.self, Interfaces.self],
+    subcommands: [
+      Trace.self, Stream.self, Ping.self, Multipath.self, Bufferbloat.self, Interfaces.self,
+    ],
     defaultSubcommand: Trace.self
   )
 }
@@ -279,6 +282,178 @@ extension SwiftFTRCommand {
       if let dasn = classified.destinationASN {
         print("Destination ASN: AS\(dasn) (\(classified.destinationASName ?? "?"))")
       }
+    }
+  }
+}
+
+// MARK: - Stream Subcommand
+
+extension SwiftFTRCommand {
+  struct Stream: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+      commandName: "stream",
+      abstract: "Streaming traceroute with real-time hop updates",
+      discussion: """
+        Performs a streaming traceroute that displays hops as they arrive in real-time.
+        Uses AsyncSequence to emit hops as ICMP responses are received.
+
+        Features:
+          - Real-time display: hops shown immediately as responses arrive
+          - Automatic retry: re-probes unresponsive TTLs after --retry-after seconds
+          - Arrival order: hops displayed in network arrival order, then sorted at end
+
+        Examples:
+          swift-ftr stream 1.1.1.1
+          swift-ftr stream example.com --timeout 15 --retry-after 5
+          swift-ftr stream 8.8.8.8 -m 20 --no-retry
+        """
+    )
+
+    @Option(
+      name: [.short, .customLong("max-hops")], help: "Maximum TTL/hops to probe (default: 30)")
+    var maxHops: Int = 30
+
+    @Option(name: [.short, .customLong("timeout")], help: "Total timeout in seconds (default: 10)")
+    var timeout: Double = 10.0
+
+    @Option(
+      name: .customLong("retry-after"), help: "Retry unresponsive TTLs after N seconds (default: 4)"
+    )
+    var retryAfter: Double = 4.0
+
+    @Flag(name: .customLong("no-retry"), help: "Disable automatic retry of unresponsive TTLs")
+    var noRetry: Bool = false
+
+    @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+    var interface: String?
+
+    @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
+    var sourceIP: String?
+
+    @Flag(name: .customLong("verbose"), help: "Enable verbose logging")
+    var verbose: Bool = false
+
+    @Argument(help: "Destination hostname or IPv4 address")
+    var host: String
+
+    func run() async throws {
+      let ftrConfig = SwiftFTRConfig(
+        enableLogging: verbose,
+        interface: interface,
+        sourceIP: sourceIP
+      )
+      let tracer = SwiftFTR(config: ftrConfig)
+
+      let streamConfig = StreamingTraceConfig(
+        probeTimeout: timeout,
+        retryAfter: noRetry ? nil : retryAfter,
+        emitTimeouts: true,
+        maxHops: maxHops
+      )
+
+      // Resolve hostname for display
+      let displayHost: String
+      let displayIP: String
+      do {
+        // Try to resolve if it's a hostname
+        var hints = addrinfo()
+        hints.ai_family = AF_INET
+        hints.ai_socktype = SOCK_DGRAM
+        var res: UnsafeMutablePointer<addrinfo>?
+        if getaddrinfo(host, nil, &hints, &res) == 0, let info = res {
+          defer { freeaddrinfo(info) }
+          if info.pointee.ai_family == AF_INET,
+            let sa = info.pointee.ai_addr?.withMemoryRebound(
+              to: sockaddr_in.self, capacity: 1,
+              {
+                $0.pointee
+              })
+          {
+            var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+            var addr = sa.sin_addr
+            inet_ntop(AF_INET, &addr, &buf, socklen_t(INET_ADDRSTRLEN))
+            if let nullIndex = buf.firstIndex(of: 0) {
+              displayIP = String(
+                decoding: buf[..<nullIndex].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            } else {
+              displayIP = String(decoding: buf.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+            }
+            displayHost = host
+          } else {
+            displayHost = host
+            displayIP = host
+          }
+        } else {
+          displayHost = host
+          displayIP = host
+        }
+      }
+
+      print(
+        "stream to \(displayHost) (\(displayIP)), \(maxHops) max hops, \(timeout)s timeout, retry after \(noRetry ? "disabled" : "\(retryAfter)s")"
+      )
+      print("")
+
+      // Track hops for final sorted display
+      var hops: [StreamingHop] = []
+      var reachedDestination = false
+
+      // Print header
+      print("Hops arriving (in network order):")
+      print(String(repeating: "-", count: 60))
+
+      do {
+        for try await hop in tracer.traceStream(to: host, config: streamConfig) {
+          hops.append(hop)
+
+          // Print hop immediately as it arrives
+          let ttlStr = String(format: "%2d", hop.ttl)
+          if let ip = hop.ipAddress, let rtt = hop.rtt {
+            let rttMs = String(format: "%.3f ms", rtt * 1000)
+            let marker = hop.reachedDestination ? " <-- destination" : ""
+            print(
+              "\(ttlStr)  \(ip.padding(toLength: 16, withPad: " ", startingAt: 0)) \(rttMs)\(marker)"
+            )
+            if hop.reachedDestination {
+              reachedDestination = true
+            }
+          } else {
+            print("\(ttlStr)  *")
+          }
+
+          // Flush stdout for real-time display
+          fflush(stdout)
+        }
+      } catch {
+        fputs("\nError: \(error)\n", stderr)
+        Foundation.exit(1)
+      }
+
+      // Print sorted summary
+      print("")
+      print(String(repeating: "-", count: 60))
+      print("Summary (sorted by TTL):")
+      print("")
+
+      let sortedHops = hops.sorted { $0.ttl < $1.ttl }
+      for hop in sortedHops {
+        let ttlStr = String(format: "%2d", hop.ttl)
+        if let ip = hop.ipAddress, let rtt = hop.rtt {
+          let rttMs = String(format: "%.3f ms", rtt * 1000)
+          let marker = hop.reachedDestination ? " <-- destination" : ""
+          print(
+            "\(ttlStr)  \(ip.padding(toLength: 16, withPad: " ", startingAt: 0)) \(rttMs)\(marker)")
+        } else {
+          print("\(ttlStr)  *")
+        }
+      }
+
+      print("")
+      let responded = hops.filter { $0.ipAddress != nil }.count
+      let timedOut = hops.filter { $0.ipAddress == nil }.count
+      print(
+        "\(hops.count) hops total, \(responded) responded, \(timedOut) timed out, destination \(reachedDestination ? "reached" : "not reached")"
+      )
     }
   }
 }

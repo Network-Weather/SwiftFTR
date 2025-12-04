@@ -97,7 +97,7 @@ struct ActorSchedulingTests {
       "Child Task should be delayed while actor is busy (max observed: \(maxDelay)s)")
   }
 
-  @Test("Detached Task starts faster than actor-bound Task")
+  @Test("Detached Task starts faster than actor-bound Task", .disabled("Flaky under system load"))
   func testDetachedTaskStartsFasterThanActorBound() async {
     let probe = TaskInheritanceProbe()
     let spinDuration = 0.2

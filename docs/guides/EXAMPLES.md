@@ -3,6 +3,7 @@
 ## Table of Contents
 - [Basic Usage](#basic-usage)
 - [Configuration Options](#configuration-options)
+- [Streaming Traceroute (v0.11.0+)](#streaming-traceroute-v0110)
 - [DNS Queries (v0.7.1+)](#dns-queries-v071)
 - [Ping (v0.5.0+)](#ping-v050)
 - [Multipath Discovery (v0.5.0+)](#multipath-discovery-v050)
@@ -122,6 +123,210 @@ do {
 } catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
     print("Failed to bind to source IP \(ip): \(details ?? "")")
 }
+```
+
+## Streaming Traceroute (v0.11.0+)
+
+The streaming traceroute API provides real-time hop updates as ICMP responses arrive, rather than waiting for the complete trace to finish. This is ideal for responsive UIs and immediate feedback.
+
+### Basic Streaming Trace
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+
+// Stream hops as they arrive (not sorted by TTL)
+for try await hop in tracer.traceStream(to: "1.1.1.1") {
+    if let ip = hop.ipAddress, let rtt = hop.rtt {
+        print("TTL \(hop.ttl): \(ip) - \(String(format: "%.1f", rtt * 1000))ms")
+    } else {
+        print("TTL \(hop.ttl): *")
+    }
+
+    if hop.reachedDestination {
+        print("  <-- destination reached!")
+    }
+}
+```
+
+### Custom Configuration
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+
+// Configure streaming behavior
+let config = StreamingTraceConfig(
+    probeTimeout: 15.0,    // Total timeout for trace (default: 10s)
+    retryAfter: 5.0,       // Retry unresponsive TTLs after 5s (default: 4s)
+    emitTimeouts: true,    // Emit timeout placeholders at end (default: true)
+    maxHops: 30            // Maximum TTLs to probe (default: 40)
+)
+
+for try await hop in tracer.traceStream(to: "example.com", config: config) {
+    // Process each hop as it arrives
+    print("Received hop at TTL \(hop.ttl)")
+}
+```
+
+### Disable Retry for Simpler Behavior
+```swift
+import SwiftFTR
+
+// Disable automatic retry of unresponsive TTLs
+let config = StreamingTraceConfig(
+    probeTimeout: 10.0,
+    retryAfter: nil,      // nil = no retry
+    emitTimeouts: false   // Don't emit timeout placeholders
+)
+
+var hops: [StreamingHop] = []
+for try await hop in tracer.traceStream(to: "8.8.8.8", config: config) {
+    hops.append(hop)
+}
+
+// Sort by TTL for display
+let sorted = hops.sorted { $0.ttl < $1.ttl }
+for hop in sorted {
+    print("\(hop.ttl): \(hop.ipAddress ?? "*")")
+}
+```
+
+### Real-Time UI Updates (SwiftUI)
+```swift
+import SwiftUI
+import SwiftFTR
+
+@MainActor
+class StreamingTraceViewModel: ObservableObject {
+    @Published var hops: [StreamingHop] = []
+    @Published var isTracing = false
+    @Published var destinationReached = false
+
+    private let tracer = SwiftFTR()
+    private var traceTask: Task<Void, Never>?
+
+    func startTrace(to destination: String) {
+        isTracing = true
+        hops = []
+        destinationReached = false
+
+        traceTask = Task {
+            do {
+                for try await hop in tracer.traceStream(to: destination) {
+                    // Each hop triggers UI update as it arrives
+                    hops.append(hop)
+                    hops.sort { $0.ttl < $1.ttl }
+
+                    if hop.reachedDestination {
+                        destinationReached = true
+                    }
+                }
+            } catch {
+                print("Trace error: \(error)")
+            }
+            isTracing = false
+        }
+    }
+
+    func cancel() {
+        traceTask?.cancel()
+        isTracing = false
+    }
+}
+
+struct StreamingTraceView: View {
+    @StateObject private var viewModel = StreamingTraceViewModel()
+    @State private var destination = "1.1.1.1"
+
+    var body: some View {
+        VStack {
+            HStack {
+                TextField("Destination", text: $destination)
+                Button(viewModel.isTracing ? "Cancel" : "Trace") {
+                    if viewModel.isTracing {
+                        viewModel.cancel()
+                    } else {
+                        viewModel.startTrace(to: destination)
+                    }
+                }
+            }
+            .padding()
+
+            if viewModel.isTracing {
+                ProgressView("Tracing... \(viewModel.hops.count) hops")
+            }
+
+            List(viewModel.hops, id: \.ttl) { hop in
+                HStack {
+                    Text("\(hop.ttl)")
+                        .frame(width: 30)
+                    Text(hop.ipAddress ?? "*")
+                    Spacer()
+                    if let rtt = hop.rtt {
+                        Text(String(format: "%.1f ms", rtt * 1000))
+                    }
+                    if hop.reachedDestination {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundColor(.green)
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+### Collecting and Sorting Results
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+
+// Collect all hops, then sort by TTL
+var hops: [StreamingHop] = []
+for try await hop in tracer.traceStream(to: "cloudflare.com") {
+    hops.append(hop)
+}
+
+// Sort by TTL for traditional traceroute display
+let sorted = hops.sorted { $0.ttl < $1.ttl }
+print("Trace complete: \(sorted.count) hops")
+
+for hop in sorted {
+    let ip = hop.ipAddress ?? "*"
+    let rtt = hop.rtt.map { String(format: "%.1f ms", $0 * 1000) } ?? "timeout"
+    let dest = hop.reachedDestination ? " <-- destination" : ""
+    print("\(hop.ttl)\t\(ip)\t\(rtt)\(dest)")
+}
+```
+
+### Cancellation
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+
+// Create a cancellable task
+let traceTask = Task {
+    for try await hop in tracer.traceStream(to: "example.com") {
+        print("TTL \(hop.ttl): \(hop.ipAddress ?? "*")")
+
+        // Early exit on some condition
+        if hop.reachedDestination {
+            break  // This cancels remaining work
+        }
+    }
+}
+
+// Or cancel externally
+Task {
+    try await Task.sleep(nanoseconds: 3_000_000_000)  // 3 seconds
+    traceTask.cancel()
+    print("Trace cancelled")
+}
+
+try await traceTask.value
 ```
 
 ## DNS Queries (v0.7.1+)

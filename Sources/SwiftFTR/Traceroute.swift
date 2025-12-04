@@ -323,6 +323,385 @@ public actor SwiftFTR {
     }
   }
 
+  // MARK: - Streaming Traceroute
+
+  /// Perform a streaming traceroute, emitting hops as ICMP responses arrive.
+  ///
+  /// Returns an `AsyncThrowingStream` that yields `StreamingHop` values as responses
+  /// are received. Hops are emitted in arrival order (not TTL order) for minimum latency.
+  /// The caller is responsible for sorting by TTL if needed and for enriching with rDNS/ASN.
+  ///
+  /// The streaming trace uses a retry strategy for unresponsive hops:
+  /// - Sends initial probes to all TTLs immediately
+  /// - After `retryAfter` seconds (default 4s), re-probes any TTLs before the destination
+  ///   that haven't responded (helps with rate-limited routers or packet loss)
+  /// - Completes after `probeTimeout` (default 10s) or when destination + all earlier hops resolve
+  ///
+  /// Example:
+  /// ```swift
+  /// let tracer = SwiftFTR()
+  /// for try await hop in tracer.traceStream(to: "1.1.1.1") {
+  ///     print("TTL \(hop.ttl): \(hop.ipAddress ?? "*")")
+  /// }
+  /// ```
+  ///
+  /// - Parameters:
+  ///   - host: Destination hostname or IPv4 address.
+  ///   - streamConfig: Configuration for streaming behavior (timeouts, retry, etc.)
+  /// - Returns: An `AsyncThrowingStream<StreamingHop, Error>` yielding hops as they arrive.
+  public nonisolated func traceStream(
+    to host: String,
+    config streamConfig: StreamingTraceConfig = .default
+  ) -> AsyncThrowingStream<StreamingHop, Error> {
+    AsyncThrowingStream { continuation in
+      let handle = TraceHandle()
+
+      Task { [self] in
+        // Register active trace
+        await self.registerActiveTrace(handle)
+        defer { Task { await self.unregisterActiveTrace(handle) } }
+
+        do {
+          try await self.performStreamingTrace(
+            to: host,
+            handle: handle,
+            streamConfig: streamConfig,
+            yield: { hop in
+              continuation.yield(hop)
+            }
+          )
+          continuation.finish()
+        } catch {
+          continuation.finish(throwing: error)
+        }
+      }
+
+      continuation.onTermination = { @Sendable _ in
+        Task { await handle.cancel() }
+      }
+    }
+  }
+
+  /// Register an active trace handle for cancellation tracking.
+  private func registerActiveTrace(_ handle: TraceHandle) {
+    activeTraces.insert(handle)
+  }
+
+  /// Unregister an active trace handle.
+  private func unregisterActiveTrace(_ handle: TraceHandle) {
+    activeTraces.remove(handle)
+  }
+
+  /// Internal implementation of streaming trace with two-phase timeout.
+  internal func performStreamingTrace(
+    to host: String,
+    handle: TraceHandle,
+    streamConfig: StreamingTraceConfig,
+    yield: @escaping (StreamingHop) -> Void
+  ) async throws {
+    let maxHops = streamConfig.maxHops
+    let payloadSize = config.payloadSize
+
+    // Validate interface early if specified
+    var interfaceIndex: UInt32? = nil
+    if let interfaceName = config.interface {
+      if config.enableLogging {
+        print("[SwiftFTR] Validating interface '\(interfaceName)' for streaming trace...")
+      }
+      interfaceIndex = try validateInterface(interfaceName)
+    }
+
+    // Resolve destination
+    let destAddr = try resolveIPv4(host: host, enableLogging: config.enableLogging)
+
+    // Check cancellation before socket creation
+    if await handle.isCancelled {
+      throw TracerouteError.cancelled
+    }
+
+    // Create ICMP datagram socket (no raw socket, no root needed)
+    let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+    if fd < 0 {
+      let details =
+        "Failed to create ICMP datagram socket. On macOS 10.9+, SOCK_DGRAM/IPPROTO_ICMP should work without root."
+      throw TracerouteError.socketCreateFailed(errno: errno, details: details)
+    }
+    defer { close(fd) }
+
+    // Bind to interface if specified
+    if let ifIndex = interfaceIndex {
+      var boundIndex = ifIndex
+      if setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &boundIndex, socklen_t(MemoryLayout<UInt32>.size))
+        != 0
+      {
+        let error = errno
+        throw TracerouteError.interfaceBindFailed(
+          interface: config.interface!, errno: error, details: nil)
+      }
+    }
+
+    // Bind to source IP if specified
+    if let sourceIP = config.sourceIP {
+      var bindAddr = sockaddr_in()
+      bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+      bindAddr.sin_family = sa_family_t(AF_INET)
+      bindAddr.sin_port = 0
+      if inet_pton(AF_INET, sourceIP, &bindAddr.sin_addr) != 1 {
+        throw TracerouteError.sourceIPBindFailed(
+          sourceIP: sourceIP, errno: EINVAL, details: "Invalid IP address format")
+      }
+      let bindResult = withUnsafePointer(to: &bindAddr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+          bind(fd, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+      }
+      if bindResult != 0 {
+        let error = errno
+        throw TracerouteError.sourceIPBindFailed(
+          sourceIP: sourceIP, errno: error, details: nil)
+      }
+    }
+
+    // Set non-blocking
+    let flags = fcntl(fd, F_GETFL, 0)
+    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+
+    // Enable receiving TTL of replies (best-effort)
+    var on: Int32 = 1
+    _ = setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, socklen_t(MemoryLayout<Int32>.size))
+
+    // Generate flow identifier
+    let identifier = UInt16.random(in: 0...UInt16.max)
+
+    // Tracking structures
+    struct SendInfo {
+      let ttl: Int
+      let sentAt: TimeInterval
+    }
+    var outstanding: [UInt16: SendInfo] = [:]
+    var receivedTTLs: Set<Int> = []
+    var reachedTTL: Int? = nil
+
+    // Send all probes
+    if config.enableLogging {
+      print("[SwiftFTR] Streaming trace: sending \(maxHops) probes...")
+    }
+
+    for ttl in 1...maxHops {
+      var ttlVar: Int32 = Int32(ttl)
+      if setsockopt(fd, IPPROTO_IP, IP_TTL, &ttlVar, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+        throw TracerouteError.setsockoptFailed(option: "IP_TTL", errno: errno)
+      }
+      let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
+      let packet = makeICMPEchoRequest(
+        identifier: identifier, sequence: seq, payloadSize: payloadSize)
+      let sentAt = monotonicNow()
+      var addr = destAddr
+      let sent = packet.withUnsafeBytes { rawBuf in
+        withUnsafePointer(to: &addr) { aptr -> ssize_t in
+          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+            sendto(
+              fd, rawBuf.baseAddress!, rawBuf.count, 0, saPtr,
+              socklen_t(MemoryLayout<sockaddr_in>.size))
+          }
+        }
+      }
+      if sent < 0 { throw TracerouteError.sendFailed(errno: errno) }
+      outstanding[seq] = SendInfo(ttl: ttl, sentAt: sentAt)
+    }
+
+    // Timeout and retry strategy
+    let probesSentAt = monotonicNow()
+    let deadline = probesSentAt + streamConfig.probeTimeout
+    let retryThreshold = streamConfig.retryAfter.map { probesSentAt + $0 }
+    var didRetry = false
+
+    if config.enableLogging {
+      print(
+        "[SwiftFTR] Streaming trace: timeout \(streamConfig.probeTimeout)s, retry after \(streamConfig.retryAfter.map { "\($0)s" } ?? "disabled")"
+      )
+    }
+
+    var storage = sockaddr_storage()
+    var buf = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
+
+    // Receive loop with retry support
+    recvLoop: while monotonicNow() < deadline {
+      // Check cancellation
+      if await handle.isCancelled {
+        throw TracerouteError.cancelled
+      }
+
+      var fds = Darwin.pollfd(fd: fd, events: Int16(Darwin.POLLIN), revents: 0)
+      let msLeft = Int32(min(50, max(0, (deadline - monotonicNow()) * 1000)))
+      let rv = withUnsafeMutablePointer(to: &fds) { p in Darwin.poll(p, 1, msLeft) }
+      if rv == 0 {
+        // Poll timeout - check if we should retry unresponsive TTLs
+        if !didRetry, let retryAt = retryThreshold, monotonicNow() >= retryAt {
+          // Find TTLs that haven't responded yet (only those before destination)
+          let ttlCutoff = reachedTTL ?? maxHops
+          var missingTTLs: [Int] = []
+          for ttl in 1..<ttlCutoff {
+            if !receivedTTLs.contains(ttl) {
+              missingTTLs.append(ttl)
+            }
+          }
+
+          if !missingTTLs.isEmpty {
+            didRetry = true
+            if config.enableLogging {
+              print(
+                "[SwiftFTR] Streaming trace: retrying \(missingTTLs.count) unresponsive TTLs: \(missingTTLs)"
+              )
+            }
+
+            // Re-probe missing TTLs with new sequence numbers
+            for ttl in missingTTLs {
+              var ttlVar: Int32 = Int32(ttl)
+              if setsockopt(fd, IPPROTO_IP, IP_TTL, &ttlVar, socklen_t(MemoryLayout<Int32>.size))
+                != 0
+              {
+                continue  // Skip this TTL on error
+              }
+              // Use sequence = TTL + maxHops to distinguish retry probes
+              let seq: UInt16 = UInt16(truncatingIfNeeded: ttl + maxHops)
+              let packet = makeICMPEchoRequest(
+                identifier: identifier, sequence: seq, payloadSize: payloadSize)
+              let sentAt = monotonicNow()
+              var addr = destAddr
+              let sent = packet.withUnsafeBytes { rawBuf in
+                withUnsafePointer(to: &addr) { aptr -> ssize_t in
+                  aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                    sendto(
+                      fd, rawBuf.baseAddress!, rawBuf.count, 0, saPtr,
+                      socklen_t(MemoryLayout<sockaddr_in>.size))
+                  }
+                }
+              }
+              if sent > 0 {
+                outstanding[seq] = SendInfo(ttl: ttl, sentAt: sentAt)
+              }
+            }
+          }
+        }
+        continue
+      }
+      if rv < 0 { break }
+
+      // Drain available datagrams
+      while true {
+        var addrlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let n = withUnsafeMutablePointer(to: &storage) { sptr -> ssize_t in
+          sptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+            return recvfrom(fd, &buf, buf.count, 0, saptr, &addrlen)
+          }
+        }
+        if n < 0 {
+          if errno == EWOULDBLOCK || errno == EAGAIN { break } else { break }
+        }
+
+        let parsedOpt: ParsedICMP? = buf.withUnsafeBytes { rawPtr in
+          let slice = UnsafeRawBufferPointer(rebasing: rawPtr.prefix(Int(n)))
+          return parseICMPv4Message(buffer: slice, from: storage)
+        }
+        guard let parsed = parsedOpt else { continue }
+
+        // Helper to emit intermediate hop if valid
+        func emitIntermediateHop(seq: UInt16) {
+          guard let info = outstanding[seq] else { return }
+          // Skip hops beyond known destination TTL
+          if let destTTL = reachedTTL, info.ttl > destTTL { return }
+          if receivedTTLs.contains(info.ttl) { return }
+
+          let rtt = monotonicNow() - info.sentAt
+          receivedTTLs.insert(info.ttl)
+          yield(
+            StreamingHop(
+              ttl: info.ttl,
+              ipAddress: parsed.sourceAddress,
+              rtt: rtt,
+              reachedDestination: false
+            ))
+        }
+
+        switch parsed.kind {
+        case .echoReply(let id, let seq):
+          guard id == identifier else { continue }
+          if let info = outstanding.removeValue(forKey: seq) {
+            // Skip if we already have the destination at a lower TTL
+            // (all probes with TTL >= destination will get Echo Replies)
+            if let destTTL = reachedTTL, info.ttl > destTTL {
+              continue
+            }
+            let rtt = monotonicNow() - info.sentAt
+            if !receivedTTLs.contains(info.ttl) {
+              receivedTTLs.insert(info.ttl)
+              yield(
+                StreamingHop(
+                  ttl: info.ttl,
+                  ipAddress: parsed.sourceAddress,
+                  rtt: rtt,
+                  reachedDestination: true
+                ))
+              if reachedTTL == nil || info.ttl < reachedTTL! {
+                reachedTTL = info.ttl
+              }
+            }
+          }
+
+        case .timeExceeded(let originalID, let originalSeq):
+          guard originalID == nil || originalID == identifier else { continue }
+          if let seq = originalSeq {
+            emitIntermediateHop(seq: seq)
+          }
+
+        case .destinationUnreachable(let originalID, let originalSeq):
+          guard originalID == nil || originalID == identifier else { continue }
+          if let seq = originalSeq {
+            emitIntermediateHop(seq: seq)
+          }
+
+        case .other:
+          continue
+        }
+
+        // Early exit: destination reached AND all earlier hops resolved
+        if let rttl = reachedTTL {
+          var done = true
+          for i in 1..<rttl {
+            if !receivedTTLs.contains(i) {
+              done = false
+              break
+            }
+          }
+          if done { break recvLoop }
+        }
+      }
+    }
+
+    // Emit timeout placeholders for missing TTLs
+    if streamConfig.emitTimeouts {
+      let cutoff = reachedTTL ?? maxHops
+      for ttl in 1...cutoff {
+        if !receivedTTLs.contains(ttl) {
+          let hop = StreamingHop(
+            ttl: ttl,
+            ipAddress: nil,
+            rtt: nil,
+            reachedDestination: false
+          )
+          yield(hop)
+        }
+      }
+    }
+
+    if config.enableLogging {
+      print(
+        "[SwiftFTR] Streaming trace complete: \(receivedTTLs.count) hops received, reachedTTL=\(reachedTTL.map(String.init) ?? "nil")"
+      )
+    }
+  }
+
   // Validate network interface exists and is available
   internal func validateInterface(_ interfaceName: String) throws -> UInt32 {
     #if os(macOS)
