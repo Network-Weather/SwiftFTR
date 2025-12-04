@@ -314,8 +314,9 @@ private final class UDPProbeOperation: @unchecked Sendable {
     lock.lock()
     if isFinished {
       lock.unlock()
-      continuation.resume(returning: UDPProbeResultInternal(
-        isReachable: false, rtt: nil, responseType: nil, error: "Operation already finished"))
+      continuation.resume(
+        returning: UDPProbeResultInternal(
+          isReachable: false, rtt: nil, responseType: nil, error: "Operation already finished"))
       return
     }
     self.continuation = continuation
@@ -332,7 +333,7 @@ private final class UDPProbeOperation: @unchecked Sendable {
     source.setEventHandler { [weak self] in
       self?.handleRead()
     }
-    source.setCancelHandler { }
+    source.setCancelHandler {}
     source.activate()
     self.readSource = source
 
@@ -360,12 +361,13 @@ private final class UDPProbeOperation: @unchecked Sendable {
     if bytesRead > 0 {
       // Got UDP reply
       let rtt = udpMonotonicTime() - probeStartTime
-      finish(result: UDPProbeResultInternal(
-        isReachable: true,
-        rtt: rtt,
-        responseType: "udp_reply",
-        error: nil
-      ))
+      finish(
+        result: UDPProbeResultInternal(
+          isReachable: true,
+          rtt: rtt,
+          responseType: "udp_reply",
+          error: nil
+        ))
       return
     }
 
@@ -375,12 +377,13 @@ private final class UDPProbeOperation: @unchecked Sendable {
       // ECONNREFUSED = ICMP Port Unreachable (host is up!)
       if err == ECONNREFUSED {
         let rtt = udpMonotonicTime() - probeStartTime
-        finish(result: UDPProbeResultInternal(
-          isReachable: true,
-          rtt: rtt,
-          responseType: "icmp_port_unreachable",
-          error: nil
-        ))
+        finish(
+          result: UDPProbeResultInternal(
+            isReachable: true,
+            rtt: rtt,
+            responseType: "icmp_port_unreachable",
+            error: nil
+          ))
         return
       }
 
@@ -391,32 +394,35 @@ private final class UDPProbeOperation: @unchecked Sendable {
 
       // Network unreachable errors = host down
       if err == EHOSTUNREACH || err == ENETUNREACH || err == EHOSTDOWN {
-        finish(result: UDPProbeResultInternal(
-          isReachable: false,
-          rtt: nil,
-          responseType: nil,
-          error: "Network unreachable: \(String(cString: strerror(err)))"
-        ))
+        finish(
+          result: UDPProbeResultInternal(
+            isReachable: false,
+            rtt: nil,
+            responseType: nil,
+            error: "Network unreachable: \(String(cString: strerror(err)))"
+          ))
         return
       }
 
       // Other errors
-      finish(result: UDPProbeResultInternal(
-        isReachable: false,
-        rtt: nil,
-        responseType: nil,
-        error: "Receive error: \(String(cString: strerror(err)))"
-      ))
+      finish(
+        result: UDPProbeResultInternal(
+          isReachable: false,
+          rtt: nil,
+          responseType: nil,
+          error: "Receive error: \(String(cString: strerror(err)))"
+        ))
     }
   }
 
   private func handleTimeout() {
-    finish(result: UDPProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseType: "timeout",
-      error: "No response within timeout"
-    ))
+    finish(
+      result: UDPProbeResultInternal(
+        isReachable: false,
+        rtt: nil,
+        responseType: "timeout",
+        error: "No response within timeout"
+      ))
   }
 
   private func finish(result: UDPProbeResultInternal) {

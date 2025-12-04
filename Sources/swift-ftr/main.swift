@@ -704,7 +704,8 @@ extension SwiftFTRCommand {
     @Option(name: [.short, .customLong("timeout")], help: "Timeout in seconds (default: 2.0)")
     var timeout: Double = 2.0
 
-    @Option(name: .customLong("payload"), help: "Hex payload to send (e.g., '00' for single null byte)")
+    @Option(
+      name: .customLong("payload"), help: "Hex payload to send (e.g., '00' for single null byte)")
     var payloadHex: String?
 
     @Flag(name: .customLong("json"), help: "Output JSON format")

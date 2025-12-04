@@ -412,9 +412,10 @@ private final class TCPProbeOperation: @unchecked Sendable {
     lock.lock()
     if isFinished {
       lock.unlock()
-      continuation.resume(returning: ProbeResult(
-        isReachable: false, connectionState: .error, rtt: nil,
-        error: "Operation already finished"))
+      continuation.resume(
+        returning: ProbeResult(
+          isReachable: false, connectionState: .error, rtt: nil,
+          error: "Operation already finished"))
       return
     }
     self.continuation = continuation
@@ -431,7 +432,7 @@ private final class TCPProbeOperation: @unchecked Sendable {
     source.setEventHandler { [weak self] in
       self?.handleConnectComplete()
     }
-    source.setCancelHandler { }
+    source.setCancelHandler {}
     source.activate()
     self.writeSource = source
 
@@ -462,23 +463,27 @@ private final class TCPProbeOperation: @unchecked Sendable {
 
     if error == 0 {
       // Connection succeeded (SYN-ACK received)
-      finish(result: ProbeResult(
-        isReachable: true, connectionState: .open, rtt: rtt, error: nil))
+      finish(
+        result: ProbeResult(
+          isReachable: true, connectionState: .open, rtt: rtt, error: nil))
     } else if error == ECONNREFUSED {
       // Port closed but host reachable (RST received)
-      finish(result: ProbeResult(
-        isReachable: true, connectionState: .closed, rtt: rtt, error: nil))
+      finish(
+        result: ProbeResult(
+          isReachable: true, connectionState: .closed, rtt: rtt, error: nil))
     } else {
       // Other error (network unreachable, etc.)
       let errorMsg = String(cString: strerror(error))
-      finish(result: ProbeResult(
-        isReachable: false, connectionState: .error, rtt: nil, error: errorMsg))
+      finish(
+        result: ProbeResult(
+          isReachable: false, connectionState: .error, rtt: nil, error: errorMsg))
     }
   }
 
   private func handleTimeout() {
-    finish(result: ProbeResult(
-      isReachable: false, connectionState: .filtered, rtt: nil, error: "Connection timeout"))
+    finish(
+      result: ProbeResult(
+        isReachable: false, connectionState: .filtered, rtt: nil, error: "Connection timeout"))
   }
 
   private func finish(result: ProbeResult) {
