@@ -14,6 +14,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
         trace       - Perform traceroute with ASN classification
         stream      - Streaming traceroute with real-time hop updates
         ping        - Send ICMP echo requests to measure latency
+        probe       - Test TCP/UDP/HTTP/DNS reachability
         multipath   - Discover ECMP paths using Dublin Traceroute
         bufferbloat - Test for bufferbloat (latency under load)
         interfaces  - List network interfaces (WiFi, Ethernet, VPN tunnels)
@@ -22,7 +23,8 @@ struct SwiftFTRCommand: AsyncParsableCommand {
         swift-ftr example.com
       """,
     subcommands: [
-      Trace.self, Stream.self, Ping.self, Multipath.self, Bufferbloat.self, Interfaces.self,
+      Trace.self, Stream.self, Ping.self, Probe.self, Multipath.self, Bufferbloat.self,
+      Interfaces.self,
     ],
     defaultSubcommand: Trace.self
   )
@@ -572,6 +574,380 @@ extension SwiftFTRCommand {
       let data = try! encoder.encode(result)
       print(String(data: data, encoding: .utf8)!)
     }
+  }
+}
+
+// MARK: - Probe Subcommand
+
+extension SwiftFTRCommand {
+  struct Probe: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+      commandName: "probe",
+      abstract: "Test TCP/UDP/HTTP/DNS reachability",
+      discussion: """
+        Tests reachability using various protocols without requiring root/sudo.
+
+        Supported protocols:
+          tcp   - TCP port reachability (SYN probe)
+          udp   - UDP port reachability (connected socket)
+          http  - HTTP/HTTPS server reachability
+          dns   - DNS server reachability
+
+        Key behaviors:
+          - TCP: Returns success on connection OR RST (closed port = host reachable)
+          - UDP: Uses connected socket trick to detect ICMP Port Unreachable
+          - HTTP: Any HTTP response (even 4xx/5xx) = success
+          - DNS: Any DNS response (even NXDOMAIN) = success
+
+        Examples:
+          swift-ftr probe tcp 1.1.1.1 53
+          swift-ftr probe tcp example.com 443 --timeout 5
+          swift-ftr probe udp 8.8.8.8 53
+          swift-ftr probe http https://example.com
+          swift-ftr probe dns 1.1.1.1
+          swift-ftr probe dns 8.8.8.8 google.com
+        """,
+      subcommands: [TCPProbeCmd.self, UDPProbeCmd.self, HTTPProbeCmd.self, DNSProbeCmd.self]
+    )
+  }
+
+  // MARK: - TCP Probe
+
+  struct TCPProbeCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+      commandName: "tcp",
+      abstract: "Test TCP port reachability"
+    )
+
+    @Option(name: [.short, .customLong("timeout")], help: "Timeout in seconds (default: 2.0)")
+    var timeout: Double = 2.0
+
+    @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+    var interface: String?
+
+    @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
+    var sourceIP: String?
+
+    @Flag(name: .customLong("json"), help: "Output JSON format")
+    var json: Bool = false
+
+    @Argument(help: "Target hostname or IP address")
+    var host: String
+
+    @Argument(help: "Target port")
+    var port: Int
+
+    func run() async throws {
+      let config = TCPProbeConfig(
+        host: host,
+        port: port,
+        timeout: timeout,
+        interface: interface,
+        sourceIP: sourceIP
+      )
+
+      do {
+        let result = try await tcpProbe(config: config)
+
+        if json {
+          printJSON(result)
+        } else {
+          printPretty(result)
+        }
+      } catch {
+        fputs("Error: \(error)\n", stderr)
+        Foundation.exit(1)
+      }
+    }
+
+    private func printPretty(_ result: TCPProbeResult) {
+      let status = result.isReachable ? "✓ Reachable" : "✗ Unreachable"
+      let stateLabel: String
+      switch result.connectionState {
+      case .open:
+        stateLabel = "open (SYN-ACK)"
+      case .closed:
+        stateLabel = "closed (RST)"
+      case .filtered:
+        stateLabel = "filtered (no response)"
+      case .error:
+        stateLabel = "error"
+      }
+      print("TCP probe to \(result.host):\(port)")
+      print("  Resolved IP: \(result.resolvedIP)")
+      print("  Status: \(status)")
+      print("  Port State: \(stateLabel)")
+      if let rtt = result.rtt {
+        print("  RTT: \(String(format: "%.3f", rtt * 1000)) ms")
+      }
+      if let error = result.error {
+        print("  Error: \(error)")
+      }
+    }
+
+    private func printJSON(_ result: TCPProbeResult) {
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try! encoder.encode(result)
+      print(String(data: data, encoding: .utf8)!)
+    }
+  }
+
+  // MARK: - UDP Probe
+
+  struct UDPProbeCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+      commandName: "udp",
+      abstract: "Test UDP port reachability"
+    )
+
+    @Option(name: [.short, .customLong("timeout")], help: "Timeout in seconds (default: 2.0)")
+    var timeout: Double = 2.0
+
+    @Option(
+      name: .customLong("payload"), help: "Hex payload to send (e.g., '00' for single null byte)")
+    var payloadHex: String?
+
+    @Flag(name: .customLong("json"), help: "Output JSON format")
+    var json: Bool = false
+
+    @Argument(help: "Target hostname or IP address")
+    var host: String
+
+    @Argument(help: "Target port")
+    var port: Int
+
+    func run() async throws {
+      // Parse hex payload if provided
+      let payload: Data
+      if let hex = payloadHex {
+        payload = Data(hexString: hex) ?? Data()
+      } else {
+        payload = Data()
+      }
+
+      let config = UDPProbeConfig(
+        host: host,
+        port: port,
+        timeout: timeout,
+        payload: payload
+      )
+
+      do {
+        let result = try await udpProbe(config: config)
+
+        if json {
+          printJSON(result)
+        } else {
+          printPretty(result)
+        }
+      } catch {
+        fputs("Error: \(error)\n", stderr)
+        Foundation.exit(1)
+      }
+    }
+
+    private func printPretty(_ result: UDPProbeResult) {
+      let status = result.isReachable ? "✓ Reachable" : "✗ Unreachable"
+      print("UDP probe to \(result.host):\(port)")
+      print("  Resolved IP: \(result.resolvedIP)")
+      print("  Status: \(status)")
+      if let responseType = result.responseType {
+        print("  Response: \(responseType)")
+      }
+      if let rtt = result.rtt {
+        print("  RTT: \(String(format: "%.3f", rtt * 1000)) ms")
+      }
+      if let error = result.error {
+        print("  Error: \(error)")
+      }
+    }
+
+    private func printJSON(_ result: UDPProbeResult) {
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try! encoder.encode(result)
+      print(String(data: data, encoding: .utf8)!)
+    }
+  }
+
+  // MARK: - HTTP Probe
+
+  struct HTTPProbeCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+      commandName: "http",
+      abstract: "Test HTTP/HTTPS server reachability"
+    )
+
+    @Option(name: [.short, .customLong("timeout")], help: "Timeout in seconds (default: 2.0)")
+    var timeout: Double = 2.0
+
+    @Flag(name: .customLong("follow-redirects"), help: "Follow HTTP redirects")
+    var followRedirects: Bool = false
+
+    @Flag(name: .customLong("json"), help: "Output JSON format")
+    var json: Bool = false
+
+    @Argument(help: "URL to probe (e.g., https://example.com)")
+    var url: String
+
+    func run() async throws {
+      let config = HTTPProbeConfig(
+        url: url,
+        timeout: timeout,
+        followRedirects: followRedirects
+      )
+
+      do {
+        let result = try await httpProbe(config: config)
+
+        if json {
+          printJSON(result)
+        } else {
+          printPretty(result)
+        }
+      } catch {
+        fputs("Error: \(error)\n", stderr)
+        Foundation.exit(1)
+      }
+    }
+
+    private func printPretty(_ result: HTTPProbeResult) {
+      let status = result.isReachable ? "✓ Reachable" : "✗ Unreachable"
+      print("HTTP probe to \(result.url)")
+      print("  Status: \(status)")
+      if let statusCode = result.statusCode {
+        print("  HTTP Status: \(statusCode)")
+      }
+      if let rtt = result.rtt {
+        print("  Total Time: \(String(format: "%.3f", rtt * 1000)) ms")
+      }
+      if let tcpRTT = result.tcpHandshakeRTT {
+        print("  TCP Handshake: \(String(format: "%.3f", tcpRTT * 1000)) ms")
+      }
+      if let networkRTT = result.networkRTT {
+        print("  Network RTT: \(String(format: "%.3f", networkRTT * 1000)) ms")
+      }
+      if let error = result.error {
+        print("  Error: \(error)")
+      }
+    }
+
+    private func printJSON(_ result: HTTPProbeResult) {
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try! encoder.encode(result)
+      print(String(data: data, encoding: .utf8)!)
+    }
+  }
+
+  // MARK: - DNS Probe
+
+  struct DNSProbeCmd: AsyncParsableCommand {
+    static let configuration = CommandConfiguration(
+      commandName: "dns",
+      abstract: "Test DNS server reachability"
+    )
+
+    @Option(name: [.short, .customLong("timeout")], help: "Timeout in seconds (default: 2.0)")
+    var timeout: Double = 2.0
+
+    @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+    var interface: String?
+
+    @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
+    var sourceIP: String?
+
+    @Flag(name: .customLong("json"), help: "Output JSON format")
+    var json: Bool = false
+
+    @Argument(help: "DNS server IP address")
+    var server: String
+
+    @Argument(help: "Domain to query (default: example.com)")
+    var query: String = "example.com"
+
+    func run() async throws {
+      let config = DNSProbeConfig(
+        server: server,
+        query: query,
+        timeout: timeout,
+        interface: interface,
+        sourceIP: sourceIP
+      )
+
+      do {
+        let result = try await dnsProbe(config: config)
+
+        if json {
+          printJSON(result)
+        } else {
+          printPretty(result)
+        }
+
+        // Exit with failure if not reachable
+        if !result.isReachable {
+          Foundation.exit(1)
+        }
+      } catch {
+        fputs("Error: \(error)\n", stderr)
+        Foundation.exit(1)
+      }
+    }
+
+    private func printPretty(_ result: DNSProbeResult) {
+      let status = result.isReachable ? "✓ Reachable" : "✗ Unreachable"
+      print("DNS probe to \(result.server)")
+      print("  Query: \(result.query)")
+      print("  Status: \(status)")
+      if let responseCode = result.responseCode {
+        print("  Response Code: \(rcodeToString(responseCode)) (\(responseCode))")
+      }
+      if let rtt = result.rtt {
+        print("  RTT: \(String(format: "%.3f", rtt * 1000)) ms")
+      }
+      if let error = result.error {
+        print("  Error: \(error)")
+      }
+    }
+
+    private func printJSON(_ result: DNSProbeResult) {
+      let encoder = JSONEncoder()
+      encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+      let data = try! encoder.encode(result)
+      print(String(data: data, encoding: .utf8)!)
+    }
+
+    private func rcodeToString(_ rcode: Int) -> String {
+      switch rcode {
+      case 0: return "NOERROR"
+      case 1: return "FORMERR"
+      case 2: return "SERVFAIL"
+      case 3: return "NXDOMAIN"
+      case 4: return "NOTIMP"
+      case 5: return "REFUSED"
+      default: return "UNKNOWN"
+      }
+    }
+  }
+}
+
+// MARK: - Hex String Helper
+
+extension Data {
+  init?(hexString: String) {
+    let hex = hexString.replacingOccurrences(of: " ", with: "")
+    guard hex.count % 2 == 0 else { return nil }
+
+    var data = Data()
+    var index = hex.startIndex
+    while index < hex.endIndex {
+      let nextIndex = hex.index(index, offsetBy: 2)
+      guard let byte = UInt8(hex[index..<nextIndex], radix: 16) else { return nil }
+      data.append(byte)
+      index = nextIndex
+    }
+    self = data
   }
 }
 
