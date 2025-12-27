@@ -3,6 +3,30 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.11.3 — 2025-12-27
+-------------------
+### Resilient Public IP Discovery
+
+**Multi-Server STUN Fallback**
+- Public IP discovery now tries multiple STUN servers in sequence for resilience
+- Server list: Google (primary + backup) and Cloudflare on different ports
+- Improves success rate in restrictive network environments
+
+**DNS-Based Fallback via Akamai whoami**
+- NEW: If all STUN servers fail, falls back to DNS TXT query to `whoami.ds.akahelp.net`
+- DNS queries work in captive portal environments where STUN/UDP may be blocked
+- Parses the `ip` field from Akamai's response to extract public IPv4
+
+**Unified `getPublicIPv4()` Function**
+- Tiered discovery: STUN (fast, ~10-50ms) → DNS (reliable, ~50-100ms)
+- Both `Segmentation.swift` and `Traceroute.swift` now use the unified approach
+- New error type `PublicIPError` provides details when all methods fail
+
+**Why This Matters**
+- Hotel/corporate networks often block non-standard UDP ports (STUN)
+- Captive portals must allow DNS for the portal itself to function
+- This change significantly improves public IP detection in edge cases
+
 0.11.2 — 2025-12-04
 -------------------
 ### Multi-Protocol Probing Enhancements

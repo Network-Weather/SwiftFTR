@@ -1263,14 +1263,15 @@ public actor SwiftFTR {
     return try await runner.runDetached()
   }
 
-  /// Discover public IP via STUN
+  /// Discover public IP via STUN (with DNS fallback)
   internal func discoverPublicIP() async throws -> String {
     let interface = config.interface
     let sourceIP = config.sourceIP
     let enableLogging = config.enableLogging
     return try await runDetachedBlockingIO {
-      try stunGetPublicIPv4(
-        timeout: 0.8,
+      try getPublicIPv4(
+        stunTimeout: 0.8,
+        dnsTimeout: 2.0,
         interface: interface,
         sourceIP: sourceIP,
         enableLogging: enableLogging
