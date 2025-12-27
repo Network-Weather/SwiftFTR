@@ -31,7 +31,7 @@ How It Works
    - Compute RTT with a monotonic clock and place the hop at `ttl - 1`.
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
 5) Optional classification (when using `traceClassified`):
-   - Detect the client’s public IP via STUN (or use `PTR_PUBLIC_IP`, or disable via `PTR_SKIP_STUN`).
+   - Detect the client's public IP via STUN with DNS fallback (or use `PTR_PUBLIC_IP`, or disable via `PTR_SKIP_STUN`).
    - Batch‑resolve ASNs using Team Cymru DNS WHOIS and apply heuristics for PRIVATE and CGNAT ranges.
    - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and “hole‑fill” missing stretches between identical segments.
 
@@ -72,71 +72,41 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 - ✅ Thread-safe usage from any actor or task
 - ✅ Builds under Swift 6 language mode with strict concurrency checks
 
-New in v0.11.1
---------------
-- **VPN-Aware Classification**: Proper hop classification when tracing through VPN interfaces
-  - Private/CGNAT IPs (100.64.x, 192.168.x, 10.x) → `VPN` (tunnel infrastructure)
-  - Public IPs → `TRANSIT` (exit node's upstream network)
-  - Fixes misclassification of VPN exit node's ISP
+Key Features
+------------
+**Traceroute**
+- Parallel ICMP probing with O(1) time complexity (~1 second for 30 hops)
+- Streaming API with real-time hop updates via `AsyncThrowingStream`
+- ASN-based hop classification: LOCAL, ISP, TRANSIT, VPN, DESTINATION
+- VPN-aware classification for tunnel and exit node detection
+- Automatic rDNS lookups with 24-hour caching
 
-New in v0.11.0
---------------
-- **Streaming Traceroute API**: Real-time hop updates via `AsyncThrowingStream`
-  - `tracer.traceStream(to:)` emits hops as ICMP responses arrive
-  - Automatic retry of unresponsive TTLs after configurable threshold
-  - Smart filtering: hops beyond destination TTL not emitted
-  - Accurate RTT timing from probe transmission
-- **CLI Stream Subcommand**: `swift-ftr stream <host>` for real-time display
+**Network Probing**
+- **Ping**: ICMP echo with statistics (min/avg/max RTT, jitter, packet loss)
+- **TCP Probe**: Port state detection (open/closed/filtered)
+- **UDP Probe**: Connected-socket with ICMP unreachable detection
+- **DNS Probe**: Direct server queries with 11 record types (A, AAAA, TXT, MX, etc.)
+- **HTTP/HTTPS Probe**: Web server reachability testing
 
-Previous v0.8.0 features:
-- **Complete DNS API Redesign**: Modern `tracer.dns` namespace with rich metadata
-  - `tracer.dns.a()`, `tracer.dns.aaaa()`, `tracer.dns.reverseIPv4()`, `tracer.dns.txt()`
-  - Generic `tracer.dns.query(name:type:)` for any DNS record type
-  - Returns structured `DNSQueryResult` with server, RTT, timestamp, and records
-- **High-Precision Timing**: 0.1ms resolution using `mach_absolute_time()`
-- **11 DNS Record Types**: A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS
-- **CAA Records**: Certificate Authority Authorization (RFC 6844)
-- **HTTPS Records**: HTTP/3 Service Binding (RFC 9460)
-- **Breaking**: Replaces 0.7.1 DNS functions with namespace API for better ergonomics
+**Multipath Discovery**
+- Dublin Traceroute-style ECMP path enumeration
+- Smart deduplication and divergence point detection
+- Flow identifier control for reproducible traces
 
-New in v0.7.0
--------------
-- **Per-Operation Interface Binding**: Override global interface/sourceIP for individual operations
-  - Add `interface`/`sourceIP` to PingConfig, TCPProbeConfig, DNSProbeConfig, BufferbloatConfig
-  - Resolution order: Operation → Global → System Default
-  - Enables multi-interface monitoring (WiFi + Ethernet + VPN)
-  - Eliminates packet loss during interface transitions
+**Interface & Binding**
+- Per-operation interface binding (WiFi, Ethernet, VPN)
+- Source IP binding for multi-homed hosts
+- Resolution order: Operation → Global → System Default
 
-Previous v0.6.0 features:
-- **Multi-Protocol Probing**: Test network reachability using multiple protocols
-  - TCP SYN probe (port reachability without full connection)
-  - UDP probe (connected-socket approach detects ICMP Port Unreachable)
-  - DNS probe (direct DNS query to verify DNS server availability)
-  - HTTP/HTTPS probe (web server reachability, any response = success)
-  - Comprehensive test suite with Swift Testing framework
+**Public IP Discovery**
+- STUN with multi-server fallback (Google, Cloudflare)
+- DNS-based fallback via Akamai whoami (works behind captive portals)
+- Results cached until network change
 
-Previous v0.5.2 features:
-- **Parallel Ping Execution**: `ping()` is now nonisolated for true concurrent execution (6.4x speedup)
-- **Code Quality**: Fixed linter warnings, improved documentation
-
-Previous v0.5.0 features:
-- **Ping API**: Efficient ICMP echo monitoring with comprehensive statistics (min/avg/max RTT, packet loss, jitter)
-- **Multipath Discovery**: Dublin Traceroute-style ECMP path enumeration with smart deduplication
-- **Flow Identifier Control**: Optional flow ID parameter for stable, reproducible traces
-- **CLI Enhancements**: New `swift-ftr ping` and `swift-ftr multipath` subcommands with JSON output
-
-Previous v0.4.0 features:
-- **Network Interface Selection**: Specify which interface to use with `interface` config or `-i` CLI option
-- **Source IP Binding**: Bind to specific source IP with `sourceIP` config or `-s` CLI option
-- **Enhanced Error Reporting**: Detailed OS-level error messages with errno values
-- **Context-aware Classification**: Improved private IP classification for ISP internal routing
-
-Previous v0.3.0 features:
-- **Trace Cancellation**: Cancel in-flight traces when network conditions change
-- **rDNS Support**: Automatic reverse DNS lookups with built-in caching (86400s TTL)
-- **STUN Caching**: Public IP discovery results are cached until network changes
-- **Network Change API**: Call `networkChanged()` to invalidate caches and cancel active traces
-- **Actor-based Architecture**: SwiftFTR is now an actor for better concurrency safety
+**Architecture**
+- Actor-based design for thread safety
+- Works from any actor or task (no `@MainActor` required)
+- Network change API for cache invalidation and trace cancellation
 
 Use It as a Library
 -------------------
@@ -148,7 +118,7 @@ let config = SwiftFTRConfig(
     maxHops: 40,        // Max TTL to probe
     maxWaitMs: 1000,    // Timeout in milliseconds
     payloadSize: 56,    // ICMP payload size
-    publicIP: nil,      // Auto-detect via STUN
+    publicIP: nil,      // Auto-detect via STUN (with DNS fallback)
     enableLogging: false, // Set true for debugging
     interface: "en0",   // Optional: specific network interface
     sourceIP: "192.168.1.100" // Optional: specific source IP

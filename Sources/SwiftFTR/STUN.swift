@@ -9,6 +9,14 @@ public struct STUNPublicIP: Sendable {
   public let ip: String
 }
 
+/// Well-known public STUN servers for fallback
+/// Uses multiple providers and ports for resilience
+let stunServers: [(host: String, port: UInt16)] = [
+  ("stun.l.google.com", 19302),  // Google (port 19302)
+  ("stun1.l.google.com", 19302),  // Google backup (port 19302)
+  ("stun.cloudflare.com", 3478),  // Cloudflare (port 3478)
+]
+
 enum STUNError: Error, CustomStringConvertible {
   case resolveFailed(errno: Int32, details: String?)
   case socketFailed(errno: Int32, details: String?)
@@ -254,4 +262,204 @@ func stunGetPublicIPv4(
     ofs += ((alen + 3) / 4) * 4
   }
   throw STUNError.recvTimeout
+}
+
+// MARK: - Multi-Server STUN Fallback
+
+/// Attempts to discover public IPv4 by trying multiple STUN servers in sequence.
+/// Falls back through the server list until one succeeds.
+///
+/// - Parameters:
+///   - timeout: Timeout per server attempt (default 1.0s)
+///   - interface: Network interface to bind to (optional)
+///   - sourceIP: Source IP address to bind to (optional)
+///   - enableLogging: Enable debug logging
+/// - Returns: Public IP if any server responds
+/// - Throws: STUNError.recvTimeout if all servers fail
+func stunGetPublicIPv4WithFallback(
+  timeout: TimeInterval = 1.0,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  var lastError: Error = STUNError.recvTimeout
+
+  for (host, port) in stunServers {
+    if enableLogging {
+      print("[STUN] Trying \(host):\(port)...")
+    }
+
+    do {
+      let result = try stunGetPublicIPv4(
+        host: host,
+        port: port,
+        timeout: timeout,
+        interface: interface,
+        sourceIP: sourceIP,
+        enableLogging: enableLogging
+      )
+      if enableLogging {
+        print("[STUN] Success from \(host):\(port) -> \(result.ip)")
+      }
+      return result
+    } catch {
+      if enableLogging {
+        print("[STUN] Failed \(host):\(port): \(error)")
+      }
+      lastError = error
+      continue
+    }
+  }
+
+  throw lastError
+}
+
+// MARK: - DNS-Based Public IP Discovery
+
+/// Error type for DNS-based public IP discovery
+enum DNSPublicIPError: Error, CustomStringConvertible, Sendable {
+  case queryFailed(String)
+  case noIPInResponse
+
+  var description: String {
+    switch self {
+    case .queryFailed(let reason):
+      return "DNS public IP query failed: \(reason)"
+    case .noIPInResponse:
+      return "DNS response did not contain an IP address"
+    }
+  }
+}
+
+/// Discovers public IPv4 via DNS TXT query to Akamai's whoami service.
+/// This works in captive portal environments where STUN may be blocked,
+/// because DNS queries are typically allowed (needed for the captive portal itself).
+///
+/// Queries: whoami.ds.akahelp.net TXT
+/// Response format: "ip" "x.x.x.x", "ecs" "x.x.x.0/24/24", "ns" "x.x.x.x"
+///
+/// - Parameters:
+///   - timeout: Query timeout (default 2.0s)
+///   - servers: DNS servers to try (default: Cloudflare + Google)
+///   - enableLogging: Enable debug logging
+/// - Returns: Public IP from DNS response
+/// - Throws: DNSPublicIPError on failure
+func getPublicIPv4ViaDNS(
+  timeout: TimeInterval = 2.0,
+  servers: [String] = ["1.1.1.1", "8.8.8.8"],
+  enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  if enableLogging {
+    print("[DNS-IP] Querying whoami.ds.akahelp.net TXT...")
+  }
+
+  // Use existing DNSClient.queryTXT which tries multiple servers
+  guard
+    let txtRecords = DNSClient.queryTXT(
+      name: "whoami.ds.akahelp.net",
+      timeout: timeout,
+      servers: servers
+    )
+  else {
+    throw DNSPublicIPError.queryFailed("No response from DNS servers")
+  }
+
+  if enableLogging {
+    print("[DNS-IP] Got \(txtRecords.count) TXT records")
+  }
+
+  // Parse response - looking for the "ip" record
+  // Akamai returns multiple TXT records: "ns<IP>", "ecs<subnet>", "ip<IP>"
+  // The TXT character-strings are concatenated, so we see e.g. "ip4.36.162.212"
+  for record in txtRecords {
+    if enableLogging {
+      print("[DNS-IP] Record: \(record)")
+    }
+
+    let trimmed = record.trimmingCharacters(in: .whitespaces)
+
+    // Look for record starting with "ip" prefix
+    if trimmed.hasPrefix("ip") {
+      // Extract the IP address after the "ip" prefix
+      var ipPart = String(trimmed.dropFirst(2))
+      ipPart = ipPart.trimmingCharacters(in: CharacterSet(charactersIn: " \""))
+
+      // Validate it's a valid IPv4 address
+      let octets = ipPart.split(separator: ".").compactMap { Int($0) }
+      if octets.count == 4, octets.allSatisfy({ $0 >= 0 && $0 <= 255 }) {
+        if enableLogging {
+          print("[DNS-IP] Found public IP: \(ipPart)")
+        }
+        return STUNPublicIP(ip: ipPart)
+      }
+    }
+  }
+
+  throw DNSPublicIPError.noIPInResponse
+}
+
+// MARK: - Unified Public IP Discovery
+
+/// Error type for unified public IP discovery
+public enum PublicIPError: Error, CustomStringConvertible, Sendable {
+  case allMethodsFailed(stunError: String, dnsError: String)
+
+  public var description: String {
+    switch self {
+    case .allMethodsFailed(let stunError, let dnsError):
+      return "Failed to discover public IP. STUN: \(stunError). DNS: \(dnsError)"
+    }
+  }
+}
+
+/// Discovers public IPv4 using a tiered fallback strategy:
+/// 1. STUN (fastest, tries multiple servers)
+/// 2. DNS whoami (reliable fallback, works behind captive portals)
+///
+/// - Parameters:
+///   - stunTimeout: Timeout per STUN server (default 0.8s)
+///   - dnsTimeout: Timeout for DNS query (default 2.0s)
+///   - interface: Network interface to bind to (optional)
+///   - sourceIP: Source IP address to bind to (optional)
+///   - enableLogging: Enable debug logging
+/// - Returns: Public IP from first successful method
+/// - Throws: PublicIPError if all methods fail
+func getPublicIPv4(
+  stunTimeout: TimeInterval = 0.8,
+  dnsTimeout: TimeInterval = 2.0,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  // Tier 1: Try STUN (fastest)
+  var stunErrorMsg = "Unknown error"
+  do {
+    return try stunGetPublicIPv4WithFallback(
+      timeout: stunTimeout,
+      interface: interface,
+      sourceIP: sourceIP,
+      enableLogging: enableLogging
+    )
+  } catch {
+    stunErrorMsg = String(describing: error)
+    if enableLogging {
+      print("[PublicIP] STUN failed, trying DNS fallback...")
+    }
+  }
+
+  // Tier 2: Try DNS whoami (reliable fallback)
+  var dnsErrorMsg = "Unknown error"
+  do {
+    return try getPublicIPv4ViaDNS(
+      timeout: dnsTimeout,
+      enableLogging: enableLogging
+    )
+  } catch {
+    dnsErrorMsg = String(describing: error)
+    if enableLogging {
+      print("[PublicIP] DNS fallback also failed")
+    }
+  }
+
+  throw PublicIPError.allMethodsFailed(stunError: stunErrorMsg, dnsError: dnsErrorMsg)
 }

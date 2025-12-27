@@ -156,9 +156,10 @@ public struct TraceClassifier: Sendable {
     if let providedIP = publicIP {
       allIPs.insert(providedIP)
     } else {
-      // Try STUN (best effort) if no public IP provided
-      if let pub = try? stunGetPublicIPv4(
-        timeout: 0.8, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+      // Try to discover public IP (STUN with DNS fallback) if not provided
+      if let pub = try? getPublicIPv4(
+        stunTimeout: 0.8, dnsTimeout: 2.0,
+        interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
       {
         resolvedPublicIP = pub.ip
         allIPs.insert(pub.ip)
