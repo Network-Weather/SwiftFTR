@@ -113,12 +113,14 @@ public func httpProbe(config: HTTPProbeConfig) async throws -> HTTPProbeResult {
     // Use custom delegate to prevent redirects AND capture metrics
     let delegate = NoRedirectDelegate()
     let session = URLSession(configuration: sessionConfig, delegate: delegate, delegateQueue: nil)
+    defer { session.finishTasksAndInvalidate() }
     return await performProbe(
       url: url, session: session, startTime: startTime, config: config, delegate: delegate)
   } else {
     // Use metrics delegate to capture timing
     let delegate = MetricsDelegate()
     let session = URLSession(configuration: sessionConfig, delegate: delegate, delegateQueue: nil)
+    defer { session.finishTasksAndInvalidate() }
     return await performProbe(
       url: url, session: session, startTime: startTime, config: config, delegate: delegate)
   }

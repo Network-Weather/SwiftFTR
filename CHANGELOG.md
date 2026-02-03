@@ -3,6 +3,16 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.11.4 — 2026-02-02
+-------------------
+### Bug Fixes
+
+**Fixed URLSession Memory Leak in HTTP Probe**
+- `httpProbe()` was leaking `URLSession` objects due to missing invalidation
+- Sessions with delegates create retain cycles if not explicitly invalidated
+- Added `defer { session.finishTasksAndInvalidate() }` to both redirect and metrics code paths
+- Fixes leak of `NSURLSessionConfiguration`, `SecCertificate`, and related CFNetwork objects
+
 0.11.3 — 2025-12-27
 -------------------
 ### Resilient Public IP Discovery
