@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to AI coding assistants working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Common Development Commands
 
@@ -29,14 +29,10 @@ swift format lint -r Sources Tests
 
 # Auto-format code
 swift format -i -r Sources Tests
-
-# Run periphery to find unused code (if installed)
-periphery scan
 ```
 
 ### Documentation
 ```bash
-# Generate DocC documentation
 swift package --allow-writing-to-directory docs \
   generate-documentation --target SwiftFTR \
   --output-path docs --transform-for-static-hosting --hosting-base-path SwiftFTR
@@ -44,75 +40,82 @@ swift package --allow-writing-to-directory docs \
 
 ## Architecture Overview
 
+SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram sockets (no sudo). It also provides ping, TCP/UDP/DNS/HTTP probing, multipath discovery, and streaming traceroute APIs.
+
 ### Core Components
 
 **SwiftFTR Actor** (`Sources/SwiftFTR/Traceroute.swift`)
-- Main actor coordinating all traceroute operations
+- Main `actor` coordinating all operations; thread-safe without `@MainActor`
 - Manages active traces via `TraceHandle` for cancellation support
-- Provides `trace()` and `traceClassified()` public APIs
-- Handles network change events to invalidate caches and cancel active traces
+- Public APIs: `trace()`, `traceClassified()`, `traceStream()`, `ping()`, `discoverPaths()`, plus probe APIs
+- `networkChanged()` invalidates all caches and cancels active traces
 
 **ICMP Module** (`Sources/SwiftFTR/ICMP.swift`)
-- Low-level ICMP packet handling using `SOCK_DGRAM` socket (no sudo required on macOS)
-- Parallel probe strategy: sends all TTL probes in one burst
-- Non-blocking socket with `poll(2)` for efficient I/O
-- Monotonic clock timing for accurate RTT measurements
+- `SOCK_DGRAM` + `IPPROTO_ICMP` socket (no root required on macOS)
+- Parallel probe: sends all TTL probes in one burst, listens with `DispatchSourceRead` (kqueue-backed)
+- Monotonic clock (`CLOCK_MONOTONIC`) timing for accurate RTT
+- `@_spi(Testing)` exposes `__parseICMPMessage` for unit tests
 
 **Classification System** (`Sources/SwiftFTR/Segmentation.swift`)
-- `TraceClassifier` performs ASN-based hop categorization
-- Categories: LOCAL, ISP, TRANSIT, DESTINATION
-- Hole-filling algorithm to interpolate missing hops between identical segments
-- Uses Team Cymru DNS WHOIS for ASN lookups with caching
+- `TraceClassifier` categorizes hops: LOCAL, ISP, TRANSIT, VPN, DESTINATION
+- Hole-filling algorithm interpolates missing hops between identical segments
+- VPN-aware classification for tunnel and exit node detection
+
+**ASN Resolution** (`Sources/SwiftFTR/ASN.swift`, `HybridASNResolver.swift`, `LocalASNResolver.swift`)
+- Multiple strategies via `ASNResolverStrategy`: `.dns` (Team Cymru), `.embedded` (SwiftIP2ASN local DB), `.remote(bundledPath:url:)`, `.hybrid(source, fallbackTimeout:)`
+- `_ASNMemoryCache`: in-memory cache with 2048 entry capacity
+
+**Probe Modules** — each in its own file:
+- `Ping.swift`: ICMP echo with statistics (min/avg/max RTT, jitter, packet loss)
+- `TCPProbe.swift`: Port state detection (open/closed/filtered)
+- `UDPProbe.swift`: Connected-socket with ICMP unreachable detection
+- `DNS.swift`: Direct server queries with 11 record types; `@_spi(Testing)` exposes `__dnsEncodeQName`
+- `HTTPProbe.swift`: Web server reachability via URLSession
+- `StreamingTrace.swift`: `AsyncThrowingStream`-based real-time hop delivery
+- `Multipath.swift`: Dublin Traceroute-style ECMP path enumeration
 
 **Caching Infrastructure**
-- `RDNSCache` (`Sources/SwiftFTR/RDNSCache.swift`): Reverse DNS with 86400s TTL
-- `STUNCache` (in `STUN.swift`): Public IP discovery, invalidated on network changes
-- `_ASNMemoryCache` (in `ASN.swift`): In-memory ASN lookup cache with 2048 entry capacity
+- `RDNSCache` (`RDNSCache.swift`): Reverse DNS with 86400s TTL
+- `STUNCache` (in `STUN.swift`): Public IP via STUN + DNS fallback, invalidated on network change
+- `_ASNMemoryCache` (in `ASN.swift`): LRU-style IP-to-ASN cache
 
 ### Key Design Patterns
 
-1. **Actor-based Concurrency**: SwiftFTR is an actor ensuring thread-safe operations without MainActor requirements
-2. **Cancellation Support**: Active traces can be cancelled via `TraceHandle` or globally via `networkChanged()`
-3. **Dependency Injection**: Resolvers (ASN, DNS) are injectable via configuration for testing
-4. **Resource Management**: Single socket per trace, buffer reuse, minimal allocations
+1. **Actor-based Concurrency**: `SwiftFTR` is an `actor`, thread-safe from any context
+2. **Cancellation**: Via `TraceHandle` per-trace or `networkChanged()` globally
+3. **Dependency Injection**: Resolvers (ASN, DNS) are injectable via `SwiftFTRConfig` for testing
+4. **Per-Operation Interface Binding**: Override global interface on individual operations (ping, trace, etc.)
+5. **Resource Management**: Single socket per trace, buffer reuse, minimal allocations
 
-### Protocol Extensions
+## Environment Variables
 
-The codebase defines several protocols for extensibility:
-- `ASNResolver`: Custom ASN lookup implementations
-- `DNSResolver`: Alternative DNS resolution strategies
-- All public types conform to `Sendable` for Swift 6 concurrency
+| Variable | Effect |
+|---|---|
+| `PTR_SKIP_STUN=1` | Skip STUN public IP discovery (used in tests for isolation) |
+| `PTR_PUBLIC_IP=x.y.z.w` | Override public IP (bypasses STUN) |
+| `SWIFTFTR_VERBOSE_HTTP_TIMING=1` | Verbose HTTP probe timing logs |
+| `SWIFTFTR_DEBUG_MULTIPATH` | Debug output for multipath discovery |
 
 ## Swift 6 Compliance
 
-This project requires Swift 6.1+ and builds with strict concurrency checking enabled:
-- Language mode: Swift 6 (`swiftLanguageModes: [.v6]` in Package.swift)
-- All public types are `Sendable`
-- No `@MainActor` requirements for library APIs
-- Thread-safe from any actor or task context
+- Swift tools version 6.0, language mode Swift 6 (`swiftLanguageModes: [.v6]`)
+- Requires Swift 6.1+ / Xcode 16.4+, macOS 13+
+- All public types are `Sendable`; no `@MainActor` requirements
 
-## Project Structure
+## Testing Notes
 
-SwiftPM's `Package.swift` wires the `SwiftFTR` library plus CLI:
-- `Sources/SwiftFTR/`: Core library (tracer, DNS, ICMP, configuration)
-- `Sources/swift-ftr/`: CLI entry point and JSON emitters
-- `Sources/hop-monitor/`: Ancillary monitoring tool
-- `Tests/SwiftFTRTests/`: Unit and integration tests
-- `docs/`: Documentation and guides
-- `FuzzCorpus/`: Fuzzing inputs for packet parsing
+- **Offline by default**: Use `PTR_SKIP_STUN=1` for deterministic/offline test runs
+- **`NetworkTestGate`**: Actor-based concurrency limiter in tests that perform real network I/O
+- **STUN tests**: Conditionally enabled — skipped when `PTR_SKIP_STUN` is set
+- **ICMP on CI**: Network traces do NOT work on GitHub cloud runners; integration tests require self-hosted runners or local execution
+- Tests should not assume specific hop counts, ASN assignments, or that TRANSIT segments exist
 
 ## Coding Conventions
 
-- **Formatting**: `swift-format` driven; check with `swift format lint -r Sources Tests`
-- **Naming**: Standard camelCase; exceptions documented in `docs/development/CODE_STYLE.md`:
-  - snake_case JSON properties in `Sources/swift-ftr/main.swift`
-  - `LLVMFuzzerTestOneInput` for libFuzzer entry points
-  - `@_spi(Testing)` double-underscore helpers
-- **Commits**: Conventional Commits (`feat(tracer):`, `fix(dns):`, `docs:`)
-- **Testing**: Tests must be deterministic/offline; inject resolvers or supply config
-
-## Security Notes
-
-- Keep tokens and ASN data out of git
-- Configure with `SwiftFTRConfig(publicIP:)`, `SwiftFTRConfig(interface:)`, or CLI flags
-- Use `git config core.hooksPath .githooks` for local format enforcement
+- **Formatting**: `swift-format` enforced; pre-push hook at `.githooks/pre-push` (enable with `git config core.hooksPath .githooks`)
+- **Naming**: camelCase with documented exceptions:
+  - snake_case JSON properties in `Sources/swift-ftr/main.swift` (public API backward compat)
+  - `LLVMFuzzerTestOneInput` (libFuzzer requirement)
+  - `__`-prefixed `@_spi(Testing)` helpers (internal testing exposure)
+- **Commits**: Conventional Commits with scopes (`feat(tracer):`, `fix(dns):`, `docs:`)
+- **Dependencies**: SwiftPM only — `swift-argument-parser`, `swift-docc-plugin`, `swift-ip2asn`

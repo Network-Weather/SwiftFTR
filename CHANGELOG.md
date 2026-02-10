@@ -3,6 +3,36 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.11.5 — 2026-02-10
+-------------------
+### IPv6 DNS Transport Support
+
+**Dual-Stack DNS Queries**
+- All DNS query functions (`performDNSQueryInternal`, `DNSClient.queryTXTOnce`) now support both IPv4 and IPv6 DNS servers
+- Socket creation, interface binding, sendto/recvfrom all branch on detected address family
+- Link-local IPv6 servers (e.g. `fe80::1%en0`) fully supported with `sin6_scope_id` from `%zone` suffix
+- Uses `IPV6_BOUND_IF` / `IPPROTO_IPV6` for IPv6 interface binding (vs `IP_BOUND_IF` / `IPPROTO_IP` for IPv4)
+- Source IP binding validates that source and server address families match
+
+**New APIs**
+- `DNSQueries.reverseIPv6(ip:server:timeout:interface:sourceIP:)` — PTR lookup via `ip6.arpa`
+- `reverseIPv6(ip:server:...)` — standalone free function matching the existing `reverseDNS()` pattern
+- `_formatReverseDNS()` now handles IPv6 (expands via `inet_pton`, reverses nibbles, appends `.ip6.arpa`)
+- `reverseDNS()` in Utils.swift now resolves both IPv4 and IPv6 addresses via `getnameinfo`
+
+**New Utilities**
+- `detectAddressFamily()` — returns `AF_INET`, `AF_INET6`, or `-1`; strips `%zone` suffixes
+- `parseIPv6Scoped()` — extracts bare IP and numeric scope ID from link-local addresses
+
+**Why This Matters**
+- iPhone tethering on IPv6-only / NAT64 networks provides link-local IPv6 DNS servers
+- Without this change, all DNS queries fail with `sendFailed` because sockets were hardcoded to `AF_INET`
+- Default DNS server remains `8.8.8.8` — callers opt in to IPv6 by passing an IPv6 server address
+
+**Testing**
+- 4 new offline unit tests: `testFormatReverseDNSIPv6`, `testDetectAddressFamily`, `testParseIPv6Scoped`, existing IPv4 tests unbroken
+- Live-verified all query types (A, AAAA, TXT, PTR, PTR6, NS) through `fe80::28d5:b1ff:fe4d:3564%en0`
+
 0.11.4 — 2026-02-02
 -------------------
 ### Bug Fixes

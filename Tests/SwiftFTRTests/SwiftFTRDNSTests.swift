@@ -183,6 +183,82 @@ final class SwiftFTRDNSTests: XCTestCase {
     XCTAssertNil(__dnsFormatReverseDNS(""))  // Empty
   }
 
+  func testFormatReverseDNSIPv6() {
+    // Google Public DNS IPv6: 2001:4860:4860::8888
+    // Expanded: 2001:4860:4860:0000:0000:0000:0000:8888
+    // Nibbles reversed: 8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa
+    let result1 = __dnsFormatReverseDNS("2001:4860:4860::8888")
+    XCTAssertEqual(
+      result1,
+      "8.8.8.8.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa")
+
+    // Localhost ::1
+    let result2 = __dnsFormatReverseDNS("::1")
+    XCTAssertEqual(
+      result2,
+      "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa")
+
+    // All zeros ::
+    let result3 = __dnsFormatReverseDNS("::")
+    XCTAssertEqual(
+      result3,
+      "0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa")
+
+    // Fully expanded address
+    let result4 = __dnsFormatReverseDNS("2001:0db8:0001:0002:0003:0004:0005:0006")
+    XCTAssertEqual(
+      result4,
+      "6.0.0.0.5.0.0.0.4.0.0.0.3.0.0.0.2.0.0.0.1.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa")
+
+    // Invalid IPv6 strings
+    XCTAssertNil(__dnsFormatReverseDNS("not-an-ip"))
+    XCTAssertNil(__dnsFormatReverseDNS("gggg::1"))
+  }
+
+  func testDetectAddressFamily() {
+    // IPv4
+    XCTAssertEqual(__detectAddressFamily("8.8.8.8"), AF_INET)
+    XCTAssertEqual(__detectAddressFamily("192.168.1.1"), AF_INET)
+    XCTAssertEqual(__detectAddressFamily("0.0.0.0"), AF_INET)
+
+    // IPv6
+    XCTAssertEqual(__detectAddressFamily("::1"), AF_INET6)
+    XCTAssertEqual(__detectAddressFamily("2001:4860:4860::8888"), AF_INET6)
+    XCTAssertEqual(__detectAddressFamily("fe80::1"), AF_INET6)
+
+    // IPv6 link-local with scope ID
+    XCTAssertEqual(__detectAddressFamily("fe80::1%en0"), AF_INET6)
+    XCTAssertEqual(__detectAddressFamily("fe80::28d5:b1ff:fe4d:3564%en0"), AF_INET6)
+
+    // Invalid
+    XCTAssertEqual(__detectAddressFamily("not-an-ip"), -1)
+    XCTAssertEqual(__detectAddressFamily(""), -1)
+    XCTAssertEqual(__detectAddressFamily("256.1.1.1"), -1)
+  }
+
+  func testParseIPv6Scoped() {
+    // Global address without scope
+    let r1 = __parseIPv6Scoped("2001:4860:4860::8888")
+    XCTAssertEqual(r1.ip, "2001:4860:4860::8888")
+    XCTAssertEqual(r1.scopeID, 0)
+
+    // Link-local with interface name (scope ID depends on interface existence)
+    let r2 = __parseIPv6Scoped("fe80::1%lo0")
+    XCTAssertEqual(r2.ip, "fe80::1")
+    // lo0 should always exist on macOS; its index is typically 1
+    XCTAssertGreaterThan(r2.scopeID, 0)
+
+    // Numeric zone ID
+    let r3 = __parseIPv6Scoped("fe80::1%42")
+    XCTAssertEqual(r3.ip, "fe80::1")
+    XCTAssertEqual(r3.scopeID, 42)
+
+    // Non-existent interface falls back to numeric parse (which fails -> 0)
+    let r4 = __parseIPv6Scoped("fe80::1%nonexistent_iface")
+    XCTAssertEqual(r4.ip, "fe80::1")
+    XCTAssertEqual(r4.scopeID, 0)
+  }
+
   // MARK: - New Parser Tests (0.8.0)
 
   func testParseTXT() {
@@ -445,4 +521,5 @@ final class SwiftFTRDNSTests: XCTestCase {
     XCTAssertEqual(result2?.priority, 2)
     XCTAssertEqual(result2?.target, "h3.example.com")
   }
+
 }

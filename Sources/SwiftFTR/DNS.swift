@@ -367,6 +367,83 @@ public struct DNSQueries: Sendable {
     )
   }
 
+  /// Reverse DNS lookup for IPv6 address (PTR record via ip6.arpa)
+  ///
+  /// - Parameters:
+  ///   - ip: IPv6 address to look up (e.g. "2001:4860:4860::8888")
+  ///   - server: DNS server to use (defaults to config or 8.8.8.8)
+  ///   - timeout: Query timeout in seconds (defaults to config or 3.0)
+  ///   - interface: Network interface to bind to (defaults to config)
+  ///   - sourceIP: Source IP address to bind to (defaults to config)
+  /// - Returns: DNS query result with PTR records
+  /// - Throws: DNSError on query failure
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
+  public func reverseIPv6(
+    ip: String,
+    server: String? = nil,
+    timeout: TimeInterval? = nil,
+    interface: String? = nil,
+    sourceIP: String? = nil
+  ) async throws -> DNSQueryResult {
+    let timer = HighPrecisionTimer()
+    let startTime = Date()
+
+    // Format IP to ip6.arpa
+    guard let arpaQuery = _formatReverseDNS(ip) else {
+      throw DNSError.invalidIP(ip)
+    }
+
+    // Use config defaults
+    let resolvedServer = server ?? "8.8.8.8"
+    let resolvedTimeout = timeout ?? 3.0
+    let resolvedInterface = interface ?? tracer.config.interface
+    let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
+
+    // Query PTR record
+    let answers = try await runDetachedBlockingIO {
+      try performDNSQueryInternal(
+        server: resolvedServer,
+        query: arpaQuery,
+        queryType: DNSRecordType.ptr.rawValue,
+        timeout: resolvedTimeout,
+        interface: resolvedInterface,
+        sourceIP: resolvedSourceIP
+      )
+    }
+
+    let rttMs = timer.elapsedMs()
+
+    // Parse all PTR records
+    var records: [DNSRecord] = []
+    for answer in answers where answer.type == DNSRecordType.ptr.rawValue {
+      if let hostname = DNSClient.parsePTR(
+        rdata: answer.rdata,
+        rdataOffsetInMessage: answer.rdataOffset,
+        fullMessage: answer.fullMessage
+      ) {
+        records.append(
+          DNSRecord(
+            name: answer.name,
+            type: .ptr,
+            recordClass: answer.klass,
+            ttl: answer.ttl,
+            data: .hostname(hostname)
+          ))
+      }
+    }
+
+    return DNSQueryResult(
+      query: ip,
+      queryType: .ptr,
+      server: resolvedServer,
+      records: records,
+      rttMs: rttMs,
+      timestamp: startTime
+    )
+  }
+
   /// Query for text record (TXT record)
   ///
   /// - Parameters:
@@ -942,6 +1019,73 @@ public func reverseDNS(
   )
 }
 
+/// Perform reverse DNS lookup for an IPv6 address (PTR query via ip6.arpa)
+///
+/// - Parameters:
+///   - ip: IPv6 address to resolve (e.g., "2001:4860:4860::8888")
+///   - server: DNS server to query
+///   - timeout: Query timeout in seconds (default: 2.0)
+///   - interface: Network interface to bind to (macOS only, optional)
+///   - sourceIP: Source IP address to bind to (optional)
+/// - Returns: ReverseDNSResult containing hostname (or nil) and timing information
+/// - Throws: DNSError on network failures or invalid input
+#if compiler(>=6.2)
+  @concurrent
+#endif
+public func reverseIPv6(
+  ip: String,
+  server: String,
+  timeout: TimeInterval = 2.0,
+  interface: String? = nil,
+  sourceIP: String? = nil
+) async throws -> ReverseDNSResult {
+  let startTime = Date()
+
+  // Convert IPv6 to reverse DNS format (ip6.arpa)
+  guard let reverseName = _formatReverseDNS(ip) else {
+    throw DNSError.invalidIP(ip)
+  }
+
+  // Query PTR record
+  let answers = try await runDetachedBlockingIO {
+    try performDNSQueryInternal(
+      server: server,
+      query: reverseName,
+      queryType: 12,  // PTR
+      timeout: timeout,
+      interface: interface,
+      sourceIP: sourceIP
+    )
+  }
+
+  let rtt = Date().timeIntervalSince(startTime)
+
+  // Parse first PTR record
+  for answer in answers where answer.type == 12 {
+    if let hostname = DNSClient.parsePTR(
+      rdata: answer.rdata,
+      rdataOffsetInMessage: answer.rdataOffset,
+      fullMessage: answer.fullMessage
+    ) {
+      return ReverseDNSResult(
+        ip: ip,
+        server: server,
+        hostname: hostname,
+        rtt: rtt,
+        timestamp: startTime
+      )
+    }
+  }
+
+  return ReverseDNSResult(
+    ip: ip,
+    server: server,
+    hostname: nil,
+    rtt: rtt,
+    timestamp: startTime
+  )
+}
+
 /// Query IPv6 address (AAAA record)
 ///
 /// Queries the specified DNS server for IPv6 addresses associated with a hostname.
@@ -1110,7 +1254,13 @@ private func performDNSQueryInternal(
   interface: String?,
   sourceIP: String?
 ) throws -> [DNSClient.Answer] {
-  let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+  // Detect server address family (IPv4 vs IPv6)
+  let serverFamily = detectAddressFamily(server)
+  guard serverFamily == AF_INET || serverFamily == AF_INET6 else {
+    throw DNSError.invalidIP(server)
+  }
+
+  let fd = socket(serverFamily, SOCK_DGRAM, IPPROTO_UDP)
   guard fd >= 0 else {
     throw DNSError.socketCreationFailed
   }
@@ -1125,8 +1275,11 @@ private func performDNSQueryInternal(
       }
 
       var index = ifaceIndex
+      let (proto, opt) =
+        serverFamily == AF_INET6
+        ? (IPPROTO_IPV6, IPV6_BOUND_IF) : (IPPROTO_IP, IP_BOUND_IF)
       let result = setsockopt(
-        fd, IPPROTO_IP, IP_BOUND_IF,
+        fd, proto, opt,
         &index, socklen_t(MemoryLayout<UInt32>.size))
 
       guard result >= 0 else {
@@ -1139,23 +1292,49 @@ private func performDNSQueryInternal(
 
   // Bind to source IP if specified
   if let srcIP = sourceIP {
-    var sourceAddr = sockaddr_in()
-    sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    sourceAddr.sin_family = sa_family_t(AF_INET)
-    sourceAddr.sin_port = 0  // Any port
-
-    guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
-      throw DNSError.bindFailed("Invalid source IP address '\(srcIP)'")
+    let srcFamily = detectAddressFamily(srcIP)
+    guard srcFamily == serverFamily else {
+      throw DNSError.bindFailed(
+        "Source IP family (\(srcFamily == AF_INET ? "IPv4" : "IPv6")) doesn't match server family")
     }
 
-    let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-        bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+    if serverFamily == AF_INET6 {
+      let (bare6, scopeID) = parseIPv6Scoped(srcIP)
+      var sourceAddr6 = sockaddr_in6()
+      sourceAddr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      sourceAddr6.sin6_family = sa_family_t(AF_INET6)
+      sourceAddr6.sin6_port = 0
+      sourceAddr6.sin6_scope_id = scopeID
+      guard inet_pton(AF_INET6, bare6, &sourceAddr6.sin6_addr) == 1 else {
+        throw DNSError.bindFailed("Invalid source IPv6 address '\(srcIP)'")
       }
-    }
+      let bindResult = withUnsafePointer(to: &sourceAddr6) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+          bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+      }
+      guard bindResult >= 0 else {
+        throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
+      }
+    } else {
+      var sourceAddr = sockaddr_in()
+      sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+      sourceAddr.sin_family = sa_family_t(AF_INET)
+      sourceAddr.sin_port = 0
 
-    guard bindResult >= 0 else {
-      throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
+      guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
+        throw DNSError.bindFailed("Invalid source IP address '\(srcIP)'")
+      }
+
+      let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+          bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+      }
+
+      guard bindResult >= 0 else {
+        throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
+      }
     }
   }
 
@@ -1169,16 +1348,6 @@ private func performDNSQueryInternal(
   }
   _ = withUnsafePointer(to: &tv) { p in
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
-  }
-
-  // Prepare destination
-  var dst = sockaddr_in()
-  dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-  dst.sin_family = sa_family_t(AF_INET)
-  dst.sin_port = in_port_t(53).bigEndian
-  let ok = server.withCString { cs in inet_pton(AF_INET, cs, &dst.sin_addr) }
-  guard ok == 1 else {
-    throw DNSError.invalidIP(server)
   }
 
   // Build DNS query message
@@ -1203,11 +1372,42 @@ private func performDNSQueryInternal(
   append16(queryType)  // QTYPE
   append16(1)  // QCLASS IN
 
-  // Send query
-  let sent: ssize_t = msg.withUnsafeBytes { raw in
-    withUnsafePointer(to: &dst) { aptr in
-      aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-        sendto(fd, raw.baseAddress!, raw.count, 0, saptr, socklen_t(MemoryLayout<sockaddr_in>.size))
+  // Prepare destination and send
+  let sent: ssize_t
+  if serverFamily == AF_INET6 {
+    let (bare6, scopeID) = parseIPv6Scoped(server)
+    var dst6 = sockaddr_in6()
+    dst6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+    dst6.sin6_family = sa_family_t(AF_INET6)
+    dst6.sin6_port = in_port_t(53).bigEndian
+    dst6.sin6_scope_id = scopeID
+    guard inet_pton(AF_INET6, bare6, &dst6.sin6_addr) == 1 else {
+      throw DNSError.invalidIP(server)
+    }
+    sent = msg.withUnsafeBytes { raw in
+      withUnsafePointer(to: &dst6) { aptr in
+        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+          sendto(
+            fd, raw.baseAddress!, raw.count, 0, saptr,
+            socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+      }
+    }
+  } else {
+    var dst4 = sockaddr_in()
+    dst4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    dst4.sin_family = sa_family_t(AF_INET)
+    dst4.sin_port = in_port_t(53).bigEndian
+    guard server.withCString({ cs in inet_pton(AF_INET, cs, &dst4.sin_addr) }) == 1 else {
+      throw DNSError.invalidIP(server)
+    }
+    sent = msg.withUnsafeBytes { raw in
+      withUnsafePointer(to: &dst4) { aptr in
+        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+          sendto(
+            fd, raw.baseAddress!, raw.count, 0, saptr,
+            socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
       }
     }
   }
@@ -1216,11 +1416,11 @@ private func performDNSQueryInternal(
     throw DNSError.sendFailed
   }
 
-  // Receive response
+  // Receive response (sockaddr_storage is large enough for both families)
   var buf = [UInt8](repeating: 0, count: 2048)
-  var from = sockaddr_in()
-  var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_in>.size)
-  let n = withUnsafeMutablePointer(to: &from) { aptr -> ssize_t in
+  var fromStorage = sockaddr_storage()
+  var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
+  let n = withUnsafeMutablePointer(to: &fromStorage) { aptr -> ssize_t in
     aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
       recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
     }
@@ -1348,14 +1548,29 @@ private func _encodeQName(_ name: String) -> [UInt8] {
   return out
 }
 
-/// Format IPv4 address for reverse DNS (PTR) query
-/// Example: "10.1.10.1" -> "1.10.1.10.in-addr.arpa"
-private func _formatReverseDNS(_ ipv4: String) -> String? {
-  let octets = ipv4.split(separator: ".").compactMap { Int($0) }
-  guard octets.count == 4, octets.allSatisfy({ $0 >= 0 && $0 <= 255 }) else {
-    return nil
+/// Format an IP address for reverse DNS (PTR) query.
+/// - IPv4 example: `"10.1.10.1"` → `"1.10.1.10.in-addr.arpa"`
+/// - IPv6 example: `"2001:4860:4860::8888"` → `"8.8.8.8.0.0.0.0...0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa"`
+private func _formatReverseDNS(_ ip: String) -> String? {
+  // Try IPv4 first
+  let octets = ip.split(separator: ".").compactMap { Int($0) }
+  if octets.count == 4, octets.allSatisfy({ $0 >= 0 && $0 <= 255 }) {
+    return "\(octets[3]).\(octets[2]).\(octets[1]).\(octets[0]).in-addr.arpa"
   }
-  return "\(octets[3]).\(octets[2]).\(octets[1]).\(octets[0]).in-addr.arpa"
+
+  // Try IPv6 — expand via inet_pton to get 16 raw bytes
+  let bare = ip.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ip
+  var addr6 = in6_addr()
+  guard inet_pton(AF_INET6, bare, &addr6) == 1 else { return nil }
+
+  // Read 16 bytes, expand each byte to two hex nibbles, reverse all 32 nibbles
+  let rawBytes = withUnsafeBytes(of: &addr6) { Array($0) }
+  var nibbles: [String] = []
+  for byte in rawBytes {
+    nibbles.append(String(byte >> 4, radix: 16))
+    nibbles.append(String(byte & 0x0F, radix: 16))
+  }
+  return nibbles.reversed().joined(separator: ".") + ".ip6.arpa"
 }
 
 struct DNSClient {
@@ -1384,7 +1599,10 @@ struct DNSClient {
 
   private static func queryTXTOnce(name: String, timeout: TimeInterval, server: String) -> [String]?
   {
-    let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    let serverFamily = detectAddressFamily(server)
+    guard serverFamily == AF_INET || serverFamily == AF_INET6 else { return nil }
+
+    let fd = socket(serverFamily, SOCK_DGRAM, IPPROTO_UDP)
     if fd < 0 { return nil }
     defer { close(fd) }
     var tv = timeval(
@@ -1395,13 +1613,6 @@ struct DNSClient {
     _ = withUnsafePointer(to: &tv) { p in
       setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
     }
-
-    var dst = sockaddr_in()
-    dst.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    dst.sin_family = sa_family_t(AF_INET)
-    dst.sin_port = in_port_t(53).bigEndian
-    let ok = server.withCString { cs in inet_pton(AF_INET, cs, &dst.sin_addr) }
-    if ok != 1 { return nil }
 
     var msg = Data()
     let id = UInt16.random(in: 0...UInt16.max)
@@ -1427,20 +1638,50 @@ struct DNSClient {
     append16(16)  // QTYPE TXT
     append16(1)  // QCLASS IN
 
-    let sent: ssize_t = msg.withUnsafeBytes { raw in
-      withUnsafePointer(to: &dst) { aptr in
-        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-          sendto(
-            fd, raw.baseAddress!, raw.count, 0, saptr, socklen_t(MemoryLayout<sockaddr_in>.size))
+    // Send to server (IPv4 or IPv6)
+    let sent: ssize_t
+    if serverFamily == AF_INET6 {
+      let (bare6, scopeID) = parseIPv6Scoped(server)
+      var dst6 = sockaddr_in6()
+      dst6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      dst6.sin6_family = sa_family_t(AF_INET6)
+      dst6.sin6_port = in_port_t(53).bigEndian
+      dst6.sin6_scope_id = scopeID
+      guard inet_pton(AF_INET6, bare6, &dst6.sin6_addr) == 1 else { return nil }
+      sent = msg.withUnsafeBytes { raw in
+        withUnsafePointer(to: &dst6) { aptr in
+          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+            sendto(
+              fd, raw.baseAddress!, raw.count, 0, saptr,
+              socklen_t(MemoryLayout<sockaddr_in6>.size))
+          }
+        }
+      }
+    } else {
+      var dst4 = sockaddr_in()
+      dst4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+      dst4.sin_family = sa_family_t(AF_INET)
+      dst4.sin_port = in_port_t(53).bigEndian
+      guard server.withCString({ cs in inet_pton(AF_INET, cs, &dst4.sin_addr) }) == 1 else {
+        return nil
+      }
+      sent = msg.withUnsafeBytes { raw in
+        withUnsafePointer(to: &dst4) { aptr in
+          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+            sendto(
+              fd, raw.baseAddress!, raw.count, 0, saptr,
+              socklen_t(MemoryLayout<sockaddr_in>.size))
+          }
         }
       }
     }
     if sent <= 0 { return nil }
 
+    // Receive response (sockaddr_storage handles both families)
     var buf = [UInt8](repeating: 0, count: 2048)
-    var from = sockaddr_in()
-    var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_in>.size)
-    let n = withUnsafeMutablePointer(to: &from) { aptr -> ssize_t in
+    var fromStorage = sockaddr_storage()
+    var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let n = withUnsafeMutablePointer(to: &fromStorage) { aptr -> ssize_t in
       aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
         recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
       }
@@ -1898,8 +2139,20 @@ public func __dnsParsePTR(
 
 // swift-format-ignore: AlwaysUseLowerCamelCase
 @_spi(Test)
-public func __dnsFormatReverseDNS(_ ipv4: String) -> String? {
-  _formatReverseDNS(ipv4)
+public func __dnsFormatReverseDNS(_ ip: String) -> String? {
+  _formatReverseDNS(ip)
+}
+
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
+public func __detectAddressFamily(_ ip: String) -> Int32 {
+  detectAddressFamily(ip)
+}
+
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
+public func __parseIPv6Scoped(_ server: String) -> (ip: String, scopeID: UInt32) {
+  parseIPv6Scoped(server)
 }
 
 // swift-format-ignore: AlwaysUseLowerCamelCase

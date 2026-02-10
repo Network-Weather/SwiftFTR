@@ -4,6 +4,31 @@ import Foundation
   import Darwin
 #endif
 
+/// Returns `AF_INET` for IPv4, `AF_INET6` for IPv6, or `-1` if the string is not a valid IP.
+/// Strips scope ID (e.g. `%en0`) from IPv6 link-local addresses before parsing.
+@inline(__always)
+func detectAddressFamily(_ ip: String) -> Int32 {
+  var addr4 = in_addr()
+  if inet_pton(AF_INET, ip, &addr4) == 1 { return Int32(AF_INET) }
+  let bare = ip.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ip
+  var addr6 = in6_addr()
+  if inet_pton(AF_INET6, bare, &addr6) == 1 { return Int32(AF_INET6) }
+  return -1
+}
+
+/// Parse an IPv6 server string like `fe80::1%en0` into (bareIP, scopeID).
+/// `scopeID` is the numeric interface index (from the `%zone` suffix), or 0 if absent.
+func parseIPv6Scoped(_ server: String) -> (ip: String, scopeID: UInt32) {
+  let parts = server.split(separator: "%", maxSplits: 1)
+  let bare = String(parts[0])
+  if parts.count == 2 {
+    let zone = String(parts[1])
+    let idx = if_nametoindex(zone)  // returns 0 if not found
+    return (bare, idx != 0 ? idx : UInt32(zone) ?? 0)
+  }
+  return (bare, 0)
+}
+
 @inline(__always)
 func ipString(_ sin: sockaddr_in) -> String {
   var sin = sin
@@ -45,25 +70,52 @@ public func isCGNATIPv4(_ ip: String) -> Bool {
   return a == 100 && (64...127).contains(b)
 }
 
-/// Performs a best-effort reverse DNS lookup for the given IPv4 string.
+/// Performs a best-effort reverse DNS lookup for the given IP string (IPv4 or IPv6).
 /// - Returns: A hostname if one exists, otherwise nil. Blocking but bounded by system resolver.
-public func reverseDNS(_ ipv4: String) -> String? {
-  var sin = sockaddr_in()
-  sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-  sin.sin_family = sa_family_t(AF_INET)
-  let ok = ipv4.withCString { cs in inet_pton(AF_INET, cs, &sin.sin_addr) }
-  guard ok == 1 else { return nil }
-  var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-  let res = withUnsafePointer(to: &sin) { aptr in
-    aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-      getnameinfo(
-        saptr, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0, 0)
+public func reverseDNS(_ ip: String) -> String? {
+  let family = detectAddressFamily(ip)
+  if family == AF_INET {
+    var sin = sockaddr_in()
+    sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    sin.sin_family = sa_family_t(AF_INET)
+    let ok = ip.withCString { cs in inet_pton(AF_INET, cs, &sin.sin_addr) }
+    guard ok == 1 else { return nil }
+    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+    let res = withUnsafePointer(to: &sin) { aptr in
+      aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+        getnameinfo(
+          saptr, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0, 0
+        )
+      }
     }
-  }
-  if res == 0 {
-    return host.withUnsafeBufferPointer { ptr in
-      String(cString: ptr.baseAddress!)
+    if res == 0 {
+      return host.withUnsafeBufferPointer { ptr in
+        String(cString: ptr.baseAddress!)
+      }
     }
+    return nil
+  } else if family == AF_INET6 {
+    let (bare, scopeID) = parseIPv6Scoped(ip)
+    var sin6 = sockaddr_in6()
+    sin6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+    sin6.sin6_family = sa_family_t(AF_INET6)
+    sin6.sin6_scope_id = scopeID
+    let ok = bare.withCString { cs in inet_pton(AF_INET6, cs, &sin6.sin6_addr) }
+    guard ok == 1 else { return nil }
+    var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+    let res = withUnsafePointer(to: &sin6) { aptr in
+      aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+        getnameinfo(
+          saptr, socklen_t(MemoryLayout<sockaddr_in6>.size), &host, socklen_t(host.count), nil, 0,
+          0)
+      }
+    }
+    if res == 0 {
+      return host.withUnsafeBufferPointer { ptr in
+        String(cString: ptr.baseAddress!)
+      }
+    }
+    return nil
   }
   return nil
 }
