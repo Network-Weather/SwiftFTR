@@ -3,6 +3,38 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.12.0 — 2026-02-10
+-------------------
+### Non-Blocking I/O Modernization
+
+**Traceroute I/O: poll(2) replaced with DispatchSourceRead**
+- `TraceReceiveOperation` and `StreamingTraceReceiveOperation` now use kqueue-backed `DispatchSourceRead` for ICMP socket readiness, replacing the legacy `poll(2)` busy loop
+- `DispatchSourceTimer` replaces manual deadline arithmetic for both the overall timeout and the streaming retry timer
+- Eliminates thread-blocking: the cooperative thread pool is never stalled waiting for socket data
+- Completes the I/O modernization started in v0.11.2 (TCP/UDP probes) and v0.8.0 (ping), bringing all socket-based operations to event-driven I/O
+
+### Concurrency Bug Fixes
+
+**Data race elimination in trace operations**
+- `TraceReceiveOperation.cancel()` now sets the finished flag under lock and dispatches source cleanup to the serial queue, preventing races between cancellation (any thread) and `handleRead()`/`setupSources()` (serial queue)
+- Same fix applied to `StreamingTraceReceiveOperation.cancel()`
+- `finish()` in both operations simplified to only run on the serial queue — `hops`, `reachedTTL`, and `receivedTTLs` no longer need lock-protected copies since they're only mutated on that same queue
+- `setupSources()` now guards against setup after `cancel()` has already completed, preventing leaked DispatchSources that would hold strong references to the operation
+
+**HTTPProbe delegate thread safety**
+- `NoRedirectDelegate` and `MetricsDelegate` now protect `taskMetrics` with `NSLock`, eliminating a theoretical data race between URLSession's internal queue and the caller's `extractTimingMetrics()` read
+
+### Config Validation
+
+- `SwiftFTRConfig.init()`: precondition that `maxHops` is 1...255, `maxWaitMs` is positive, `payloadSize` is non-negative
+- `StreamingTraceConfig.init()`: precondition that `maxHops` is 1...255, `probeTimeout` is positive
+- Prevents runtime crashes from `1...0` range construction when `maxHops == 0`
+
+### Compatibility
+- No breaking changes to public APIs
+- All 157 tests passing
+- Requires macOS 13+, Swift 6.1+
+
 0.11.5 — 2026-02-10
 -------------------
 ### IPv6 DNS Transport Support

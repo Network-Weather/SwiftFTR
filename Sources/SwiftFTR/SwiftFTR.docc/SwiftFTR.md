@@ -77,6 +77,8 @@ let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
 - ``SwiftFTR/SwiftFTR``
 - ``SwiftFTR/TraceResult``
 - ``SwiftFTR/TraceHop``
+- ``SwiftFTR/TraceHandle``
+- ``SwiftFTR/TracerouteError``
 - <doc:Tracing>
 
 ### Classification
@@ -85,31 +87,76 @@ let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
 - ``SwiftFTR/ClassifiedTrace``
 - ``SwiftFTR/ClassifiedHop``
 - ``SwiftFTR/HopCategory``
+- ``SwiftFTR/VPNContext``
 
-### Ping (v0.5.0+)
+### Streaming Traceroute
+
+- ``SwiftFTR/StreamingHop``
+- ``SwiftFTR/StreamingTraceConfig``
+- <doc:StreamingTrace>
+
+### Ping
 
 - ``SwiftFTR/PingConfig``
 - ``SwiftFTR/PingResult``
+- ``SwiftFTR/PingResponse``
 - ``SwiftFTR/PingStatistics``
 - <doc:Ping>
 
-### Multipath Discovery (v0.5.0+)
+### Network Probing
+
+- ``SwiftFTR/TCPProbeConfig``
+- ``SwiftFTR/TCPProbeResult``
+- ``SwiftFTR/TCPConnectionState``
+- ``SwiftFTR/UDPProbeConfig``
+- ``SwiftFTR/UDPProbeResult``
+- ``SwiftFTR/HTTPProbeConfig``
+- ``SwiftFTR/HTTPProbeResult``
+- ``SwiftFTR/DNSProbeConfig``
+- ``SwiftFTR/DNSProbeResult``
+- <doc:Probing>
+
+### Bufferbloat & Responsiveness
+
+- ``SwiftFTR/BufferbloatConfig``
+- ``SwiftFTR/BufferbloatResult``
+- ``SwiftFTR/BufferbloatGrade``
+- ``SwiftFTR/LoadType``
+- ``SwiftFTR/RPMScore``
+- ``SwiftFTR/RPMGrade``
+- ``SwiftFTR/VideoCallImpact``
+- ``SwiftFTR/VideoCallSeverity``
+- <doc:Bufferbloat>
+
+### Multipath Discovery
 
 - ``SwiftFTR/MultipathConfig``
 - ``SwiftFTR/NetworkTopology``
 - ``SwiftFTR/DiscoveredPath``
+- ``SwiftFTR/FlowIdentifier``
 - <doc:Multipath>
 
-### DNS Queries (v0.8.0+)
+### DNS Queries
 
-- ``SwiftFTR/DNSClient``
+- ``SwiftFTR/DNSQueries``
 - ``SwiftFTR/DNSQueryResult``
 - ``SwiftFTR/DNSRecord``
 - ``SwiftFTR/DNSRecordType``
 - ``SwiftFTR/DNSRecordData``
 
-### Interface Binding (v0.7.0+)
+### ASN Resolution
 
-- ``SwiftFTR/SwiftFTRConfig/interface``
-- ``SwiftFTR/SwiftFTRConfig/sourceIP``
+- ``SwiftFTR/ASNInfo``
+- ``SwiftFTR/ASNResolverStrategy``
+- ``SwiftFTR/ASNResolver``
+
+### Network Interfaces
+
+- ``SwiftFTR/NetworkInterface``
+- ``SwiftFTR/NetworkInterfaceSnapshot``
+- ``SwiftFTR/InterfaceType``
 - <doc:InterfaceBinding>
+
+### Configuration
+
+- ``SwiftFTR/SwiftFTRConfig``
