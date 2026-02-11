@@ -6,9 +6,9 @@ We release patches for security vulnerabilities in the following versions:
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.8.x   | :white_check_mark: |
-| 0.7.x   | :white_check_mark: |
-| < 0.7   | :x:                |
+| 0.11.x  | :white_check_mark: |
+| 0.10.x  | :white_check_mark: |
+| < 0.10  | :x:                |
 
 ## Reporting a Vulnerability
 
@@ -70,6 +70,7 @@ SwiftFTR includes several security-conscious design choices:
 SwiftFTR minimizes external dependencies to reduce attack surface:
 - Swift Argument Parser (CLI only)
 - Swift DocC Plugin (documentation only)
+- Swift-IP2ASN (offline ASN lookups, used by `.embedded`/`.hybrid` resolver strategies)
 
 We regularly review and update dependencies for security patches.
 

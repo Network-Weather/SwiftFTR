@@ -208,7 +208,7 @@ extension SwiftFTRCommand {
         DestASNObj(asn: d.asn, name: d.name, country_code: d.countryCode)
       }
       let root = Root(
-        version: "0.5.0",
+        version: swiftFTRVersion,
         target: classified.destinationHost,
         target_ip: classified.destinationIP,
         public_ip: classified.publicIP,

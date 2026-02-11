@@ -44,8 +44,8 @@ Classic traceroute often probes sequentially and waits per hop; SwiftFTR probes 
 
 If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e.g., `20`). You can also tune `payloadSize` in advanced scenarios.
 
-- Requirements
---------------
+Requirements
+------------
 - Swift 6.1+ (requires Xcode 16.4 or later)
 - macOS 13+
 - IPv4 only at the moment (ICMPv4 Echo). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS’s ICMP datagram behavior.
@@ -57,7 +57,7 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.8.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.11.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
@@ -147,7 +147,7 @@ for hop in classified.hops {
 // Handle network changes (e.g., WiFi to cellular, VPN connect/disconnect)
 await tracer.networkChanged()  // Cancels active traces and clears caches
 
-// NEW in v0.5.0: Ping API
+// Ping API
 let pingConfig = PingConfig(count: 5, interval: 1.0, timeout: 2.0)
 let pingResult = try await tracer.ping(to: "1.1.1.1", config: pingConfig)
 print("Packet loss: \(Int(pingResult.statistics.packetLoss * 100))%")
@@ -155,13 +155,13 @@ if let avg = pingResult.statistics.avgRTT {
     print("Avg RTT: \(String(format: "%.2f ms", avg * 1000))")
 }
 
-// Concurrent pings (v0.5.2+): Multiple pings execute in parallel, not serially
+// Concurrent pings: Multiple pings execute in parallel, not serially
 async let cf = tracer.ping(to: "1.1.1.1", config: pingConfig)
 async let goog = tracer.ping(to: "8.8.8.8", config: pingConfig)
 let (cloudflare, google) = try await (cf, goog)
 // 20 concurrent pings: ~1.1s (parallel) vs ~7.2s (if serialized) = 6.4x speedup
 
-// NEW in v0.5.0: Multipath Discovery (ECMP enumeration)
+// Multipath Discovery (ECMP enumeration)
 let multipathConfig = MultipathConfig(flowVariations: 8, maxPaths: 16)
 let topology = try await tracer.discoverPaths(to: "8.8.8.8", config: multipathConfig)
 print("Found \(topology.uniquePathCount) unique paths")
@@ -169,7 +169,7 @@ for hop in topology.uniqueHops() {
     print("Discovered hop at TTL \(hop.ttl): \(hop.ip ?? "*")")
 }
 
-// NEW in v0.7.0: Per-Operation Interface Binding
+// Per-Operation Interface Binding
 // Override global interface for specific operations
 let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))  // Global: WiFi
 
@@ -189,7 +189,7 @@ let (wifiResult, ethResult) = try await (wifi, ethernet)
 print("WiFi loss: \(Int(wifiResult.statistics.packetLoss * 100))%")
 print("Ethernet loss: \(Int(ethResult.statistics.packetLoss * 100))%")
 
-// NEW in v0.8.0: DNS API with rich metadata
+// DNS API with rich metadata
 // IPv4 address lookup
 let aResult = try await tracer.dns.a(hostname: "google.com")
 print("Server: \(aResult.server), RTT: \(aResult.rttMs)ms")
@@ -252,7 +252,7 @@ for record in httpsResult.records {
 // Supports 11 DNS record types:
 // A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS
 
-// NEW in v0.11.0: Streaming Traceroute API
+// Streaming Traceroute API
 // Get hops as they arrive (not sorted by TTL)
 for try await hop in tracer.traceStream(to: "1.1.1.1") {
     if let ip = hop.ipAddress, let rtt = hop.rtt {
@@ -311,7 +311,7 @@ Options:
 - `--public-ip IP`: Override public IP (bypasses STUN)
 - `--verbose`: Enable debug logging
 
-### Ping (v0.5.0+)
+### Ping
 ```bash
 .build/release/swift-ftr ping 1.1.1.1 -c 10 -i 1.0
 ```
@@ -324,7 +324,7 @@ Options:
 - `--interface IFACE`: Network interface to use
 - `--json`: Output JSON format
 
-### Multipath Discovery (v0.5.0+)
+### Multipath Discovery
 ```bash
 .build/release/swift-ftr multipath 8.8.8.8 --flows 8 --max-paths 16
 ```
@@ -337,7 +337,7 @@ Options:
 - `-t, --timeout SEC`: Timeout per flow in seconds (default 2.0)
 - `--json`: Output JSON format
 
-### Streaming Traceroute (v0.11.0+)
+### Streaming Traceroute
 ```bash
 .build/release/swift-ftr stream 1.1.1.1 -m 30 --timeout 15
 ```
