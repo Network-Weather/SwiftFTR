@@ -2,7 +2,7 @@
 
 This roadmap outlines the development direction for SwiftFTR. It is prioritized by value and impact rather than strict timelines or version numbers.
 
-## Current Stable State (v0.11.5)
+## Current Stable State (v0.12.0)
 - **Core**: Parallel traceroute with ICMP datagram sockets (no sudo required on macOS).
 - **Scalability**: Massively parallel `ping` architecture using `kqueue`/`epoll` (C10k ready).
 - **DNS**: Full-featured DNS client supporting 11 record types (A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS) with high-precision timing. IPv6 DNS transport supported (v0.11.5).
@@ -19,19 +19,13 @@ This roadmap outlines the development direction for SwiftFTR. It is prioritized 
 - **Resilient Public IP**: STUN multi-server fallback with DNS-based discovery via Akamai whoami (v0.11.3).
 - **URLSession Leak Fix**: Proper session invalidation in HTTP probe to prevent memory leaks (v0.11.4).
 - **IPv6 DNS Transport**: Dual-stack DNS queries, link-local IPv6 server support, reverse IPv6 lookups (v0.11.5).
+- **Traceroute I/O Modernization**: Replaced last `poll(2)` holdouts with kqueue-backed `DispatchSourceRead` — fully non-blocking I/O throughout the codebase (v0.12.0).
 
 ---
 
 ## Priority Queue (Next Up)
 
 These features are the primary focus for upcoming releases, ranked by priority.
-
-### Traceroute I/O Modernization
-**Goal**: Replace blocking `poll(2)` in ICMP traceroute with async DispatchSource.
-- **Current State**: Traceroute.swift uses `poll()` for ICMP response collection in `performTrace()` and `performStreamingTrace()`.
-- **Target**: Migrate to `DispatchSourceRead` pattern used by Ping (v0.8.0) and TCP/UDP probes (v0.11.2).
-- **Benefit**: Fully non-blocking I/O throughout the codebase; better cancellation support; last `poll(2)` holdout removed.
-- **Complexity**: Higher than probes—traceroute sends burst probes and collects multiple TTL responses on one socket.
 
 ### IPv6 Traceroute (ICMPv6)
 **Goal**: Full feature parity for IPv6 networks.
