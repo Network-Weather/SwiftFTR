@@ -367,11 +367,11 @@ let ptr = try await tracer.dns.reverseIPv4(ip: "8.8.8.8")
 print("8.8.8.8 → \(ptr.records.first.map { "\($0.data)" } ?? "no PTR")")
 // Output: 8.8.8.8 → ptr("dns.google")
 
-// TXT records
-let txt = try await tracer.dns.txt(hostname: "google.com")
+// TXT records — .txt wraps [String] (one string per TXT chunk)
+let txt = try await tracer.dns.txt(hostname: "example.com")
 for record in txt.records {
-  if case .txt(let value) = record.data {
-    print("TXT: \(value)")
+  if case .txt(let values) = record.data {
+    print("TXT: \(values.joined())")
   }
 }
 
