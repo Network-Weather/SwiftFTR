@@ -474,11 +474,7 @@ public actor SwiftFTR {
     let identifier = UInt16.random(in: 0...UInt16.max)
 
     // Tracking structures
-    struct SendInfo {
-      let ttl: Int
-      let sentAt: TimeInterval
-    }
-    var outstanding: [UInt16: SendInfo] = [:]
+    var outstanding: [UInt16: TraceSendInfo] = [:]
     var receivedTTLs: Set<Int> = []
     var reachedTTL: Int? = nil
 
@@ -507,198 +503,41 @@ public actor SwiftFTR {
         }
       }
       if sent < 0 { throw TracerouteError.sendFailed(errno: errno) }
-      outstanding[seq] = SendInfo(ttl: ttl, sentAt: sentAt)
+      outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
     }
 
-    // Timeout and retry strategy
-    let probesSentAt = monotonicNow()
-    let deadline = probesSentAt + streamConfig.probeTimeout
-    let retryThreshold = streamConfig.retryAfter.map { probesSentAt + $0 }
-    var didRetry = false
-
+    // Collect responses via DispatchSourceRead with retry support.
     if config.enableLogging {
       print(
         "[SwiftFTR] Streaming trace: timeout \(streamConfig.probeTimeout)s, retry after \(streamConfig.retryAfter.map { "\($0)s" } ?? "disabled")"
       )
     }
 
-    var storage = sockaddr_storage()
-    var buf = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
+    let streamOperation = StreamingTraceReceiveOperation(
+      sockfd: fd,
+      identifier: identifier,
+      outstanding: outstanding,
+      maxHops: maxHops,
+      payloadSize: payloadSize,
+      destAddr: destAddr,
+      streamConfig: streamConfig,
+      enableLogging: config.enableLogging,
+      yield: yield
+    )
 
-    // Receive loop with retry support
-    recvLoop: while monotonicNow() < deadline {
-      // Check cancellation
-      if await handle.isCancelled {
-        throw TracerouteError.cancelled
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation {
+        (continuation: CheckedContinuation<Void, Error>) in
+        streamOperation.start(continuation: continuation)
       }
-
-      var fds = Darwin.pollfd(fd: fd, events: Int16(Darwin.POLLIN), revents: 0)
-      let msLeft = Int32(min(50, max(0, (deadline - monotonicNow()) * 1000)))
-      let rv = withUnsafeMutablePointer(to: &fds) { p in Darwin.poll(p, 1, msLeft) }
-      if rv == 0 {
-        // Poll timeout - check if we should retry unresponsive TTLs
-        if !didRetry, let retryAt = retryThreshold, monotonicNow() >= retryAt {
-          // Find TTLs that haven't responded yet (only those before destination)
-          let ttlCutoff = reachedTTL ?? maxHops
-          var missingTTLs: [Int] = []
-          for ttl in 1..<ttlCutoff {
-            if !receivedTTLs.contains(ttl) {
-              missingTTLs.append(ttl)
-            }
-          }
-
-          if !missingTTLs.isEmpty {
-            didRetry = true
-            if config.enableLogging {
-              print(
-                "[SwiftFTR] Streaming trace: retrying \(missingTTLs.count) unresponsive TTLs: \(missingTTLs)"
-              )
-            }
-
-            // Re-probe missing TTLs with new sequence numbers
-            for ttl in missingTTLs {
-              var ttlVar: Int32 = Int32(ttl)
-              if setsockopt(fd, IPPROTO_IP, IP_TTL, &ttlVar, socklen_t(MemoryLayout<Int32>.size))
-                != 0
-              {
-                continue  // Skip this TTL on error
-              }
-              // Use sequence = TTL + maxHops to distinguish retry probes
-              let seq: UInt16 = UInt16(truncatingIfNeeded: ttl + maxHops)
-              let packet = makeICMPEchoRequest(
-                identifier: identifier, sequence: seq, payloadSize: payloadSize)
-              let sentAt = monotonicNow()
-              var addr = destAddr
-              let sent = packet.withUnsafeBytes { rawBuf in
-                withUnsafePointer(to: &addr) { aptr -> ssize_t in
-                  aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-                    sendto(
-                      fd, rawBuf.baseAddress!, rawBuf.count, 0, saPtr,
-                      socklen_t(MemoryLayout<sockaddr_in>.size))
-                  }
-                }
-              }
-              if sent > 0 {
-                outstanding[seq] = SendInfo(ttl: ttl, sentAt: sentAt)
-              }
-            }
-          }
-        }
-        continue
-      }
-      if rv < 0 { break }
-
-      // Drain available datagrams
-      while true {
-        var addrlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        let n = withUnsafeMutablePointer(to: &storage) { sptr -> ssize_t in
-          sptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-            return recvfrom(fd, &buf, buf.count, 0, saptr, &addrlen)
-          }
-        }
-        if n < 0 {
-          if errno == EWOULDBLOCK || errno == EAGAIN { break } else { break }
-        }
-
-        let parsedOpt: ParsedICMP? = buf.withUnsafeBytes { rawPtr in
-          let slice = UnsafeRawBufferPointer(rebasing: rawPtr.prefix(Int(n)))
-          return parseICMPv4Message(buffer: slice, from: storage)
-        }
-        guard let parsed = parsedOpt else { continue }
-
-        // Helper to emit intermediate hop if valid
-        func emitIntermediateHop(seq: UInt16) {
-          guard let info = outstanding[seq] else { return }
-          // Skip hops beyond known destination TTL
-          if let destTTL = reachedTTL, info.ttl > destTTL { return }
-          if receivedTTLs.contains(info.ttl) { return }
-
-          let rtt = monotonicNow() - info.sentAt
-          receivedTTLs.insert(info.ttl)
-          yield(
-            StreamingHop(
-              ttl: info.ttl,
-              ipAddress: parsed.sourceAddress,
-              rtt: rtt,
-              reachedDestination: false
-            ))
-        }
-
-        switch parsed.kind {
-        case .echoReply(let id, let seq):
-          guard id == identifier else { continue }
-          if let info = outstanding.removeValue(forKey: seq) {
-            // Skip if we already have the destination at a lower TTL
-            // (all probes with TTL >= destination will get Echo Replies)
-            if let destTTL = reachedTTL, info.ttl > destTTL {
-              continue
-            }
-            let rtt = monotonicNow() - info.sentAt
-            if !receivedTTLs.contains(info.ttl) {
-              receivedTTLs.insert(info.ttl)
-              yield(
-                StreamingHop(
-                  ttl: info.ttl,
-                  ipAddress: parsed.sourceAddress,
-                  rtt: rtt,
-                  reachedDestination: true
-                ))
-              if reachedTTL == nil || info.ttl < reachedTTL! {
-                reachedTTL = info.ttl
-              }
-            }
-          }
-
-        case .timeExceeded(let originalID, let originalSeq):
-          guard originalID == nil || originalID == identifier else { continue }
-          if let seq = originalSeq {
-            emitIntermediateHop(seq: seq)
-          }
-
-        case .destinationUnreachable(let originalID, let originalSeq):
-          guard originalID == nil || originalID == identifier else { continue }
-          if let seq = originalSeq {
-            emitIntermediateHop(seq: seq)
-          }
-
-        case .other:
-          continue
-        }
-
-        // Early exit: destination reached AND all earlier hops resolved
-        if let rttl = reachedTTL {
-          var done = true
-          for i in 1..<rttl {
-            if !receivedTTLs.contains(i) {
-              done = false
-              break
-            }
-          }
-          if done { break recvLoop }
-        }
-      }
+    } onCancel: {
+      streamOperation.cancel()
     }
 
-    // Emit timeout placeholders for missing TTLs
-    if streamConfig.emitTimeouts {
-      let cutoff = reachedTTL ?? maxHops
-      for ttl in 1...cutoff {
-        if !receivedTTLs.contains(ttl) {
-          let hop = StreamingHop(
-            ttl: ttl,
-            ipAddress: nil,
-            rtt: nil,
-            reachedDestination: false
-          )
-          yield(hop)
-        }
-      }
-    }
-
-    if config.enableLogging {
-      print(
-        "[SwiftFTR] Streaming trace complete: \(receivedTTLs.count) hops received, reachedTTL=\(reachedTTL.map(String.init) ?? "nil")"
-      )
+    // Check TraceHandle cancellation
+    if await handle.isCancelled {
+      streamOperation.cancel()
+      throw TracerouteError.cancelled
     }
   }
 
@@ -872,7 +711,7 @@ public actor SwiftFTR {
       }
     }
 
-    // Set non-blocking: avoid blocking recvfrom; we use poll(2) for readiness.
+    // Set non-blocking: DispatchSourceRead handles readiness via kqueue.
     let flags = fcntl(fd, F_GETFL, 0)
     _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
@@ -887,11 +726,7 @@ public actor SwiftFTR {
     let identifier = flowIdentifier ?? UInt16.random(in: 0...UInt16.max)
 
     // Tracking maps
-    struct SendInfo {
-      let ttl: Int
-      let sentAt: TimeInterval
-    }
-    var outstanding: [UInt16: SendInfo] = [:]  // key = sequence (== ttl)
+    var outstanding: [UInt16: TraceSendInfo] = [:]  // key = sequence (== ttl)
 
     // Send one probe per TTL, quickly adjusting IP_TTL between sends.
     if config.enableLogging {
@@ -918,107 +753,43 @@ public actor SwiftFTR {
         }
       }
       if sent < 0 { throw TracerouteError.sendFailed(errno: errno) }
-      outstanding[seq] = SendInfo(ttl: ttl, sentAt: sentAt)
+      outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
     }
 
-    // Prepare hops
-    var hops: [TraceHop?] = Array(repeating: nil, count: maxHops)
-    var reachedTTL: Int? = nil
-
-    // Global deadline for the receive loop. We probe all TTLs up-front,
-    // then wait until either all earlier hops are filled or the timeout hits.
+    // Collect responses via DispatchSourceRead (kqueue-backed on macOS).
+    // All probes are already in-flight; we wait for responses until the deadline
+    // or until all hops up to the destination are filled.
     let startWall = Date()
-    let deadline = monotonicNow() + timeout
 
     if config.enableLogging {
       print("[SwiftFTR] Entering receive loop, deadline in \(timeout)s...")
     }
-    var storage = sockaddr_storage()
-    // Use a named constant to avoid magic numbers for buffer sizes.
-    var buf = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
 
-    // Receive loop until timeout or all TTLs resolved up to reachedTTL.
-    // The loop uses poll(2) to wait for readability and then drains datagrams.
-    recvLoop: while monotonicNow() < deadline {
-      // Check if cancelled
-      if await handle.isCancelled {
-        throw TracerouteError.cancelled
+    let operation = TraceReceiveOperation(
+      sockfd: fd,
+      identifier: identifier,
+      outstanding: outstanding,
+      maxHops: maxHops,
+      timeout: timeout,
+      enableLogging: config.enableLogging
+    )
+
+    let receiveResult: TraceReceiveResult = try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        operation.start(continuation: continuation)
       }
-
-      var fds = Darwin.pollfd(fd: fd, events: Int16(Darwin.POLLIN), revents: 0)
-      // Use shorter poll timeout for responsive cancellation (max 100ms)
-      let msLeft = Int32(min(100, max(0, (deadline - monotonicNow()) * 1000)))
-      let rv = withUnsafeMutablePointer(to: &fds) { p in Darwin.poll(p, 1, msLeft) }
-      if rv == 0 { continue }  // Timeout - check cancellation and continue
-      if rv < 0 { break }  // Error
-
-      // Drain available datagrams
-      while true {
-        var addrlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        let n = withUnsafeMutablePointer(to: &storage) { sptr -> ssize_t in
-          sptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-            return recvfrom(fd, &buf, buf.count, 0, saptr, &addrlen)
-          }
-        }
-        if n < 0 {
-          if errno == EWOULDBLOCK || errno == EAGAIN { break } else { break }
-        }
-        let parsedOpt: ParsedICMP? = buf.withUnsafeBytes { rawPtr in
-          let slice = UnsafeRawBufferPointer(rebasing: rawPtr.prefix(Int(n)))
-          return parseICMPv4Message(buffer: slice, from: storage)
-        }
-        guard let parsed = parsedOpt else { continue }
-
-        switch parsed.kind {
-        case .echoReply(let id, let seq):
-          guard id == identifier else { continue }
-          if let info = outstanding.removeValue(forKey: seq) {
-            let rtt = monotonicNow() - info.sentAt
-            let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
-            if hops[hopIndex] == nil {
-              hops[hopIndex] = TraceHop(
-                ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: true)
-            }
-            if reachedTTL == nil || info.ttl < reachedTTL! { reachedTTL = info.ttl }
-          }
-        case .timeExceeded(let originalID, let originalSeq):
-          guard originalID == nil || originalID == identifier else { continue }
-          if let seq = originalSeq, let info = outstanding[seq] {
-            let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
-            if hops[hopIndex] == nil {
-              let rtt = monotonicNow() - info.sentAt
-              hops[hopIndex] = TraceHop(
-                ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
-            }
-          }
-        case .destinationUnreachable(let originalID, let originalSeq):
-          guard originalID == nil || originalID == identifier else { continue }
-          if let seq = originalSeq, let info = outstanding.removeValue(forKey: seq) {
-            let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
-            let rtt = monotonicNow() - info.sentAt
-            if hops[hopIndex] == nil {
-              hops[hopIndex] = TraceHop(
-                ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
-            }
-            // Destination unreachable could mean we've hit the dest depending on method, but for ICMP echo it usually signals admin blocks; keep going
-          }
-        case .other:
-          continue
-        }
-
-        // Stop early if we reached destination and resolved all earlier hops (or timed out)
-        if let rttl = reachedTTL {
-          var done = true
-          for i in 0..<(rttl) {
-            if hops[i] == nil {
-              done = false
-              break
-            }
-          }
-          if done { break recvLoop }
-        }
-      }
+    } onCancel: {
+      operation.cancel()
     }
+
+    // Also check TraceHandle cancellation
+    if await handle.isCancelled {
+      operation.cancel()
+      throw TracerouteError.cancelled
+    }
+
+    var hops = receiveResult.hops
+    let reachedTTL = receiveResult.reachedTTL
 
     // Finalize hops: mark unresolved up to reachedTTL (or max) as timeouts
     let cutoff = reachedTTL ?? maxHops
@@ -1427,9 +1198,486 @@ internal func resolveIPv4(host: String, enableLogging: Bool = false) throws -> s
     host: host, details: "Host resolved but no IPv4 address available")
 }
 
-// Use Darwin.poll and Darwin.pollfd directly
-
 private enum Constants {
   /// Receive buffer size for incoming ICMP datagrams.
   static let receiveBufferSize = 2048
+}
+
+// MARK: - Trace Receive Result
+
+/// Result returned by TraceReceiveOperation.
+private struct TraceReceiveResult {
+  var hops: [TraceHop?]
+  var reachedTTL: Int?
+}
+
+/// Shared send info for probe tracking.
+private struct TraceSendInfo {
+  let ttl: Int
+  let sentAt: TimeInterval
+}
+
+// MARK: - TraceReceiveOperation
+
+/// Manages the DispatchSource-based receive loop for performTrace().
+///
+/// After all probes are sent, this operation listens for ICMP responses
+/// using a kqueue-backed DispatchSourceRead, matching responses to probes
+/// by identifier/sequence. Completes when all hops are filled or the
+/// deadline expires.
+private final class TraceReceiveOperation: @unchecked Sendable {
+  private let sockfd: Int32
+  private let identifier: UInt16
+  private let maxHops: Int
+  private let enableLogging: Bool
+
+  private var outstanding: [UInt16: TraceSendInfo]
+  private var hops: [TraceHop?]
+  private var reachedTTL: Int?
+
+  private var continuation: CheckedContinuation<TraceReceiveResult, Error>?
+  private var readSource: DispatchSourceRead?
+  private var timerSource: DispatchSourceTimer?
+  private var recvBuffer = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
+
+  private let queue: DispatchQueue
+  private let lock = NSLock()
+  private var isFinished = false
+  private let timeout: TimeInterval
+
+  init(
+    sockfd: Int32,
+    identifier: UInt16,
+    outstanding: [UInt16: TraceSendInfo],
+    maxHops: Int,
+    timeout: TimeInterval,
+    enableLogging: Bool
+  ) {
+    self.sockfd = sockfd
+    self.identifier = identifier
+    self.outstanding = outstanding
+    self.maxHops = maxHops
+    self.timeout = timeout
+    self.enableLogging = enableLogging
+    self.hops = Array(repeating: nil, count: maxHops)
+    self.queue = DispatchQueue(
+      label: "com.swiftftr.trace.\(UInt64.random(in: 0...UInt64.max))", qos: .userInitiated)
+  }
+
+  func start(continuation: CheckedContinuation<TraceReceiveResult, Error>) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      continuation.resume(throwing: TracerouteError.cancelled)
+      return
+    }
+    self.continuation = continuation
+    lock.unlock()
+
+    queue.async { self.setupSources() }
+  }
+
+  func cancel() {
+    finish(error: TracerouteError.cancelled)
+  }
+
+  private func setupSources() {
+    let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
+    source.setEventHandler { self.handleRead() }
+    source.setCancelHandler {}
+    source.activate()
+    self.readSource = source
+
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: .now() + timeout)
+    timer.setEventHandler { self.finish() }
+    timer.activate()
+    self.timerSource = timer
+  }
+
+  private func handleRead() {
+    if checkFinishedSync() { return }
+
+    while true {
+      var storage = sockaddr_storage()
+      var addrlen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      let n = withUnsafeMutablePointer(to: &storage) { sptr -> ssize_t in
+        sptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+          recvfrom(sockfd, &recvBuffer, recvBuffer.count, 0, saptr, &addrlen)
+        }
+      }
+      if n < 0 { break }  // EAGAIN/EWOULDBLOCK
+
+      let parsedOpt: ParsedICMP? = recvBuffer.withUnsafeBytes { rawPtr in
+        let slice = UnsafeRawBufferPointer(rebasing: rawPtr.prefix(Int(n)))
+        return parseICMPv4Message(buffer: slice, from: storage)
+      }
+      guard let parsed = parsedOpt else { continue }
+
+      switch parsed.kind {
+      case .echoReply(let id, let seq):
+        guard id == identifier else { continue }
+        if let info = outstanding.removeValue(forKey: seq) {
+          let rtt = monotonicNow() - info.sentAt
+          let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
+          if hops[hopIndex] == nil {
+            hops[hopIndex] = TraceHop(
+              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: true)
+          }
+          if reachedTTL == nil || info.ttl < reachedTTL! { reachedTTL = info.ttl }
+        }
+
+      case .timeExceeded(let originalID, let originalSeq):
+        guard originalID == nil || originalID == identifier else { continue }
+        if let seq = originalSeq, let info = outstanding[seq] {
+          let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
+          if hops[hopIndex] == nil {
+            let rtt = monotonicNow() - info.sentAt
+            hops[hopIndex] = TraceHop(
+              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
+          }
+        }
+
+      case .destinationUnreachable(let originalID, let originalSeq):
+        guard originalID == nil || originalID == identifier else { continue }
+        if let seq = originalSeq, let info = outstanding.removeValue(forKey: seq) {
+          let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
+          let rtt = monotonicNow() - info.sentAt
+          if hops[hopIndex] == nil {
+            hops[hopIndex] = TraceHop(
+              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
+          }
+        }
+
+      case .other:
+        continue
+      }
+
+      // Early completion: destination reached and all earlier hops filled
+      if let rttl = reachedTTL {
+        var done = true
+        for i in 0..<rttl {
+          if hops[i] == nil {
+            done = false
+            break
+          }
+        }
+        if done {
+          finish()
+          return
+        }
+      }
+    }
+  }
+
+  private func finish(error: Error? = nil) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
+    }
+    isFinished = true
+    let currentContinuation = self.continuation
+    self.continuation = nil
+    let finalHops = self.hops
+    let finalReachedTTL = self.reachedTTL
+    lock.unlock()
+
+    readSource?.cancel()
+    timerSource?.cancel()
+    readSource = nil
+    timerSource = nil
+
+    guard let continuation = currentContinuation else { return }
+
+    if let error = error {
+      continuation.resume(throwing: error)
+    } else {
+      continuation.resume(
+        returning: TraceReceiveResult(hops: finalHops, reachedTTL: finalReachedTTL))
+    }
+  }
+
+  private func checkFinishedSync() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return isFinished
+  }
+}
+
+// MARK: - StreamingTraceReceiveOperation
+
+/// Manages the DispatchSource-based receive loop for performStreamingTrace().
+///
+/// Yields StreamingHop values as ICMP responses arrive. Supports retry
+/// of unresponsive TTLs via a secondary DispatchSourceTimer.
+private final class StreamingTraceReceiveOperation: @unchecked Sendable {
+  private let sockfd: Int32
+  private let identifier: UInt16
+  private let maxHops: Int
+  private let payloadSize: Int
+  private let destAddr: sockaddr_in
+  private let streamConfig: StreamingTraceConfig
+  private let enableLogging: Bool
+  private let yieldHop: (StreamingHop) -> Void
+
+  private var outstanding: [UInt16: TraceSendInfo]
+  private var receivedTTLs: Set<Int> = []
+  private var reachedTTL: Int?
+  private var didRetry = false
+
+  private var continuation: CheckedContinuation<Void, Error>?
+  private var readSource: DispatchSourceRead?
+  private var deadlineTimer: DispatchSourceTimer?
+  private var retryTimer: DispatchSourceTimer?
+  private var recvBuffer = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
+
+  private let queue: DispatchQueue
+  private let lock = NSLock()
+  private var isFinished = false
+
+  init(
+    sockfd: Int32,
+    identifier: UInt16,
+    outstanding: [UInt16: TraceSendInfo],
+    maxHops: Int,
+    payloadSize: Int,
+    destAddr: sockaddr_in,
+    streamConfig: StreamingTraceConfig,
+    enableLogging: Bool,
+    yield: @escaping (StreamingHop) -> Void
+  ) {
+    self.sockfd = sockfd
+    self.identifier = identifier
+    self.outstanding = outstanding
+    self.maxHops = maxHops
+    self.payloadSize = payloadSize
+    self.destAddr = destAddr
+    self.streamConfig = streamConfig
+    self.enableLogging = enableLogging
+    self.yieldHop = yield
+    self.queue = DispatchQueue(
+      label: "com.swiftftr.stream.\(UInt64.random(in: 0...UInt64.max))", qos: .userInitiated)
+  }
+
+  func start(continuation: CheckedContinuation<Void, Error>) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      continuation.resume(throwing: TracerouteError.cancelled)
+      return
+    }
+    self.continuation = continuation
+    lock.unlock()
+
+    queue.async { self.setupSources() }
+  }
+
+  func cancel() {
+    finish(error: TracerouteError.cancelled)
+  }
+
+  private func setupSources() {
+    // Read source for incoming ICMP responses
+    let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
+    source.setEventHandler { self.handleRead() }
+    source.setCancelHandler {}
+    source.activate()
+    self.readSource = source
+
+    // Overall deadline timer
+    let deadline = DispatchSource.makeTimerSource(queue: queue)
+    deadline.schedule(deadline: .now() + streamConfig.probeTimeout)
+    deadline.setEventHandler { self.finish() }
+    deadline.activate()
+    self.deadlineTimer = deadline
+
+    // Retry timer (if configured)
+    if let retryAfter = streamConfig.retryAfter {
+      let retry = DispatchSource.makeTimerSource(queue: queue)
+      retry.schedule(deadline: .now() + retryAfter)
+      retry.setEventHandler { self.handleRetry() }
+      retry.activate()
+      self.retryTimer = retry
+    }
+  }
+
+  private func handleRead() {
+    if checkFinishedSync() { return }
+
+    while true {
+      var storage = sockaddr_storage()
+      var addrlen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      let n = withUnsafeMutablePointer(to: &storage) { sptr -> ssize_t in
+        sptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+          recvfrom(sockfd, &recvBuffer, recvBuffer.count, 0, saptr, &addrlen)
+        }
+      }
+      if n < 0 { break }  // EAGAIN/EWOULDBLOCK
+
+      let parsedOpt: ParsedICMP? = recvBuffer.withUnsafeBytes { rawPtr in
+        let slice = UnsafeRawBufferPointer(rebasing: rawPtr.prefix(Int(n)))
+        return parseICMPv4Message(buffer: slice, from: storage)
+      }
+      guard let parsed = parsedOpt else { continue }
+
+      switch parsed.kind {
+      case .echoReply(let id, let seq):
+        guard id == identifier else { continue }
+        if let info = outstanding.removeValue(forKey: seq) {
+          if let destTTL = reachedTTL, info.ttl > destTTL { continue }
+          let rtt = monotonicNow() - info.sentAt
+          if !receivedTTLs.contains(info.ttl) {
+            receivedTTLs.insert(info.ttl)
+            yieldHop(
+              StreamingHop(
+                ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: true))
+            if reachedTTL == nil || info.ttl < reachedTTL! {
+              reachedTTL = info.ttl
+            }
+          }
+        }
+
+      case .timeExceeded(let originalID, let originalSeq):
+        guard originalID == nil || originalID == identifier else { continue }
+        if let seq = originalSeq {
+          emitIntermediateHop(seq: seq, parsed: parsed)
+        }
+
+      case .destinationUnreachable(let originalID, let originalSeq):
+        guard originalID == nil || originalID == identifier else { continue }
+        if let seq = originalSeq {
+          emitIntermediateHop(seq: seq, parsed: parsed)
+        }
+
+      case .other:
+        continue
+      }
+
+      // Early exit: destination reached AND all earlier hops resolved
+      if let rttl = reachedTTL {
+        var done = true
+        for i in 1..<rttl {
+          if !receivedTTLs.contains(i) {
+            done = false
+            break
+          }
+        }
+        if done {
+          finish()
+          return
+        }
+      }
+    }
+  }
+
+  private func emitIntermediateHop(seq: UInt16, parsed: ParsedICMP) {
+    guard let info = outstanding[seq] else { return }
+    if let destTTL = reachedTTL, info.ttl > destTTL { return }
+    if receivedTTLs.contains(info.ttl) { return }
+
+    let rtt = monotonicNow() - info.sentAt
+    receivedTTLs.insert(info.ttl)
+    yieldHop(
+      StreamingHop(
+        ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false))
+  }
+
+  private func handleRetry() {
+    if checkFinishedSync() { return }
+    if didRetry { return }
+    didRetry = true
+
+    let ttlCutoff = reachedTTL ?? maxHops
+    var missingTTLs: [Int] = []
+    for ttl in 1..<ttlCutoff {
+      if !receivedTTLs.contains(ttl) {
+        missingTTLs.append(ttl)
+      }
+    }
+
+    guard !missingTTLs.isEmpty else { return }
+
+    if enableLogging {
+      print(
+        "[SwiftFTR] Streaming trace: retrying \(missingTTLs.count) unresponsive TTLs: \(missingTTLs)"
+      )
+    }
+
+    for ttl in missingTTLs {
+      var ttlVar: Int32 = Int32(ttl)
+      if setsockopt(sockfd, IPPROTO_IP, IP_TTL, &ttlVar, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+        continue
+      }
+      let seq: UInt16 = UInt16(truncatingIfNeeded: ttl + maxHops)
+      let packet = makeICMPEchoRequest(
+        identifier: identifier, sequence: seq, payloadSize: payloadSize)
+      let sentAt = monotonicNow()
+      var addr = destAddr
+      let sent = packet.withUnsafeBytes { rawBuf in
+        withUnsafePointer(to: &addr) { aptr -> ssize_t in
+          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+            sendto(
+              sockfd, rawBuf.baseAddress!, rawBuf.count, 0, saPtr,
+              socklen_t(MemoryLayout<sockaddr_in>.size))
+          }
+        }
+      }
+      if sent > 0 {
+        outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
+      }
+    }
+  }
+
+  private func finish(error: Error? = nil) {
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
+    }
+    isFinished = true
+    let currentContinuation = self.continuation
+    self.continuation = nil
+    let finalReceivedTTLs = self.receivedTTLs
+    let finalReachedTTL = self.reachedTTL
+    lock.unlock()
+
+    readSource?.cancel()
+    deadlineTimer?.cancel()
+    retryTimer?.cancel()
+    readSource = nil
+    deadlineTimer = nil
+    retryTimer = nil
+
+    // Emit timeout placeholders for missing TTLs
+    if streamConfig.emitTimeouts {
+      let cutoff = finalReachedTTL ?? maxHops
+      for ttl in 1...cutoff {
+        if !finalReceivedTTLs.contains(ttl) {
+          yieldHop(
+            StreamingHop(ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false))
+        }
+      }
+    }
+
+    if enableLogging {
+      print(
+        "[SwiftFTR] Streaming trace complete: \(finalReceivedTTLs.count) hops received, reachedTTL=\(finalReachedTTL.map(String.init) ?? "nil")"
+      )
+    }
+
+    guard let continuation = currentContinuation else { return }
+
+    if let error = error {
+      continuation.resume(throwing: error)
+    } else {
+      continuation.resume()
+    }
+  }
+
+  private func checkFinishedSync() -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return isFinished
+  }
 }
