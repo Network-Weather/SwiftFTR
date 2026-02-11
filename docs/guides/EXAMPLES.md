@@ -4,7 +4,7 @@
 - [Basic Usage](#basic-usage)
 - [Configuration Options](#configuration-options)
 - [Streaming Traceroute (v0.11.0+)](#streaming-traceroute-v0110)
-- [DNS Queries (v0.7.1+)](#dns-queries-v071)
+- [DNS Queries (v0.8.0+)](#dns-queries-v080)
 - [Ping (v0.5.0+)](#ping-v050)
 - [Multipath Discovery (v0.5.0+)](#multipath-discovery-v050)
 - [Bufferbloat Detection (v0.5.1+)](#bufferbloat-detection-v051)
@@ -329,24 +329,94 @@ Task {
 try await traceTask.value
 ```
 
-## DNS Queries (v0.7.1+)
+## DNS Queries (v0.8.0+)
 
-SwiftFTR provides low-level DNS query capabilities with full control over the DNS server used. This is particularly useful for network diagnostics, reverse DNS lookups, and querying specific DNS servers (like gateways).
+SwiftFTR provides two DNS query interfaces:
+
+1. **`tracer.dns.*()` methods** (recommended) — structured queries via the `DNSQueries` namespace with rich metadata, default server, and 11 record types
+2. **Standalone functions** (`reverseDNS()`, `queryA()`, `queryAAAA()`) — lower-level functions that require an explicit DNS server argument
+
+### tracer.dns API (Recommended)
+
+The `tracer.dns` interface provides structured results with RTT, TTL, server info, and parsed record data.
+
+```swift
+import SwiftFTR
+
+let tracer = SwiftFTR()
+
+// A record lookup — returns DNSQueryResult with parsed records
+let aResult = try await tracer.dns.a(hostname: "google.com")
+print("Query took \(aResult.rttMs)ms via \(aResult.server)")
+for record in aResult.records {
+  if case .ipv4(let addr) = record.data {
+    print("  \(addr) (TTL: \(record.ttl)s)")
+  }
+}
+
+// AAAA record lookup
+let aaaaResult = try await tracer.dns.aaaa(hostname: "google.com")
+for record in aaaaResult.records {
+  if case .ipv6(let addr) = record.data {
+    print("  \(addr)")
+  }
+}
+
+// Reverse DNS (PTR) lookup
+let ptr = try await tracer.dns.reverseIPv4(ip: "8.8.8.8")
+print("8.8.8.8 → \(ptr.records.first.map { "\($0.data)" } ?? "no PTR")")
+// Output: 8.8.8.8 → ptr("dns.google")
+
+// TXT records
+let txt = try await tracer.dns.txt(hostname: "google.com")
+for record in txt.records {
+  if case .txt(let value) = record.data {
+    print("TXT: \(value)")
+  }
+}
+
+// Generic query — supports all 11 record types
+let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
+for record in mx.records {
+  if case .mx(let priority, let exchange) = record.data {
+    print("MX priority \(priority): \(exchange)")
+  }
+}
+
+// Query a specific DNS server (e.g., your gateway)
+let gatewayPTR = try await tracer.dns.reverseIPv4(
+  ip: "10.1.10.1",
+  server: "10.1.10.1"  // Query the gateway itself
+)
+if let record = gatewayPTR.records.first, case .ptr(let hostname) = record.data {
+  print("Gateway hostname: \(hostname)")
+}
+
+// Query via specific interface
+let result = try await tracer.dns.a(
+  hostname: "example.com",
+  interface: "en0",
+  sourceIP: "192.168.1.100"
+)
+```
 
 ### Reverse DNS Lookup (PTR Records)
 
-Query a DNS server for the hostname of an IP address. This is especially useful for identifying network devices like gateways.
+The standalone `reverseDNS()` function returns a `ReverseDNSResult` struct with `.hostname`, `.rtt`, `.ip`, and `.server` fields.
 
 ```swift
 import SwiftFTR
 
 // Query gateway for its own hostname (common pattern for vendor detection)
-if let hostname = try await reverseDNS(
+let result = try await reverseDNS(
   ip: "10.1.10.1",
   server: "10.1.10.1"  // Query the gateway itself!
-) {
+)
+
+if let hostname = result.hostname {
   print("Gateway hostname: \(hostname)")
   // Example output: "Docsis-Gateway.hsd1.ca.comcast.net"
+  print("Lookup took \(String(format: "%.1f", result.rtt * 1000))ms")
 
   // Detect vendor from hostname
   if hostname.contains("docsis") {
@@ -359,10 +429,11 @@ if let hostname = try await reverseDNS(
 }
 
 // Query public DNS server for reverse lookup
-if let hostname = try await reverseDNS(
+let googleResult = try await reverseDNS(
   ip: "8.8.8.8",
   server: "1.1.1.1"
-) {
+)
+if let hostname = googleResult.hostname {
   print("8.8.8.8 resolves to: \(hostname)")
   // Output: "dns.google"
 }
@@ -370,20 +441,20 @@ if let hostname = try await reverseDNS(
 
 ### IPv6 Address Lookup (AAAA Records)
 
-Query for IPv6 addresses associated with a hostname.
+`queryAAAA()` returns an `AAAAQueryResult` struct with an `.addresses` array.
 
 ```swift
 import SwiftFTR
 
 // Query for IPv6 addresses
-let ipv6Addresses = try await queryAAAA(
+let result = try await queryAAAA(
   hostname: "google.com",
   server: "8.8.8.8"
 )
 
-if !ipv6Addresses.isEmpty {
+if !result.addresses.isEmpty {
   print("IPv6 addresses for google.com:")
-  for addr in ipv6Addresses {
+  for addr in result.addresses {
     print("  \(addr)")
   }
   // Example output:
@@ -394,40 +465,40 @@ if !ipv6Addresses.isEmpty {
 }
 
 // Check if a service supports IPv6
-let hasIPv6 = try await queryAAAA(
+let checkResult = try await queryAAAA(
   hostname: "example.com",
   server: "1.1.1.1"
 )
-print("IPv6 support: \(hasIPv6.isEmpty ? "No" : "Yes")")
+print("IPv6 support: \(checkResult.addresses.isEmpty ? "No" : "Yes")")
 ```
 
 ### IPv4 Address Lookup (A Records)
 
-Query for IPv4 addresses associated with a hostname.
+`queryA()` returns an `AQueryResult` struct with an `.addresses` array.
 
 ```swift
 import SwiftFTR
 
 // Query for IPv4 addresses
-let ipv4Addresses = try await queryA(
+let result = try await queryA(
   hostname: "example.com",
   server: "8.8.8.8"
 )
 
 print("IPv4 addresses for example.com:")
-for addr in ipv4Addresses {
+for addr in result.addresses {
   print("  \(addr)")
 }
 // Example output:
 //   93.184.216.34
 
 // Query multiple hostnames in parallel
-async let cloudflare = queryA(hostname: "cloudflare.com", server: "1.1.1.1")
-async let google = queryA(hostname: "google.com", server: "1.1.1.1")
+async let cfResult = queryA(hostname: "cloudflare.com", server: "1.1.1.1")
+async let gResult = queryA(hostname: "google.com", server: "1.1.1.1")
 
-let (cfAddrs, gAddrs) = try await (cloudflare, google)
-print("Cloudflare IPs: \(cfAddrs)")
-print("Google IPs: \(gAddrs)")
+let (cf, g) = try await (cfResult, gResult)
+print("Cloudflare IPs: \(cf.addresses)")
+print("Google IPs: \(g.addresses)")
 ```
 
 ### DNS Queries with Interface Binding
@@ -438,25 +509,28 @@ All DNS query functions support network interface and source IP binding.
 import SwiftFTR
 
 // Query via specific network interface (e.g., WiFi)
-let hostnameViaWiFi = try await reverseDNS(
+let wifiResult = try await reverseDNS(
   ip: "10.1.10.1",
   server: "10.1.10.1",
   interface: "en0"  // WiFi interface
 )
+print("Via WiFi: \(wifiResult.hostname ?? "no PTR")")
 
 // Query via specific source IP
-let hostnameViaCellular = try await reverseDNS(
+let cellResult = try await reverseDNS(
   ip: "10.1.10.1",
   server: "10.1.10.1",
   sourceIP: "192.168.1.100"  // Specific source address
 )
+print("Via cellular: \(cellResult.hostname ?? "no PTR")")
 
 // Query IPv6 via specific interface
-let ipv6ViaEthernet = try await queryAAAA(
+let ethResult = try await queryAAAA(
   hostname: "google.com",
   server: "2001:4860:4860::8888",  // Google's IPv6 DNS
   interface: "en1"  // Ethernet interface
 )
+print("Via ethernet: \(ethResult.addresses)")
 ```
 
 ### Network Device Identification Pattern
@@ -474,14 +548,14 @@ struct NetworkDevice {
 
 func identifyGateway(ip: String) async throws -> NetworkDevice {
   // Try to get hostname by querying the gateway for its own PTR record
-  let hostname = try await reverseDNS(
+  let result = try await reverseDNS(
     ip: ip,
     server: ip,  // Ask gateway about itself
     timeout: 2.0
   )
 
   // Detect vendor from hostname patterns
-  let vendor: String? = if let hostname = hostname {
+  let vendor: String? = if let hostname = result.hostname {
     switch {
     case hostname.lowercased().contains("docsis"):
       "Cable Modem"
@@ -500,7 +574,7 @@ func identifyGateway(ip: String) async throws -> NetworkDevice {
     nil
   }
 
-  return NetworkDevice(ip: ip, hostname: hostname, vendor: vendor)
+  return NetworkDevice(ip: ip, hostname: result.hostname, vendor: vendor)
 }
 
 // Usage
@@ -522,11 +596,11 @@ DNS queries throw `DNSError` for various failure conditions:
 import SwiftFTR
 
 do {
-  let hostname = try await reverseDNS(
+  let result = try await reverseDNS(
     ip: "10.1.10.1",
     server: "10.1.10.1"
   )
-  print("Hostname: \(hostname ?? "No PTR record")")
+  print("Hostname: \(result.hostname ?? "No PTR record")")
 } catch DNSError.timeout {
   print("DNS query timed out")
 } catch DNSError.invalidIP(let ip) {
