@@ -57,7 +57,7 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.11.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.12.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
