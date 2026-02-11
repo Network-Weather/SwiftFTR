@@ -302,7 +302,20 @@ private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterv
 // MARK: - No Redirect Delegate
 
 private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-  var taskMetrics: URLSessionTaskMetrics?
+  private let _lock = NSLock()
+  private var _taskMetrics: URLSessionTaskMetrics?
+  var taskMetrics: URLSessionTaskMetrics? {
+    get {
+      _lock.lock()
+      defer { _lock.unlock() }
+      return _taskMetrics
+    }
+    set {
+      _lock.lock()
+      defer { _lock.unlock() }
+      _taskMetrics = newValue
+    }
+  }
 
   func urlSession(
     _ session: URLSession,
@@ -328,7 +341,20 @@ private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unche
 // MARK: - Metrics Delegate
 
 private final class MetricsDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-  var taskMetrics: URLSessionTaskMetrics?
+  private let _lock = NSLock()
+  private var _taskMetrics: URLSessionTaskMetrics?
+  var taskMetrics: URLSessionTaskMetrics? {
+    get {
+      _lock.lock()
+      defer { _lock.unlock() }
+      return _taskMetrics
+    }
+    set {
+      _lock.lock()
+      defer { _lock.unlock() }
+      _taskMetrics = newValue
+    }
+  }
 
   func urlSession(
     _ session: URLSession,

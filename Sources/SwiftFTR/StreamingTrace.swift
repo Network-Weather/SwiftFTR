@@ -91,6 +91,8 @@ public struct StreamingTraceConfig: Sendable {
     emitTimeouts: Bool = true,
     maxHops: Int = 40
   ) {
+    precondition(maxHops >= 1 && maxHops <= 255, "maxHops must be 1...255")
+    precondition(probeTimeout > 0, "probeTimeout must be positive")
     self.probeTimeout = probeTimeout
     self.retryAfter = retryAfter
     self.emitTimeouts = emitTimeouts

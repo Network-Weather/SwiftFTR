@@ -193,6 +193,9 @@ public struct SwiftFTRConfig: Sendable {
     sourceIP: String? = nil,
     asnResolverStrategy: ASNResolverStrategy = .dns
   ) {
+    precondition(maxHops >= 1 && maxHops <= 255, "maxHops must be 1...255")
+    precondition(maxWaitMs > 0, "maxWaitMs must be positive")
+    precondition(payloadSize >= 0, "payloadSize must be non-negative")
     self.maxHops = maxHops
     self.maxWaitMs = maxWaitMs
     self.payloadSize = payloadSize
@@ -475,8 +478,6 @@ public actor SwiftFTR {
 
     // Tracking structures
     var outstanding: [UInt16: TraceSendInfo] = [:]
-    var receivedTTLs: Set<Int> = []
-    var reachedTTL: Int? = nil
 
     // Send all probes
     if config.enableLogging {
@@ -1278,10 +1279,31 @@ private final class TraceReceiveOperation: @unchecked Sendable {
   }
 
   func cancel() {
-    finish(error: TracerouteError.cancelled)
+    // Set cancelled flag synchronously so start() can detect it
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
+    }
+    isFinished = true
+    let currentContinuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+
+    // Dispatch cleanup to serial queue to avoid racing with handleRead/setupSources
+    queue.async {
+      self.readSource?.cancel()
+      self.timerSource?.cancel()
+      self.readSource = nil
+      self.timerSource = nil
+      currentContinuation?.resume(throwing: TracerouteError.cancelled)
+    }
   }
 
   private func setupSources() {
+    // Guard against setup after cancel() already completed
+    if checkFinishedSync() { return }
+
     let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
     source.setEventHandler { self.handleRead() }
     source.setCancelHandler {}
@@ -1370,7 +1392,11 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     }
   }
 
-  private func finish(error: Error? = nil) {
+  /// Only called from serial queue (timer handler or handleRead).
+  /// The lock only protects `isFinished` and `continuation` (accessed from both
+  /// the serial queue and `cancel()`). `hops` and `reachedTTL` are safe to read
+  /// without lock here because they are only mutated on this same serial queue.
+  private func finish() {
     lock.lock()
     if isFinished {
       lock.unlock()
@@ -1379,8 +1405,6 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     isFinished = true
     let currentContinuation = self.continuation
     self.continuation = nil
-    let finalHops = self.hops
-    let finalReachedTTL = self.reachedTTL
     lock.unlock()
 
     readSource?.cancel()
@@ -1389,13 +1413,8 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     timerSource = nil
 
     guard let continuation = currentContinuation else { return }
-
-    if let error = error {
-      continuation.resume(throwing: error)
-    } else {
-      continuation.resume(
-        returning: TraceReceiveResult(hops: finalHops, reachedTTL: finalReachedTTL))
-    }
+    continuation.resume(
+      returning: TraceReceiveResult(hops: hops, reachedTTL: reachedTTL))
   }
 
   private func checkFinishedSync() -> Bool {
@@ -1474,10 +1493,33 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   }
 
   func cancel() {
-    finish(error: TracerouteError.cancelled)
+    // Set cancelled flag synchronously so start() can detect it
+    lock.lock()
+    if isFinished {
+      lock.unlock()
+      return
+    }
+    isFinished = true
+    let currentContinuation = self.continuation
+    self.continuation = nil
+    lock.unlock()
+
+    // Dispatch cleanup to serial queue to avoid racing with handleRead/setupSources
+    queue.async {
+      self.readSource?.cancel()
+      self.deadlineTimer?.cancel()
+      self.retryTimer?.cancel()
+      self.readSource = nil
+      self.deadlineTimer = nil
+      self.retryTimer = nil
+      currentContinuation?.resume(throwing: TracerouteError.cancelled)
+    }
   }
 
   private func setupSources() {
+    // Guard against setup after cancel() already completed
+    if checkFinishedSync() { return }
+
     // Read source for incoming ICMP responses
     let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
     source.setEventHandler { self.handleRead() }
@@ -1629,7 +1671,11 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     }
   }
 
-  private func finish(error: Error? = nil) {
+  /// Only called from serial queue (deadline timer, handleRead, or handleRetry path).
+  /// The lock only protects `isFinished` and `continuation` (accessed from both
+  /// the serial queue and `cancel()`). `receivedTTLs` and `reachedTTL` are safe
+  /// to read without lock here because they are only mutated on this same serial queue.
+  private func finish() {
     lock.lock()
     if isFinished {
       lock.unlock()
@@ -1638,8 +1684,6 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     isFinished = true
     let currentContinuation = self.continuation
     self.continuation = nil
-    let finalReceivedTTLs = self.receivedTTLs
-    let finalReachedTTL = self.reachedTTL
     lock.unlock()
 
     readSource?.cancel()
@@ -1651,9 +1695,9 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
 
     // Emit timeout placeholders for missing TTLs
     if streamConfig.emitTimeouts {
-      let cutoff = finalReachedTTL ?? maxHops
+      let cutoff = reachedTTL ?? maxHops
       for ttl in 1...cutoff {
-        if !finalReceivedTTLs.contains(ttl) {
+        if !receivedTTLs.contains(ttl) {
           yieldHop(
             StreamingHop(ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false))
         }
@@ -1662,17 +1706,12 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
 
     if enableLogging {
       print(
-        "[SwiftFTR] Streaming trace complete: \(finalReceivedTTLs.count) hops received, reachedTTL=\(finalReachedTTL.map(String.init) ?? "nil")"
+        "[SwiftFTR] Streaming trace complete: \(receivedTTLs.count) hops received, reachedTTL=\(reachedTTL.map(String.init) ?? "nil")"
       )
     }
 
     guard let continuation = currentContinuation else { return }
-
-    if let error = error {
-      continuation.resume(throwing: error)
-    } else {
-      continuation.resume()
-    }
+    continuation.resume()
   }
 
   private func checkFinishedSync() -> Bool {
