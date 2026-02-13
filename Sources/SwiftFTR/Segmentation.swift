@@ -156,11 +156,14 @@ public struct TraceClassifier: Sendable {
     if let providedIP = publicIP {
       allIPs.insert(providedIP)
     } else {
-      // Try to discover public IP (STUN with DNS fallback) if not provided
-      if let pub = try? getPublicIPv4(
-        stunTimeout: 0.8, dnsTimeout: 2.0,
-        interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
-      {
+      // Try to discover public IP (STUN with DNS fallback) if not provided.
+      // Must run off the cooperative pool to avoid deadlocking callers that
+      // are already actor-isolated (e.g. SwiftFTR.traceClassified).
+      if let pub = try? await runDetachedBlockingIO({
+        try getPublicIPv4(
+          stunTimeout: 0.8, dnsTimeout: 2.0,
+          interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+      }) {
         resolvedPublicIP = pub.ip
         allIPs.insert(pub.ip)
       }
