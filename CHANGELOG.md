@@ -3,6 +3,15 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.12.1 — 2026-02-13
+-------------------
+### Bug Fix
+
+**Fix actor deadlock in `TraceClassifier.classify()` when `publicIP` is nil**
+- `classify()` called `getPublicIPv4()` synchronously, blocking STUN/DNS socket I/O on the cooperative thread pool
+- When called from actor-isolated `traceClassified()`, this starved the executor and caused deadlock under concurrent load (99 hang events + 101 timeouts across 9 hosts in 30 days)
+- Wrapped the call in `runDetachedBlockingIO()` to offload blocking I/O to a detached task, matching the pattern already used by `discoverPublicIP()`
+
 0.12.0 — 2026-02-10
 -------------------
 ### Non-Blocking I/O Modernization
