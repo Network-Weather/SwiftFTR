@@ -3,6 +3,14 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.12.2 — 2026-03-12
+-------------------
+### Dependency Update
+
+**Bump swift-ip2asn to 0.3.0**
+- Improved robustness against crashes when the `ip2asn.ultra` database file is missing
+- Updated bundled IP-to-ASN database
+
 0.12.1 — 2026-02-13
 -------------------
 ### Bug Fix

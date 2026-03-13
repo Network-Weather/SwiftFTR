@@ -19,7 +19,7 @@ let package = Package(
         // Enables `swift package generate-documentation`
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.0"),
         // Local ASN database for offline IP-to-ASN lookups
-        .package(url: "https://github.com/network-weather/swift-ip2asn", from: "0.2.1")
+        .package(url: "https://github.com/network-weather/swift-ip2asn", from: "0.3.0")
     ],
     targets: [
         .target(
