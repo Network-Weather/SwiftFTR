@@ -3,6 +3,15 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.12.3 — 2026-04-03
+-------------------
+### Bug Fix
+
+**Fix wrong public IP on cellular/CGNAT networks**
+- Increased STUN timeout from 0.8s to 2.0s per server. The previous timeout was too tight for cellular networks where UDP round-trip takes 200-500ms with packet loss, causing STUN to fail and fall through to the DNS fallback.
+- The DNS whoami fallback (`whoami.ds.akahelp.net` TXT query) returns the IP visible to the recursive DNS resolver, not the actual exit IP. On carrier networks with CGNAT (e.g., T-Mobile), DNS traffic exits through a different NAT pool than HTTP/STUN traffic, returning a wrong IP (e.g., 172.32.0.x instead of 172.56.x.x). Added documentation warning. Callers should prefer STUN or HTTP-based discovery.
+- DNS fallback timeout increased from 2.0s to 3.0s.
+
 0.12.2 — 2026-03-12
 -------------------
 ### Dependency Update
