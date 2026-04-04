@@ -447,7 +447,13 @@ func getPublicIPv4(
     }
   }
 
-  // Tier 2: Try DNS whoami (reliable fallback)
+  // Tier 2: Try DNS whoami (last resort fallback)
+  // WARNING: On carrier networks with CGNAT, DNS traffic exits through a different
+  // NAT pool than HTTP/STUN traffic. The Akamai whoami TXT record returns the IP
+  // visible to the recursive DNS resolver, not the actual exit IP that websites see.
+  // For example, T-Mobile returns 172.32.0.x via DNS but 172.56.x.x via STUN/HTTP.
+  // This fallback is only useful when STUN is completely blocked (e.g., UDP-filtered
+  // enterprise networks). Callers should prefer HTTP-based IP discovery when available.
   var dnsErrorMsg = "Unknown error"
   do {
     return try getPublicIPv4ViaDNS(

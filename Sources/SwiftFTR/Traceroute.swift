@@ -1042,8 +1042,8 @@ public actor SwiftFTR {
     let enableLogging = config.enableLogging
     return try await runDetachedBlockingIO {
       try getPublicIPv4(
-        stunTimeout: 0.8,
-        dnsTimeout: 2.0,
+        stunTimeout: 2.0,
+        dnsTimeout: 3.0,
         interface: interface,
         sourceIP: sourceIP,
         enableLogging: enableLogging
