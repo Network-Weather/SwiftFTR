@@ -423,9 +423,20 @@ struct PingIntegrationTests {
 
     // If SwiftFTR sees high trailing loss, cross-check against system ping.
     // We tolerate genuine network loss but flag the specific tail-end pattern
-    // that the bug used to produce.
+    // that the bug used to produce. Cross-check must be available (fail-closed):
+    // if /sbin/ping can't run or its output can't be parsed, we fail the test
+    // rather than silently passing on missing evidence.
     if trailingLossPct > 0.05 {
-      let sysLossPct = systemPingLoss(target: target, count: count, intervalSec: interval)
+      guard let sysLossPct = systemPingLoss(target: target, count: count, intervalSec: interval)
+      else {
+        Issue.record(
+          """
+          SwiftFTR reported \(trailingLossPct * 100)% trailing-block loss but the \
+          /sbin/ping cross-check was unavailable, so we cannot tell real loss from a \
+          regression of the deadline-anchoring fix. Failing closed.
+          """)
+        return
+      }
       #expect(
         trailingLossPct - sysLossPct < 0.05,
         """
@@ -437,9 +448,10 @@ struct PingIntegrationTests {
     }
   }
 
-  /// Run system `/sbin/ping` with matching parameters and parse the loss %.
-  /// Returns 1.0 on parse failure (forces a flake into the safe direction).
-  private func systemPingLoss(target: String, count: Int, intervalSec: Double) -> Double {
+  /// Run system `/sbin/ping` with matching parameters and parse the loss percentage.
+  /// Returns nil when /sbin/ping cannot be executed or its summary cannot be parsed —
+  /// callers must treat that as a test failure rather than a 0% / 100% sentinel.
+  private func systemPingLoss(target: String, count: Int, intervalSec: Double) -> Double? {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/sbin/ping")
     p.arguments = [
@@ -455,24 +467,23 @@ struct PingIntegrationTests {
       try p.run()
       p.waitUntilExit()
     } catch {
-      return 1.0
+      return nil
     }
+    guard p.terminationStatus == 0 else { return nil }
     let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    guard let output = String(data: data, encoding: .utf8) else { return 1.0 }
+    guard let output = String(data: data, encoding: .utf8) else { return nil }
     // Look for "X.X% packet loss" in the stats summary.
-    for line in output.split(separator: "\n") {
-      if line.contains("packet loss") {
-        let parts = line.split(separator: ",")
-        for part in parts where part.contains("packet loss") {
-          let trimmed = part.trimmingCharacters(in: .whitespaces)
-          if let pctRange = trimmed.range(of: "%") {
-            let numStr = trimmed[..<pctRange.lowerBound]
-            if let v = Double(numStr) { return v / 100.0 }
-          }
+    for line in output.split(separator: "\n") where line.contains("packet loss") {
+      let parts = line.split(separator: ",")
+      for part in parts where part.contains("packet loss") {
+        let trimmed = part.trimmingCharacters(in: .whitespaces)
+        if let pctRange = trimmed.range(of: "%") {
+          let numStr = trimmed[..<pctRange.lowerBound]
+          if let v = Double(numStr) { return v / 100.0 }
         }
       }
     }
-    return 1.0
+    return nil
   }
 }
 

@@ -359,7 +359,6 @@ private final class PingOperation: @unchecked Sendable {
   private var continuation: CheckedContinuation<PingResult, Error>?
   private var readSource: DispatchSourceRead?
   private var timerSource: DispatchSourceTimer?
-  private var safetyTimerSource: DispatchSourceTimer?
 
   // Guarded by lock
   private var sentTimes: [Int: TimeInterval] = [:]
@@ -429,26 +428,23 @@ private final class PingOperation: @unchecked Sendable {
     source.activate()
     self.readSource = source
 
-    // Deadline-anchored finish: armed initially at now + timeout (covers the no-send case),
-    // re-armed on every successful sendto to (last-send-time + config.timeout). The last
-    // send wins, so the operation always gives the final ping a full `timeout` budget to
-    // reply regardless of any accumulated Task.sleep drift in the send loop.
+    // The deadline timer plays two roles. Until the send loop has issued all `count`
+    // sendto calls it acts purely as a safety net (a generous upper bound that prevents
+    // an indefinite hang if something goes wrong). Once all sends are attempted, the
+    // send loop re-arms it to (last-send-time + config.timeout) so the final ping gets
+    // a full `timeout` budget regardless of any accumulated Task.sleep drift.
+    //
+    // We must not anchor the deadline to the per-send wall clock *during* the send
+    // loop: that would let the timer fire while later sleeps were still in progress
+    // (e.g., count=3, interval=2.0, timeout=0.5 → seq=1 sent at t=0, timer at t=0.5,
+    // but seq=2 isn't scheduled to send until t=2.0).
+    let safetyBudget =
+      2.0 * (Double(max(config.count - 1, 0)) * max(config.interval, 0) + config.timeout) + 5.0
     let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + .nanoseconds(Int(config.timeout * 1_000_000_000)))
+    timer.schedule(deadline: .now() + .nanoseconds(Int(safetyBudget * 1_000_000_000)))
     timer.setEventHandler { self.finish() }
     timer.activate()
     self.timerSource = timer
-
-    // Safety net: a hard upper bound so any future bug cannot leave the operation
-    // hanging indefinitely. Under the new design the deadline timer above always
-    // fires first; this exists purely to bound worst-case duration.
-    let safetyBudget =
-      2.0 * (Double(max(config.count - 1, 0)) * max(config.interval, 0) + config.timeout) + 5.0
-    let safety = DispatchSource.makeTimerSource(queue: queue)
-    safety.schedule(deadline: .now() + .nanoseconds(Int(safetyBudget * 1_000_000_000)))
-    safety.setEventHandler { self.finish() }
-    safety.activate()
-    self.safetyTimerSource = safety
   }
 
   private func startSending() {
@@ -475,11 +471,6 @@ private final class PingOperation: @unchecked Sendable {
             self.lock.lock()
             self.sentTimes[seq] = sendTime
             self.lock.unlock()
-
-            // Anchor the deadline to this send. DispatchSourceTimer.schedule replaces
-            // the prior deadline, so the most recent send always wins.
-            self.timerSource?.schedule(
-              deadline: .now() + .nanoseconds(Int(self.config.timeout * 1_000_000_000)))
           } catch {
             // Send error (e.g., ENOBUFS): leave sentTimes[seq] unset so this packet is
             // excluded from the "sent" count rather than masquerading as transport loss.
@@ -489,6 +480,27 @@ private final class PingOperation: @unchecked Sendable {
         if seq < self.config.count && self.config.interval > 0 {
           try? await Task.sleep(nanoseconds: UInt64(self.config.interval * 1_000_000_000))
         }
+      }
+
+      // All sends have been attempted. On the serial queue (so we observe a consistent
+      // snapshot of sentTimes), anchor the deadline timer to (last send time + timeout).
+      // If no send ever succeeded, finish immediately — there is nothing more to wait
+      // for, and the timeout-budget assumption ("at least one packet went out") is moot.
+      self.queue.async {
+        if self.checkFinishedSync() { return }
+        self.lock.lock()
+        let lastSendTime = self.sentTimes.values.max()
+        self.lock.unlock()
+
+        guard let lastSendTime = lastSendTime else {
+          self.finish()
+          return
+        }
+
+        let nowMono = self.executor.monotonicTime()
+        let deadlineDelta = max(0, lastSendTime + self.config.timeout - nowMono)
+        self.timerSource?.schedule(
+          deadline: .now() + .nanoseconds(Int(deadlineDelta * 1_000_000_000)))
       }
     }
   }
@@ -576,10 +588,8 @@ private final class PingOperation: @unchecked Sendable {
     lock.unlock()
 
     timerSource?.cancel()
-    safetyTimerSource?.cancel()
     readSource?.cancel()
     timerSource = nil
-    safetyTimerSource = nil
     readSource = nil
 
     // Close socket AFTER sources are cancelled and we're done with them.
@@ -616,11 +626,11 @@ private final class PingOperation: @unchecked Sendable {
       }
     }
     responses.sort { $0.sequence < $1.sequence }
-    // Use actual sends (sentTimes count) rather than the configured count so that
-    // local send failures (ENOBUFS etc.) don't masquerade as transport packet loss.
-    // When all sends succeed this equals config.count.
-    let actualSent = sentTimes.isEmpty ? config.count : sentTimes.count
-    let stats = PingStatistics.compute(responses: responses, sent: actualSent)
+    // Use actual sends rather than the configured count so that local send failures
+    // (ENOBUFS etc.) don't masquerade as transport packet loss. When all sends succeed
+    // this equals config.count; when every send fails this honestly reports sent=0
+    // (PingStatistics.compute returns packetLoss=1.0 in that case).
+    let stats = PingStatistics.compute(responses: responses, sent: sentTimes.count)
     let result = PingResult(
       target: target, resolvedIP: resolved, responses: responses, statistics: stats)
     continuation.resume(returning: result)
