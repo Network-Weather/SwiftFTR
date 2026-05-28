@@ -50,12 +50,9 @@ Now ships v6 trace, traceClassified, and traceStream via the same entry points a
 
 **Deferred follow-up** (not blocking v6 trace correctness): `VPNContext.vpnLocalIPs` is empty by default — populating it with both v4 and v6 addresses of detected VPN interfaces is its own refactor (the field has been empty since the initial implementation; v6 trace classification works correctly without it because it falls through to ASN-based segmentation). NWX flagged the dual-stack-source / v4-only-tunnel edge case for follow-up attention.
 
-### Stage 3 — TCP / UDP probes over IPv6
+### ~~Stage 3 — TCP / UDP probes over IPv6~~ *(shipped)*
 
-- Dual-stack `resolveHostname` in `TCPProbe.swift` and `UDPProbe.swift` (currently both `AF_INET`-only at file scope).
-- `sockaddr_in6` `connect()` paths for both.
-- HTTPProbe needs no work — `URLSession` is already v6-aware via the OS resolver.
-- Probe integration tests gain v6 cases under the same `IPv6Reachability` gate.
+Dual-stack `tcpProbe(...)` and `udpProbe(...)`: same entry points work for both families, family detected at resolve time, `PreferredFamily` on both configs. `IPV6_BOUND_IF` for v6 interface binding, link-local `%zone` source-IP suffixes preserved. The shared `bindProbeSourceIP` helper in `Hostname.swift` is used by both probes. `HTTPProbe` was already v6-aware via `URLSession` — no work needed. New `testTCPProbeIPv6` / `testUDPProbeIPv6` integration tests gated on `IPv6Reachability`.
 
 ### Stage 4 — STUN over IPv6 + dual-stack public-IP discovery
 

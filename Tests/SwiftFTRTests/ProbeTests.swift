@@ -108,6 +108,41 @@ struct UDPProbeTests {
     #expect(result.isReachable)
   }
 
+  // MARK: - IPv6
+
+  /// TCP probe over IPv6. Network-gated and v6-reachability-gated; skips cleanly
+  /// on v4-only hosts.
+  @Test(
+    "TCP probe to reachable v6 host (Cloudflare 2606:4700:4700::1111:443)",
+    .enabled(
+      if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")
+        && IPv6Reachability.isAvailable()))
+  func testTCPProbeIPv6() async throws {
+    let result = try await tcpProbe(
+      host: "2606:4700:4700::1111", port: 443, timeout: 3.0)
+    #expect(result.resolvedIP == "2606:4700:4700::1111")
+    #expect(result.isReachable, "Cloudflare v6 :443 should be reachable from a v6-capable host")
+    #expect(result.connectionState == .open)
+  }
+
+  /// UDP probe to a v6 host. Doesn't expect a UDP reply from Cloudflare DNS
+  /// (which only answers well-formed DNS queries), so this asserts the probe
+  /// path runs to completion rather than the result of the probe.
+  @Test(
+    "UDP probe to v6 host completes (2606:4700:4700::1111:53)",
+    .enabled(
+      if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")
+        && IPv6Reachability.isAvailable()))
+  func testUDPProbeIPv6() async throws {
+    let result = try await udpProbe(
+      host: "2606:4700:4700::1111", port: 53, timeout: 2.0)
+    #expect(result.resolvedIP == "2606:4700:4700::1111")
+    // Either we got a UDP reply (responseType="udp_reply"), an ICMPv6 error
+    // (responseType="icmp_port_unreachable"), or a timeout (responseType="timeout").
+    // All three are valid outcomes — what we assert is that the path ran.
+    #expect(result.responseType != nil || result.error != nil)
+  }
+
   // Helper to build a simple DNS query packet
   private func buildDNSQuery(domain: String) -> Data {
     var data = Data()
