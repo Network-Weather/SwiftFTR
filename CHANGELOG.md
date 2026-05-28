@@ -3,6 +3,34 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.12.4 — 2026-05-27
+-------------------
+### Bug Fixes
+
+**Fix false packet-loss reports from `ping()` under realistic scheduler jitter**
+- The `PingOperation` overall timer used `(count - 1) * interval + timeout`, which assumed every `Task.sleep(interval)` returned exactly on time. On Darwin, `Task.sleep` only guarantees a lower bound and routinely oversleeps by 1–10 ms, so the budget silently slipped — for the last few percent of sequences in long runs the kernel timer fired before their replies arrived, marking them as timeouts indistinguishable from real loss.
+- Repro: `ping 1.1.1.1 -c 500 -i 0.01 -t 0.3` reported ~5.8% loss while system `/sbin/ping` reported 0%, with the timeouts clustered at the trailing sequences (472–500). Worse at higher `count`/shorter `interval`.
+- Fix: the operation timer is now anchored to the actual `sendto` wall-clock — armed initially at `now + timeout`, re-armed on each successful send to `(send-time + config.timeout)`. The most recent send always wins, so the final ping gets a full `timeout` budget regardless of accumulated `Task.sleep` drift.
+- A defensive safety-net upper bound is kept as a backstop against pathological hangs.
+
+**Fix incorrect `ttl` field in `PingResponse`**
+- `parsePingMessage` read `bytes[icmpOffset + 8]`, which lands inside the synthetic ICMP payload (`'a'` = 0x61 = 97) rather than at byte 8 of the IPv4 header where TTL actually lives (RFC 791 §3.1). Every reply reported `ttl == 97`.
+- Fix: read `bytes[8]` when the IP header is present in the buffer; report `nil` when the kernel stripped the IP header (the typical Darwin `SOCK_DGRAM` ICMP path).
+
+**Fix RTT inflation from queue-dispatch latency**
+- `sendTime` was captured in the `Task.detached` send loop before the `queue.async` block ran the actual `sendto`. Any time spent in the serial queue processing prior read events was charged against RTT.
+- Fix: capture `sendTime` on the serial queue immediately before `sendto`.
+
+**Report actual sends in `PingStatistics.sent`**
+- `stats.sent` used `config.count` rather than the number of sends that actually went out. Local send failures (e.g. `ENOBUFS`) silently inflated the loss percentage.
+- Fix: use `sentTimes.count`. When all sends succeed this is identical to `config.count`.
+
+### Dependency Update
+- Bump `swift-ip2asn` floor to 0.3.1 (was 0.3.0). Picks up the latest bundled IP-to-ASN database.
+
+### Note
+The 0.12.3 CHANGELOG entry shipped without a corresponding `Version.swift` bump; 0.12.4 brings the constant back into sync.
+
 0.12.3 — 2026-04-03
 -------------------
 ### Bug Fix

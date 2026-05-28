@@ -1,5 +1,5 @@
-@_spi(Testing) @testable import SwiftFTR
 import XCTest
+@_spi(Testing) @testable import SwiftFTR
 
 final class SwiftFTRCacheTests: XCTestCase {
   override func setUp() async throws {
