@@ -48,7 +48,6 @@ Unreleased (0.13.0-dev)
 
 **Notes**
 - `VPNContext.vpnLocalIPs` extension to include v6 addresses of detected VPN interfaces is deferred to a follow-up — currently `vpnLocalIPs` is empty regardless of family (pre-existing state). v6 trace correctness does not depend on it; the classifier handles v6 hops via ASN-based segmentation.
-- TCP/UDP probes and STUN remain IPv4-only; their v6 ports are subsequent stages per `docs/IPV6.md`.
 
 **IPv6 `ping()` over ICMPv6 (Stage 1 of full v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
 - `SwiftFTR.ping(to:)` now accepts IPv6 literals and IPv6-resolving hostnames. Same entry point as v4; family is auto-detected from the resolved address. `tracer.ping(to: "2606:4700:4700::1111")` and `tracer.ping(to: "1.1.1.1")` both go through the existing `ping(to:config:)` API.
@@ -66,9 +65,6 @@ Unreleased (0.13.0-dev)
 - `docs/IPV6.md`: forward-looking plan for full v6 parity across `trace`, `TCP/UDP probes`, `STUN`, and `swift-ip2asn` 0.4.0 ASN labels; architectural contracts (canonical form, link-local scope, single dest-string entry, family-agnostic errors); environment variables; CI/CD considerations; known limitations (NAT64 transparency, happy-eyeballs deferred).
 - Stress-test rename: `testIPv6Rejection` → `testIPv6TraceStillUnsupported` (only trace is still v4-only; ping v6 is implemented).
 
-### Notes
-- `Traceroute`, `TCPProbe`, `UDPProbe`, and `STUN` remain IPv4-only; their v6 work is staged as follow-up PRs per `docs/IPV6.md`.
-- `swift-ip2asn` floor is still `0.3.1`; v6 ASN labels arrive together with v6 traceroute in a later stage.
 
 0.12.4 — 2026-05-27
 -------------------
