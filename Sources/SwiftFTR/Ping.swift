@@ -428,7 +428,11 @@ struct PingExecutor: Sendable {
 
   /// Dual-stack resolver. Honors `PreferredFamily`:
   /// - `.auto`: literal IPs are dispatched by `detectAddressFamily`; hostnames use
-  ///   `getaddrinfo(AF_UNSPEC)` and take the first answer.
+  ///   `getaddrinfo(AF_UNSPEC)` and take the first answer. Darwin's `getaddrinfo`
+  ///   returns addresses in RFC 6724 source/destination ordering, so the first
+  ///   answer is the system-preferred address for an outgoing connection from this
+  ///   host — not an arbitrary one. On a dual-stack host this typically means v6
+  ///   first when a routable v6 path exists, v4 otherwise.
   /// - `.v4` / `.v6`: forces the family; throws `.resolutionFailed` if unavailable.
   ///
   /// The canonical printable form (`inet_ntop`) is returned in `ResolvedHost.canonical`,
@@ -727,7 +731,13 @@ private final class PingOperation: @unchecked Sendable {
                 let n = recvmsg(sockfd, &msg, 0)
                 if n >= 0 {
                   fromLen = msg.msg_namelen
-                  hopLimit = Self.extractHopLimit(msg: msg)
+                  // If the kernel had to truncate the ancillary buffer (extra cmsgs
+                  // we didn't account for), our hop-limit reading would be unreliable.
+                  // Skip the cmsg walk and let ttl be nil so callers see that as a
+                  // real condition rather than a silently lost field.
+                  if (msg.msg_flags & MSG_CTRUNC) == 0 {
+                    hopLimit = extractIPv6HopLimit(msg: msg)
+                  }
                 }
                 return n
               }
@@ -878,35 +888,39 @@ private final class PingOperation: @unchecked Sendable {
     return swiftftrParsePingMessage(buffer: buffer, expectedIdentifier: expectedIdentifier)
   }
 
-  /// Walks the cmsg ancillary buffer attached to a `msghdr` to find an IPv6
-  /// hop-limit field. Darwin's `<sys/socket.h>` `CMSG_*` macros aren't bridged to
-  /// Swift, so we do the pointer arithmetic explicitly: cmsg data follows the
-  /// header at a 4-byte aligned offset; the next cmsg starts `cmsg_len` bytes
-  /// after the current one, also aligned. Returns nil if no hop-limit cmsg
-  /// is present (e.g. if `IPV6_RECVHOPLIMIT` setsockopt didn't take).
-  static func extractHopLimit(msg: msghdr) -> Int? {
-    guard msg.msg_controllen >= socklen_t(MemoryLayout<cmsghdr>.size),
-      let base = msg.msg_control
-    else { return nil }
-    let alignedHeader = (MemoryLayout<cmsghdr>.size + 3) & ~3
-    let end = base.advanced(by: Int(msg.msg_controllen))
-    var cursor = base
-    while cursor.advanced(by: MemoryLayout<cmsghdr>.size) <= end {
-      let hdr = cursor.assumingMemoryBound(to: cmsghdr.self).pointee
-      if hdr.cmsg_level == IPPROTO_IPV6
-        && (hdr.cmsg_type == IPV6_HOPLIMIT_CMSG_2292
-          || hdr.cmsg_type == IPV6_HOPLIMIT_CMSG_3542)
-        && Int(hdr.cmsg_len) >= alignedHeader + MemoryLayout<Int32>.size
-      {
-        let dataPtr = cursor.advanced(by: alignedHeader).assumingMemoryBound(to: Int32.self)
-        return Int(dataPtr.pointee)
-      }
-      let advance = (Int(hdr.cmsg_len) + 3) & ~3
-      guard advance > 0 else { break }
-      cursor = cursor.advanced(by: advance)
+}
+
+/// Walks the cmsg ancillary buffer attached to a `msghdr` to find an IPv6
+/// hop-limit field. Darwin's `<sys/socket.h>` `CMSG_*` macros aren't bridged to
+/// Swift, so we do the pointer arithmetic explicitly: cmsg data follows the
+/// header at a 4-byte aligned offset; the next cmsg starts `cmsg_len` bytes
+/// after the current one, also aligned. Returns nil if no hop-limit cmsg
+/// is present (e.g. if `IPV6_RECVHOPLIMIT` setsockopt didn't take).
+///
+/// Free function so Stage 2 (v6 traceroute) can reuse it without depending on
+/// `PingOperation`'s state.
+internal func extractIPv6HopLimit(msg: msghdr) -> Int? {
+  guard msg.msg_controllen >= socklen_t(MemoryLayout<cmsghdr>.size),
+    let base = msg.msg_control
+  else { return nil }
+  let alignedHeader = (MemoryLayout<cmsghdr>.size + 3) & ~3
+  let end = base.advanced(by: Int(msg.msg_controllen))
+  var cursor = base
+  while cursor.advanced(by: MemoryLayout<cmsghdr>.size) <= end {
+    let hdr = cursor.assumingMemoryBound(to: cmsghdr.self).pointee
+    if hdr.cmsg_level == IPPROTO_IPV6
+      && (hdr.cmsg_type == IPV6_HOPLIMIT_CMSG_2292
+        || hdr.cmsg_type == IPV6_HOPLIMIT_CMSG_3542)
+      && Int(hdr.cmsg_len) >= alignedHeader + MemoryLayout<Int32>.size
+    {
+      let dataPtr = cursor.advanced(by: alignedHeader).assumingMemoryBound(to: Int32.self)
+      return Int(dataPtr.pointee)
     }
-    return nil
+    let advance = (Int(hdr.cmsg_len) + 3) & ~3
+    guard advance > 0 else { break }
+    cursor = cursor.advanced(by: advance)
   }
+  return nil
 }
 
 /// Free-function parser used by `PingOperation.parsePingMessage` and exposed via

@@ -50,6 +50,7 @@ Independently shippable PRs, in priority order. Each stage builds on the pattern
 - Streaming v6 traceroute (`StreamingTrace.swift`).
 - Flip `StressTests.testIPv6TraceStillUnsupported` to assert success.
 - Cross-check against `/usr/sbin/traceroute6 2606:4700:4700::1111`.
+- **`VPNContext.forInterface(_:)` and `TraceClassifier` need to handle dual-stack-source / v4-only-tunnel.** NWX's `SplitTunnelManager` and `TopologyDiscoveryManager` both pass a `VPNContext` to `traceClassified`. When the tunnel interface (typically a `utun*`) is v4-only but the physical interface is dual-stack, a v6 trace bound to `en0` will traverse a different path than `VPNContext` was constructed to describe. The classifier needs to know which family each hop carried and resolve the VPN-vs-direct decision per-hop rather than once-per-trace. This is the place where most real-world VPN setups will surface dual-stack edge cases — flagged here so Stage 2 doesn't ship a v6 trace that silently misclassifies.
 
 ### Stage 3 — TCP / UDP probes over IPv6
 

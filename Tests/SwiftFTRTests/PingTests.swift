@@ -468,12 +468,22 @@ struct PingIntegrationTests {
     }
   }
 
-  /// Run system `/sbin/ping6` with matching parameters and parse the loss percentage.
-  /// Returns nil when ping6 can't be executed or its summary can't be parsed.
+  /// Run system ping with matching parameters and parse the loss percentage.
+  /// Tries `/sbin/ping6` first (macOS 13/14/15 ship it), falls back to
+  /// `/sbin/ping -6` for forward-compatibility — Apple has been folding family-
+  /// specific tools into the family-agnostic `ping` binary in recent releases.
+  /// Returns nil when neither path is executable or its summary can't be parsed.
   private func systemPing6Loss(target: String, count: Int) -> Double? {
+    if let loss = runPing(args: ["-q", "-c", String(count), target], path: "/sbin/ping6") {
+      return loss
+    }
+    return runPing(args: ["-6", "-q", "-c", String(count), target], path: "/sbin/ping")
+  }
+
+  private func runPing(args: [String], path: String) -> Double? {
     let p = Process()
-    p.executableURL = URL(fileURLWithPath: "/sbin/ping6")
-    p.arguments = ["-q", "-c", String(count), target]
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
     let pipe = Pipe()
     p.standardOutput = pipe
     p.standardError = Pipe()
