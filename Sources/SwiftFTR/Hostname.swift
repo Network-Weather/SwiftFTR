@@ -18,6 +18,51 @@ public struct ResolvedHost: Sendable {
   public let canonical: String
 }
 
+/// Family-aware source-IP bind shared by TCP/UDP probes. Returns nil on success;
+/// returns an error message string on failure (probes use string errors, not
+/// thrown `TracerouteError`, because they report through their own result types).
+/// For v6 the link-local `%zone` suffix is honored via `parseIPv6Scoped`.
+internal func bindProbeSourceIP(sockfd: Int32, family: Int32, sourceIP: String) -> String? {
+  switch family {
+  case AF_INET:
+    var addr = sockaddr_in()
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = 0
+    if inet_pton(AF_INET, sourceIP, &addr.sin_addr) != 1 {
+      return "Invalid source IPv4 address '\(sourceIP)'"
+    }
+    let rc = withUnsafePointer(to: &addr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        Darwin.bind(sockfd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    if rc < 0 {
+      return "Failed to bind to source IP '\(sourceIP)': \(String(cString: strerror(errno)))"
+    }
+    return nil
+  case AF_INET6:
+    let (bare, scopeID) = parseIPv6Scoped(sourceIP)
+    var addr = sockaddr_in6()
+    addr.sin6_family = sa_family_t(AF_INET6)
+    addr.sin6_port = 0
+    addr.sin6_scope_id = scopeID
+    if inet_pton(AF_INET6, bare, &addr.sin6_addr) != 1 {
+      return "Invalid source IPv6 address '\(sourceIP)'"
+    }
+    let rc = withUnsafePointer(to: &addr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        Darwin.bind(sockfd, sa, socklen_t(MemoryLayout<sockaddr_in6>.size))
+      }
+    }
+    if rc < 0 {
+      return "Failed to bind to source IP '\(sourceIP)': \(String(cString: strerror(errno)))"
+    }
+    return nil
+  default:
+    return "Unsupported family for source bind: \(family)"
+  }
+}
+
 /// Dual-stack host resolver shared across `ping()`, `trace()`, and friends.
 ///
 /// Honors `PreferredFamily`:

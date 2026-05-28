@@ -43,18 +43,24 @@ public struct TCPProbeConfig: Sendable {
   /// **Note**: Most users only need to set ``interface``.
   public let sourceIP: String?
 
+  /// IP family preference. Defaults to `.auto` (let the resolved address decide).
+  /// See `PreferredFamily` and `docs/IPV6.md`.
+  public let preferredFamily: PreferredFamily
+
   public init(
     host: String,
     port: Int,
     timeout: TimeInterval = 2.0,
     interface: String? = nil,
-    sourceIP: String? = nil
+    sourceIP: String? = nil,
+    preferredFamily: PreferredFamily = .auto
   ) {
     self.host = host
     self.port = port
     self.timeout = timeout
     self.interface = interface
     self.sourceIP = sourceIP
+    self.preferredFamily = preferredFamily
   }
 }
 
@@ -139,11 +145,14 @@ public func tcpProbe(
 public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
   let startTime = Date()
 
-  // Resolve hostname to IP address
-  guard let resolvedIP = try? await resolveHostname(config.host) else {
+  // Resolve via the shared dual-stack helper (Hostname.swift).
+  let resolved: ResolvedHost
+  do {
+    resolved = try resolveHost(host: config.host, prefer: config.preferredFamily)
+  } catch {
     return TCPProbeResult(
       host: config.host,
-      resolvedIP: config.host,  // Assume it's already an IP
+      resolvedIP: config.host,
       port: config.port,
       isReachable: false,
       connectionState: .error,
@@ -153,9 +162,8 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
     )
   }
 
-  // Perform TCP SYN probe using non-blocking socket
   let result = try await performTCPProbe(
-    ip: resolvedIP,
+    resolved: resolved,
     port: config.port,
     timeout: config.timeout,
     startTime: startTime,
@@ -165,7 +173,7 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
 
   return TCPProbeResult(
     host: config.host,
-    resolvedIP: resolvedIP,
+    resolvedIP: resolved.canonical,
     port: config.port,
     isReachable: result.isReachable,
     connectionState: result.connectionState,
@@ -177,50 +185,6 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
 
 // MARK: - Private Implementation
 
-private func resolveHostname(_ host: String) async throws -> String {
-  // If already an IP address, return it
-  if isIPAddress(host) {
-    return host
-  }
-
-  // Use getaddrinfo for DNS resolution
-  var hints = addrinfo()
-  hints.ai_family = AF_INET  // IPv4 for now
-  hints.ai_socktype = SOCK_STREAM
-
-  var result: UnsafeMutablePointer<addrinfo>?
-  defer { if let result = result { freeaddrinfo(result) } }
-
-  let status = getaddrinfo(host, nil, &hints, &result)
-  guard status == 0, let addr = result else {
-    throw TCPProbeError.resolutionFailed
-  }
-
-  // Extract IP address from result
-  var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-  getnameinfo(
-    addr.pointee.ai_addr,
-    socklen_t(addr.pointee.ai_addrlen),
-    &hostname,
-    socklen_t(hostname.count),
-    nil,
-    0,
-    NI_NUMERICHOST
-  )
-
-  // Convert to String, truncating at null terminator
-  let nullIndex = hostname.firstIndex(of: 0) ?? hostname.count
-  let bytes = hostname[..<nullIndex].map { UInt8(bitPattern: $0) }
-  return String(decoding: bytes, as: UTF8.self)
-}
-
-private func isIPAddress(_ string: String) -> Bool {
-  // Simple check for IPv4 format
-  let components = string.split(separator: ".")
-  guard components.count == 4 else { return false }
-  return components.allSatisfy { UInt8($0) != nil }
-}
-
 private struct ProbeResult {
   let isReachable: Bool
   let connectionState: TCPConnectionState
@@ -229,114 +193,86 @@ private struct ProbeResult {
 }
 
 private func performTCPProbe(
-  ip: String,
+  resolved: ResolvedHost,
   port: Int,
   timeout: TimeInterval,
   startTime: Date,
   interface: String?,
   sourceIP: String?
 ) async throws -> ProbeResult {
-  // Create socket
-  let sockfd = socket(AF_INET, SOCK_STREAM, 0)
+  // Family-aware socket. v4 → AF_INET, v6 → AF_INET6.
+  let sockfd = socket(resolved.family, SOCK_STREAM, 0)
   guard sockfd >= 0 else {
     return ProbeResult(
-      isReachable: false,
-      connectionState: .error,
-      rtt: nil,
-      error: "Failed to create socket: \(String(cString: strerror(errno)))"
-    )
+      isReachable: false, connectionState: .error, rtt: nil,
+      error: "Failed to create socket: \(String(cString: strerror(errno)))")
   }
 
-  // Bind to interface if specified
   if let iface = interface {
     #if canImport(Darwin)
       let ifaceIndex = if_nametoindex(iface)
       guard ifaceIndex != 0 else {
         close(sockfd)
         return ProbeResult(
-          isReachable: false,
-          connectionState: .error,
-          rtt: nil,
-          error: "Interface '\(iface)' not found"
-        )
+          isReachable: false, connectionState: .error, rtt: nil,
+          error: "Interface '\(iface)' not found")
       }
-
       var index = ifaceIndex
-      let result = setsockopt(
-        sockfd, IPPROTO_IP, IP_BOUND_IF,
-        &index, socklen_t(MemoryLayout<UInt32>.size))
-
-      guard result >= 0 else {
+      let level = resolved.family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
+      let opt = resolved.family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
+      if setsockopt(sockfd, level, opt, &index, socklen_t(MemoryLayout<UInt32>.size)) < 0 {
         close(sockfd)
         return ProbeResult(
-          isReachable: false,
-          connectionState: .error,
-          rtt: nil,
-          error: "Failed to bind to interface '\(iface)': \(String(cString: strerror(errno)))"
-        )
+          isReachable: false, connectionState: .error, rtt: nil,
+          error: "Failed to bind to interface '\(iface)': \(String(cString: strerror(errno)))")
       }
     #else
       close(sockfd)
       return ProbeResult(
-        isReachable: false,
-        connectionState: .error,
-        rtt: nil,
-        error: "Interface binding not supported on this platform"
-      )
+        isReachable: false, connectionState: .error, rtt: nil,
+        error: "Interface binding not supported on this platform")
     #endif
   }
 
-  // Bind to source IP if specified
   if let srcIP = sourceIP {
-    var sourceAddr = sockaddr_in()
-    sourceAddr.sin_family = sa_family_t(AF_INET)
-    sourceAddr.sin_port = 0  // Let system choose port
-
-    guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
+    if let err = bindProbeSourceIP(sockfd: sockfd, family: resolved.family, sourceIP: srcIP) {
       close(sockfd)
       return ProbeResult(
-        isReachable: false,
-        connectionState: .error,
-        rtt: nil,
-        error: "Invalid source IP address '\(srcIP)'"
-      )
-    }
-
-    let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        Darwin.bind(sockfd, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-
-    guard bindResult >= 0 else {
-      close(sockfd)
-      return ProbeResult(
-        isReachable: false,
-        connectionState: .error,
-        rtt: nil,
-        error: "Failed to bind to source IP '\(srcIP)': \(String(cString: strerror(errno)))"
-      )
+        isReachable: false, connectionState: .error, rtt: nil, error: err)
     }
   }
 
-  // Set socket to non-blocking
+  // Non-blocking.
   var flags = fcntl(sockfd, F_GETFL, 0)
   flags |= O_NONBLOCK
   _ = fcntl(sockfd, F_SETFL, flags)
 
-  // Prepare sockaddr
-  var addr = sockaddr_in()
-  addr.sin_family = sa_family_t(AF_INET)
-  addr.sin_port = in_port_t(port).bigEndian
-  inet_pton(AF_INET, ip, &addr.sin_addr)
+  // Build the destination sockaddr from the resolved family + port.
+  var destAddr = resolved.address
+  // sockaddr_in.sin_port and sockaddr_in6.sin6_port are both at the same
+  // offset (after the 2-byte family field), so a single overwrite works.
+  // We do it via family-aware rebinding to keep things explicit.
+  let destLen: socklen_t
+  if resolved.family == AF_INET6 {
+    destLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
+    withUnsafeMutablePointer(to: &destAddr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+        $0.pointee.sin6_port = in_port_t(port).bigEndian
+      }
+    }
+  } else {
+    destLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+    withUnsafeMutablePointer(to: &destAddr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+        $0.pointee.sin_port = in_port_t(port).bigEndian
+      }
+    }
+  }
 
-  // Record start time using monotonic clock
   let probeStartTime = monotonicTime()
-
-  // Attempt connection
-  let connectResult = withUnsafePointer(to: &addr) {
+  let connectResult = withUnsafePointer(to: &destAddr) {
     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-      connect(sockfd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      connect(sockfd, $0, destLen)
     }
   }
 

@@ -21,16 +21,22 @@ public struct UDPProbeConfig: Sendable {
   /// Payload to send (default: empty)
   public let payload: Data
 
+  /// IP family preference. Defaults to `.auto` (let the resolved address decide).
+  /// See `PreferredFamily` and `docs/IPV6.md`.
+  public let preferredFamily: PreferredFamily
+
   public init(
     host: String,
     port: Int,
     timeout: TimeInterval = 2.0,
-    payload: Data = Data()
+    payload: Data = Data(),
+    preferredFamily: PreferredFamily = .auto
   ) {
     self.host = host
     self.port = port
     self.timeout = timeout
     self.payload = payload
+    self.preferredFamily = preferredFamily
   }
 }
 
@@ -107,8 +113,11 @@ public func udpProbe(
 public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
   let startTime = Date()
 
-  // Resolve hostname to IP address
-  guard let resolvedIP = try? await resolveHostnameUDP(config.host) else {
+  // Resolve via the shared dual-stack helper (Hostname.swift).
+  let resolved: ResolvedHost
+  do {
+    resolved = try resolveHost(host: config.host, prefer: config.preferredFamily)
+  } catch {
     return UDPProbeResult(
       host: config.host,
       resolvedIP: config.host,
@@ -121,9 +130,8 @@ public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
     )
   }
 
-  // Perform UDP probe
   let result = try await performUDPProbe(
-    ip: resolvedIP,
+    resolved: resolved,
     port: config.port,
     payload: config.payload,
     timeout: config.timeout,
@@ -132,7 +140,7 @@ public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
 
   return UDPProbeResult(
     host: config.host,
-    resolvedIP: resolvedIP,
+    resolvedIP: resolved.canonical,
     port: config.port,
     isReachable: result.isReachable,
     rtt: result.rtt,
@@ -144,49 +152,6 @@ public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
 
 // MARK: - Private Implementation
 
-private func resolveHostnameUDP(_ host: String) async throws -> String {
-  // If already an IP address, return it
-  if isIPAddressUDP(host) {
-    return host
-  }
-
-  // Use getaddrinfo for DNS resolution
-  var hints = addrinfo()
-  hints.ai_family = AF_INET  // IPv4
-  hints.ai_socktype = SOCK_DGRAM
-
-  var result: UnsafeMutablePointer<addrinfo>?
-  defer { if let result = result { freeaddrinfo(result) } }
-
-  let status = getaddrinfo(host, nil, &hints, &result)
-  guard status == 0, let addr = result else {
-    throw UDPProbeError.resolutionFailed
-  }
-
-  // Extract IP address
-  var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-  getnameinfo(
-    addr.pointee.ai_addr,
-    socklen_t(addr.pointee.ai_addrlen),
-    &hostname,
-    socklen_t(hostname.count),
-    nil,
-    0,
-    NI_NUMERICHOST
-  )
-
-  // Convert to String, truncating at null terminator
-  let nullIndex = hostname.firstIndex(of: 0) ?? hostname.count
-  let bytes = hostname[..<nullIndex].map { UInt8(bitPattern: $0) }
-  return String(decoding: bytes, as: UTF8.self)
-}
-
-private func isIPAddressUDP(_ string: String) -> Bool {
-  let components = string.split(separator: ".")
-  guard components.count == 4 else { return false }
-  return components.allSatisfy { UInt8($0) != nil }
-}
-
 private struct UDPProbeResultInternal {
   let isReachable: Bool
   let rtt: TimeInterval?
@@ -195,38 +160,48 @@ private struct UDPProbeResultInternal {
 }
 
 private func performUDPProbe(
-  ip: String,
+  resolved: ResolvedHost,
   port: Int,
   payload: Data,
   timeout: TimeInterval,
   startTime: Date
 ) async throws -> UDPProbeResultInternal {
-  // Create UDP socket
-  let sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+  // Family-aware socket. v4 → AF_INET, v6 → AF_INET6.
+  let sockfd = socket(resolved.family, SOCK_DGRAM, IPPROTO_UDP)
   guard sockfd >= 0 else {
     return UDPProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseType: nil,
-      error: "Failed to create UDP socket"
-    )
+      isReachable: false, rtt: nil, responseType: nil,
+      error: "Failed to create UDP socket")
   }
 
-  // Set socket to non-blocking
   var flags = fcntl(sockfd, F_GETFL, 0)
   flags |= O_NONBLOCK
   _ = fcntl(sockfd, F_SETFL, flags)
 
-  // Prepare destination address
-  var addr = sockaddr_in()
-  addr.sin_family = sa_family_t(AF_INET)
-  addr.sin_port = in_port_t(port).bigEndian
-  inet_pton(AF_INET, ip, &addr.sin_addr)
+  // Build the destination sockaddr from the resolved family + port.
+  var destAddr = resolved.address
+  let destLen: socklen_t
+  if resolved.family == AF_INET6 {
+    destLen = socklen_t(MemoryLayout<sockaddr_in6>.size)
+    withUnsafeMutablePointer(to: &destAddr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) {
+        $0.pointee.sin6_port = in_port_t(port).bigEndian
+      }
+    }
+  } else {
+    destLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+    withUnsafeMutablePointer(to: &destAddr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) {
+        $0.pointee.sin_port = in_port_t(port).bigEndian
+      }
+    }
+  }
 
-  // Connect the UDP socket - this allows kernel to deliver ICMP errors
-  let connectResult = withUnsafePointer(to: &addr) {
+  // Connect the UDP socket - this allows the kernel to deliver ICMP/ICMPv6
+  // errors as ECONNREFUSED on recv(), avoiding the need for a raw ICMP socket.
+  let connectResult = withUnsafePointer(to: &destAddr) {
     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-      connect(sockfd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      connect(sockfd, $0, destLen)
     }
   }
 
