@@ -1,37 +1,14 @@
 # SwiftFTR Roadmap
 
-This roadmap outlines the development direction for SwiftFTR. It is prioritized by value and impact rather than strict timelines or version numbers.
+Forward-looking work, stack-ranked top-to-bottom by priority. For what has already shipped, see [CHANGELOG.md](CHANGELOG.md).
 
-## Current Stable State (v0.12.0)
-- **Core**: Parallel traceroute with ICMP datagram sockets (no sudo required on macOS).
-- **Scalability**: Massively parallel `ping` architecture using `kqueue`/`epoll` (C10k ready).
-- **DNS**: Full-featured DNS client supporting 11 record types (A, AAAA, PTR, TXT, MX, NS, CNAME, SOA, SRV, CAA, HTTPS) with high-precision timing. IPv6 DNS transport supported (v0.11.5).
-- **Reachability**: Multi-protocol probing (TCP SYN, UDP connected, HTTP/S) with modern DispatchSource I/O.
-- **TCP Probe**: Port state visibility—distinguishes open (SYN-ACK) vs closed (RST) vs filtered (timeout).
-- **Monitoring**: Bufferbloat testing, Multipath (ECMP) discovery, and network interface binding.
-- **Architecture**: Fully async/await, Swift 6 strict concurrency compliant, actor-based.
-- **Performance**: Parallel ASN resolution with bounded concurrency (v0.8.1).
-- **Offline ASN**: Local IP-to-ASN lookups via Swift-IP2ASN (~10μs), configurable strategy (v0.9.0).
-- **VPN-Aware Classification**: VPN/overlay/corporate hop categories with interface discovery (v0.10.0).
-- **Streaming Traceroute**: Real-time hop updates via `AsyncThrowingStream` with automatic retry (v0.11.0).
-- **Improved VPN Classification**: Private/CGNAT IPs as VPN, public IPs as TRANSIT when tracing through VPN (v0.11.1).
-- **CLI Probe Command**: `swift-ftr probe tcp/udp/http/dns` for interactive diagnostics (v0.11.2).
-- **Resilient Public IP**: STUN multi-server fallback with DNS-based discovery via Akamai whoami (v0.11.3).
-- **URLSession Leak Fix**: Proper session invalidation in HTTP probe to prevent memory leaks (v0.11.4).
-- **IPv6 DNS Transport**: Dual-stack DNS queries, link-local IPv6 server support, reverse IPv6 lookups (v0.11.5).
-- **Traceroute I/O Modernization**: Replaced last `poll(2)` holdouts with kqueue-backed `DispatchSourceRead` — fully non-blocking I/O throughout the codebase (v0.12.0).
-
----
-
-## Priority Queue (Next Up)
-
-These features are the primary focus for upcoming releases, ranked by priority.
+## Priority Queue
 
 ### IPv6 Traceroute (ICMPv6)
 **Goal**: Full feature parity for IPv6 networks.
-- **DNS transport**: Done (v0.11.5) — IPv6 DNS server support with link-local scope IDs.
-- **Remaining**: ICMPv6 Echo Request/Reply, IPv6 traceroute with `IPV6_UNICAST_HOPS`, IPv6 STUN.
+- **Remaining work**: ICMPv6 Echo Request/Reply, IPv6 traceroute with `IPV6_UNICAST_HOPS`, IPv6 STUN, IPv6 host-resolution path in `ping()` / `trace()` / probes (currently `AF_INET`-only).
 - **Challenges**: Different socket options (`IPPROTO_ICMPV6`, `IPV6_UNICAST_HOPS`) and header structures compared to IPv4.
+- **ASN data**: Bump `swift-ip2asn` floor to 0.4.0 ([release notes](https://github.com/Network-Weather/swift-ip2asn/releases/tag/v0.4.0)) — adds dual-stack `UltraCompactDatabase.lookup` (IPv4 + IPv6 binary search), bundled DB grows from ~3.5 MB to ~4 MB (~565K ranges, +119K IPv6). Ship the bump in the same release as the first IPv6 trace surface, so IPv6 ASN labels light up together with v6 hops — bumping standalone is pure carrying cost (~600 KB of dormant data).
 
 ### Enterprise Proxy & VPN Telemetry
 **Goal**: Measure performance in locked-down corporate environments where direct internet access is blocked.
