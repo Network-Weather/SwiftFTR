@@ -48,7 +48,7 @@ Now ships v6 trace, traceClassified, and traceStream via the same entry points a
 
 **Folded in from former Stage 6**: `swift-ip2asn` bumped to 0.4.0; `CymruDNSResolver` gained v6 lookups via `origin6.asn.cymru.com` with a new `reverseIPv6Nibbles` helper. v6 hops now get full `[AS… - ASNAME]` annotations identically to v4 traces.
 
-**Deferred follow-up** (not blocking v6 trace correctness): `VPNContext.vpnLocalIPs` is empty by default — populating it with both v4 and v6 addresses of detected VPN interfaces is its own refactor (the field has been empty since the initial implementation; v6 trace classification works correctly without it because it falls through to ASN-based segmentation). NWX flagged the dual-stack-source / v4-only-tunnel edge case for follow-up attention.
+**`VPNContext.vpnLocalIPs` is now populated** (shipped in PR #21 as part of v0.13.0 hardening): `VPNContext.forInterface(_:)` walks `getifaddrs` and collects every v4 and v6 address bound to a VPN-shaped interface (`utun*`, `ipsec*`, `ppp*`, `tun*`, `tap*`, `wg*`, `gpd*`, `ztun*`). The classifier now tags hops that land on a VPN local IP as `.vpn` rather than `.transit`. v6 link-local entries keep their `%zone` suffix so set membership matches what the parsed hops look like.
 
 ### ~~Stage 3 — TCP / UDP probes over IPv6~~ *(shipped)*
 

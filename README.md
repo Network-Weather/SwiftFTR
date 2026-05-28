@@ -7,33 +7,35 @@ SwiftFTR
 [![Platform](https://img.shields.io/badge/platform-macOS%2013%2B-blue.svg)](https://developer.apple.com/macos/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Fast, parallel traceroute for Swift on macOS — no sudo required. SwiftFTR uses ICMP datagram sockets with async/await to probe every hop at once, then classifies the path into segments like LOCAL, ISP, TRANSIT, and DESTINATION.
+Fast, parallel traceroute for Swift on macOS — no sudo required, full IPv4 and IPv6 support. SwiftFTR uses ICMP datagram sockets with async/await to probe every hop at once, then classifies the path into segments like LOCAL, ISP, TRANSIT, and DESTINATION.
 
 [API Documentation](https://swiftftr.networkweather.com/) — generated via DocC and published by GitHub Pages.
 
 Why SwiftFTR?
 -------------
-- No sudo: Uses `SOCK_DGRAM` with `IPPROTO_ICMP` on macOS, so you can run traceroute‑style measurements from apps, tests, and CI without elevated privileges.
+- No sudo: Uses `SOCK_DGRAM` with `IPPROTO_ICMP` / `IPPROTO_ICMPV6` on macOS, so you can run traceroute‑style measurements from apps, tests, and CI without elevated privileges.
 - Parallel by design: Sends one ICMP Echo per TTL up to your max hop in a tight loop, then listens for all responses concurrently.
-- Simple async API: A single `trace(...)` call returns structured hops; `traceClassified(...)` adds ASN‑based labeling.
+- Simple async API: A single `trace(...)` call returns structured hops; `traceClassified(...)` adds ASN‑based labeling. The same entry point accepts IPv4 or IPv6 targets — family is detected automatically.
+- Dual-stack: ping, traceroute, TCP/UDP probes, and STUN-based public-IP discovery all work over IPv4 and IPv6 through the same APIs. v4 literals transparently work on v6-only NAT64 networks via system synthesis.
 - Production‑friendly: Monotonic RTT timing, buffer reuse, and an in‑memory ASN cache minimize noise and allocations.
 
 How It Works
 ------------
-1) Resolve destination IPv4 address.
-2) Open an ICMP datagram socket (`SOCK_DGRAM`, `IPPROTO_ICMP`). Set non‑blocking mode.
+1) Resolve destination via a dual-stack `getaddrinfo` (with `AI_V4MAPPED | AI_ADDRCONFIG`) so v4 literals on v6-only NAT64 networks transparently get a synthesized v6 mapping.
+2) Open an ICMP/ICMPv6 datagram socket — `SOCK_DGRAM` with `IPPROTO_ICMP` or `IPPROTO_ICMPV6` depending on the resolved family. Set non‑blocking mode.
 3) For TTL = 1…maxHops:
-   - Set `IP_TTL` to the current TTL and send an ICMP Echo Request with a stable identifier and sequence (seq = TTL).
+   - Set `IP_TTL` (v4) or `IPV6_UNICAST_HOPS` (v6) to the current TTL and send an Echo Request with a stable identifier and sequence (seq = TTL).
    - Record send time in a small map keyed by `sequence`.
 4) Register a `DispatchSourceRead` (kqueue-backed on macOS) and handle packets until a global deadline:
+   - For v6, `recvmsg` is used so the reply's hop limit arrives via cmsg ancillary data (the kernel strips the IPv6 header from `SOCK_DGRAM` deliveries).
    - Parse each incoming datagram as one of: Echo Reply, Time Exceeded, or Destination Unreachable.
    - Match replies back to the original probe using the identifier/sequence embedded in the payload.
    - Compute RTT with a monotonic clock and place the hop at `ttl - 1`.
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
 5) Optional classification (when using `traceClassified`):
-   - Detect the client's public IP via STUN with DNS fallback (or use `PTR_PUBLIC_IP`, or disable via `PTR_SKIP_STUN`).
-   - Batch‑resolve ASNs using Team Cymru DNS WHOIS and apply heuristics for PRIVATE and CGNAT ranges.
-   - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and “hole‑fill” missing stretches between identical segments.
+   - Detect the client's public IP via STUN with DNS fallback (or use `PTR_PUBLIC_IP`, or disable via `PTR_SKIP_STUN`). `getPublicIPs()` returns both v4 and v6 in parallel for callers that want a dual-stack view.
+   - Batch‑resolve ASNs using Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) or the embedded local database via swift-ip2asn 0.4.0. Apply heuristics for PRIVATE and CGNAT ranges.
+   - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and "hole‑fill" missing stretches between identical segments.
 
 How Fast Is It?
 ---------------
@@ -48,7 +50,7 @@ Requirements
 ------------
 - Swift 6.1+ (requires Xcode 16.4 or later)
 - macOS 13+
-- IPv4 only at the moment (ICMPv4 Echo). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS’s ICMP datagram behavior.
+- IPv4 and IPv6 supported across all surfaces (ICMPv4 Echo, ICMPv6 Echo per RFC 4443). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS's ICMP datagram behavior.
 
 Install (SwiftPM)
 -----------------
@@ -57,7 +59,7 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.12.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.13.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
@@ -75,32 +77,41 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 Key Features
 ------------
 **Traceroute**
-- Parallel ICMP probing with O(1) time complexity (~1 second for 30 hops)
+- Parallel ICMP/ICMPv6 probing with O(1) time complexity (~1 second for 30 hops)
 - Streaming API with real-time hop updates via `AsyncThrowingStream`
 - ASN-based hop classification: LOCAL, ISP, TRANSIT, VPN, DESTINATION
+- v6 hops get full ASN annotations via Team Cymru `origin6.asn.cymru.com` or the embedded swift-ip2asn database
 - VPN-aware classification for tunnel and exit node detection
 - Automatic rDNS lookups with 24-hour caching
 
+**Dual-stack IPv4 / IPv6 (v0.13.0)**
+- Every diagnostic accepts v4 literals, v6 literals, and hostnames through the same entry points
+- `PreferredFamily { .v4, .v6, .auto }` lets callers force a family; default `.auto` lets the OS decide
+- v4 literals on v6-only NAT64 networks transparently use the gateway's synthesized v6 mapping (RFC 6147)
+- All emitted addresses are in `inet_ntop` canonical form; link-local addresses keep their `%zone` suffix
+- `interface: "en0"` binds v6 sockets via `IPV6_BOUND_IF`
+
 **Network Probing**
-- **Ping**: ICMP echo with statistics (min/avg/max RTT, jitter, packet loss)
-- **TCP Probe**: Port state detection (open/closed/filtered)
-- **UDP Probe**: Connected-socket with ICMP unreachable detection
+- **Ping**: ICMP/ICMPv6 echo with statistics (min/avg/max RTT, jitter, packet loss)
+- **TCP Probe**: Port state detection (open/closed/filtered) over v4 or v6
+- **UDP Probe**: Connected-socket with ICMP/ICMPv6 unreachable detection
 - **DNS Probe**: Direct server queries with 11 record types (A, AAAA, TXT, MX, etc.)
 - **HTTP/HTTPS Probe**: Web server reachability testing
 
 **Multipath Discovery**
-- Dublin Traceroute-style ECMP path enumeration
+- Dublin Traceroute-style ECMP path enumeration (v4)
 - Smart deduplication and divergence point detection
 - Flow identifier control for reproducible traces
 
 **Interface & Binding**
-- Per-operation interface binding (WiFi, Ethernet, VPN)
-- Source IP binding for multi-homed hosts
+- Per-operation interface binding (WiFi, Ethernet, VPN) — `IP_BOUND_IF` (v4) / `IPV6_BOUND_IF` (v6)
+- Source IP binding for multi-homed hosts, v4 or v6 (link-local `%zone` honored)
 - Resolution order: Operation → Global → System Default
 
 **Public IP Discovery**
-- STUN with multi-server fallback (Google, Cloudflare)
-- DNS-based fallback via Akamai whoami (works behind captive portals)
+- STUN over both v4 and v6 with multi-server fallback (Google, Cloudflare)
+- `getPublicIPs()` runs both families in parallel and returns whichever succeeded
+- DNS-based fallback via Akamai whoami (v4 only — works behind captive portals)
 - Results cached until network change
 
 **Architecture**
@@ -133,6 +144,17 @@ for hop in result.hops {
     let rtt  = hop.rtt.map { String(format: "%.3f ms", $0 * 1000) } ?? "timeout"
     print("\(hop.ttl)\t\(addr)\t\(rtt)")
 }
+
+// IPv6 works through the same entry point — family auto-detected from the target.
+let v6Result = try await tracer.trace(to: "2606:4700:4700::1111")
+// Or force a family explicitly:
+let v6Config = SwiftFTRConfig(preferredFamily: .v6)
+let alwaysV6 = SwiftFTR(config: v6Config)
+let google = try await alwaysV6.trace(to: "google.com")  // prefers AAAA if available
+
+// Dual-stack public-IP discovery (v0.13.0):
+let publicIPs = await getPublicIPs()
+print("v4: \(publicIPs.v4 ?? "n/a"), v6: \(publicIPs.v6 ?? "n/a")")
 
 // With ASN classification
 let classified = try await tracer.traceClassified(to: "www.example.com")

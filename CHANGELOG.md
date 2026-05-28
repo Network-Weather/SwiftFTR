@@ -3,135 +3,60 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-Unreleased (0.13.0-dev)
------------------------
-### Features
+0.13.0 — 2026-05-28
+-------------------
 
-**NAT64 transparency for IPv4 literals on v6-only networks**
+**Full IPv6 feature parity.** Every diagnostic surface — `ping()`, `trace()`, `traceClassified()`, `traceStream()`, `tcpProbe()`, `udpProbe()`, STUN-based public-IP discovery — now accepts IPv6 literals and IPv6-resolving hostnames through the same entry points as their IPv4 counterparts. Family is auto-detected from the resolved address; opt-in `PreferredFamily` forces a specific family per operation. v6 hops in classified traces carry full ASN annotations via `swift-ip2asn` 0.4.0. v4 literals on v6-only NAT64 networks "just work" via system-level synthesis.
 
-In `.auto` mode (the default), v4 literals like `"1.1.1.1"` now go through `getaddrinfo` with `AI_V4MAPPED | AI_ADDRCONFIG` flags rather than the previous `inet_pton` fast path. macOS's resolver synthesizes a v4-mapped v6 address (typically under `64:ff9b::/96` per RFC 6147) when the system has detected a DNS64/NAT64 network — so `tracer.ping("1.1.1.1")` on a v6-only cellular network now "just works" via the gateway's translator rather than failing with `EHOSTUNREACH`.
+### New public API (additive; no source breakage)
 
-- Behavior on dual-stack networks is unchanged: `getaddrinfo` returns the v4 entry directly because v4 is locally routable.
-- Behavior on v6-only NAT64 networks: `getaddrinfo` returns the synthesized v6 address, the v6 socket is used transparently, and the trace/probe completes.
-- Force modes (`.v4` and `.v6`) keep the `inet_pton` fast path for literals — users that explicitly pinned a family opted out of NAT64 synthesis.
-- Cross-family literal rejection still throws (`.v4` against a v6 literal, `.v6` against a v4 literal) — preserved tests confirm.
-- Matches Apple's [SupportingIPv6DNS64NAT64](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/NetworkingOverview/SupportingIPv6DNS64NAT64/SupportingIPv6DNS64NAT64.html) guidance for IPv6-compatible apps.
+- `public enum PreferredFamily { case v4, v6, auto }` — opt-in family preference.
+- `PingConfig.preferredFamily` and `SwiftFTRConfig.preferredFamily` — both default `.auto`.
+- `TCPProbeConfig.preferredFamily` and `UDPProbeConfig.preferredFamily` — same.
+- `public struct PublicIPs { let v4: String?; let v6: String? }` with `any: String?` accessor (v6-preferred).
+- `public func getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:) async -> PublicIPs` — runs v4 and v6 STUN sweeps in parallel via `async let`. Never throws.
+- `STUNPublicIP.family: Int32` — distinguishes v4 vs v6 results without string parsing. Defaults to `AF_INET` for back-compat.
+- `stunGetPublicIPv6` / `stunGetPublicIPv6WithFallback` — single-family v6 entry points; existing v4 entry points unchanged.
+- `public struct ResolvedHost` — exposed so it can flow through library internals; useful for callers building atop the low-level helpers.
 
-Verified end-to-end on a dual-stack host: `swift-ftr ping 1.1.1.1` still resolves to `1.1.1.1` and pings v4; `swift-ftr ping 2606:4700:4700::1111` pings v6; `swift-ftr ping cloudflare.com` picks v6 (system-preferred address per RFC 6724). All 168 unit tests pass.
+### Behavior changes (no source breakage)
 
-### Bug Fix
+- **`PingResponse.ttl`** now carries the IPv6 hop limit for v6 replies (same field, same units 1–255). Doc-comment updated to describe the dual meaning. Same shape, no new field added.
+- **Canonical-form contract**: every emitted address (`PingResult.resolvedIP`, `TraceHop.ipAddress`, `STUNPublicIP.ip`, `ParsedICMP.sourceAddress`) is in `inet_ntop` canonical form. Round-tripping `String → resolve → String` is stable. Link-local addresses keep their `%<ifname>` zone suffix via `if_indextoname` — downstream consumers (NWX) use these strings as dictionary keys, and consistency matters.
+- **`interface: "en0"`** binds v6 sockets via `IPV6_BOUND_IF` (mirrors v4 `IP_BOUND_IF`). Same `interface` field as before.
+- **`sourceIP`** auto-routes to the matching family's bind path for `getPublicIPs` (v6 source-IP doesn't try to bind a v4 socket and vice versa).
+- **`.auto` mode + v4 literal** now goes through `getaddrinfo(AI_V4MAPPED | AI_ADDRCONFIG)` rather than the `inet_pton` fast path. On dual-stack hosts behavior is unchanged; on v6-only NAT64 networks macOS synthesizes a v6 mapping per RFC 6147 and the trace/probe completes transparently. Matches [Apple's IPv6 guidance](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/NetworkingOverview/SupportingIPv6DNS64NAT64/SupportingIPv6DNS64NAT64.html). Force modes (`.v4` / `.v6`) keep the `inet_pton` fast path.
 
-**Populate `VPNContext.vpnLocalIPs` from `getifaddrs`**
+### Implementation highlights
 
-Pre-existing bug: `VPNContext.vpnLocalIPs: Set<String>` has been declared since the initial implementation but was always populated as an empty set by `VPNContext.forInterface(_:)`. Downstream consumers (NWX flagged this during the IPv6 review) relied on it to tag hops that land on a VPN local IP as `.vpn` rather than `.transit`, but the empty set meant the classifier silently fell through to ASN-based segmentation only.
+- **ICMPv6 codec** in `ICMP.swift`: `makeICMPv6EchoRequest`, `parseICMPv6Message`. Kernel computes the ICMPv6 checksum (it needs the IPv6 pseudo-header). Embedded IPv6 + ICMPv6 packet parsing for Time Exceeded / Destination Unreachable.
+- **Sockets**: `AF_INET6 / SOCK_DGRAM / IPPROTO_ICMPV6` with `IPV6_UNICAST_HOPS` and `IPV6_RECVHOPLIMIT` (cmsg-delivered hop limit). No root or special entitlements required.
+- **STUN v6**: `XOR-MAPPED-ADDRESS` Family `0x02` parsing per RFC 5389 §15.2 — bytes 4..15 un-XOR against the 12-byte transaction ID.
+- **v6 ASN labels**: `CymruDNSResolver` now queries `origin6.asn.cymru.com` with the IPv6 nibble-reverse form (new `reverseIPv6Nibbles` helper in `Utils.swift`). `LocalASNResolver` transparent for v6 via `swift-ip2asn` 0.4.0's dual-stack `UltraCompactDatabase.lookup`.
+- **Shared infrastructure** in `Hostname.swift`: `resolveHost(host:prefer:) -> ResolvedHost` is the single resolver across ping/trace/probes/STUN; `bindSourceIP(sockfd:family:sourceIP:)` and `bindInterface(sockfd:family:ifIndex:)` are the single bind helpers, used everywhere. `Traceroute`'s `bindTraceInterface` / `bindTraceSourceIP` are thin wrappers translating string errors to typed `TracerouteError` cases.
 
-- `VPNContext.forInterface(_:)` now calls a new internal `discoverVPNLocalIPs()` that walks `getifaddrs` and collects every IPv4 and IPv6 address bound to an interface that `NetworkInterfaceDiscovery.isVPNInterface` matches (`utun*`, `ipsec*`, `ppp*`, `tun*`, `tap*`, `wg*`, `gpd*`, `ztun*`).
-- v6 link-local addresses keep their `%zone` suffix via the existing `ipv6String` helper so set entries match what the classifier sees from a parsed hop.
-- New `testVPNContextPopulatesLocalIPs` asserts the discovery returns valid v4/v6 strings and that calls with different VPN-shaped interface names yield the same set (since we walk every VPN interface on the host).
-- All 168 unit tests pass.
+### Bug fixes
+
+- **`VPNContext.vpnLocalIPs` is finally populated**. Pre-existing bug: `vpnLocalIPs: Set<String>` has been declared since the initial implementation but was always returned as an empty set. `VPNContext.forInterface(_:)` now walks `getifaddrs` and collects every v4 and v6 address bound to any detected VPN interface (`utun*`, `ipsec*`, `ppp*`, `tun*`, `tap*`, `wg*`, `gpd*`, `ztun*`). v6 link-local addresses keep their `%zone` suffix so set entries match what the classifier sees from a parsed hop.
 
 ### Tooling
 
-**ICMPv6 parser fuzzer (`icmpv6fuzz`)**
+- **`icmpv6fuzz`** — new defense-in-depth fuzz target for the v6 parsers. Feeds random buffers (sized 0..4096 bytes) to `parseICMPv6Message` and `swiftftrParseV6PingMessage`; plants the expected identifier at canonical offsets every ~16 iterations so post-identifier-match code paths get exercised. 500K iterations, zero crashes. `ITER=500000 swift run -c release icmpv6fuzz`.
+- **`icmpv6probe`**, **`ip2asnv6probe`**, **`traceroute6probe`** — diagnostic spike executables that empirically validated Darwin's `SOCK_DGRAM IPPROTO_ICMPV6` behavior, swift-ip2asn 0.4.0's v6 lookups, and real-world ICMPv6 Time Exceeded delivery. Ship in the repo as reproducible diagnostics.
 
-Defense-in-depth fuzzer for the v6 parsers added across Stages 1–2. Mirrors the existing `icmpfuzz` target — feeds random buffers (sized 0..4096 bytes) and random `sockaddr_storage` shapes to both `parseICMPv6Message` (via `@_spi(Fuzz) __fuzz_parseICMPv6`) and `swiftftrParseV6PingMessage` (via `@_spi(Test) __parseV6PingMessage`).
+### Dependencies
 
-- Every ~16 iterations the fuzzer plants a random expected identifier at the canonical offsets in the buffer (bytes 4–5 for the outer ICMPv6 header, bytes 8+40+4..5 for the embedded ICMPv6 header inside a Time Exceeded message) so the post-identifier-match code paths get exercised, not just the identifier-mismatch reject.
-- 500,000 iterations with no crashes confirmed; default `ITER=50000` completes in <1s on M-series.
-- Run with: `ITER=500000 swift run -c release icmpv6fuzz`.
-
-### Refactor
-
-**Resolver and bind-helper consolidation (Stage 5 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
-
-Pure refactor; no behavior change, no public API change. Tidies up duplication that accumulated across Stages 1–4 now that every caller path is family-aware.
-
-- `Multipath.swift` was the last remaining caller of the old `resolveIPv4(host:enableLogging:) -> sockaddr_in` helper. Migrated to `resolveHost(host:, prefer: .v4)` (Multipath stays v4-only by design since ECMP probing is heavily tied to IPv4 paris-traceroute / 5-tuple semantics, but uses the shared resolver).
-- Deleted the now-unused `resolveIPv4` from `Traceroute.swift` (lines 1024–1064). `Hostname.resolveHost(host:prefer:)` is the only resolver in the codebase.
-- Renamed `bindProbeSourceIP` → `bindSourceIP` in `Hostname.swift` — no longer probe-specific; it's the shared family-aware source-IP bind for every socket path (ping, trace, probes, STUN).
-- Added new `bindInterface(sockfd:family:ifIndex:) -> String?` helper in `Hostname.swift` — same low-level shape as `bindSourceIP`. Centralizes the `IP_BOUND_IF` (v4) / `IPV6_BOUND_IF` (v6) `setsockopt` call.
-- `Traceroute.swift`'s `bindTraceInterface` and `bindTraceSourceIP` are now thin wrappers that delegate to the shared helpers and translate the string error to the typed `TracerouteError.{interfaceBindFailed, sourceIPBindFailed}` thrown by trace's caller contract.
-- `TCPProbe.swift` and `STUN.swift` now call `bindInterface` directly (was: inline `setsockopt` with hand-rolled level/opt branching). Tests untouched.
-
-The shared helpers (`resolveHost`, `bindSourceIP`, `bindInterface`) all live in `Hostname.swift` and are family-aware, so any future v6 work calls the same code paths v4 does.
-
-### Features
-
-**IPv6 STUN + dual-stack public-IP discovery (Stage 4 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
-- `STUN.swift` is now dual-stack. New `stunGetPublicIP(family:host:port:...)` core builds the binding request, sends it, and parses the XOR-MAPPED-ADDRESS attribute for both v4 (Family `0x01`) and v6 (Family `0x02`) per RFC 5389 §15.2. The v6 parser correctly un-XORs bytes 4..15 of the address against the request's 12-byte transaction ID.
-- `STUNPublicIP` gains a `family: Int32` field (defaults to `AF_INET` for back-compat) so callers can tell v4 and v6 results apart without parsing the string.
-- New public `PublicIPs { v4: String?, v6: String? }` struct plus a convenience `any: String?` that prefers v6 when both are present.
-- New `public func getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:) async -> PublicIPs` runs v4 and v6 STUN sweeps in parallel via `async let` and returns whichever succeeded. Never throws — failures show up as nil fields so callers don't have to branch on the common "v4-only network" and "v6-only network" cases.
-- Family-aware `IPV6_BOUND_IF` for v6 interface binding. v6 source-IP binding reuses `bindProbeSourceIP` (added Stage 3) which honors link-local `%zone` suffixes.
-- `sourceIP` passed to `getPublicIPs` is auto-routed to the matching family's sweep only — a v6 source-IP doesn't try to bind a v4 socket and vice versa.
-- Back-compat shims: `stunGetPublicIPv4`, `stunGetPublicIPv4WithFallback`, and `getPublicIPv4` keep their pre-Stage-4 signatures; new `stunGetPublicIPv6` / `stunGetPublicIPv6WithFallback` companions added for callers that want a single-family v6 result.
-
-**Verified end-to-end** against Cloudflare WARP: `stunGetPublicIPv6(host: "stun.cloudflare.com", port: 3478)` returns the host's GUA v6 address; `getPublicIPs()` returns both families populated.
-
-**Tests**
-- `testSTUNPublicIPCarriesFamily`: pure-unit, asserts the new family field round-trips.
-- `testPublicIPsAny`: pure-unit, asserts the v6-preferred convenience accessor.
-- `testSTUNv6Cloudflare`: network + v6-reachability gated; asserts `stunGetPublicIPv6` returns a non-link-local GUA.
-- `testGetPublicIPsDualStack`: same gating; asserts both `v4` and `v6` fields are populated on a dual-stack host.
-
-
-**IPv6 TCP & UDP probes (Stage 3 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
-- `tcpProbe(...)` and `udpProbe(...)` now accept IPv6 literals and IPv6-resolving hostnames using the same entry points as v4. Family auto-detected from the resolved address; opt-in `TCPProbeConfig.preferredFamily` / `UDPProbeConfig.preferredFamily` forces a specific family (additive, default `.auto`).
-- Family-aware sockets (`socket(family, SOCK_STREAM, 0)` / `socket(family, SOCK_DGRAM, IPPROTO_UDP)`), `sockaddr_in6` `connect()` paths, `IPV6_BOUND_IF` for v6 interface binding, link-local `%zone` suffixes preserved in v6 source-IP binding.
-- Shared `bindProbeSourceIP(sockfd:family:sourceIP:)` helper in `Hostname.swift` so TCP and UDP probes use the same family-aware bind path.
-- `HTTPProbe` was already v6-capable via `URLSession`; no work needed there.
-- Both probes now use the shared `resolveHost(...)` helper introduced in Stage 2, removing the deprecated v4-only `resolveHostname` / `resolveHostnameUDP` helpers (deleted in this PR).
-
-**Verified end-to-end** (Cloudflare WARP v6 + literal v4): `tcp probe 1.1.1.1 443` and `tcp probe 2606:4700:4700::1111 443` both succeed with similar RTT (~7-9ms); `udp probe` reaches v4 and v6 destinations (response timeout is the expected behavior when the target doesn't speak our empty UDP probe).
-
-**Tests**
-- New `testTCPProbeIPv6`: gated on `SKIP_NETWORK_TESTS` + `IPv6Reachability.isAvailable()`; asserts `tcp probe 2606:4700:4700::1111:443` returns `.open` with the canonical resolved IP.
-- New `testUDPProbeIPv6`: same gating; asserts the v6 probe path completes (timeout/reply/ICMP error all valid).
-
-
-**IPv6 `trace()`, `traceClassified()`, and `traceStream()` over ICMPv6 (Stage 2 of v6 parity)**
-- Dual-stack `Traceroute.swift`: `SwiftFTR.trace()`, `traceClassified()`, and `traceStream()` now accept IPv6 literals and IPv6-resolving hostnames using the same entry points as v4. Family auto-detected from the resolved address; opt-in `SwiftFTRConfig.preferredFamily` forces a specific family (additive, default `.auto`).
-- ICMPv6 path: `socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)`, `IPV6_UNICAST_HOPS` cycling per probe (replaces v4's `IP_TTL`), `IPV6_RECVHOPLIMIT` cmsg so hop limit arrives via `recvmsg`. Embedded-packet parsing in Time Exceeded / Destination Unreachable uses the existing `parseICMPv6Message` (added Stage 1).
-- `interface: "en0"` binds v6 trace sockets via `IPV6_BOUND_IF`; source-IP binding honors link-local `%zone` suffixes via `parseIPv6Scoped`.
-- Empirically validated end-to-end against Cloudflare WARP v6 connectivity: real intermediate routers deliver Time Exceeded (Spike B), `parseICMPv6Message` correctly recovers embedded original identifier/sequence from real packets.
-- File-scope helpers `createTraceSocket(family:)`, `setTraceHopLimit(...)`, `bindTraceInterface(...)`, `bindTraceSourceIP(...)`, `sendTraceProbe(...)`, `recvTraceMessage(...)` centralize family branching so all three entry points and both receive operations share the same dual-stack code.
-
-**v6 ASN labels via `swift-ip2asn` 0.4.0 (folded into Stage 2; was originally planned as Stage 6)**
-- Bumped `swift-ip2asn` floor from `0.3.1` to `0.4.0` — adds dual-stack `UltraCompactDatabase.lookup(_ ipString:)` that transparently dispatches v4 vs v6.
-- `CymruDNSResolver.resolve` now does v6 ASN lookups against `origin6.asn.cymru.com` using the IPv6 nibble-reverse form (new `reverseIPv6Nibbles` helper in `Utils.swift`). The default `.dns` strategy now annotates v6 hops with `[AS… - ASNAME]` exactly like v4. Verified end-to-end: `swift-ftr 2001:4860:4860::8888` returns AS13335 → AS15169 trace through Cloudflare to Google.
-- `LocalASNResolver` works transparently for v6 because the 0.4.0 lookup API accepts both families (no code change needed beyond the dep bump).
-
-**Shared dual-stack resolver in `Hostname.swift`**
-- `resolveHost(host:prefer:) -> ResolvedHost` moved from `Ping.swift` into its own file at file scope so `Traceroute.swift` shares it. Smallest possible extraction; full Stage-5 resolver consolidation across `TCPProbe.swift` / `UDPProbe.swift` is still pending.
-- `ResolvedHost` made `public` so it can flow through trace operation classes.
-
-**New diagnostics**
-- `Tests/TestSupport/ip2asnv6probe/` (Spike A): standalone executable confirming `UltraCompactDatabase.lookup` returns expected ASNs for Cloudflare, Google, Quad9 v6 anycast addresses, and nil for loopback/link-local/unallocated. Run with `swift run ip2asnv6probe`.
-- `Tests/TestSupport/traceroute6probe/` (Spike B): standalone executable doing manual hop-limit cycling against any v6 target; uses the library's `@_spi(Test) __parseV6PingMessage` to exercise the real parser on real wire data. Run with `swift run traceroute6probe <ipv6-addr>`.
-
-**Tests**
-- New `LocalASNResolverTests.testEmbeddedDatabaseIPv6Lookup`: asserts Cloudflare and Google v6 anycast addresses resolve to AS13335 and AS15169 via the bundled DB.
-- `StressTests.testIPv6Rejection` → `testIPv6TraceSucceeds`: now asserts v6 trace works when v6 reachability is available; skips cleanly otherwise.
-- All 161 existing tests pass with `PTR_SKIP_STUN=1 SKIP_NETWORK_TESTS=1 swift test`.
-
-**Notes**
-- `VPNContext.vpnLocalIPs` extension to include v6 addresses of detected VPN interfaces is deferred to a follow-up — currently `vpnLocalIPs` is empty regardless of family (pre-existing state). v6 trace correctness does not depend on it; the classifier handles v6 hops via ASN-based segmentation.
-
-**IPv6 `ping()` over ICMPv6 (Stage 1 of full v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
-- `SwiftFTR.ping(to:)` now accepts IPv6 literals and IPv6-resolving hostnames. Same entry point as v4; family is auto-detected from the resolved address. `tracer.ping(to: "2606:4700:4700::1111")` and `tracer.ping(to: "1.1.1.1")` both go through the existing `ping(to:config:)` API.
-- New `public enum PreferredFamily { case v4, v6, auto }` and `PingConfig.preferredFamily: PreferredFamily = .auto` (additive — existing callers unaffected). Use `.v4` / `.v6` to force a family; `.auto` (default) takes the literal's family for IP literals and the first `getaddrinfo(AF_UNSPEC)` answer for hostnames.
-- ICMPv6 codec (`makeICMPv6EchoRequest`, `parseICMPv6Message`) in `ICMP.swift`. Mirrors the IPv4 codec but lets the kernel compute the checksum (which requires the IPv6 pseudo-header).
-- `AF_INET6 / SOCK_DGRAM / IPPROTO_ICMPV6` socket creation with `IPV6_UNICAST_HOPS` (outbound) and `IPV6_RECVHOPLIMIT` (so replies carry the hop limit in cmsg ancillary data). No root or special entitlements required — same model as v4.
-- `interface: "en0"` binds v6 sockets via `IPV6_BOUND_IF` (mirrors v4's `IP_BOUND_IF`). Source-IP binding via `parseIPv6Scoped` preserves link-local `%zone` suffixes.
-- `PingResponse.ttl` carries the IPv6 hop limit for v6 replies (same field, same units 1–255). Documented dual meaning; no new `hopLimit` field added.
-- Every emitted address is in `inet_ntop` canonical form so `String → resolve → String` is stable (e.g. `2606:4700:0000:...:1111` round-trips to `2606:4700::1111`). Link-local hops keep `%<ifname>` zone suffix via `if_indextoname` (downstream consumers use these strings as dictionary keys; consistency matters).
-- New executable `icmpv6probe` (under `Tests/TestSupport/icmpv6probe/`) — diagnostic that empirically validates Darwin's SOCK_DGRAM ICMPv6 behavior; runnable via `swift run icmpv6probe <target>`. Used during development to confirm: kernel strips IPv6 header, identifier is preserved end-to-end, hop limit arrives via cmsg.
-- New tests: 4 unit cases for the v6 parser (synthetic buffers, always run); network-gated integration test (`testIPv6PingReachable`) cross-checks against `/sbin/ping6` and fails closed when the cross-check is unavailable; `PreferredFamily.v4`/`.v6` rejection tests for cross-family literals.
-- New `IPv6Reachability` helper (`Tests/SwiftFTRTests/IPv6Reachability.swift`) gates network-gated v6 tests on actual routable v6 connectivity — skips cleanly on v4-only CI runners (GitHub-hosted macOS runners notably lack public v6). `SKIP_IPV6_TESTS=1` and `FORCE_IPV6_TESTS=1` env-var overrides.
+- `swift-ip2asn` floor bumped from `0.3.1` to `0.4.0` — adds dual-stack `UltraCompactDatabase.lookup` accepting both v4 and v6 strings transparently.
 
 ### Documentation
-- `docs/IPV6.md`: forward-looking plan for full v6 parity across `trace`, `TCP/UDP probes`, `STUN`, and `swift-ip2asn` 0.4.0 ASN labels; architectural contracts (canonical form, link-local scope, single dest-string entry, family-agnostic errors); environment variables; CI/CD considerations; known limitations (NAT64 transparency, happy-eyeballs deferred).
-- Stress-test rename: `testIPv6Rejection` → `testIPv6TraceStillUnsupported` (only trace is still v4-only; ping v6 is implemented).
+
+- New [`docs/IPV6.md`](docs/IPV6.md) — architectural contracts (canonical form, link-local scope, single dest-string entry, family-agnostic errors), CI/CD considerations, env vars (`SKIP_NETWORK_TESTS`, `SKIP_IPV6_TESTS`, `FORCE_IPV6_TESTS`), known limitations.
+- `README.md` updated for dual-stack support and the new public API.
+
+### Testing
+
+- `IPv6Reachability` helper gates network-gated v6 tests on actual routable v6 connectivity — skips cleanly on v4-only CI runners. GitHub-hosted macOS runners notably lack public v6, so the v6 integration tests skip there.
+- All **168** unit tests pass with `PTR_SKIP_STUN=1 SKIP_NETWORK_TESTS=1 swift test`.
 
 
 0.12.4 — 2026-05-27

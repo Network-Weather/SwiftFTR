@@ -76,7 +76,7 @@ extension SwiftFTRCommand {
       name: [.short, .customLong("timeout")], help: "Overall wait after sending probes (seconds)")
     var timeout: Double = 1.0
 
-    @Argument(help: "Destination hostname or IPv4 address")
+    @Argument(help: "Destination hostname or IPv4/IPv6 address")
     var host: String
 
     mutating func run() async throws {
@@ -335,7 +335,7 @@ extension SwiftFTRCommand {
     @Flag(name: .customLong("verbose"), help: "Enable verbose logging")
     var verbose: Bool = false
 
-    @Argument(help: "Destination hostname or IPv4 address")
+    @Argument(help: "Destination hostname or IPv4/IPv6 address")
     var host: String
 
     func run() async throws {
@@ -1013,7 +1013,7 @@ extension SwiftFTRCommand {
     @Flag(name: .customLong("verbose"), help: "Enable verbose logging")
     var verbose: Bool = false
 
-    @Argument(help: "Destination hostname or IPv4 address")
+    @Argument(help: "Destination hostname or IPv4/IPv6 address")
     var target: String
 
     func run() async throws {
