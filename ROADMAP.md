@@ -5,7 +5,7 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 ## Priority Queue
 
 ### IPv6 feature parity
-Extend dual-stack support across traceroute, TCP/UDP probes, STUN, and ASN classification. Sequenced plan, architectural contracts, and CI considerations in [`docs/IPV6.md`](docs/IPV6.md).
+Extend dual-stack support across TCP/UDP probes, STUN, and dual-stack public-IP discovery. Sequenced plan, architectural contracts, and CI considerations in [`docs/IPV6.md`](docs/IPV6.md).
 
 ### Enterprise Proxy & VPN Telemetry
 **Goal**: Measure performance in locked-down corporate environments where direct internet access is blocked.
