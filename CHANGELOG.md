@@ -16,6 +16,16 @@ Pre-existing bug: `VPNContext.vpnLocalIPs: Set<String>` has been declared since 
 - New `testVPNContextPopulatesLocalIPs` asserts the discovery returns valid v4/v6 strings and that calls with different VPN-shaped interface names yield the same set (since we walk every VPN interface on the host).
 - All 168 unit tests pass.
 
+### Tooling
+
+**ICMPv6 parser fuzzer (`icmpv6fuzz`)**
+
+Defense-in-depth fuzzer for the v6 parsers added across Stages 1–2. Mirrors the existing `icmpfuzz` target — feeds random buffers (sized 0..4096 bytes) and random `sockaddr_storage` shapes to both `parseICMPv6Message` (via `@_spi(Fuzz) __fuzz_parseICMPv6`) and `swiftftrParseV6PingMessage` (via `@_spi(Test) __parseV6PingMessage`).
+
+- Every ~16 iterations the fuzzer plants a random expected identifier at the canonical offsets in the buffer (bytes 4–5 for the outer ICMPv6 header, bytes 8+40+4..5 for the embedded ICMPv6 header inside a Time Exceeded message) so the post-identifier-match code paths get exercised, not just the identifier-mismatch reject.
+- 500,000 iterations with no crashes confirmed; default `ITER=50000` completes in <1s on M-series.
+- Run with: `ITER=500000 swift run -c release icmpv6fuzz`.
+
 ### Refactor
 
 **Resolver and bind-helper consolidation (Stage 5 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
