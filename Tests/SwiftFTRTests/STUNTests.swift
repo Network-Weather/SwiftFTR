@@ -360,4 +360,62 @@ struct STUNTests {
     #expect(stunParts[0] != 10, "STUN IP should be public, not 10.x.x.x")
     #expect(dnsParts[0] != 10, "DNS IP should be public, not 10.x.x.x")
   }
+
+  // MARK: - IPv6 STUN (Stage 4)
+
+  /// `STUNPublicIP` carries the family alongside the IP string.
+  @Test("STUNPublicIP carries family tag")
+  func testSTUNPublicIPCarriesFamily() {
+    let v4 = STUNPublicIP(ip: "203.0.113.45", family: AF_INET)
+    let v6 = STUNPublicIP(ip: "2001:db8::1", family: AF_INET6)
+    #expect(v4.family == AF_INET)
+    #expect(v6.family == AF_INET6)
+  }
+
+  /// `PublicIPs.any` prefers v6 when both are present.
+  @Test("PublicIPs.any returns v6 when both present, v4 otherwise")
+  func testPublicIPsAny() {
+    #expect(PublicIPs(v4: "203.0.113.5", v6: "2001:db8::1").any == "2001:db8::1")
+    #expect(PublicIPs(v4: "203.0.113.5", v6: nil).any == "203.0.113.5")
+    #expect(PublicIPs(v4: nil, v6: "2001:db8::1").any == "2001:db8::1")
+    #expect(PublicIPs(v4: nil, v6: nil).any == nil)
+  }
+
+  /// IPv6 STUN against Cloudflare. Gated on network + v6 reachability so it
+  /// skips cleanly on v4-only CI runners.
+  @Test(
+    "IPv6 STUN returns valid public v6 IP (Cloudflare)",
+    .enabled(
+      if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil
+        && !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")
+        && IPv6Reachability.isAvailable()))
+  func testSTUNv6Cloudflare() throws {
+    let result = try stunGetPublicIPv6(host: "stun.cloudflare.com", port: 3478, timeout: 2.0)
+    #expect(result.family == AF_INET6, "v6 STUN should return AF_INET6")
+    #expect(result.ip.contains(":"), "v6 address should contain colons (\(result.ip))")
+    // Sanity: v6 should not be link-local or loopback.
+    #expect(!result.ip.hasPrefix("fe80"), "should be GUA, not link-local")
+    #expect(result.ip != "::1", "should not be loopback")
+  }
+
+  /// Dual-stack discovery returns whichever families succeeded. On a dual-stack
+  /// host both should be present; never throws (failures show up as nil fields).
+  @Test(
+    "getPublicIPs returns both families on a dual-stack host",
+    .enabled(
+      if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil
+        && !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")
+        && IPv6Reachability.isAvailable()))
+  func testGetPublicIPsDualStack() async {
+    let ips = await getPublicIPs(stunTimeout: 2.0)
+    #expect(ips.v4 != nil, "v4 STUN should succeed on a dual-stack host")
+    #expect(ips.v6 != nil, "v6 STUN should succeed on a dual-stack host")
+    if let v4 = ips.v4 {
+      let parts = v4.split(separator: ".").compactMap { Int($0) }
+      #expect(parts.count == 4, "v4 IP should be dotted-quad")
+    }
+    if let v6 = ips.v6 {
+      #expect(v6.contains(":"), "v6 IP should contain colons")
+    }
+  }
 }

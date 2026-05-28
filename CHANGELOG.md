@@ -7,6 +7,24 @@ Unreleased (0.13.0-dev)
 -----------------------
 ### Features
 
+**IPv6 STUN + dual-stack public-IP discovery (Stage 4 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
+- `STUN.swift` is now dual-stack. New `stunGetPublicIP(family:host:port:...)` core builds the binding request, sends it, and parses the XOR-MAPPED-ADDRESS attribute for both v4 (Family `0x01`) and v6 (Family `0x02`) per RFC 5389 §15.2. The v6 parser correctly un-XORs bytes 4..15 of the address against the request's 12-byte transaction ID.
+- `STUNPublicIP` gains a `family: Int32` field (defaults to `AF_INET` for back-compat) so callers can tell v4 and v6 results apart without parsing the string.
+- New public `PublicIPs { v4: String?, v6: String? }` struct plus a convenience `any: String?` that prefers v6 when both are present.
+- New `public func getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:) async -> PublicIPs` runs v4 and v6 STUN sweeps in parallel via `async let` and returns whichever succeeded. Never throws — failures show up as nil fields so callers don't have to branch on the common "v4-only network" and "v6-only network" cases.
+- Family-aware `IPV6_BOUND_IF` for v6 interface binding. v6 source-IP binding reuses `bindProbeSourceIP` (added Stage 3) which honors link-local `%zone` suffixes.
+- `sourceIP` passed to `getPublicIPs` is auto-routed to the matching family's sweep only — a v6 source-IP doesn't try to bind a v4 socket and vice versa.
+- Back-compat shims: `stunGetPublicIPv4`, `stunGetPublicIPv4WithFallback`, and `getPublicIPv4` keep their pre-Stage-4 signatures; new `stunGetPublicIPv6` / `stunGetPublicIPv6WithFallback` companions added for callers that want a single-family v6 result.
+
+**Verified end-to-end** against Cloudflare WARP: `stunGetPublicIPv6(host: "stun.cloudflare.com", port: 3478)` returns the host's GUA v6 address; `getPublicIPs()` returns both families populated.
+
+**Tests**
+- `testSTUNPublicIPCarriesFamily`: pure-unit, asserts the new family field round-trips.
+- `testPublicIPsAny`: pure-unit, asserts the v6-preferred convenience accessor.
+- `testSTUNv6Cloudflare`: network + v6-reachability gated; asserts `stunGetPublicIPv6` returns a non-link-local GUA.
+- `testGetPublicIPsDualStack`: same gating; asserts both `v4` and `v6` fields are populated on a dual-stack host.
+
+
 **IPv6 TCP & UDP probes (Stage 3 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
 - `tcpProbe(...)` and `udpProbe(...)` now accept IPv6 literals and IPv6-resolving hostnames using the same entry points as v4. Family auto-detected from the resolved address; opt-in `TCPProbeConfig.preferredFamily` / `UDPProbeConfig.preferredFamily` forces a specific family (additive, default `.auto`).
 - Family-aware sockets (`socket(family, SOCK_STREAM, 0)` / `socket(family, SOCK_DGRAM, IPPROTO_UDP)`), `sockaddr_in6` `connect()` paths, `IPV6_BOUND_IF` for v6 interface binding, link-local `%zone` suffixes preserved in v6 source-IP binding.
