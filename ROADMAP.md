@@ -5,7 +5,7 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 ## Priority Queue
 
 ### IPv6 hardening
-Remaining v6 follow-ups: NAT64 transparency, happy-eyeballs racing, v6-capable CI runner, v6 parser fuzzing, `VPNContext.vpnLocalIPs` population. Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).
+Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner. Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).
 
 ### Enterprise Proxy & VPN Telemetry
 **Goal**: Measure performance in locked-down corporate environments where direct internet access is blocked.
