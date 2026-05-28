@@ -65,16 +65,19 @@ final class LocalASNResolverTests: XCTestCase {
     await resolver.preload()
     let preloadTime = Date().timeIntervalSince(preloadStart)
 
-    // Preload should take ~35-50ms (database load)
-    XCTAssertLessThan(preloadTime, 0.5, "Preload should complete in <500ms")
+    // Preload typically takes ~35-50ms on a developer machine, but GitHub-hosted
+    // macOS runners are routinely slower (observed 0.9s under load). Use a
+    // generous ceiling that catches outright regressions without flaking on
+    // shared CI runners; the actual perf budget is enforced by ResourceBenchmark.
+    XCTAssertLessThan(preloadTime, 2.0, "Preload should complete in <2s")
 
     // Subsequent lookup should be fast (no load delay)
     let lookupStart = Date()
     _ = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
     let lookupTime = Date().timeIntervalSince(lookupStart)
 
-    // Lookup should be < 10ms (microseconds for actual lookup + overhead)
-    XCTAssertLessThan(lookupTime, 0.01, "Post-preload lookup should be <10ms")
+    // Lookup should be < 50ms under CI load (microseconds for actual lookup + scheduling overhead).
+    XCTAssertLessThan(lookupTime, 0.05, "Post-preload lookup should be <50ms")
   }
 
   // MARK: - IP Filtering Tests

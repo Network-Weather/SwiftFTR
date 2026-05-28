@@ -105,4 +105,126 @@ final class SwiftFTRPingParserTests: XCTestCase {
     }
     XCTAssertNil(parsed, "reply with wrong identifier must be filtered")
   }
+
+  // MARK: - ICMPv6 (RFC 4443) parser
+
+  /// ICMPv6 Echo Reply: kernel strips the IPv6 header on SOCK_DGRAM IPPROTO_ICMPV6,
+  /// so the buffer arrives starting with the ICMPv6 type byte. Hop limit is
+  /// delivered out-of-band via cmsg and passed to the parser as `hopLimit:`.
+  func testV6EchoReplyParsesIdentifierSequenceAndHopLimit() {
+    let identifier: UInt16 = 0xABCD
+    let sequence: UInt16 = 0x002A
+    let hopLimit = 57
+
+    // 8-byte ICMPv6 echo reply + 8-byte payload (no IPv6 header — kernel-stripped).
+    var pkt = [UInt8](repeating: 0, count: 8 + 8)
+    pkt[0] = 129  // ICMPv6 EchoReply
+    pkt[1] = 0  // code
+    pkt[4] = UInt8(identifier >> 8)
+    pkt[5] = UInt8(identifier & 0xFF)
+    pkt[6] = UInt8(sequence >> 8)
+    pkt[7] = UInt8(sequence & 0xFF)
+    for i in 0..<8 { pkt[8 + i] = 0x61 + UInt8(i) }
+
+    let parsed = pkt.withUnsafeBytes { raw -> TestParsedPingMessage? in
+      __parseV6PingMessage(
+        buffer: raw, hopLimit: hopLimit, expectedIdentifier: identifier)
+    }
+    guard let parsed = parsed else {
+      XCTFail("parser returned nil")
+      return
+    }
+    switch parsed {
+    case .echoReply(let seq, let ttl):
+      XCTAssertEqual(seq, sequence)
+      XCTAssertEqual(ttl, hopLimit, "hop limit must be the cmsg value, not parsed from buffer")
+    default:
+      XCTFail("expected echoReply, got \(parsed)")
+    }
+  }
+
+  /// Hop limit cmsg may be absent (e.g. `IPV6_RECVHOPLIMIT` setsockopt failed).
+  /// In that case `ttl` is nil — same semantics as v4 with no IP header.
+  func testV6EchoReplyNilHopLimitWhenAbsent() {
+    let identifier: UInt16 = 0x1234
+    let sequence: UInt16 = 0x0001
+    var pkt = [UInt8](repeating: 0, count: 8)
+    pkt[0] = 129
+    pkt[4] = 0x12
+    pkt[5] = 0x34
+    pkt[6] = 0x00
+    pkt[7] = 0x01
+
+    let parsed = pkt.withUnsafeBytes { raw -> TestParsedPingMessage? in
+      __parseV6PingMessage(buffer: raw, hopLimit: nil, expectedIdentifier: identifier)
+    }
+    guard let parsed = parsed else {
+      XCTFail("parser returned nil")
+      return
+    }
+    switch parsed {
+    case .echoReply(let seq, let ttl):
+      XCTAssertEqual(seq, sequence)
+      XCTAssertNil(ttl)
+    default:
+      XCTFail("expected echoReply, got \(parsed)")
+    }
+  }
+
+  /// ICMPv6 identifier mismatch — filter out replies that don't belong to this socket.
+  func testV6EchoReplyIdentifierMismatchRejected() {
+    var pkt = [UInt8](repeating: 0, count: 8)
+    pkt[0] = 129
+    pkt[4] = 0xDE
+    pkt[5] = 0xAD
+    pkt[6] = 0x00
+    pkt[7] = 0x01
+
+    let parsed = pkt.withUnsafeBytes { raw -> TestParsedPingMessage? in
+      __parseV6PingMessage(buffer: raw, hopLimit: 64, expectedIdentifier: 0xBEEF)
+    }
+    XCTAssertNil(parsed, "reply with wrong identifier must be filtered")
+  }
+
+  /// ICMPv6 Time Exceeded with embedded IPv6 + Echo Request — verifies the parser
+  /// walks past the fixed 40-byte v6 header (no IHL field, unlike v4) and recovers
+  /// the original identifier+sequence so traceroute v6 (future stage) can correlate.
+  func testV6TimeExceededRecoversOriginalIdentifierAndSequence() {
+    let originalID: UInt16 = 0xCAFE
+    let originalSeq: UInt16 = 0x000F
+
+    // Outer ICMPv6 TimeExceeded (8 bytes) + embedded IPv6 (40 bytes) + embedded
+    // ICMPv6 EchoRequest (8 bytes).
+    var pkt = [UInt8](repeating: 0, count: 8 + 40 + 8)
+    pkt[0] = 3  // ICMPv6 TimeExceeded
+    pkt[1] = 0  // code = hop limit exceeded in transit
+
+    // Embedded IPv6 header at offset 8: version=6 in top nibble of byte 0.
+    pkt[8] = 0x60  // version=6, no traffic class
+    pkt[8 + 6] = 58  // next header = ICMPv6
+    // Source and destination addresses (bytes 8+8..8+39) left zero — parser doesn't inspect.
+
+    // Embedded ICMPv6 EchoRequest at offset 8 + 40 = 48.
+    let inner = 48
+    pkt[inner + 0] = 128  // EchoRequest
+    pkt[inner + 4] = UInt8(originalID >> 8)
+    pkt[inner + 5] = UInt8(originalID & 0xFF)
+    pkt[inner + 6] = UInt8(originalSeq >> 8)
+    pkt[inner + 7] = UInt8(originalSeq & 0xFF)
+
+    let parsed = pkt.withUnsafeBytes { raw -> TestParsedPingMessage? in
+      __parseV6PingMessage(buffer: raw, hopLimit: 0, expectedIdentifier: originalID)
+    }
+    guard let parsed = parsed else {
+      XCTFail("parser returned nil")
+      return
+    }
+    switch parsed {
+    case .timeExceeded(let seq, _, let code):
+      XCTAssertEqual(seq, originalSeq)
+      XCTAssertEqual(code, 0)
+    default:
+      XCTFail("expected timeExceeded, got \(parsed)")
+    }
+  }
 }

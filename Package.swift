@@ -66,7 +66,13 @@ let package = Package(
         .executableTarget(
             name: "ResourceBenchmark",
             dependencies: ["SwiftFTR"],
-            path: "Tests/TestSupport"
+            path: "Tests/TestSupport",
+            exclude: ["icmpv6probe"]
+        ),
+        .executableTarget(
+            name: "icmpv6probe",
+            dependencies: ["SwiftFTR"],
+            path: "Tests/TestSupport/icmpv6probe"
         )
     ],
     // Swift 6 language mode with strict concurrency checking

@@ -381,6 +381,7 @@ Fuzzing
 Documentation
 -------------
 - DocC bundle at `Sources/SwiftFTR/SwiftFTR.docc`.
+- [`docs/IPV6.md`](docs/IPV6.md) — sequenced plan and architectural contracts for IPv6 feature parity (ping, traceroute, probes, STUN, ASN).
 
 Generate and view the docs:
 

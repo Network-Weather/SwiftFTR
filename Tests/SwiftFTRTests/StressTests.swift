@@ -104,19 +104,18 @@ final class StressAndEdgeCaseTests: XCTestCase {
     }
   }
 
-  func testIPv6Rejection() async throws {
+  /// Traceroute v6 is still unimplemented at the time of this test — only `ping()`
+  /// gained IPv6 support in Stage 1. This asserts the trace path still throws.
+  /// Removed in the Stage-2 trace-v6 PR.
+  func testIPv6TraceStillUnsupported() async throws {
     let config = SwiftFTRConfig()
     let tracer = SwiftFTR(config: config)
-
-    // Currently only IPv4 is supported
     do {
       _ = try await tracer.trace(to: "2001:4860:4860::8888")
-      XCTFail("Should reject IPv6")
-    } catch TracerouteError.resolutionFailed(_, let details) {
-      // Should fail because IPv6 is not supported
-      XCTAssertNotNil(details)
+      XCTFail("Stage-1 trace should still reject IPv6 (only ping v6 implemented)")
     } catch {
-      // Any error is acceptable for unsupported IPv6
+      // Any thrown error is acceptable here — different code paths produce
+      // different specific errors (resolutionFailed, sendFailed, etc.).
       XCTAssertTrue(true)
     }
   }

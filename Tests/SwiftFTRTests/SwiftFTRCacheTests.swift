@@ -1,4 +1,5 @@
 import XCTest
+
 @_spi(Testing) @testable import SwiftFTR
 
 final class SwiftFTRCacheTests: XCTestCase {

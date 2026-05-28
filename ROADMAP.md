@@ -4,11 +4,8 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 
 ## Priority Queue
 
-### IPv6 Traceroute (ICMPv6)
-**Goal**: Full feature parity for IPv6 networks.
-- **Remaining work**: ICMPv6 Echo Request/Reply, IPv6 traceroute with `IPV6_UNICAST_HOPS`, IPv6 STUN, IPv6 host-resolution path in `ping()` / `trace()` / probes (currently `AF_INET`-only).
-- **Challenges**: Different socket options (`IPPROTO_ICMPV6`, `IPV6_UNICAST_HOPS`) and header structures compared to IPv4.
-- **ASN data**: Bump `swift-ip2asn` floor to 0.4.0 ([release notes](https://github.com/Network-Weather/swift-ip2asn/releases/tag/v0.4.0)) — adds dual-stack `UltraCompactDatabase.lookup` (IPv4 + IPv6 binary search), bundled DB grows from ~3.5 MB to ~4 MB (~565K ranges, +119K IPv6). Ship the bump in the same release as the first IPv6 trace surface, so IPv6 ASN labels light up together with v6 hops — bumping standalone is pure carrying cost (~600 KB of dormant data).
+### IPv6 feature parity
+Match the existing IPv4 surface across ping, traceroute, probes, STUN, and ASN classification. Sequenced plan, architectural contracts (canonical address form, link-local scope handling, `PreferredFamily`, interface binding), and CI considerations in [`docs/IPV6.md`](docs/IPV6.md).
 
 ### Enterprise Proxy & VPN Telemetry
 **Goal**: Measure performance in locked-down corporate environments where direct internet access is blocked.
