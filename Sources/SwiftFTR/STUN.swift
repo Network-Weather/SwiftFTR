@@ -4,13 +4,43 @@ import Foundation
   import Darwin
 #endif
 
-/// Public IPv4 discovered via a STUN Binding request.
+/// Public IP discovered via a STUN Binding request. The `ip` string is in
+/// canonical `inet_ntop` form for v4 (`x.x.x.x`) or v6 (`fc00::1`).
 public struct STUNPublicIP: Sendable {
   public let ip: String
+  /// Address family of the discovered IP. `AF_INET` (2) or `AF_INET6` (30 on Darwin).
+  /// Added for Stage-4 dual-stack discovery; older callers can ignore it.
+  public let family: Int32
+
+  public init(ip: String, family: Int32 = AF_INET) {
+    self.ip = ip
+    self.family = family
+  }
 }
 
-/// Well-known public STUN servers for fallback
-/// Uses multiple providers and ports for resilience
+/// Public IPs discovered across both v4 and v6 in a single sweep. Either field
+/// may be nil if that family's STUN/DNS path didn't succeed. NWX-style downstream
+/// consumers can render both alongside each other (e.g. a status row showing
+/// "v4: 203.0.113.5 / v6: 2001:db8::1").
+public struct PublicIPs: Sendable {
+  public let v4: String?
+  public let v6: String?
+
+  public init(v4: String? = nil, v6: String? = nil) {
+    self.v4 = v4
+    self.v6 = v6
+  }
+
+  /// Convenience: any non-nil IP, preferring v6 if both are present. Useful for
+  /// callers that just want "what IP is the world likely to see me as" and
+  /// don't need the family-specific breakdown.
+  public var any: String? { v6 ?? v4 }
+}
+
+/// Well-known public STUN servers for fallback.
+/// Uses multiple providers and ports for resilience. Cloudflare and Google's
+/// STUN servers resolve to both v4 and v6 records; the family preference passed
+/// to the resolver determines which is used.
 let stunServers: [(host: String, port: UInt16)] = [
   ("stun.l.google.com", 19302),  // Google (port 19302)
   ("stun1.l.google.com", 19302),  // Google backup (port 19302)
@@ -55,124 +85,96 @@ enum STUNError: Error, CustomStringConvertible {
   }
 }
 
-// Minimal STUN RFC 5389 Binding request to obtain public IP address via XOR-MAPPED-ADDRESS.
-func stunGetPublicIPv4(
-  host: String = "stun.l.google.com", port: UInt16 = 19302, timeout: TimeInterval = 1.0,
-  interface: String? = nil, sourceIP: String? = nil, enableLogging: Bool = false
+/// Family-parameterized STUN core. Builds the binding request, sends it, and
+/// parses the XOR-MAPPED-ADDRESS attribute. Supports both AF_INET and AF_INET6.
+///
+/// Pass `family: AF_INET6` to discover the v6 public IP; the resolver, socket,
+/// and bind paths all dispatch on family. The XOR-MAPPED-ADDRESS parser handles
+/// both v4 (Family 0x01) and v6 (Family 0x02) per RFC 5389 §15.2.
+internal func stunGetPublicIP(
+  family: Int32,
+  host: String,
+  port: UInt16,
+  timeout: TimeInterval = 1.0,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
 ) throws -> STUNPublicIP {
-  // Resolve server
   var hints = addrinfo(
-    ai_flags: AI_ADDRCONFIG, ai_family: AF_INET, ai_socktype: SOCK_DGRAM, ai_protocol: IPPROTO_UDP,
-    ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+    ai_flags: AI_ADDRCONFIG, ai_family: family, ai_socktype: SOCK_DGRAM,
+    ai_protocol: IPPROTO_UDP, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
   var res: UnsafeMutablePointer<addrinfo>? = nil
   let resolveResult = getaddrinfo(host, String(port), &hints, &res)
   guard resolveResult == 0, let info = res, let sa = info.pointee.ai_addr else {
     let error = errno
+    let famName = family == AF_INET6 ? "v6" : "v4"
     throw STUNError.resolveFailed(
       errno: error,
-      details: "Failed to resolve STUN server '\(host):\(port)'"
-    )
+      details: "Failed to resolve STUN server '\(host):\(port)' (\(famName))")
   }
   defer { freeaddrinfo(info) }
-  var server = sockaddr_in()
-  memcpy(&server, sa, min(MemoryLayout<sockaddr_in>.size, Int(info.pointee.ai_addrlen)))
 
-  let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+  // Copy the resolved sockaddr into sockaddr_storage so we can sendto from a
+  // single family-agnostic value.
+  var server = sockaddr_storage()
+  let serverLen = socklen_t(min(MemoryLayout<sockaddr_storage>.size, Int(info.pointee.ai_addrlen)))
+  withUnsafeMutablePointer(to: &server) { dst in
+    memcpy(dst, sa, Int(serverLen))
+  }
+
+  let fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
   if fd < 0 {
     let error = errno
     throw STUNError.socketFailed(
       errno: error,
-      details: "Unable to create UDP socket for STUN. May indicate system resource limits."
-    )
+      details: "Unable to create UDP socket for STUN. May indicate system resource limits.")
   }
   defer { close(fd) }
 
-  // Bind to specific interface if requested
   if let interfaceName = interface {
     if enableLogging {
       print("[STUN] Binding socket to interface '\(interfaceName)'...")
     }
-
     #if os(macOS)
       let ifIndex = if_nametoindex(interfaceName)
       if ifIndex == 0 {
         let error = errno
-        let details =
-          "Interface '\(interfaceName)' not found for STUN. Common causes: (1) Interface doesn't exist, (2) Interface is down, (3) Typo in interface name. Use 'ifconfig' to list available interfaces."
-        if enableLogging {
-          print("[STUN] ERROR: \(details)")
-        }
+        let details = "Interface '\(interfaceName)' not found for STUN."
+        if enableLogging { print("[STUN] ERROR: \(details)") }
         throw STUNError.interfaceBindFailed(
           interface: interfaceName, errno: error, details: details)
       }
-
       var index = ifIndex
-      if setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout<UInt32>.size)) != 0
-      {
+      // IP_BOUND_IF for v4, IPV6_BOUND_IF for v6.
+      let level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
+      let opt = family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
+      if setsockopt(fd, level, opt, &index, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
         let error = errno
-        let details =
-          "Failed to bind STUN socket to interface index \(ifIndex). This may indicate: (1) Insufficient permissions, (2) Interface is not available for UDP binding, (3) Interface doesn't support the operation."
-        if enableLogging {
-          print("[STUN] ERROR: \(details)")
-        }
+        let details = "Failed to bind STUN socket to interface index \(ifIndex)."
+        if enableLogging { print("[STUN] ERROR: \(details)") }
         throw STUNError.interfaceBindFailed(
           interface: interfaceName, errno: error, details: details)
       }
-
       if enableLogging {
-        print("[STUN] Successfully bound to interface '\(interfaceName)' (index: \(ifIndex))")
+        print("[STUN] Bound to interface '\(interfaceName)' (index: \(ifIndex))")
       }
     #else
-      let error = ENOTSUP
-      let details =
-        "Interface binding for STUN is currently only supported on macOS. Linux support requires SO_BINDTODEVICE."
-      if enableLogging {
-        print("[STUN] ERROR: \(details)")
-      }
-      throw STUNError.interfaceBindFailed(interface: interfaceName, errno: error, details: details)
+      throw STUNError.interfaceBindFailed(
+        interface: interfaceName, errno: ENOTSUP,
+        details: "Interface binding for STUN currently only supported on macOS.")
     #endif
   }
 
-  // Bind to specific source IP if requested
   if let srcIP = sourceIP {
     if enableLogging {
       print("[STUN] Binding socket to source IP '\(srcIP)'...")
     }
-
-    var sourceAddr = sockaddr_in()
-    sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    sourceAddr.sin_family = sa_family_t(AF_INET)
-    sourceAddr.sin_port = 0  // Any port
-
-    if inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) != 1 {
-      let error = EINVAL
-      let details =
-        "Invalid source IP address format '\(srcIP)'. Must be valid IPv4 in dotted decimal notation."
-      if enableLogging {
-        print("[STUN] ERROR: \(details)")
-      }
-      throw STUNError.sourceIPBindFailed(sourceIP: srcIP, errno: error, details: details)
+    // Reuse the family-aware probe source bind helper (added Stage 3).
+    if let errMsg = bindProbeSourceIP(sockfd: fd, family: family, sourceIP: srcIP) {
+      if enableLogging { print("[STUN] ERROR: \(errMsg)") }
+      throw STUNError.sourceIPBindFailed(sourceIP: srcIP, errno: errno, details: errMsg)
     }
-
-    let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-        bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-
-    if bindResult != 0 {
-      let error = errno
-      let details =
-        "Failed to bind to source IP. Common causes: (1) IP not assigned to any interface, (2) IP on different interface than specified, (3) Permission denied."
-      if enableLogging {
-        print("[STUN] ERROR: bind() failed - errno=\(error): \(String(cString: strerror(error)))")
-      }
-      throw STUNError.sourceIPBindFailed(sourceIP: srcIP, errno: error, details: details)
-    }
-
-    if enableLogging {
-      print("[STUN] Successfully bound to source IP '\(srcIP)'")
-    }
+    if enableLogging { print("[STUN] Bound to source IP '\(srcIP)'") }
   }
 
   // Set timeouts
@@ -185,40 +187,47 @@ func stunGetPublicIPv4(
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
   }
 
-  // Build STUN Binding Request
+  // Build STUN Binding Request (RFC 5389 §6).
   var req = [UInt8](repeating: 0, count: 20)
-  // Type 0x0001, Length 0x0000
+  // Type 0x0001 (Binding Request), Length 0x0000.
   req[0] = 0x00
   req[1] = 0x01
   req[2] = 0x00
   req[3] = 0x00
-  // Magic cookie 0x2112A442
+  // Magic cookie 0x2112A442.
   req[4] = 0x21
   req[5] = 0x12
   req[6] = 0xA4
   req[7] = 0x42
-  // Transaction ID 12 random bytes
-  for i in 0..<12 { req[8 + i] = UInt8.random(in: 0...255) }
+  // Transaction ID — 12 random bytes. We keep a copy because the IPv6
+  // XOR-MAPPED-ADDRESS parse needs them to un-XOR bytes 4..15 of the address.
+  var transactionID = [UInt8](repeating: 0, count: 12)
+  for i in 0..<12 {
+    transactionID[i] = UInt8.random(in: 0...255)
+    req[8 + i] = transactionID[i]
+  }
 
+  let serverAddrLen =
+    family == AF_INET6
+    ? socklen_t(MemoryLayout<sockaddr_in6>.size)
+    : socklen_t(MemoryLayout<sockaddr_in>.size)
   let sent = req.withUnsafeBytes { raw in
     withUnsafePointer(to: &server) { aptr in
       aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-        sendto(fd, raw.baseAddress!, raw.count, 0, saptr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        sendto(fd, raw.baseAddress!, raw.count, 0, saptr, serverAddrLen)
       }
     }
   }
   if sent < 0 {
     let error = errno
     throw STUNError.sendFailed(
-      errno: error,
-      details: "Failed to send STUN request to \(host):\(port)"
-    )
+      errno: error, details: "Failed to send STUN request to \(host):\(port)")
   }
 
-  // Receive response
+  // Receive response into a family-agnostic storage.
   var buf = [UInt8](repeating: 0, count: 512)
-  var from = sockaddr_in()
-  var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_in>.size)
+  var from = sockaddr_storage()
+  var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
   let n = withUnsafeMutablePointer(to: &from) { aptr -> ssize_t in
     aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
       recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
@@ -226,7 +235,7 @@ func stunGetPublicIPv4(
   }
   if n <= 0 { throw STUNError.recvTimeout }
 
-  // Parse attributes; expect XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001)
+  // Parse XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001) per RFC 5389 §15.
   if n < 20 { throw STUNError.recvTimeout }
   let magic: UInt32 = 0x2112_A442
   var ofs = 20
@@ -235,76 +244,113 @@ func stunGetPublicIPv4(
     let alen = Int(UInt16(buf[ofs + 2]) << 8 | UInt16(buf[ofs + 3]))
     ofs += 4
     if ofs + alen > n { break }
-    if atype == 0x0020 || atype == 0x0001 {  // XOR-MAPPED-ADDRESS or MAPPED-ADDRESS
+    if atype == 0x0020 || atype == 0x0001 {
       if alen >= 8 {
-        let family = buf[ofs + 1]
-        if family == 0x01 {  // IPv4
-          var port: UInt16 = (UInt16(buf[ofs + 2]) << 8) | UInt16(buf[ofs + 3])
+        let attrFamily = buf[ofs + 1]
+        // Reserved/port handling — we don't use the port, just skip past it.
+        if attrFamily == 0x01 && alen >= 8 {
+          // IPv4 — 4 bytes of address after the 4-byte family/port header.
           var addr: UInt32 =
             (UInt32(buf[ofs + 4]) << 24) | (UInt32(buf[ofs + 5]) << 16)
             | (UInt32(buf[ofs + 6]) << 8) | UInt32(buf[ofs + 7])
-          if atype == 0x0020 {
-            // XOR with magic cookie
-            port ^= UInt16((magic >> 16) & 0xFFFF)
-            addr ^= magic
-          }
+          if atype == 0x0020 { addr ^= magic }
           let oct1 = (addr >> 24) & 0xFF
           let oct2 = (addr >> 16) & 0xFF
           let oct3 = (addr >> 8) & 0xFF
           let oct4 = addr & 0xFF
-          let ip = "\(oct1).\(oct2).\(oct3).\(oct4)"
-          _ = port  // not used currently
-          return STUNPublicIP(ip: ip)
+          return STUNPublicIP(ip: "\(oct1).\(oct2).\(oct3).\(oct4)", family: AF_INET)
+        } else if attrFamily == 0x02 && alen >= 20 {
+          // IPv6 — 16 bytes of address. For XOR-MAPPED-ADDRESS the first 4
+          // bytes XOR against the magic cookie; the remaining 12 bytes XOR
+          // against the request transaction ID (RFC 5389 §15.2).
+          var v6Bytes = [UInt8](repeating: 0, count: 16)
+          for i in 0..<16 { v6Bytes[i] = buf[ofs + 4 + i] }
+          if atype == 0x0020 {
+            v6Bytes[0] ^= UInt8((magic >> 24) & 0xFF)
+            v6Bytes[1] ^= UInt8((magic >> 16) & 0xFF)
+            v6Bytes[2] ^= UInt8((magic >> 8) & 0xFF)
+            v6Bytes[3] ^= UInt8(magic & 0xFF)
+            for i in 0..<12 { v6Bytes[4 + i] ^= transactionID[i] }
+          }
+          // Format as canonical IPv6 string via inet_ntop.
+          var in6 = in6_addr()
+          withUnsafeMutableBytes(of: &in6) { dst in
+            for i in 0..<16 { dst[i] = v6Bytes[i] }
+          }
+          var strBuf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+          _ = withUnsafePointer(to: &in6) { src in
+            inet_ntop(AF_INET6, src, &strBuf, socklen_t(INET6_ADDRSTRLEN))
+          }
+          let ip = strBuf.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+          return STUNPublicIP(ip: ip, family: AF_INET6)
         }
       }
     }
-    // attributes are padded to 4
+    // Attributes are padded to 4.
     ofs += ((alen + 3) / 4) * 4
   }
   throw STUNError.recvTimeout
 }
 
+/// Back-compat wrapper for v4-only callers. Same signature/behavior as before
+/// Stage 4; delegates to the family-parameterized `stunGetPublicIP`.
+func stunGetPublicIPv4(
+  host: String = "stun.l.google.com", port: UInt16 = 19302, timeout: TimeInterval = 1.0,
+  interface: String? = nil, sourceIP: String? = nil, enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  return try stunGetPublicIP(
+    family: AF_INET, host: host, port: port, timeout: timeout,
+    interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+}
+
+/// v6 companion to `stunGetPublicIPv4`. Forces the resolver and socket to v6.
+func stunGetPublicIPv6(
+  host: String = "stun.cloudflare.com", port: UInt16 = 3478, timeout: TimeInterval = 1.0,
+  interface: String? = nil, sourceIP: String? = nil, enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  return try stunGetPublicIP(
+    family: AF_INET6, host: host, port: port, timeout: timeout,
+    interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+}
+
 // MARK: - Multi-Server STUN Fallback
 
-/// Attempts to discover public IPv4 by trying multiple STUN servers in sequence.
-/// Falls back through the server list until one succeeds.
+/// Attempts to discover the public IP of a given family by trying multiple STUN
+/// servers in sequence. Falls back through the server list until one succeeds.
 ///
 /// - Parameters:
+///   - family: `AF_INET` for v4 or `AF_INET6` for v6.
 ///   - timeout: Timeout per server attempt (default 1.0s)
 ///   - interface: Network interface to bind to (optional)
 ///   - sourceIP: Source IP address to bind to (optional)
 ///   - enableLogging: Enable debug logging
 /// - Returns: Public IP if any server responds
 /// - Throws: STUNError.recvTimeout if all servers fail
-func stunGetPublicIPv4WithFallback(
+internal func stunGetPublicIPWithFallback(
+  family: Int32,
   timeout: TimeInterval = 1.0,
   interface: String? = nil,
   sourceIP: String? = nil,
   enableLogging: Bool = false
 ) throws -> STUNPublicIP {
   var lastError: Error = STUNError.recvTimeout
+  let famName = family == AF_INET6 ? "v6" : "v4"
 
   for (host, port) in stunServers {
     if enableLogging {
-      print("[STUN] Trying \(host):\(port)...")
+      print("[STUN] Trying \(host):\(port) (\(famName))...")
     }
-
     do {
-      let result = try stunGetPublicIPv4(
-        host: host,
-        port: port,
-        timeout: timeout,
-        interface: interface,
-        sourceIP: sourceIP,
-        enableLogging: enableLogging
-      )
+      let result = try stunGetPublicIP(
+        family: family, host: host, port: port, timeout: timeout,
+        interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
       if enableLogging {
-        print("[STUN] Success from \(host):\(port) -> \(result.ip)")
+        print("[STUN] Success from \(host):\(port) (\(famName)) -> \(result.ip)")
       }
       return result
     } catch {
       if enableLogging {
-        print("[STUN] Failed \(host):\(port): \(error)")
+        print("[STUN] Failed \(host):\(port) (\(famName)): \(error)")
       }
       lastError = error
       continue
@@ -312,6 +358,30 @@ func stunGetPublicIPv4WithFallback(
   }
 
   throw lastError
+}
+
+/// Back-compat shim — v4-only callers.
+func stunGetPublicIPv4WithFallback(
+  timeout: TimeInterval = 1.0,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  return try stunGetPublicIPWithFallback(
+    family: AF_INET, timeout: timeout,
+    interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+}
+
+/// v6 companion.
+func stunGetPublicIPv6WithFallback(
+  timeout: TimeInterval = 1.0,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  return try stunGetPublicIPWithFallback(
+    family: AF_INET6, timeout: timeout,
+    interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
 }
 
 // MARK: - DNS-Based Public IP Discovery
@@ -468,4 +538,60 @@ func getPublicIPv4(
   }
 
   throw PublicIPError.allMethodsFailed(stunError: stunErrorMsg, dnsError: dnsErrorMsg)
+}
+
+/// Discovers both v4 and v6 public IPs in parallel via STUN. Returns whatever
+/// succeeded — either or both fields of `PublicIPs` may be nil. Never throws:
+/// callers see "no IP discovered" as `PublicIPs(v4: nil, v6: nil)` rather than
+/// having to handle exceptions for the common "this network is v4-only" or
+/// "this network is v6-only" cases.
+///
+/// Each family-specific sweep walks the same STUN server list (`stunServers`)
+/// using `stunGetPublicIPWithFallback`. The DNS whoami fallback used by the
+/// older `getPublicIPv4` is NOT run here for v6 because Akamai's whoami service
+/// returns only v4. v6 discovery is STUN-only.
+///
+/// - Parameters:
+///   - stunTimeout: Per-server timeout (default 0.8s).
+///   - interface: Optional interface to bind to (applied to both families).
+///   - sourceIP: Optional source IP. If v4, only the v4 STUN sweep gets it;
+///               if v6, only the v6 sweep. (Cross-family bind would fail.)
+///   - enableLogging: Verbose logging.
+public func getPublicIPs(
+  stunTimeout: TimeInterval = 0.8,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
+) async -> PublicIPs {
+  // Detect family of sourceIP (if provided) so we only pass it to the matching sweep.
+  let sourceFamily = sourceIP.map { detectAddressFamily($0) } ?? -1
+  let v4Source = (sourceFamily == AF_INET) ? sourceIP : nil
+  let v6Source = (sourceFamily == AF_INET6) ? sourceIP : nil
+
+  async let v4Task: String? = Task {
+    do {
+      let r = try stunGetPublicIPWithFallback(
+        family: AF_INET, timeout: stunTimeout, interface: interface,
+        sourceIP: v4Source, enableLogging: enableLogging)
+      return r.ip
+    } catch {
+      if enableLogging { print("[STUN] v4 sweep failed: \(error)") }
+      return nil
+    }
+  }.value
+
+  async let v6Task: String? = Task {
+    do {
+      let r = try stunGetPublicIPWithFallback(
+        family: AF_INET6, timeout: stunTimeout, interface: interface,
+        sourceIP: v6Source, enableLogging: enableLogging)
+      return r.ip
+    } catch {
+      if enableLogging { print("[STUN] v6 sweep failed: \(error)") }
+      return nil
+    }
+  }.value
+
+  let (v4, v6) = await (v4Task, v6Task)
+  return PublicIPs(v4: v4, v6: v6)
 }

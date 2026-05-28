@@ -54,11 +54,9 @@ Now ships v6 trace, traceClassified, and traceStream via the same entry points a
 
 Dual-stack `tcpProbe(...)` and `udpProbe(...)`: same entry points work for both families, family detected at resolve time, `PreferredFamily` on both configs. `IPV6_BOUND_IF` for v6 interface binding, link-local `%zone` source-IP suffixes preserved. The shared `bindProbeSourceIP` helper in `Hostname.swift` is used by both probes. `HTTPProbe` was already v6-aware via `URLSession` — no work needed. New `testTCPProbeIPv6` / `testUDPProbeIPv6` integration tests gated on `IPv6Reachability`.
 
-### Stage 4 — STUN over IPv6 + dual-stack public-IP discovery
+### ~~Stage 4 — STUN over IPv6 + dual-stack public-IP discovery~~ *(shipped)*
 
-- Add v6 STUN servers to the rotation in `STUN.swift` (Cloudflare's STUN servers are reachable over v6).
-- Surface separate v4 / v6 public IPs (or a merged set) from the classifier. May require an additive `PublicIP` struct.
-- `TraceClassifier`'s VPN detection logic needs to handle v6 hops — straightforward since address classification is already string-based.
+`STUN.swift` is now dual-stack via a family-parameterized core (`stunGetPublicIP(family:host:port:...)`) that resolves, sockets, binds, sends, and parses XOR-MAPPED-ADDRESS for both v4 (Family 0x01) and v6 (Family 0x02) per RFC 5389 §15.2 — including the v6-specific un-XOR of bytes 4..15 against the transaction ID. `STUNPublicIP` gained a `family` field; new `PublicIPs { v4, v6 }` struct and `public func getPublicIPs() async -> PublicIPs` run both families in parallel via `async let` and return whichever succeeded (never throws). v6 source-IP binding reuses the family-aware `bindProbeSourceIP` helper introduced in Stage 3. Back-compat shims for `stunGetPublicIPv4*` and `getPublicIPv4`; new `stunGetPublicIPv6*` companions added.
 
 ### Stage 5 — Resolver consolidation
 
