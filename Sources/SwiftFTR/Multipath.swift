@@ -640,9 +640,10 @@ extension SwiftFTR {
       Task { await handle.cancel() }
     }
 
-    // Resolve destination IP
-    let destAddr = try resolveIPv4(host: host, enableLogging: config.enableLogging)
-    let destIP = ipString(destAddr)
+    // Resolve destination IP via the shared dual-stack resolver. Multipath stays
+    // v4-only by design (ECMP probing is heavily tied to IPv4 paris-traceroute /
+    // 5-tuple semantics), so we force `.v4` rather than auto-detecting.
+    let destIP = try resolveHost(host: host, prefer: .v4).canonical
 
     // Collect IPs for batch operations
     var allIPs = Set(tr.hops.compactMap { $0.ipAddress })

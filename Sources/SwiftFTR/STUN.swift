@@ -144,16 +144,11 @@ internal func stunGetPublicIP(
         throw STUNError.interfaceBindFailed(
           interface: interfaceName, errno: error, details: details)
       }
-      var index = ifIndex
-      // IP_BOUND_IF for v4, IPV6_BOUND_IF for v6.
-      let level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
-      let opt = family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
-      if setsockopt(fd, level, opt, &index, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
+      if let errMsg = bindInterface(sockfd: fd, family: family, ifIndex: ifIndex) {
         let error = errno
-        let details = "Failed to bind STUN socket to interface index \(ifIndex)."
-        if enableLogging { print("[STUN] ERROR: \(details)") }
+        if enableLogging { print("[STUN] ERROR: \(errMsg)") }
         throw STUNError.interfaceBindFailed(
-          interface: interfaceName, errno: error, details: details)
+          interface: interfaceName, errno: error, details: errMsg)
       }
       if enableLogging {
         print("[STUN] Bound to interface '\(interfaceName)' (index: \(ifIndex))")
@@ -169,8 +164,7 @@ internal func stunGetPublicIP(
     if enableLogging {
       print("[STUN] Binding socket to source IP '\(srcIP)'...")
     }
-    // Reuse the family-aware probe source bind helper (added Stage 3).
-    if let errMsg = bindProbeSourceIP(sockfd: fd, family: family, sourceIP: srcIP) {
+    if let errMsg = bindSourceIP(sockfd: fd, family: family, sourceIP: srcIP) {
       if enableLogging { print("[STUN] ERROR: \(errMsg)") }
       throw STUNError.sourceIPBindFailed(sourceIP: srcIP, errno: errno, details: errMsg)
     }

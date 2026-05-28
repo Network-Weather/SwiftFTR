@@ -58,9 +58,9 @@ Dual-stack `tcpProbe(...)` and `udpProbe(...)`: same entry points work for both 
 
 `STUN.swift` is now dual-stack via a family-parameterized core (`stunGetPublicIP(family:host:port:...)`) that resolves, sockets, binds, sends, and parses XOR-MAPPED-ADDRESS for both v4 (Family 0x01) and v6 (Family 0x02) per RFC 5389 §15.2 — including the v6-specific un-XOR of bytes 4..15 against the transaction ID. `STUNPublicIP` gained a `family` field; new `PublicIPs { v4, v6 }` struct and `public func getPublicIPs() async -> PublicIPs` run both families in parallel via `async let` and return whichever succeeded (never throws). v6 source-IP binding reuses the family-aware `bindProbeSourceIP` helper introduced in Stage 3. Back-compat shims for `stunGetPublicIPv4*` and `getPublicIPv4`; new `stunGetPublicIPv6*` companions added.
 
-### Stage 5 — Resolver consolidation
+### ~~Stage 5 — Resolver consolidation~~ *(shipped)*
 
-Pure refactor, no behavior change. Replace the 4 duplicated `resolveIPv4` / `resolveHostname` helpers (`Ping.swift`, `Traceroute.swift`, `TCPProbe.swift`, `UDPProbe.swift`) with one dual-stack helper in `Utils.swift` or a new `Hostname.swift`. Trivially-reviewable once every caller path is already v6-aware.
+`Hostname.swift` is now the single source of truth for: dual-stack `resolveHost(host:prefer:)`, family-aware `bindSourceIP(sockfd:family:sourceIP:)` (renamed from `bindProbeSourceIP`), and new `bindInterface(sockfd:family:ifIndex:)`. The old v4-only `resolveIPv4` in `Traceroute.swift` was deleted after `Multipath.swift` (the last caller) migrated to `resolveHost(host:, prefer: .v4)`. `bindTraceInterface` / `bindTraceSourceIP` became thin wrappers that translate the string-error contract to the typed `TracerouteError` cases trace callers expect. TCP, UDP, STUN all call the shared helpers directly.
 
 ### Stage 6 — `swift-ip2asn` 0.4.0 + IPv6 ASN labels
 

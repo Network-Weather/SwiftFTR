@@ -217,14 +217,11 @@ private func performTCPProbe(
           isReachable: false, connectionState: .error, rtt: nil,
           error: "Interface '\(iface)' not found")
       }
-      var index = ifaceIndex
-      let level = resolved.family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
-      let opt = resolved.family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
-      if setsockopt(sockfd, level, opt, &index, socklen_t(MemoryLayout<UInt32>.size)) < 0 {
+      if let errMsg = bindInterface(sockfd: sockfd, family: resolved.family, ifIndex: ifaceIndex) {
         close(sockfd)
         return ProbeResult(
           isReachable: false, connectionState: .error, rtt: nil,
-          error: "Failed to bind to interface '\(iface)': \(String(cString: strerror(errno)))")
+          error: "Failed to bind to interface '\(iface)': \(errMsg)")
       }
     #else
       close(sockfd)
@@ -235,7 +232,7 @@ private func performTCPProbe(
   }
 
   if let srcIP = sourceIP {
-    if let err = bindProbeSourceIP(sockfd: sockfd, family: resolved.family, sourceIP: srcIP) {
+    if let err = bindSourceIP(sockfd: sockfd, family: resolved.family, sourceIP: srcIP) {
       close(sockfd)
       return ProbeResult(
         isReachable: false, connectionState: .error, rtt: nil, error: err)
