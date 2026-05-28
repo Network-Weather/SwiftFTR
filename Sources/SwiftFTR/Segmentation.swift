@@ -108,6 +108,9 @@ public struct VPNContext: Sendable {
   ///
   /// If the interface name matches VPN patterns (utun*, ipsec*, ppp*),
   /// the context will be configured for VPN-aware classification.
+  /// `vpnLocalIPs` is populated with the v4 and v6 addresses of every VPN
+  /// interface detected on the host, so the classifier can tag hops that
+  /// land on a VPN local IP as `.vpn` rather than `.transit`.
   public static func forInterface(_ name: String?) -> VPNContext {
     guard let name = name else {
       return VPNContext()
@@ -116,8 +119,48 @@ public struct VPNContext: Sendable {
     return VPNContext(
       traceInterface: name,
       isVPNTrace: isVPN,
-      vpnLocalIPs: []
-    )
+      vpnLocalIPs: discoverVPNLocalIPs())
+  }
+
+  /// Walks `getifaddrs` and collects every v4 and v6 address bound to an
+  /// interface whose name matches `NetworkInterfaceDiscovery.isVPNInterface`.
+  /// Used to populate `VPNContext.vpnLocalIPs` so the classifier can map a
+  /// trace hop's IP back to the VPN side of a split tunnel. Both families
+  /// are included — on dual-stack-source / v4-only-tunnel setups, the v6
+  /// addresses on the physical interface are NOT in this set (correct
+  /// behavior; the v6 trace doesn't go through the VPN).
+  ///
+  /// Returns an empty set on platforms without `getifaddrs` or on error.
+  internal static func discoverVPNLocalIPs() -> Set<String> {
+    #if canImport(Darwin)
+      var ifaddrsPtr: UnsafeMutablePointer<ifaddrs>?
+      guard getifaddrs(&ifaddrsPtr) == 0, let first = ifaddrsPtr else {
+        return []
+      }
+      defer { freeifaddrs(ifaddrsPtr) }
+
+      var ips: Set<String> = []
+      var cursor: UnsafeMutablePointer<ifaddrs>? = first
+      while let addr = cursor {
+        defer { cursor = addr.pointee.ifa_next }
+        let name = String(cString: addr.pointee.ifa_name)
+        guard NetworkInterfaceDiscovery.isVPNInterface(name) else { continue }
+        guard let sa = addr.pointee.ifa_addr else { continue }
+        let family = Int32(sa.pointee.sa_family)
+        if family == AF_INET {
+          let sin = sa.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
+          ips.insert(ipString(sin))
+        } else if family == AF_INET6 {
+          let sin6 = sa.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
+          // Preserve `%zone` suffix for link-local addresses so the set
+          // entries match what the classifier sees from a parsed hop.
+          ips.insert(ipv6String(sin6.sin6_addr, scopeID: sin6.sin6_scope_id))
+        }
+      }
+      return ips
+    #else
+      return []
+    #endif
   }
 }
 

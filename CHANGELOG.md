@@ -5,6 +5,17 @@ All notable changes to this project are documented here. This project follows Se
 
 Unreleased (0.13.0-dev)
 -----------------------
+### Bug Fix
+
+**Populate `VPNContext.vpnLocalIPs` from `getifaddrs`**
+
+Pre-existing bug: `VPNContext.vpnLocalIPs: Set<String>` has been declared since the initial implementation but was always populated as an empty set by `VPNContext.forInterface(_:)`. Downstream consumers (NWX flagged this during the IPv6 review) relied on it to tag hops that land on a VPN local IP as `.vpn` rather than `.transit`, but the empty set meant the classifier silently fell through to ASN-based segmentation only.
+
+- `VPNContext.forInterface(_:)` now calls a new internal `discoverVPNLocalIPs()` that walks `getifaddrs` and collects every IPv4 and IPv6 address bound to an interface that `NetworkInterfaceDiscovery.isVPNInterface` matches (`utun*`, `ipsec*`, `ppp*`, `tun*`, `tap*`, `wg*`, `gpd*`, `ztun*`).
+- v6 link-local addresses keep their `%zone` suffix via the existing `ipv6String` helper so set entries match what the classifier sees from a parsed hop.
+- New `testVPNContextPopulatesLocalIPs` asserts the discovery returns valid v4/v6 strings and that calls with different VPN-shaped interface names yield the same set (since we walk every VPN interface on the host).
+- All 168 unit tests pass.
+
 ### Refactor
 
 **Resolver and bind-helper consolidation (Stage 5 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
