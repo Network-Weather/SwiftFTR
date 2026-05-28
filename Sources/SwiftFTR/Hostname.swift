@@ -103,13 +103,21 @@ internal func bindInterface(sockfd: Int32, family: Int32, ifIndex: UInt32) -> St
 /// `UDPProbe.swift` is Stage 5 in `docs/IPV6.md`; this is the smaller extraction
 /// that unblocks Stage 2 traceroute.
 internal func resolveHost(host: String, prefer: PreferredFamily) throws -> ResolvedHost {
-  // Numeric literal fast path.
   let detected = detectAddressFamily(host)
-  if detected == AF_INET {
-    if prefer == .v6 {
-      throw TracerouteError.resolutionFailed(
-        host: host, details: "Preferred family v6 but literal is v4")
-    }
+
+  // Force-mode fast paths: when the caller explicitly asked for v4 or v6, skip
+  // getaddrinfo and use the literal directly. This preserves the original
+  // behavior for callers that know their family and want microsecond resolution.
+  //
+  // In `.auto` mode we always go through getaddrinfo (even for literals) so
+  // macOS's resolver can synthesize a v4-mapped v6 address for v4 literals on
+  // NAT64 networks (RFC 6147 / Apple's CLAT). On dual-stack networks the
+  // resolver returns the v4 literal unchanged; on v6-only NAT64 networks it
+  // returns the synthesized v6 address and the trace/probe goes via v6
+  // transparently — no caller code changes required. The extra getaddrinfo
+  // call costs ~tens of microseconds; the NAT64 transparency it buys is worth
+  // it (matches Apple's own guidance for IPv6-compatible apps).
+  if prefer == .v4 && detected == AF_INET {
     var sin = sockaddr_in()
     sin.sin_family = sa_family_t(AF_INET)
     sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -124,11 +132,7 @@ internal func resolveHost(host: String, prefer: PreferredFamily) throws -> Resol
       family: AF_INET, address: storage,
       addressLen: socklen_t(MemoryLayout<sockaddr_in>.size), canonical: ipString(sin))
   }
-  if detected == AF_INET6 {
-    if prefer == .v4 {
-      throw TracerouteError.resolutionFailed(
-        host: host, details: "Preferred family v4 but literal is v6")
-    }
+  if prefer == .v6 && detected == AF_INET6 {
     let (bare, scopeID) = parseIPv6Scoped(host)
     var sin6 = sockaddr_in6()
     sin6.sin6_family = sa_family_t(AF_INET6)
@@ -146,11 +150,25 @@ internal func resolveHost(host: String, prefer: PreferredFamily) throws -> Resol
       addressLen: socklen_t(MemoryLayout<sockaddr_in6>.size),
       canonical: ipv6String(sin6.sin6_addr, scopeID: scopeID))
   }
+  // Mismatched literal vs preferred family throws.
+  if prefer == .v4 && detected == AF_INET6 {
+    throw TracerouteError.resolutionFailed(
+      host: host, details: "Preferred family v4 but literal is v6")
+  }
+  if prefer == .v6 && detected == AF_INET {
+    throw TracerouteError.resolutionFailed(
+      host: host, details: "Preferred family v6 but literal is v4")
+  }
 
-  // Hostname path — let getaddrinfo do dual-stack lookup; pick the first answer
-  // that matches `prefer` (or any if .auto).
+  // `.auto` mode (and any hostname path) — let getaddrinfo handle everything,
+  // including NAT64 synthesis for v4 literals on v6-only networks. The
+  // `AI_V4MAPPED | AI_ADDRCONFIG | AI_DEFAULT` flag set tells Darwin's resolver
+  // to synthesize a v4-mapped v6 address when only v6 is configured locally.
   var hints = addrinfo()
   hints.ai_socktype = SOCK_DGRAM
+  // AI_DEFAULT == AI_V4MAPPED | AI_ADDRCONFIG. Hardcoded numeric form below
+  // because AI_DEFAULT isn't exposed in all Swift overlay versions.
+  hints.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG
   switch prefer {
   case .v4: hints.ai_family = AF_INET
   case .v6: hints.ai_family = AF_INET6

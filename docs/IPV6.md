@@ -105,7 +105,7 @@ To exercise the v6 paths in CI:
 
 ## Known limitations & open questions
 
-- **NAT64 transparency** (Stage 7): `ping(to: "1.1.1.1")` on a pure-v6 network with DNS64/NAT64 should "just work" via the gateway's synthesized v6 address (typically under `64:ff9b::/96`). Stage 1 doesn't implement this — a v4 literal is treated as v4 and creates a v4 socket. Workaround: pass the hostname, not the literal. The `getaddrinfo(AF_UNSPEC)` path will return the NAT64-synthesized v6 address transparently.
+- ~~**NAT64 transparency**: `ping(to: "1.1.1.1")` on a pure-v6 network with DNS64/NAT64~~ *(shipped)*. In `.auto` mode (the default), v4 literals go through `getaddrinfo` with `AI_V4MAPPED | AI_ADDRCONFIG` flags so macOS synthesizes a v4-mapped v6 address when on a v6-only NAT64 network. Force modes (`.v4` / `.v6`) keep the `inet_pton` fast path. Dual-stack hosts see unchanged behavior.
 - **Happy-eyeballs**: `.auto` for hostnames currently takes the first `getaddrinfo` answer without racing v4 and v6 connects. RFC 8305 happy-eyeballs is deferred — most callers either pin a family (`.v4` / `.v6`) or accept the OS's resolver preference.
 - **Should the `ttl` field on `PingResponse` become `hopCount` (or split into a separate `hopLimit`)?** Currently overloaded: v4 TTL or v6 hop limit. Documented dual meaning. Splitting would be source-breaking; revisit only if it causes real consumer confusion.
 
