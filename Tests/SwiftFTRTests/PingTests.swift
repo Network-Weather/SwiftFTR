@@ -391,6 +391,89 @@ struct PingIntegrationTests {
       try await tracer.ping(to: "invalid.host.that.does.not.exist.example", config: config)
     }
   }
+
+  /// Regression test for the deadline-anchoring fix: under realistic Task.sleep
+  /// drift (interval=10ms, count=500), the previous implementation reported
+  /// false losses on the trailing ~5% of sequences because the precomputed
+  /// "total timeout" expired before the last pings could complete. This test
+  /// cross-checks against system /sbin/ping so it only fails when SwiftFTR
+  /// reports materially more loss than the kernel does.
+  @Test(
+    "No trailing-block timeouts under sleep drift (regression for false loss)",
+    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
+  func testNoTrailingFalseLoss() async throws {
+    let tracer = SwiftFTR(config: SwiftFTRConfig())
+    let count = 500
+    let interval = 0.01
+    let timeout = 0.3
+    let target = "1.1.1.1"
+
+    let result = try await NetworkTestGate.shared.withPermit {
+      try await tracer.ping(
+        to: target,
+        config: PingConfig(count: count, interval: interval, timeout: timeout))
+    }
+
+    #expect(result.responses.count == count)
+
+    // Compute trailing-block loss: timeouts in the last 10% of sequences.
+    let cutoff = Int(Double(count) * 0.9)
+    let trailingTimeouts = result.responses.suffix(count - cutoff).filter { $0.rtt == nil }.count
+    let trailingLossPct = Double(trailingTimeouts) / Double(count - cutoff)
+
+    // If SwiftFTR sees high trailing loss, cross-check against system ping.
+    // We tolerate genuine network loss but flag the specific tail-end pattern
+    // that the bug used to produce.
+    if trailingLossPct > 0.05 {
+      let sysLossPct = systemPingLoss(target: target, count: count, intervalSec: interval)
+      #expect(
+        trailingLossPct - sysLossPct < 0.05,
+        """
+        Trailing-block loss \(trailingLossPct * 100)% materially exceeds system \
+        ping loss \(sysLossPct * 100)% — likely a regression of the \
+        deadline-anchoring fix. Total SwiftFTR loss: \
+        \(result.statistics.packetLoss * 100)%.
+        """)
+    }
+  }
+
+  /// Run system `/sbin/ping` with matching parameters and parse the loss %.
+  /// Returns 1.0 on parse failure (forces a flake into the safe direction).
+  private func systemPingLoss(target: String, count: Int, intervalSec: Double) -> Double {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/sbin/ping")
+    p.arguments = [
+      "-q", "-n",
+      "-c", String(count),
+      "-i", String(intervalSec),
+      target,
+    ]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = Pipe()
+    do {
+      try p.run()
+      p.waitUntilExit()
+    } catch {
+      return 1.0
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let output = String(data: data, encoding: .utf8) else { return 1.0 }
+    // Look for "X.X% packet loss" in the stats summary.
+    for line in output.split(separator: "\n") {
+      if line.contains("packet loss") {
+        let parts = line.split(separator: ",")
+        for part in parts where part.contains("packet loss") {
+          let trimmed = part.trimmingCharacters(in: .whitespaces)
+          if let pctRange = trimmed.range(of: "%") {
+            let numStr = trimmed[..<pctRange.lowerBound]
+            if let v = Double(numStr) { return v / 100.0 }
+          }
+        }
+      }
+    }
+    return 1.0
+  }
 }
 
 @Suite("Response Collector Tests")

@@ -359,6 +359,7 @@ private final class PingOperation: @unchecked Sendable {
   private var continuation: CheckedContinuation<PingResult, Error>?
   private var readSource: DispatchSourceRead?
   private var timerSource: DispatchSourceTimer?
+  private var safetyTimerSource: DispatchSourceTimer?
 
   // Guarded by lock
   private var sentTimes: [Int: TimeInterval] = [:]
@@ -428,13 +429,26 @@ private final class PingOperation: @unchecked Sendable {
     source.activate()
     self.readSource = source
 
+    // Deadline-anchored finish: armed initially at now + timeout (covers the no-send case),
+    // re-armed on every successful sendto to (last-send-time + config.timeout). The last
+    // send wins, so the operation always gives the final ping a full `timeout` budget to
+    // reply regardless of any accumulated Task.sleep drift in the send loop.
     let timer = DispatchSource.makeTimerSource(queue: queue)
-    let totalTimeout = (Double(max(config.count - 1, 0)) * max(config.interval, 0)) + config.timeout
-    timer.schedule(deadline: .now() + totalTimeout)
-    // Strong self capture
+    timer.schedule(deadline: .now() + .nanoseconds(Int(config.timeout * 1_000_000_000)))
     timer.setEventHandler { self.finish() }
     timer.activate()
     self.timerSource = timer
+
+    // Safety net: a hard upper bound so any future bug cannot leave the operation
+    // hanging indefinitely. Under the new design the deadline timer above always
+    // fires first; this exists purely to bound worst-case duration.
+    let safetyBudget =
+      2.0 * (Double(max(config.count - 1, 0)) * max(config.interval, 0) + config.timeout) + 5.0
+    let safety = DispatchSource.makeTimerSource(queue: queue)
+    safety.schedule(deadline: .now() + .nanoseconds(Int(safetyBudget * 1_000_000_000)))
+    safety.setEventHandler { self.finish() }
+    safety.activate()
+    self.safetyTimerSource = safety
   }
 
   private func startSending() {
@@ -442,25 +456,33 @@ private final class PingOperation: @unchecked Sendable {
       for seq in 1...self.config.count {
         if await self.checkFinished() { break }
 
-        let sendTime = self.executor.monotonicTime()
         let packet = makeICMPEchoRequest(
           identifier: self.identifier,
           sequence: UInt16(seq),
           payloadSize: self.config.payloadSize
         )
 
-        // Dispatch send to serial queue
+        // Dispatch send to serial queue. sendTime is captured on the queue, immediately
+        // before sendto, so it reflects what actually went on the wire (not when this
+        // Task.detached iteration enqueued the work).
         self.queue.async {
           if self.checkFinishedSync() { return }
           do {
+            let sendTime = self.executor.monotonicTime()
             try self.executor.sendPacket(
               sockfd: self.sockfd, packet: packet, to: self.resolved)
 
             self.lock.lock()
             self.sentTimes[seq] = sendTime
             self.lock.unlock()
+
+            // Anchor the deadline to this send. DispatchSourceTimer.schedule replaces
+            // the prior deadline, so the most recent send always wins.
+            self.timerSource?.schedule(
+              deadline: .now() + .nanoseconds(Int(self.config.timeout * 1_000_000_000)))
           } catch {
-            // Ignore send errors
+            // Send error (e.g., ENOBUFS): leave sentTimes[seq] unset so this packet is
+            // excluded from the "sent" count rather than masquerading as transport loss.
           }
         }
 
@@ -554,8 +576,10 @@ private final class PingOperation: @unchecked Sendable {
     lock.unlock()
 
     timerSource?.cancel()
+    safetyTimerSource?.cancel()
     readSource?.cancel()
     timerSource = nil
+    safetyTimerSource = nil
     readSource = nil
 
     // Close socket AFTER sources are cancelled and we're done with them.
@@ -592,7 +616,11 @@ private final class PingOperation: @unchecked Sendable {
       }
     }
     responses.sort { $0.sequence < $1.sequence }
-    let stats = PingStatistics.compute(responses: responses, sent: config.count)
+    // Use actual sends (sentTimes count) rather than the configured count so that
+    // local send failures (ENOBUFS etc.) don't masquerade as transport packet loss.
+    // When all sends succeed this equals config.count.
+    let actualSent = sentTimes.isEmpty ? config.count : sentTimes.count
+    let stats = PingStatistics.compute(responses: responses, sent: actualSent)
     let result = PingResult(
       target: target, resolvedIP: resolved, responses: responses, statistics: stats)
     continuation.resume(returning: result)
@@ -608,63 +636,94 @@ private final class PingOperation: @unchecked Sendable {
   private func parsePingMessage(buffer: UnsafeRawBufferPointer, expectedIdentifier: UInt16)
     -> ParsedPingMessage?
   {
-    guard buffer.count >= 8 else { return nil }
-    let bytes = buffer.bindMemory(to: UInt8.self)
-    var icmpOffset = 0
-    let first = bytes[0]
-    if (first >> 4) == 4 {
-      let ihl = Int(first & 0x0F) * 4
-      if ihl >= 20 && ihl < buffer.count { icmpOffset = ihl }
+    return swiftftrParsePingMessage(buffer: buffer, expectedIdentifier: expectedIdentifier)
+  }
+}
+
+/// Free-function parser used by `PingOperation.parsePingMessage` and exposed via
+/// `@_spi(Test)` for unit-testing the wire-format edge cases (notably TTL extraction).
+internal func swiftftrParsePingMessage(
+  buffer: UnsafeRawBufferPointer, expectedIdentifier: UInt16
+) -> ParsedPingMessage? {
+  guard buffer.count >= 8 else { return nil }
+  let bytes = buffer.bindMemory(to: UInt8.self)
+  var icmpOffset = 0
+  let first = bytes[0]
+  if (first >> 4) == 4 {
+    let ihl = Int(first & 0x0F) * 4
+    if ihl >= 20 && ihl < buffer.count { icmpOffset = ihl }
+  }
+
+  guard buffer.count - icmpOffset >= 8 else { return nil }
+  let type = bytes[icmpOffset]
+  let code = bytes[icmpOffset + 1]
+
+  func read16(_ off: Int) -> UInt16 {
+    let hi = UInt16(bytes[off])
+    let lo = UInt16(bytes[off + 1])
+    return (hi << 8) | lo
+  }
+
+  // TTL lives at byte 8 of the IPv4 header (RFC 791 §3.1). Only available when the
+  // kernel handed us the IP header (icmpOffset > 0). On Darwin SOCK_DGRAM ICMP the
+  // IP header is sometimes stripped, in which case TTL is unrecoverable from this
+  // buffer — leave it nil.
+  let ttl: Int? = (icmpOffset > 0 && buffer.count > 8) ? Int(bytes[8]) : nil
+
+  switch type {
+  case ICMPv4Type.echoReply.rawValue:
+    let id = read16(icmpOffset + 4)
+    guard id == expectedIdentifier else { return nil }
+    let seq = read16(icmpOffset + 6)
+    return .echoReply(sequence: seq, ttl: ttl)
+
+  case ICMPv4Type.timeExceeded.rawValue, ICMPv4Type.destinationUnreachable.rawValue:
+    let embedStart = icmpOffset + 8
+    guard buffer.count - embedStart >= 28 else { return nil }
+    let embeddedIPHeaderStart = embedStart
+    let embeddedFirstByte = bytes[embeddedIPHeaderStart]
+    guard (embeddedFirstByte >> 4) == 4 else { return nil }
+    let embeddedIHL = Int(embeddedFirstByte & 0x0F) * 4
+    let embeddedICMPHeaderStart = embeddedIPHeaderStart + embeddedIHL
+    guard buffer.count - embeddedICMPHeaderStart >= 8 else { return nil }
+    let embeddedID = read16(embeddedICMPHeaderStart + 4)
+    guard embeddedID == expectedIdentifier else { return nil }
+    let originalSeq = read16(embeddedICMPHeaderStart + 6)
+    if type == ICMPv4Type.timeExceeded.rawValue {
+      return .timeExceeded(originalSequence: originalSeq, ttl: ttl, code: code)
+    } else {
+      return .destinationUnreachable(originalSequence: originalSeq, ttl: ttl, code: code)
     }
 
-    guard buffer.count - icmpOffset >= 8 else { return nil }
-    let type = bytes[icmpOffset]
-    let code = bytes[icmpOffset + 1]
+  default:
+    return nil
+  }
+}
 
-    func read16(_ off: Int) -> UInt16 {
-      let hi = UInt16(bytes[off])
-      let lo = UInt16(bytes[off + 1])
-      return (hi << 8) | lo
-    }
+/// SPI test surface mirroring `ParsedPingMessage` for unit tests.
+@_spi(Test)
+public enum TestParsedPingMessage: Sendable, Equatable {
+  case echoReply(sequence: UInt16, ttl: Int?)
+  case timeExceeded(originalSequence: UInt16, ttl: Int?, code: UInt8)
+  case destinationUnreachable(originalSequence: UInt16, ttl: Int?, code: UInt8)
+}
 
-    let ttl: Int? =
-      (icmpOffset > 0 && icmpOffset + 9 < buffer.count) ? Int(bytes[icmpOffset + 8]) : nil
-
-    switch type {
-    case ICMPv4Type.echoReply.rawValue:
-      // Validate identifier to ensure the reply belongs to this socket.
-      let id = read16(icmpOffset + 4)
-      guard id == expectedIdentifier else { return nil }
-      let seq = read16(icmpOffset + 6)
-      return .echoReply(sequence: seq, ttl: ttl)
-
-    case ICMPv4Type.timeExceeded.rawValue, ICMPv4Type.destinationUnreachable.rawValue:
-      // For Time Exceeded and Dest Unreachable, the original IP header + ICMP header
-      // of the packet that caused the error is embedded. We need to parse that.
-      let embedStart = icmpOffset + 8  // After the ICMP error header
-      guard buffer.count - embedStart >= 28 else { return nil }  // 20 (IP) + 8 (ICMP)
-
-      let embeddedIPHeaderStart = embedStart
-      let embeddedFirstByte = bytes[embeddedIPHeaderStart]
-      guard (embeddedFirstByte >> 4) == 4 else { return nil }  // Must be IPv4
-      let embeddedIHL = Int(embeddedFirstByte & 0x0F) * 4
-
-      let embeddedICMPHeaderStart = embeddedIPHeaderStart + embeddedIHL
-      guard buffer.count - embeddedICMPHeaderStart >= 8 else { return nil }
-
-      let embeddedID = read16(embeddedICMPHeaderStart + 4)
-      guard embeddedID == expectedIdentifier else { return nil }
-      let originalSeq = read16(embeddedICMPHeaderStart + 6)
-
-      if type == ICMPv4Type.timeExceeded.rawValue {
-        return .timeExceeded(originalSequence: originalSeq, ttl: ttl, code: code)
-      } else {
-        return .destinationUnreachable(originalSequence: originalSeq, ttl: ttl, code: code)
-      }
-
-    default:
-      return nil
-    }
+/// SPI parser entry point for unit tests. Use this to feed synthetic ICMP buffers
+/// and assert correct parsing of fields like TTL.
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
+public func __parsePingMessage(
+  buffer: UnsafeRawBufferPointer, expectedIdentifier: UInt16
+) -> TestParsedPingMessage? {
+  guard let p = swiftftrParsePingMessage(buffer: buffer, expectedIdentifier: expectedIdentifier)
+  else { return nil }
+  switch p {
+  case .echoReply(let seq, let ttl):
+    return .echoReply(sequence: seq, ttl: ttl)
+  case .timeExceeded(let seq, let ttl, let code):
+    return .timeExceeded(originalSequence: seq, ttl: ttl, code: code)
+  case .destinationUnreachable(let seq, let ttl, let code):
+    return .destinationUnreachable(originalSequence: seq, ttl: ttl, code: code)
   }
 }
 
