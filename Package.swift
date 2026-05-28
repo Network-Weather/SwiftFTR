@@ -47,6 +47,7 @@ let package = Package(
             exclude: ["README.md"]
         ),
         .executableTarget(name: "icmpfuzz", dependencies: ["SwiftFTR"]),
+        .executableTarget(name: "icmpv6fuzz", dependencies: ["SwiftFTR"]),
         .executableTarget(
             name: "icmpfuzzer",
             dependencies: ["SwiftFTR"],
