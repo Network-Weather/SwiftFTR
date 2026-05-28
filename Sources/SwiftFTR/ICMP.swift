@@ -191,6 +191,143 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
   return nil
 }
 
+// MARK: - ICMPv6 (RFC 4443)
+
+enum ICMPv6Type: UInt8 {
+  case destinationUnreachable = 1
+  case packetTooBig = 2
+  case timeExceeded = 3
+  case parameterProblem = 4
+  case echoRequest = 128
+  case echoReply = 129
+}
+
+/// Builds an ICMPv6 Echo Request. The Darwin kernel computes the ICMPv6 checksum on
+/// SOCK_DGRAM IPPROTO_ICMPV6 sockets because it requires the IPv6 pseudo-header
+/// (src/dst), which userspace does not know. We leave the checksum field zero.
+///
+/// Empirically verified with `icmpv6probe` (see Tests/TestSupport/icmpv6probe/):
+/// kernel rewrites checksum, preserves identifier and sequence end-to-end.
+@inline(__always)
+func makeICMPv6EchoRequest(identifier: UInt16, sequence: UInt16, payloadSize: Int) -> [UInt8] {
+  precondition(payloadSize >= 0)
+  var packet = [UInt8](repeating: 0, count: 8 + payloadSize)
+  packet[0] = ICMPv6Type.echoRequest.rawValue
+  packet[1] = 0  // code
+  // bytes 2-3 = checksum, left zero (kernel fills)
+  packet[4] = UInt8(identifier >> 8)
+  packet[5] = UInt8(identifier & 0xFF)
+  packet[6] = UInt8(sequence >> 8)
+  packet[7] = UInt8(sequence & 0xFF)
+  if payloadSize > 0 {
+    var pattern: UInt8 = 0x61  // 'a'
+    for i in 0..<payloadSize {
+      packet[8 + i] = pattern
+      pattern = pattern == 0x7A ? 0x61 : pattern + 1
+    }
+  }
+  return packet
+}
+
+/// Parses an ICMPv6 datagram delivered via SOCK_DGRAM IPPROTO_ICMPV6.
+///
+/// Darwin's behavior (confirmed empirically with the icmpv6probe spike):
+/// - Outer IPv6 header is stripped by the kernel — buffer starts at ICMPv6 type byte.
+/// - Identifier is preserved (no kernel rewrite, unlike some Linux configurations).
+/// - Hop limit arrives out-of-band via `cmsg IPPROTO_IPV6/IPV6_HOPLIMIT` (caller
+///   reads from recvmsg ancillary data and passes it here as `hopLimit:`).
+/// - Source address is the IPv6 address in `saStorage` (sockaddr_in6), formatted via
+///   `ipv6String` which preserves `%<ifname>` zone suffix for link-local addresses
+///   (the canonical-form contract NWX depends on for dictionary keys).
+func parseICMPv6Message(
+  buffer: UnsafeRawBufferPointer, hopLimit: Int?, from saStorage: sockaddr_storage
+) -> ParsedICMP? {
+  let addrStr: String = {
+    var storage = saStorage
+    if Int32(storage.ss_family) == AF_INET6 {
+      return withUnsafePointer(to: &storage) { ptr -> String in
+        ptr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { sinPtr in
+          let sin = sinPtr.pointee
+          return ipv6String(sin.sin6_addr, scopeID: sin.sin6_scope_id)
+        }
+      }
+    }
+    return "unsupported"
+  }()
+  _ = hopLimit  // currently unused at parse time; passed through by the caller
+
+  guard buffer.count >= 8 else { return nil }
+  let bytes = buffer.bindMemory(to: UInt8.self)
+  let type = bytes[0]
+  let code = bytes[1]
+
+  @inline(__always) func read16(_ off: Int) -> UInt16 {
+    (UInt16(bytes[off]) << 8) | UInt16(bytes[off + 1])
+  }
+
+  switch type {
+  case ICMPv6Type.echoReply.rawValue:
+    let id = read16(4)
+    let seq = read16(6)
+    return ParsedICMP(kind: .echoReply(id: id, seq: seq), sourceAddress: addrStr)
+
+  case ICMPv6Type.timeExceeded.rawValue, ICMPv6Type.destinationUnreachable.rawValue:
+    // After the 8-byte ICMPv6 error header, the original packet is embedded.
+    // For us, the original is an IPv6 header (fixed 40 bytes — no IHL like v4) +
+    // ICMPv6 Echo Request (8 bytes). Total minimum embedded = 48.
+    let embedStart = 8
+    guard buffer.count - embedStart >= 48 else {
+      return ParsedICMP(
+        kind: (type == ICMPv6Type.timeExceeded.rawValue)
+          ? .timeExceeded(originalID: nil, originalSeq: nil)
+          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+        sourceAddress: addrStr)
+    }
+    let ipFirst = bytes[embedStart]
+    guard (ipFirst >> 4) == 6 else {
+      // Not a v6 header where we expected one; emit unknown-id case.
+      return ParsedICMP(
+        kind: (type == ICMPv6Type.timeExceeded.rawValue)
+          ? .timeExceeded(originalID: nil, originalSeq: nil)
+          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+        sourceAddress: addrStr)
+    }
+    // Next Header at embedStart+6 should be IPPROTO_ICMPV6 (58) for the embedded
+    // ICMPv6 echo request we sent. If it's an extension header chain, we don't
+    // currently walk it — stick to the common case (no extension headers).
+    let innerICMP = embedStart + 40  // fixed v6 header length
+    guard buffer.count - innerICMP >= 8 else {
+      return ParsedICMP(
+        kind: (type == ICMPv6Type.timeExceeded.rawValue)
+          ? .timeExceeded(originalID: nil, originalSeq: nil)
+          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+        sourceAddress: addrStr)
+    }
+    let innerType = bytes[innerICMP]
+    if innerType == ICMPv6Type.echoRequest.rawValue {
+      let id = read16(innerICMP + 4)
+      let seq = read16(innerICMP + 6)
+      if type == ICMPv6Type.timeExceeded.rawValue {
+        return ParsedICMP(
+          kind: .timeExceeded(originalID: id, originalSeq: seq), sourceAddress: addrStr)
+      } else {
+        return ParsedICMP(
+          kind: .destinationUnreachable(originalID: id, originalSeq: seq), sourceAddress: addrStr)
+      }
+    }
+    return ParsedICMP(
+      kind: (type == ICMPv6Type.timeExceeded.rawValue)
+        ? .timeExceeded(originalID: nil, originalSeq: nil)
+        : .destinationUnreachable(originalID: nil, originalSeq: nil),
+      sourceAddress: addrStr)
+
+  default:
+    return ParsedICMP(kind: .other(type: type, code: code), sourceAddress: addrStr)
+  }
+}
+
+// MARK: - Test/Fuzz SPI
+
 // SPI: expose a tiny wrapper for fuzzing/external validation without making internals public.
 // swift-format-ignore: AlwaysUseLowerCamelCase
 @_spi(Fuzz)
@@ -198,6 +335,14 @@ public func __fuzz_parseICMP(buffer: UnsafeRawBufferPointer, from saStorage: soc
   -> Bool
 {
   return parseICMPv4Message(buffer: buffer, from: saStorage) != nil
+}
+
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Fuzz)
+public func __fuzz_parseICMPv6(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr_storage)
+  -> Bool
+{
+  return parseICMPv6Message(buffer: buffer, hopLimit: nil, from: saStorage) != nil
 }
 
 @_spi(Test)
@@ -218,6 +363,22 @@ public func __parseICMPMessage(buffer: UnsafeRawBufferPointer, from saStorage: s
   -> TestParsedICMP?
 {
   guard let p = parseICMPv4Message(buffer: buffer, from: saStorage) else { return nil }
+  return _toTestParsedICMP(p)
+}
+
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
+public func __parseICMPv6Message(
+  buffer: UnsafeRawBufferPointer, hopLimit: Int?, from saStorage: sockaddr_storage
+) -> TestParsedICMP? {
+  guard let p = parseICMPv6Message(buffer: buffer, hopLimit: hopLimit, from: saStorage) else {
+    return nil
+  }
+  return _toTestParsedICMP(p)
+}
+
+@inline(__always)
+private func _toTestParsedICMP(_ p: ParsedICMP) -> TestParsedICMP {
   switch p.kind {
   case .echoReply(let id, let seq):
     return TestParsedICMP(kind: .echoReply(id: id, seq: seq), source: p.sourceAddress)

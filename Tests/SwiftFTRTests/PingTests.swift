@@ -392,6 +392,113 @@ struct PingIntegrationTests {
     }
   }
 
+  /// IPv6 ping reachability test. Gated on (a) the standard `SKIP_NETWORK_TESTS`
+  /// env var and (b) actual IPv6 routability — so it skips cleanly on v4-only
+  /// CI runners rather than failing. Cross-checks against `/sbin/ping6` so genuine
+  /// network loss is not mistaken for a regression.
+  @Test(
+    "IPv6 ping to Cloudflare DNS (auto-detected family)",
+    .enabled(
+      if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")
+        && IPv6Reachability.isAvailable()))
+  func testIPv6PingReachable() async throws {
+    let tracer = SwiftFTR(config: SwiftFTRConfig())
+    let target = "2606:4700:4700::1111"
+    let count = 5
+
+    let result = try await NetworkTestGate.shared.withPermit {
+      try await tracer.ping(
+        to: target,
+        config: PingConfig(count: count, interval: 0.2, timeout: 2.0))
+    }
+
+    #expect(result.target == target)
+    #expect(
+      result.resolvedIP == target,
+      "Canonical-form contract: literal v6 in must round-trip to the same form out.")
+    #expect(result.responses.count == count)
+    #expect(result.statistics.received > 0, "Expected at least one reply from \(target)")
+
+    // Hop limit should be populated for v6 (delivered via cmsg). Allow nil for any
+    // individual response in case the kernel didn't attach it, but at least one
+    // should have it.
+    let withHop = result.responses.compactMap { $0.ttl }
+    #expect(!withHop.isEmpty, "Expected at least one response to carry a hop limit (cmsg).")
+
+    // Cross-check against system ping6 — only fail closed if SwiftFTR loss is
+    // materially worse than what the kernel ping sees.
+    let swiftftrLoss = result.statistics.packetLoss
+    if swiftftrLoss > 0.2 {
+      guard let sysLoss = systemPing6Loss(target: target, count: count) else {
+        Issue.record(
+          """
+          SwiftFTR reported \(swiftftrLoss * 100)% IPv6 loss but the /sbin/ping6 \
+          cross-check was unavailable; failing closed.
+          """)
+        return
+      }
+      #expect(
+        swiftftrLoss - sysLoss < 0.1,
+        """
+        SwiftFTR IPv6 loss \(swiftftrLoss * 100)% materially exceeds system ping6 \
+        loss \(sysLoss * 100)% — likely a regression.
+        """)
+    }
+  }
+
+  /// `PreferredFamily.v4` against a v6-only literal must throw `resolutionFailed`
+  /// rather than silently succeeding on a wrong family. Pure logic, no network
+  /// reachability required.
+  @Test("PreferredFamily.v4 rejects an IPv6 literal target")
+  func testPreferredV4RejectsV6Literal() async throws {
+    let tracer = SwiftFTR(config: SwiftFTRConfig())
+    let config = PingConfig(count: 1, timeout: 0.5, preferredFamily: .v4)
+    await #expect(throws: TracerouteError.self) {
+      try await tracer.ping(to: "2606:4700:4700::1111", config: config)
+    }
+  }
+
+  /// `PreferredFamily.v6` against a v4-only literal must throw — same shape, mirror.
+  @Test("PreferredFamily.v6 rejects an IPv4 literal target")
+  func testPreferredV6RejectsV4Literal() async throws {
+    let tracer = SwiftFTR(config: SwiftFTRConfig())
+    let config = PingConfig(count: 1, timeout: 0.5, preferredFamily: .v6)
+    await #expect(throws: TracerouteError.self) {
+      try await tracer.ping(to: "1.1.1.1", config: config)
+    }
+  }
+
+  /// Run system `/sbin/ping6` with matching parameters and parse the loss percentage.
+  /// Returns nil when ping6 can't be executed or its summary can't be parsed.
+  private func systemPing6Loss(target: String, count: Int) -> Double? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/sbin/ping6")
+    p.arguments = ["-q", "-c", String(count), target]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = Pipe()
+    do {
+      try p.run()
+      p.waitUntilExit()
+    } catch {
+      return nil
+    }
+    guard p.terminationStatus == 0 else { return nil }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    guard let output = String(data: data, encoding: .utf8) else { return nil }
+    for line in output.split(separator: "\n") where line.contains("packet loss") {
+      let parts = line.split(separator: ",")
+      for part in parts where part.contains("packet loss") {
+        let trimmed = part.trimmingCharacters(in: .whitespaces)
+        if let pctRange = trimmed.range(of: "%") {
+          let numStr = trimmed[..<pctRange.lowerBound]
+          if let v = Double(numStr) { return v / 100.0 }
+        }
+      }
+    }
+    return nil
+  }
+
   /// Regression test for the deadline-anchoring fix: under realistic Task.sleep
   /// drift (interval=10ms, count=500), the previous implementation reported
   /// false losses on the trailing ~5% of sequences because the precomputed

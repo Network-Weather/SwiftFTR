@@ -41,6 +41,30 @@ func ipString(_ sin: sockaddr_in) -> String {
   }
 }
 
+/// Canonical IPv6 string form via `inet_ntop`. Appends `%<ifname>` zone suffix when
+/// `scopeID != 0` so link-local addresses round-trip as `fe80::1%en0` rather than
+/// losing their zone (which would collide on string keys across interfaces).
+///
+/// Downstream contract (NWX): every address SwiftFTR emits goes through this
+/// formatter so that `String → resolve → String` is stable for any input.
+@inline(__always)
+func ipv6String(_ addr: in6_addr, scopeID: UInt32 = 0) -> String {
+  var a = addr
+  var buf = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
+  _ = withUnsafePointer(to: &a) { ptr in
+    inet_ntop(AF_INET6, ptr, &buf, socklen_t(INET6_ADDRSTRLEN))
+  }
+  let bare = buf.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+  guard scopeID != 0 else { return bare }
+  var nameBuf = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+  if if_indextoname(scopeID, &nameBuf) != nil {
+    let name = nameBuf.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+    if !name.isEmpty { return "\(bare)%\(name)" }
+  }
+  // Fall back to numeric scope if the interface name isn't resolvable.
+  return "\(bare)%\(scopeID)"
+}
+
 /// Returns true if the IPv4 string is in RFC1918 private or 169.254/16 link-local space.
 @inline(__always)
 public func isPrivateIPv4(_ ip: String) -> Bool {

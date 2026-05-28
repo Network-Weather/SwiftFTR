@@ -3,6 +3,30 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased (0.13.0-dev)
+-----------------------
+### Features
+
+**IPv6 `ping()` over ICMPv6 (Stage 1 of full v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
+- `SwiftFTR.ping(to:)` now accepts IPv6 literals and IPv6-resolving hostnames. Same entry point as v4; family is auto-detected from the resolved address. `tracer.ping(to: "2606:4700:4700::1111")` and `tracer.ping(to: "1.1.1.1")` both go through the existing `ping(to:config:)` API.
+- New `public enum PreferredFamily { case v4, v6, auto }` and `PingConfig.preferredFamily: PreferredFamily = .auto` (additive — existing callers unaffected). Use `.v4` / `.v6` to force a family; `.auto` (default) takes the literal's family for IP literals and the first `getaddrinfo(AF_UNSPEC)` answer for hostnames.
+- ICMPv6 codec (`makeICMPv6EchoRequest`, `parseICMPv6Message`) in `ICMP.swift`. Mirrors the IPv4 codec but lets the kernel compute the checksum (which requires the IPv6 pseudo-header).
+- `AF_INET6 / SOCK_DGRAM / IPPROTO_ICMPV6` socket creation with `IPV6_UNICAST_HOPS` (outbound) and `IPV6_RECVHOPLIMIT` (so replies carry the hop limit in cmsg ancillary data). No root or special entitlements required — same model as v4.
+- `interface: "en0"` binds v6 sockets via `IPV6_BOUND_IF` (mirrors v4's `IP_BOUND_IF`). Source-IP binding via `parseIPv6Scoped` preserves link-local `%zone` suffixes.
+- `PingResponse.ttl` carries the IPv6 hop limit for v6 replies (same field, same units 1–255). Documented dual meaning; no new `hopLimit` field added.
+- Every emitted address is in `inet_ntop` canonical form so `String → resolve → String` is stable (e.g. `2606:4700:0000:...:1111` round-trips to `2606:4700::1111`). Link-local hops keep `%<ifname>` zone suffix via `if_indextoname` (downstream consumers use these strings as dictionary keys; consistency matters).
+- New executable `icmpv6probe` (under `Tests/TestSupport/icmpv6probe/`) — diagnostic that empirically validates Darwin's SOCK_DGRAM ICMPv6 behavior; runnable via `swift run icmpv6probe <target>`. Used during development to confirm: kernel strips IPv6 header, identifier is preserved end-to-end, hop limit arrives via cmsg.
+- New tests: 4 unit cases for the v6 parser (synthetic buffers, always run); network-gated integration test (`testIPv6PingReachable`) cross-checks against `/sbin/ping6` and fails closed when the cross-check is unavailable; `PreferredFamily.v4`/`.v6` rejection tests for cross-family literals.
+- New `IPv6Reachability` helper (`Tests/SwiftFTRTests/IPv6Reachability.swift`) gates network-gated v6 tests on actual routable v6 connectivity — skips cleanly on v4-only CI runners (GitHub-hosted macOS runners notably lack public v6). `SKIP_IPV6_TESTS=1` and `FORCE_IPV6_TESTS=1` env-var overrides.
+
+### Documentation
+- `docs/IPV6.md`: forward-looking plan for full v6 parity across `trace`, `TCP/UDP probes`, `STUN`, and `swift-ip2asn` 0.4.0 ASN labels; architectural contracts (canonical form, link-local scope, single dest-string entry, family-agnostic errors); environment variables; CI/CD considerations; known limitations (NAT64 transparency, happy-eyeballs deferred).
+- Stress-test rename: `testIPv6Rejection` → `testIPv6TraceStillUnsupported` (only trace is still v4-only; ping v6 is implemented).
+
+### Notes
+- `Traceroute`, `TCPProbe`, `UDPProbe`, and `STUN` remain IPv4-only; their v6 work is staged as follow-up PRs per `docs/IPV6.md`.
+- `swift-ip2asn` floor is still `0.3.1`; v6 ASN labels arrive together with v6 traceroute in a later stage.
+
 0.12.4 — 2026-05-27
 -------------------
 ### Bug Fixes
