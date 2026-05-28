@@ -42,15 +42,13 @@ Independently shippable PRs, in priority order. Each stage builds on the pattern
 - Network-gated integration test (`testIPv6PingReachable`) cross-checking against `/sbin/ping6`.
 - `IPv6Reachability` gate so v6 tests skip cleanly on v4-only CI runners.
 
-### Stage 2 — Traceroute over ICMPv6
+### ~~Stage 2 — Traceroute over ICMPv6~~ *(shipped)*
 
-- ICMPv6 Time Exceeded handling in `Traceroute.swift`'s two receive paths (currently at lines ~1335 and ~1562).
-- Embedded IPv6 + ICMPv6 packet parsing for Time Exceeded / Destination Unreachable — different layout from v4 (fixed 40-byte v6 header, no IHL field; reuses the parser added in Stage 1).
-- `IPV6_UNICAST_HOPS` cycling per probe (analogue of v4's `IP_TTL` cycling).
-- Streaming v6 traceroute (`StreamingTrace.swift`).
-- Flip `StressTests.testIPv6TraceStillUnsupported` to assert success.
-- Cross-check against `/usr/sbin/traceroute6 2606:4700:4700::1111`.
-- **`VPNContext.forInterface(_:)` and `TraceClassifier` need to handle dual-stack-source / v4-only-tunnel.** NWX's `SplitTunnelManager` and `TopologyDiscoveryManager` both pass a `VPNContext` to `traceClassified`. When the tunnel interface (typically a `utun*`) is v4-only but the physical interface is dual-stack, a v6 trace bound to `en0` will traverse a different path than `VPNContext` was constructed to describe. The classifier needs to know which family each hop carried and resolve the VPN-vs-direct decision per-hop rather than once-per-trace. This is the place where most real-world VPN setups will surface dual-stack edge cases — flagged here so Stage 2 doesn't ship a v6 trace that silently misclassifies.
+Now ships v6 trace, traceClassified, and traceStream via the same entry points as v4. ICMPv6 Time Exceeded handling in both receive paths reuses Stage 1's `parseICMPv6Message`. `IPV6_UNICAST_HOPS` replaces `IP_TTL` for hop cycling, and `IPV6_RECVHOPLIMIT` cmsg surfaces the reply hop limit. File-scope dual-stack helpers (`createTraceSocket`, `setTraceHopLimit`, `recvTraceMessage`, etc.) keep `Traceroute.swift` readable. Spike `traceroute6probe` empirically validated Time Exceeded delivery and embedded-packet parsing against real intermediate routers before integration.
+
+**Folded in from former Stage 6**: `swift-ip2asn` bumped to 0.4.0; `CymruDNSResolver` gained v6 lookups via `origin6.asn.cymru.com` with a new `reverseIPv6Nibbles` helper. v6 hops now get full `[AS… - ASNAME]` annotations identically to v4 traces.
+
+**Deferred follow-up** (not blocking v6 trace correctness): `VPNContext.vpnLocalIPs` is empty by default — populating it with both v4 and v6 addresses of detected VPN interfaces is its own refactor (the field has been empty since the initial implementation; v6 trace classification works correctly without it because it falls through to ASN-based segmentation). NWX flagged the dual-stack-source / v4-only-tunnel edge case for follow-up attention.
 
 ### Stage 3 — TCP / UDP probes over IPv6
 

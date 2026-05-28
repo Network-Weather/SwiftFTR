@@ -173,8 +173,14 @@ public struct CymruDNSResolver: ASNResolver {
     let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
     if ips.isEmpty { return [:] }
 
-    // Filter to only public IPs
-    let publicIPs = ips.filter { !isPrivateIPv4($0) && !isCGNATIPv4($0) }
+    // Filter out v4 private/CGNAT; v6 strings pass through (no equivalent
+    // filtering — link-local v6 like fe80::/10 won't have ASN data anyway and
+    // returns nil from Cymru cleanly). Cymru's origin6.asn.cymru.com handles
+    // the v6 nibble-reversed lookup; see `lookupOriginASN`.
+    let publicIPs = ips.filter { ip -> Bool in
+      if detectAddressFamily(ip) == AF_INET6 { return true }
+      return !isPrivateIPv4(ip) && !isCGNATIPv4(ip)
+    }
     if publicIPs.isEmpty { return [:] }
 
     let semaphore = _ConcurrencySemaphore(maxConcurrent: 8)
@@ -232,11 +238,20 @@ public struct CymruDNSResolver: ASNResolver {
     return result
   }
 
-  /// Look up origin ASN for a single IP address.
+  /// Look up origin ASN for a single IP address. Dispatches v4 to
+  /// `origin.asn.cymru.com` (dotted-quad reverse) and v6 to
+  /// `origin6.asn.cymru.com` (full nibble reverse, RFC 1886 §2.5 style).
   private func lookupOriginASN(ip: String, timeout: TimeInterval) async -> _OriginASNResult? {
-    let octs = ip.split(separator: ".")
-    let rev = octs.reversed().joined(separator: ".")
-    let q = "\(rev).origin.asn.cymru.com"
+    let fam = detectAddressFamily(ip)
+    let q: String
+    if fam == AF_INET6 {
+      guard let nibblesReverse = reverseIPv6Nibbles(ip) else { return nil }
+      q = "\(nibblesReverse).origin6.asn.cymru.com"
+    } else {
+      let octs = ip.split(separator: ".")
+      let rev = octs.reversed().joined(separator: ".")
+      q = "\(rev).origin.asn.cymru.com"
+    }
 
     // Wrap blocking DNS call in detached task
     let txts = await Task.detached(priority: .userInitiated) {

@@ -7,6 +7,35 @@ Unreleased (0.13.0-dev)
 -----------------------
 ### Features
 
+**IPv6 `trace()`, `traceClassified()`, and `traceStream()` over ICMPv6 (Stage 2 of v6 parity)**
+- Dual-stack `Traceroute.swift`: `SwiftFTR.trace()`, `traceClassified()`, and `traceStream()` now accept IPv6 literals and IPv6-resolving hostnames using the same entry points as v4. Family auto-detected from the resolved address; opt-in `SwiftFTRConfig.preferredFamily` forces a specific family (additive, default `.auto`).
+- ICMPv6 path: `socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)`, `IPV6_UNICAST_HOPS` cycling per probe (replaces v4's `IP_TTL`), `IPV6_RECVHOPLIMIT` cmsg so hop limit arrives via `recvmsg`. Embedded-packet parsing in Time Exceeded / Destination Unreachable uses the existing `parseICMPv6Message` (added Stage 1).
+- `interface: "en0"` binds v6 trace sockets via `IPV6_BOUND_IF`; source-IP binding honors link-local `%zone` suffixes via `parseIPv6Scoped`.
+- Empirically validated end-to-end against Cloudflare WARP v6 connectivity: real intermediate routers deliver Time Exceeded (Spike B), `parseICMPv6Message` correctly recovers embedded original identifier/sequence from real packets.
+- File-scope helpers `createTraceSocket(family:)`, `setTraceHopLimit(...)`, `bindTraceInterface(...)`, `bindTraceSourceIP(...)`, `sendTraceProbe(...)`, `recvTraceMessage(...)` centralize family branching so all three entry points and both receive operations share the same dual-stack code.
+
+**v6 ASN labels via `swift-ip2asn` 0.4.0 (folded into Stage 2; was originally planned as Stage 6)**
+- Bumped `swift-ip2asn` floor from `0.3.1` to `0.4.0` — adds dual-stack `UltraCompactDatabase.lookup(_ ipString:)` that transparently dispatches v4 vs v6.
+- `CymruDNSResolver.resolve` now does v6 ASN lookups against `origin6.asn.cymru.com` using the IPv6 nibble-reverse form (new `reverseIPv6Nibbles` helper in `Utils.swift`). The default `.dns` strategy now annotates v6 hops with `[AS… - ASNAME]` exactly like v4. Verified end-to-end: `swift-ftr 2001:4860:4860::8888` returns AS13335 → AS15169 trace through Cloudflare to Google.
+- `LocalASNResolver` works transparently for v6 because the 0.4.0 lookup API accepts both families (no code change needed beyond the dep bump).
+
+**Shared dual-stack resolver in `Hostname.swift`**
+- `resolveHost(host:prefer:) -> ResolvedHost` moved from `Ping.swift` into its own file at file scope so `Traceroute.swift` shares it. Smallest possible extraction; full Stage-5 resolver consolidation across `TCPProbe.swift` / `UDPProbe.swift` is still pending.
+- `ResolvedHost` made `public` so it can flow through trace operation classes.
+
+**New diagnostics**
+- `Tests/TestSupport/ip2asnv6probe/` (Spike A): standalone executable confirming `UltraCompactDatabase.lookup` returns expected ASNs for Cloudflare, Google, Quad9 v6 anycast addresses, and nil for loopback/link-local/unallocated. Run with `swift run ip2asnv6probe`.
+- `Tests/TestSupport/traceroute6probe/` (Spike B): standalone executable doing manual hop-limit cycling against any v6 target; uses the library's `@_spi(Test) __parseV6PingMessage` to exercise the real parser on real wire data. Run with `swift run traceroute6probe <ipv6-addr>`.
+
+**Tests**
+- New `LocalASNResolverTests.testEmbeddedDatabaseIPv6Lookup`: asserts Cloudflare and Google v6 anycast addresses resolve to AS13335 and AS15169 via the bundled DB.
+- `StressTests.testIPv6Rejection` → `testIPv6TraceSucceeds`: now asserts v6 trace works when v6 reachability is available; skips cleanly otherwise.
+- All 161 existing tests pass with `PTR_SKIP_STUN=1 SKIP_NETWORK_TESTS=1 swift test`.
+
+**Notes**
+- `VPNContext.vpnLocalIPs` extension to include v6 addresses of detected VPN interfaces is deferred to a follow-up — currently `vpnLocalIPs` is empty regardless of family (pre-existing state). v6 trace correctness does not depend on it; the classifier handles v6 hops via ASN-based segmentation.
+- TCP/UDP probes and STUN remain IPv4-only; their v6 ports are subsequent stages per `docs/IPV6.md`.
+
 **IPv6 `ping()` over ICMPv6 (Stage 1 of full v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
 - `SwiftFTR.ping(to:)` now accepts IPv6 literals and IPv6-resolving hostnames. Same entry point as v4; family is auto-detected from the resolved address. `tracer.ping(to: "2606:4700:4700::1111")` and `tracer.ping(to: "1.1.1.1")` both go through the existing `ping(to:config:)` API.
 - New `public enum PreferredFamily { case v4, v6, auto }` and `PingConfig.preferredFamily: PreferredFamily = .auto` (additive — existing callers unaffected). Use `.v4` / `.v6` to force a family; `.auto` (default) takes the literal's family for IP literals and the first `getaddrinfo(AF_UNSPEC)` answer for hostnames.

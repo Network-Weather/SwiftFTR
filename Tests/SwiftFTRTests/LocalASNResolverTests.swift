@@ -34,6 +34,19 @@ final class LocalASNResolverTests: XCTestCase {
     }
   }
 
+  /// IPv6 ASN lookups via swift-ip2asn 0.4.0's dual-stack UltraCompactDatabase.
+  /// No network required — uses the bundled DB.
+  func testEmbeddedDatabaseIPv6Lookup() async throws {
+    let resolver = LocalASNResolver(source: .embedded)
+    let results = try await resolver.resolve(
+      ipv4Addrs: ["2606:4700:4700::1111", "2001:4860:4860::8888"], timeout: 1.0)
+
+    XCTAssertEqual(
+      results["2606:4700:4700::1111"]?.asn, 13335, "Cloudflare v6 → AS13335")
+    XCTAssertEqual(
+      results["2001:4860:4860::8888"]?.asn, 15169, "Google v6 → AS15169")
+  }
+
   /// Verify lookup performance is microsecond-level (not network-bound).
   func testLookupPerformance() async throws {
     let resolver = LocalASNResolver(source: .embedded)

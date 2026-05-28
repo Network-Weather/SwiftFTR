@@ -104,20 +104,20 @@ final class StressAndEdgeCaseTests: XCTestCase {
     }
   }
 
-  /// Traceroute v6 is still unimplemented at the time of this test — only `ping()`
-  /// gained IPv6 support in Stage 1. This asserts the trace path still throws.
-  /// Removed in the Stage-2 trace-v6 PR.
-  func testIPv6TraceStillUnsupported() async throws {
-    let config = SwiftFTRConfig()
-    let tracer = SwiftFTR(config: config)
-    do {
-      _ = try await tracer.trace(to: "2001:4860:4860::8888")
-      XCTFail("Stage-1 trace should still reject IPv6 (only ping v6 implemented)")
-    } catch {
-      // Any thrown error is acceptable here — different code paths produce
-      // different specific errors (resolutionFailed, sendFailed, etc.).
-      XCTAssertTrue(true)
+  /// IPv6 traceroute now works (Stage 2). When v6 reachability is available,
+  /// trace() to a v6 literal completes without throwing. Network-gated.
+  func testIPv6TraceSucceeds() async throws {
+    guard !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS"),
+      IPv6Reachability.isAvailable()
+    else {
+      // Skip on v4-only environments or when network tests are disabled.
+      return
     }
+    let config = SwiftFTRConfig(maxHops: 10)
+    let tracer = SwiftFTR(config: config)
+    let result = try await tracer.trace(to: "2606:4700:4700::1111")
+    XCTAssertEqual(result.destination, "2606:4700:4700::1111")
+    XCTAssertGreaterThan(result.hops.count, 0)
   }
 
   func testDNSResolutionEdgeCases() async throws {
