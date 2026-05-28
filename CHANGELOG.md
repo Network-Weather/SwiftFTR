@@ -5,6 +5,21 @@ All notable changes to this project are documented here. This project follows Se
 
 Unreleased (0.13.0-dev)
 -----------------------
+### Refactor
+
+**Resolver and bind-helper consolidation (Stage 5 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**
+
+Pure refactor; no behavior change, no public API change. Tidies up duplication that accumulated across Stages 1–4 now that every caller path is family-aware.
+
+- `Multipath.swift` was the last remaining caller of the old `resolveIPv4(host:enableLogging:) -> sockaddr_in` helper. Migrated to `resolveHost(host:, prefer: .v4)` (Multipath stays v4-only by design since ECMP probing is heavily tied to IPv4 paris-traceroute / 5-tuple semantics, but uses the shared resolver).
+- Deleted the now-unused `resolveIPv4` from `Traceroute.swift` (lines 1024–1064). `Hostname.resolveHost(host:prefer:)` is the only resolver in the codebase.
+- Renamed `bindProbeSourceIP` → `bindSourceIP` in `Hostname.swift` — no longer probe-specific; it's the shared family-aware source-IP bind for every socket path (ping, trace, probes, STUN).
+- Added new `bindInterface(sockfd:family:ifIndex:) -> String?` helper in `Hostname.swift` — same low-level shape as `bindSourceIP`. Centralizes the `IP_BOUND_IF` (v4) / `IPV6_BOUND_IF` (v6) `setsockopt` call.
+- `Traceroute.swift`'s `bindTraceInterface` and `bindTraceSourceIP` are now thin wrappers that delegate to the shared helpers and translate the string error to the typed `TracerouteError.{interfaceBindFailed, sourceIPBindFailed}` thrown by trace's caller contract.
+- `TCPProbe.swift` and `STUN.swift` now call `bindInterface` directly (was: inline `setsockopt` with hand-rolled level/opt branching). Tests untouched.
+
+The shared helpers (`resolveHost`, `bindSourceIP`, `bindInterface`) all live in `Hostname.swift` and are family-aware, so any future v6 work calls the same code paths v4 does.
+
 ### Features
 
 **IPv6 STUN + dual-stack public-IP discovery (Stage 4 of v6 parity — see [`docs/IPV6.md`](docs/IPV6.md))**

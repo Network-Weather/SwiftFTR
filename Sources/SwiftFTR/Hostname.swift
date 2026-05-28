@@ -18,11 +18,14 @@ public struct ResolvedHost: Sendable {
   public let canonical: String
 }
 
-/// Family-aware source-IP bind shared by TCP/UDP probes. Returns nil on success;
-/// returns an error message string on failure (probes use string errors, not
-/// thrown `TracerouteError`, because they report through their own result types).
+/// Family-aware source-IP bind shared across ping, trace, probes, and STUN.
+/// Returns nil on success; returns an error message string on failure. Callers
+/// that report errors via thrown types (e.g. `Traceroute`) wrap this and
+/// translate the string; callers that report via result types (probes) use the
+/// string directly.
+///
 /// For v6 the link-local `%zone` suffix is honored via `parseIPv6Scoped`.
-internal func bindProbeSourceIP(sockfd: Int32, family: Int32, sourceIP: String) -> String? {
+internal func bindSourceIP(sockfd: Int32, family: Int32, sourceIP: String) -> String? {
   switch family {
   case AF_INET:
     var addr = sockaddr_in()
@@ -61,6 +64,23 @@ internal func bindProbeSourceIP(sockfd: Int32, family: Int32, sourceIP: String) 
   default:
     return "Unsupported family for source bind: \(family)"
   }
+}
+
+/// Family-aware interface bind via `IP_BOUND_IF` (v4) or `IPV6_BOUND_IF` (v6).
+/// Returns nil on success; an error message string on failure. Caller is
+/// responsible for resolving `interfaceName` to `ifIndex` (typically via
+/// `if_nametoindex`) and for handling the `ifIndex == 0` failure case before
+/// invoking this — that lets callers produce more specific error messages
+/// (e.g. "interface not found" vs. "setsockopt failed").
+internal func bindInterface(sockfd: Int32, family: Int32, ifIndex: UInt32) -> String? {
+  var index = ifIndex
+  let level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
+  let opt = family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
+  if setsockopt(sockfd, level, opt, &index, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
+    return
+      "setsockopt(\(family == AF_INET6 ? "IPV6_BOUND_IF" : "IP_BOUND_IF")) failed: \(String(cString: strerror(errno)))"
+  }
+  return nil
 }
 
 /// Dual-stack host resolver shared across `ping()`, `trace()`, and friends.

@@ -1020,49 +1020,6 @@ public actor SwiftFTR {
   }
 }
 
-// Helpers
-internal func resolveIPv4(host: String, enableLogging: Bool = false) throws -> sockaddr_in {
-  if enableLogging {
-    print("[SwiftFTR] Resolving host: \(host)")
-  }
-  // Try numeric IPv4 first (fast path, works without DNS)
-  var addr = sockaddr_in()
-  addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-  addr.sin_family = sa_family_t(AF_INET)
-  if host.withCString({ inet_pton(AF_INET, $0, &addr.sin_addr) }) == 1 {
-    return addr
-  }
-
-  // Fall back to getaddrinfo for names
-  var hints = addrinfo(
-    ai_flags: AI_ADDRCONFIG,
-    ai_family: AF_INET,
-    ai_socktype: 0,
-    ai_protocol: 0,
-    ai_addrlen: 0,
-    ai_canonname: nil,
-    ai_addr: nil,
-    ai_next: nil
-  )
-  var res: UnsafeMutablePointer<addrinfo>? = nil
-  let err = getaddrinfo(host, nil, &hints, &res)
-  guard err == 0, let info = res else {
-    let details =
-      err != 0
-      ? "getaddrinfo error: \(String(cString: gai_strerror(err)))" : "Failed to get address info"
-    throw TracerouteError.resolutionFailed(host: host, details: details)
-  }
-  defer { freeaddrinfo(info) }
-  if info.pointee.ai_family == AF_INET, let sa = info.pointee.ai_addr {
-    memcpy(&addr, sa, min(MemoryLayout<sockaddr_in>.size, Int(info.pointee.ai_addrlen)))
-    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    addr.sin_family = sa.pointee.sa_family
-    return addr
-  }
-  throw TracerouteError.resolutionFailed(
-    host: host, details: "Host resolved but no IPv4 address available")
-}
-
 // MARK: - Dual-stack trace helpers (Stage 2 IPv6)
 
 // Stage 1 added these for the ping path in Ping.swift; the v6 socket constants
@@ -1117,18 +1074,17 @@ internal func setTraceHopLimit(sockfd: Int32, family: Int32, ttl: Int) throws {
 }
 
 /// Family-aware interface binding: v4 → `IP_BOUND_IF`, v6 → `IPV6_BOUND_IF`.
+/// Trace-layer wrapper around the shared `bindInterface`. Translates the
+/// string error to a typed `TracerouteError.interfaceBindFailed` and logs.
 internal func bindTraceInterface(
   sockfd: Int32, family: Int32, interfaceName: String, ifIndex: UInt32, enableLogging: Bool
 ) throws {
-  var index = ifIndex
-  let level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
-  let opt = family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
-  if setsockopt(sockfd, level, opt, &index, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
+  if let errMsg = bindInterface(sockfd: sockfd, family: family, ifIndex: ifIndex) {
     let error = errno
     let details =
-      "Failed to bind socket to interface '\(interfaceName)' (index: \(ifIndex)). This may indicate: (1) Insufficient permissions, (2) Interface is not available for ICMP binding, (3) Interface doesn't support the operation."
+      "Failed to bind socket to interface '\(interfaceName)' (index: \(ifIndex)): \(errMsg). This may indicate: (1) Insufficient permissions, (2) Interface is not available for ICMP binding, (3) Interface doesn't support the operation."
     if enableLogging {
-      print("[SwiftFTR] ERROR: bind-to-interface failed - errno=\(error)")
+      print("[SwiftFTR] ERROR: bind-to-interface failed - \(errMsg)")
     }
     throw TracerouteError.interfaceBindFailed(
       interface: interfaceName, errno: error, details: details)
@@ -1138,55 +1094,14 @@ internal func bindTraceInterface(
   }
 }
 
-/// Family-aware source-IP bind. v4 → `sockaddr_in`; v6 → `sockaddr_in6` with
-/// optional link-local `%zone` suffix preserved via `parseIPv6Scoped`.
+/// Trace-layer wrapper around the shared `bindSourceIP`. Translates the string
+/// error to a typed `TracerouteError.sourceIPBindFailed` and logs.
 internal func bindTraceSourceIP(
   sockfd: Int32, family: Int32, sourceIP: String, enableLogging: Bool
 ) throws {
-  switch family {
-  case AF_INET:
-    var addr = sockaddr_in()
-    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = 0
-    if inet_pton(AF_INET, sourceIP, &addr.sin_addr) != 1 {
-      throw TracerouteError.sourceIPBindFailed(
-        sourceIP: sourceIP, errno: errno,
-        details: "Invalid IPv4 address '\(sourceIP)'.")
-    }
-    let rc = withUnsafePointer(to: &addr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        bind(sockfd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-    if rc != 0 {
-      throw TracerouteError.sourceIPBindFailed(
-        sourceIP: sourceIP, errno: errno, details: "bind() failed for v4 source IP")
-    }
-  case AF_INET6:
-    let (bare, scopeID) = parseIPv6Scoped(sourceIP)
-    var addr = sockaddr_in6()
-    addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-    addr.sin6_family = sa_family_t(AF_INET6)
-    addr.sin6_scope_id = scopeID
-    if inet_pton(AF_INET6, bare, &addr.sin6_addr) != 1 {
-      throw TracerouteError.sourceIPBindFailed(
-        sourceIP: sourceIP, errno: errno,
-        details: "Invalid IPv6 address '\(sourceIP)'.")
-    }
-    let rc = withUnsafePointer(to: &addr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        bind(sockfd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
-      }
-    }
-    if rc != 0 {
-      throw TracerouteError.sourceIPBindFailed(
-        sourceIP: sourceIP, errno: errno, details: "bind() failed for v6 source IP")
-    }
-  default:
+  if let errMsg = bindSourceIP(sockfd: sockfd, family: family, sourceIP: sourceIP) {
     throw TracerouteError.sourceIPBindFailed(
-      sourceIP: sourceIP, errno: 0,
-      details: "Unsupported family for source bind: \(family)")
+      sourceIP: sourceIP, errno: errno, details: errMsg)
   }
   if enableLogging {
     print("[SwiftFTR] Bound trace socket to source IP '\(sourceIP)'")
