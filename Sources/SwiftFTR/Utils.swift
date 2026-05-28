@@ -65,6 +65,34 @@ func ipv6String(_ addr: in6_addr, scopeID: UInt32 = 0) -> String {
   return "\(bare)%\(scopeID)"
 }
 
+/// Reverse-nibble form of an IPv6 address for DNS-based lookups (Cymru
+/// `origin6.asn.cymru.com`, IP6.ARPA reverse zones, etc.). Returns the fully
+/// expanded address with each hex digit reversed and dot-separated, e.g.
+/// `2001:db8::1` → `"1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2"`.
+/// Returns nil if the input isn't a parseable IPv6 address. Scope suffix `%zone`
+/// is stripped before parsing.
+public func reverseIPv6Nibbles(_ ip: String) -> String? {
+  let (bare, _) = parseIPv6Scoped(ip)
+  var addr = in6_addr()
+  guard bare.withCString({ inet_pton(AF_INET6, $0, &addr) }) == 1 else { return nil }
+  // in6_addr is 16 bytes (8 UInt16s in big-endian). Walk byte-by-byte for
+  // straightforward nibble extraction.
+  let bytes: [UInt8] = withUnsafeBytes(of: &addr) { raw in
+    Array(raw.bindMemory(to: UInt8.self))
+  }
+  guard bytes.count == 16 else { return nil }
+  let hexDigits = "0123456789abcdef"
+  let hexArr = Array(hexDigits)
+  var nibbles: [Character] = []
+  nibbles.reserveCapacity(32)
+  for b in bytes {
+    nibbles.append(hexArr[Int(b >> 4)])
+    nibbles.append(hexArr[Int(b & 0x0F)])
+  }
+  // Reverse and dot-join.
+  return nibbles.reversed().map(String.init).joined(separator: ".")
+}
+
 /// Returns true if the IPv4 string is in RFC1918 private or 169.254/16 link-local space.
 @inline(__always)
 public func isPrivateIPv4(_ ip: String) -> Bool {

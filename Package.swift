@@ -19,7 +19,7 @@ let package = Package(
         // Enables `swift package generate-documentation`
         .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.4.0"),
         // Local ASN database for offline IP-to-ASN lookups
-        .package(url: "https://github.com/network-weather/swift-ip2asn", from: "0.3.1")
+        .package(url: "https://github.com/network-weather/swift-ip2asn", from: "0.4.0")
     ],
     targets: [
         .target(
@@ -67,12 +67,22 @@ let package = Package(
             name: "ResourceBenchmark",
             dependencies: ["SwiftFTR"],
             path: "Tests/TestSupport",
-            exclude: ["icmpv6probe"]
+            exclude: ["icmpv6probe", "ip2asnv6probe", "traceroute6probe"]
         ),
         .executableTarget(
             name: "icmpv6probe",
             dependencies: ["SwiftFTR"],
             path: "Tests/TestSupport/icmpv6probe"
+        ),
+        .executableTarget(
+            name: "ip2asnv6probe",
+            dependencies: [.product(name: "SwiftIP2ASN", package: "swift-ip2asn")],
+            path: "Tests/TestSupport/ip2asnv6probe"
+        ),
+        .executableTarget(
+            name: "traceroute6probe",
+            dependencies: ["SwiftFTR"],
+            path: "Tests/TestSupport/traceroute6probe"
         )
     ],
     // Swift 6 language mode with strict concurrency checking

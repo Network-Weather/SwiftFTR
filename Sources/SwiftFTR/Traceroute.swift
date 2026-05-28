@@ -166,6 +166,11 @@ public struct SwiftFTRConfig: Sendable {
   /// ```
   public let asnResolverStrategy: ASNResolverStrategy
 
+  /// IP family preference for resolution & traceroute. Defaults to `.auto`
+  /// (let the resolved address decide). Mirrors `PingConfig.preferredFamily`
+  /// added in Stage 1. See [docs/IPV6.md](../../docs/IPV6.md).
+  public let preferredFamily: PreferredFamily
+
   /// Creates a new SwiftFTR configuration.
   ///
   /// - Parameters:
@@ -180,6 +185,7 @@ public struct SwiftFTRConfig: Sendable {
   ///   - interface: Network interface to use for sending probes (e.g. "en0"). If nil, uses system default.
   ///   - sourceIP: Source IP address to bind to (e.g. "192.168.1.100"). Must be assigned to the interface. If nil, uses system default.
   ///   - asnResolverStrategy: Strategy for ASN lookups during classification (default: .dns)
+  ///   - preferredFamily: IP family preference for resolution (default: .auto)
   public init(
     maxHops: Int = 40,
     maxWaitMs: Int = 1000,
@@ -191,7 +197,8 @@ public struct SwiftFTRConfig: Sendable {
     rdnsCacheSize: Int? = nil,
     interface: String? = nil,
     sourceIP: String? = nil,
-    asnResolverStrategy: ASNResolverStrategy = .dns
+    asnResolverStrategy: ASNResolverStrategy = .dns,
+    preferredFamily: PreferredFamily = .auto
   ) {
     precondition(maxHops >= 1 && maxHops <= 255, "maxHops must be 1...255")
     precondition(maxWaitMs > 0, "maxWaitMs must be positive")
@@ -207,6 +214,7 @@ public struct SwiftFTRConfig: Sendable {
     self.interface = interface
     self.sourceIP = sourceIP
     self.asnResolverStrategy = asnResolverStrategy
+    self.preferredFamily = preferredFamily
   }
 }
 
@@ -414,96 +422,50 @@ public actor SwiftFTR {
       interfaceIndex = try validateInterface(interfaceName)
     }
 
-    // Resolve destination
-    let destAddr = try resolveIPv4(host: host, enableLogging: config.enableLogging)
+    // Resolve destination (dual-stack, honors config.preferredFamily).
+    let resolved = try resolveHost(host: host, prefer: config.preferredFamily)
 
-    // Check cancellation before socket creation
     if await handle.isCancelled {
       throw TracerouteError.cancelled
     }
 
-    // Create ICMP datagram socket (no raw socket, no root needed)
-    let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
-    if fd < 0 {
-      let details =
-        "Failed to create ICMP datagram socket. On macOS 10.9+, SOCK_DGRAM/IPPROTO_ICMP should work without root."
-      throw TracerouteError.socketCreateFailed(errno: errno, details: details)
-    }
+    let fd = try createTraceSocket(family: resolved.family, enableLogging: config.enableLogging)
     defer { close(fd) }
 
-    // Bind to interface if specified
     if let ifIndex = interfaceIndex {
-      var boundIndex = ifIndex
-      if setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &boundIndex, socklen_t(MemoryLayout<UInt32>.size))
-        != 0
-      {
-        let error = errno
-        throw TracerouteError.interfaceBindFailed(
-          interface: config.interface!, errno: error, details: nil)
-      }
+      try bindTraceInterface(
+        sockfd: fd, family: resolved.family,
+        interfaceName: config.interface ?? "<unknown>", ifIndex: ifIndex,
+        enableLogging: config.enableLogging)
     }
 
-    // Bind to source IP if specified
     if let sourceIP = config.sourceIP {
-      var bindAddr = sockaddr_in()
-      bindAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-      bindAddr.sin_family = sa_family_t(AF_INET)
-      bindAddr.sin_port = 0
-      if inet_pton(AF_INET, sourceIP, &bindAddr.sin_addr) != 1 {
-        throw TracerouteError.sourceIPBindFailed(
-          sourceIP: sourceIP, errno: EINVAL, details: "Invalid IP address format")
-      }
-      let bindResult = withUnsafePointer(to: &bindAddr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-          bind(fd, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-      }
-      if bindResult != 0 {
-        let error = errno
-        throw TracerouteError.sourceIPBindFailed(
-          sourceIP: sourceIP, errno: error, details: nil)
-      }
+      try bindTraceSourceIP(
+        sockfd: fd, family: resolved.family, sourceIP: sourceIP,
+        enableLogging: config.enableLogging)
     }
 
-    // Set non-blocking
     let flags = fcntl(fd, F_GETFL, 0)
     _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
-    // Enable receiving TTL of replies (best-effort)
-    var on: Int32 = 1
-    _ = setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, socklen_t(MemoryLayout<Int32>.size))
+    if resolved.family == AF_INET {
+      var on: Int32 = 1
+      _ = setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, socklen_t(MemoryLayout<Int32>.size))
+    }
 
-    // Generate flow identifier
     let identifier = UInt16.random(in: 0...UInt16.max)
-
-    // Tracking structures
     var outstanding: [UInt16: TraceSendInfo] = [:]
 
-    // Send all probes
     if config.enableLogging {
       print("[SwiftFTR] Streaming trace: sending \(maxHops) probes...")
     }
-
     for ttl in 1...maxHops {
-      var ttlVar: Int32 = Int32(ttl)
-      if setsockopt(fd, IPPROTO_IP, IP_TTL, &ttlVar, socklen_t(MemoryLayout<Int32>.size)) != 0 {
-        throw TracerouteError.setsockoptFailed(option: "IP_TTL", errno: errno)
-      }
+      try setTraceHopLimit(sockfd: fd, family: resolved.family, ttl: ttl)
       let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
-      let packet = makeICMPEchoRequest(
-        identifier: identifier, sequence: seq, payloadSize: payloadSize)
       let sentAt = monotonicNow()
-      var addr = destAddr
-      let sent = packet.withUnsafeBytes { rawBuf in
-        withUnsafePointer(to: &addr) { aptr -> ssize_t in
-          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-            sendto(
-              fd, rawBuf.baseAddress!, rawBuf.count, 0, saPtr,
-              socklen_t(MemoryLayout<sockaddr_in>.size))
-          }
-        }
-      }
-      if sent < 0 { throw TracerouteError.sendFailed(errno: errno) }
+      try sendTraceProbe(
+        sockfd: fd, resolved: resolved, identifier: identifier,
+        sequence: seq, payloadSize: payloadSize)
       outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
     }
 
@@ -516,11 +478,12 @@ public actor SwiftFTR {
 
     let streamOperation = StreamingTraceReceiveOperation(
       sockfd: fd,
+      family: resolved.family,
       identifier: identifier,
       outstanding: outstanding,
       maxHops: maxHops,
       payloadSize: payloadSize,
-      destAddr: destAddr,
+      resolved: resolved,
       streamConfig: streamConfig,
       enableLogging: config.enableLogging,
       yield: yield
@@ -611,149 +574,50 @@ public actor SwiftFTR {
         "[SwiftFTR] Starting trace to \(host) with maxHops=\(maxHops), timeout=\(timeout)s, payloadSize=\(payloadSize)"
       )
     }
-    // Resolve host (IPv4 only)
-    let destAddr = try resolveIPv4(host: host, enableLogging: config.enableLogging)
-
-    // Create ICMP datagram socket (no root required on macOS)
+    // Resolve host (dual-stack, honors config.preferredFamily).
+    let resolved = try resolveHost(host: host, prefer: config.preferredFamily)
     if config.enableLogging {
-      print("[SwiftFTR] Creating ICMP datagram socket...")
+      let famName = resolved.family == AF_INET6 ? "v6" : "v4"
+      print("[SwiftFTR] Resolved \(host) → \(resolved.canonical) (\(famName))")
     }
 
-    let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
-    if fd < 0 {
-      let error = errno
-      let details =
-        "This typically indicates: (1) Platform doesn't support ICMP datagram sockets, (2) Network permissions denied, (3) Running in sandbox without network entitlement. On macOS, this should work without root privileges."
-      throw TracerouteError.socketCreateFailed(errno: error, details: details)
-    }
-
-    if config.enableLogging {
-      print("[SwiftFTR] Socket created successfully (fd=\(fd))")
-    }
+    let fd = try createTraceSocket(family: resolved.family, enableLogging: config.enableLogging)
     defer { close(fd) }
 
-    // Bind to specific interface if requested (using pre-validated index)
     if let interfaceName = config.interface, let ifIndex = interfaceIndex {
-      if config.enableLogging {
-        print(
-          "[SwiftFTR] Binding ICMP socket to interface '\(interfaceName)' (index: \(ifIndex))...")
-      }
-
-      #if os(macOS)
-        var index = ifIndex
-        if setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &index, socklen_t(MemoryLayout<UInt32>.size))
-          != 0
-        {
-          let error = errno
-          let details =
-            "Failed to bind ICMP socket to interface '\(interfaceName)' (index: \(ifIndex)). This may indicate: (1) Insufficient permissions, (2) Interface is not available for ICMP binding, (3) Interface doesn't support the operation."
-          if config.enableLogging {
-            print(
-              "[SwiftFTR] ERROR: setsockopt(IP_BOUND_IF) failed - errno=\(error): \(String(cString: strerror(error)))"
-            )
-          }
-          throw TracerouteError.interfaceBindFailed(
-            interface: interfaceName, errno: error, details: details)
-        }
-
-        if config.enableLogging {
-          print(
-            "[SwiftFTR] Successfully bound ICMP socket to interface '\(interfaceName)' (index: \(ifIndex))"
-          )
-        }
-      #endif
+      try bindTraceInterface(
+        sockfd: fd, family: resolved.family, interfaceName: interfaceName,
+        ifIndex: ifIndex, enableLogging: config.enableLogging)
     }
 
-    // Bind to specific source IP if requested
     if let sourceIP = config.sourceIP {
-      if config.enableLogging {
-        print("[SwiftFTR] Binding ICMP socket to source IP '\(sourceIP)'...")
-      }
-
-      var sourceAddr = sockaddr_in()
-      sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-      sourceAddr.sin_family = sa_family_t(AF_INET)
-      sourceAddr.sin_port = 0  // Any port for ICMP
-
-      // Convert IP string to network address
-      if inet_pton(AF_INET, sourceIP, &sourceAddr.sin_addr) != 1 {
-        let error = errno
-        let details =
-          "Invalid source IP address '\(sourceIP)'. Must be a valid IPv4 address in dotted decimal notation (e.g., 192.168.1.100)."
-        if config.enableLogging {
-          print("[SwiftFTR] ERROR: Invalid source IP format")
-        }
-        throw TracerouteError.sourceIPBindFailed(
-          sourceIP: sourceIP, errno: error, details: details)
-      }
-
-      // Bind socket to source address
-      let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-          bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-      }
-
-      if bindResult != 0 {
-        let error = errno
-        let details =
-          "Failed to bind to source IP '\(sourceIP)'. Common causes: (1) IP not assigned to any interface, (2) IP assigned to different interface than specified, (3) Insufficient permissions, (4) Address already in use."
-        if config.enableLogging {
-          print(
-            "[SwiftFTR] ERROR: bind() failed - errno=\(error): \(String(cString: strerror(error)))"
-          )
-        }
-        throw TracerouteError.sourceIPBindFailed(
-          sourceIP: sourceIP, errno: error, details: details)
-      }
-
-      if config.enableLogging {
-        print("[SwiftFTR] Successfully bound ICMP socket to source IP '\(sourceIP)'")
-      }
+      try bindTraceSourceIP(
+        sockfd: fd, family: resolved.family, sourceIP: sourceIP,
+        enableLogging: config.enableLogging)
     }
 
-    // Set non-blocking: DispatchSourceRead handles readiness via kqueue.
     let flags = fcntl(fd, F_GETFL, 0)
     _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
 
-    // Enable receiving TTL of replies (best-effort). Some stacks may not support IP_RECVTTL; this is non-fatal
-    // and only affects extra metadata, not core correctness.
-    var on: Int32 = 1
-    if setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, socklen_t(MemoryLayout<Int32>.size)) != 0 {
-      // Not fatal; ignore
+    // Best-effort IP_RECVTTL for v4 (v6 already enabled IPV6_RECVHOPLIMIT in createTraceSocket).
+    if resolved.family == AF_INET {
+      var on: Int32 = 1
+      _ = setsockopt(fd, IPPROTO_IP, IP_RECVTTL, &on, socklen_t(MemoryLayout<Int32>.size))
     }
 
-    // Use provided flow identifier or generate random one
     let identifier = flowIdentifier ?? UInt16.random(in: 0...UInt16.max)
-
-    // Tracking maps
     var outstanding: [UInt16: TraceSendInfo] = [:]  // key = sequence (== ttl)
 
-    // Send one probe per TTL, quickly adjusting IP_TTL between sends.
     if config.enableLogging {
       print("[SwiftFTR] Sending \(maxHops) probes...")
     }
-
     for ttl in 1...maxHops {
-      var ttlVar: Int32 = Int32(ttl)
-      if setsockopt(fd, IPPROTO_IP, IP_TTL, &ttlVar, socklen_t(MemoryLayout<Int32>.size)) != 0 {
-        throw TracerouteError.setsockoptFailed(option: "IP_TTL", errno: errno)
-      }
+      try setTraceHopLimit(sockfd: fd, family: resolved.family, ttl: ttl)
       let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
-      let packet = makeICMPEchoRequest(
-        identifier: identifier, sequence: seq, payloadSize: payloadSize)
       let sentAt = monotonicNow()
-      var addr = destAddr
-      let sent = packet.withUnsafeBytes { rawBuf in
-        withUnsafePointer(to: &addr) { aptr -> ssize_t in
-          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-            sendto(
-              fd, rawBuf.baseAddress!, rawBuf.count, 0, saPtr,
-              socklen_t(MemoryLayout<sockaddr_in>.size))
-          }
-        }
-      }
-      if sent < 0 { throw TracerouteError.sendFailed(errno: errno) }
+      try sendTraceProbe(
+        sockfd: fd, resolved: resolved, identifier: identifier,
+        sequence: seq, payloadSize: payloadSize)
       outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
     }
 
@@ -768,6 +632,7 @@ public actor SwiftFTR {
 
     let operation = TraceReceiveOperation(
       sockfd: fd,
+      family: resolved.family,
       identifier: identifier,
       outstanding: outstanding,
       maxHops: maxHops,
@@ -881,9 +746,8 @@ public actor SwiftFTR {
     // Perform base trace (includes rDNS if enabled)
     let tr = try await trace(to: host)
 
-    // Resolve destination IP
-    let destAddr = try resolveIPv4(host: host, enableLogging: config.enableLogging)
-    let destIP = ipString(destAddr)
+    // Resolve destination IP (dual-stack; honors config.preferredFamily).
+    let destIP = try resolveHost(host: host, prefer: config.preferredFamily).canonical
 
     // Collect IPs for batch operations
     var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
@@ -1199,6 +1063,219 @@ internal func resolveIPv4(host: String, enableLogging: Bool = false) throws -> s
     host: host, details: "Host resolved but no IPv4 address available")
 }
 
+// MARK: - Dual-stack trace helpers (Stage 2 IPv6)
+
+// Stage 1 added these for the ping path in Ping.swift; the v6 socket constants
+// aren't bridged into Swift's Darwin overlay. Re-declared here at file scope so
+// Traceroute's helpers don't have to reach into Ping.swift internals.
+// swift-format-ignore: AlwaysUseLowerCamelCase
+private let IPV6_RECVHOPLIMIT_OPT: Int32 = 37
+
+/// Family-aware ICMP socket creation. v4 → `IPPROTO_ICMP`, v6 → `IPPROTO_ICMPV6`,
+/// both `SOCK_DGRAM` (unprivileged on Darwin).
+internal func createTraceSocket(family: Int32, enableLogging: Bool) throws -> Int32 {
+  let fd: Int32
+  switch family {
+  case AF_INET:
+    fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+  case AF_INET6:
+    fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)
+  default:
+    throw TracerouteError.socketCreateFailed(
+      errno: 0, details: "Unsupported family for trace socket: \(family)")
+  }
+  if fd < 0 {
+    let error = errno
+    let details =
+      "This typically indicates: (1) Platform doesn't support ICMP datagram sockets, (2) Network permissions denied, (3) Running in sandbox without network entitlement. On macOS, this should work without root privileges."
+    throw TracerouteError.socketCreateFailed(errno: error, details: details)
+  }
+  if enableLogging {
+    let famName = family == AF_INET6 ? "ICMPv6" : "ICMP"
+    print("[SwiftFTR] \(famName) socket created (fd=\(fd))")
+  }
+  // For v6: ask the kernel to deliver hop limit as cmsg on recvmsg (mirror of
+  // v4's IP_RECVTTL, but unrecoverable from the buffer because the kernel
+  // strips the IPv6 header — verified empirically by traceroute6probe spike).
+  if family == AF_INET6 {
+    var on: Int32 = 1
+    _ = setsockopt(
+      fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT_OPT, &on, socklen_t(MemoryLayout<Int32>.size))
+  }
+  return fd
+}
+
+/// Family-aware hop-limit setter: v4 → `IP_TTL`, v6 → `IPV6_UNICAST_HOPS`.
+internal func setTraceHopLimit(sockfd: Int32, family: Int32, ttl: Int) throws {
+  var v = Int32(ttl)
+  let level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
+  let opt = family == AF_INET6 ? IPV6_UNICAST_HOPS : IP_TTL
+  if setsockopt(sockfd, level, opt, &v, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+    let name = family == AF_INET6 ? "IPV6_UNICAST_HOPS" : "IP_TTL"
+    throw TracerouteError.setsockoptFailed(option: name, errno: errno)
+  }
+}
+
+/// Family-aware interface binding: v4 → `IP_BOUND_IF`, v6 → `IPV6_BOUND_IF`.
+internal func bindTraceInterface(
+  sockfd: Int32, family: Int32, interfaceName: String, ifIndex: UInt32, enableLogging: Bool
+) throws {
+  var index = ifIndex
+  let level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
+  let opt = family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
+  if setsockopt(sockfd, level, opt, &index, socklen_t(MemoryLayout<UInt32>.size)) != 0 {
+    let error = errno
+    let details =
+      "Failed to bind socket to interface '\(interfaceName)' (index: \(ifIndex)). This may indicate: (1) Insufficient permissions, (2) Interface is not available for ICMP binding, (3) Interface doesn't support the operation."
+    if enableLogging {
+      print("[SwiftFTR] ERROR: bind-to-interface failed - errno=\(error)")
+    }
+    throw TracerouteError.interfaceBindFailed(
+      interface: interfaceName, errno: error, details: details)
+  }
+  if enableLogging {
+    print("[SwiftFTR] Bound trace socket to interface '\(interfaceName)' (index: \(ifIndex))")
+  }
+}
+
+/// Family-aware source-IP bind. v4 → `sockaddr_in`; v6 → `sockaddr_in6` with
+/// optional link-local `%zone` suffix preserved via `parseIPv6Scoped`.
+internal func bindTraceSourceIP(
+  sockfd: Int32, family: Int32, sourceIP: String, enableLogging: Bool
+) throws {
+  switch family {
+  case AF_INET:
+    var addr = sockaddr_in()
+    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = 0
+    if inet_pton(AF_INET, sourceIP, &addr.sin_addr) != 1 {
+      throw TracerouteError.sourceIPBindFailed(
+        sourceIP: sourceIP, errno: errno,
+        details: "Invalid IPv4 address '\(sourceIP)'.")
+    }
+    let rc = withUnsafePointer(to: &addr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(sockfd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    if rc != 0 {
+      throw TracerouteError.sourceIPBindFailed(
+        sourceIP: sourceIP, errno: errno, details: "bind() failed for v4 source IP")
+    }
+  case AF_INET6:
+    let (bare, scopeID) = parseIPv6Scoped(sourceIP)
+    var addr = sockaddr_in6()
+    addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+    addr.sin6_family = sa_family_t(AF_INET6)
+    addr.sin6_scope_id = scopeID
+    if inet_pton(AF_INET6, bare, &addr.sin6_addr) != 1 {
+      throw TracerouteError.sourceIPBindFailed(
+        sourceIP: sourceIP, errno: errno,
+        details: "Invalid IPv6 address '\(sourceIP)'.")
+    }
+    let rc = withUnsafePointer(to: &addr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(sockfd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+      }
+    }
+    if rc != 0 {
+      throw TracerouteError.sourceIPBindFailed(
+        sourceIP: sourceIP, errno: errno, details: "bind() failed for v6 source IP")
+    }
+  default:
+    throw TracerouteError.sourceIPBindFailed(
+      sourceIP: sourceIP, errno: 0,
+      details: "Unsupported family for source bind: \(family)")
+  }
+  if enableLogging {
+    print("[SwiftFTR] Bound trace socket to source IP '\(sourceIP)'")
+  }
+}
+
+/// Family-aware ICMP send: v4 uses `makeICMPEchoRequest`, v6 uses
+/// `makeICMPv6EchoRequest`. Caller resolves destination via `resolveHost`.
+internal func sendTraceProbe(
+  sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, sequence: UInt16,
+  payloadSize: Int
+) throws {
+  let packet: [UInt8]
+  if resolved.family == AF_INET6 {
+    packet = makeICMPv6EchoRequest(
+      identifier: identifier, sequence: sequence, payloadSize: payloadSize)
+  } else {
+    packet = makeICMPEchoRequest(
+      identifier: identifier, sequence: sequence, payloadSize: payloadSize)
+  }
+  var addr = resolved.address
+  let sent = packet.withUnsafeBytes { raw in
+    withUnsafePointer(to: &addr) { ap -> ssize_t in
+      ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
+      }
+    }
+  }
+  if sent < 0 { throw TracerouteError.sendFailed(errno: errno) }
+}
+
+/// Family-aware receive that yields a parsed ICMP/ICMPv6 message and the
+/// reply's source `sockaddr_storage`. For v6, uses `recvmsg` so the hop
+/// limit cmsg is available (`ParsedICMP` doesn't carry hop limit but Stage 3
+/// may; in Stage 2 we just confirm the cmsg arrives and discard it). Returns
+/// `nil` on EAGAIN/EWOULDBLOCK so callers can drain in a loop.
+internal func recvTraceMessage(
+  sockfd: Int32, family: Int32,
+  recvBuffer: inout [UInt8], cmsgBuffer: inout [UInt8]
+) -> (parsed: ParsedICMP, n: Int)? {
+  var storage = sockaddr_storage()
+  if family == AF_INET6 {
+    var iov = iovec()
+    var msg = msghdr()
+    let received = recvBuffer.withUnsafeMutableBufferPointer { rb -> ssize_t in
+      cmsgBuffer.withUnsafeMutableBufferPointer { cb -> ssize_t in
+        withUnsafeMutablePointer(to: &storage) { sp -> ssize_t in
+          iov.iov_base = UnsafeMutableRawPointer(rb.baseAddress)
+          iov.iov_len = rb.count
+          return withUnsafeMutablePointer(to: &iov) { iovPtr -> ssize_t in
+            msg.msg_name = UnsafeMutableRawPointer(sp)
+            msg.msg_namelen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+            msg.msg_iov = iovPtr
+            msg.msg_iovlen = 1
+            msg.msg_control = UnsafeMutableRawPointer(cb.baseAddress)
+            msg.msg_controllen = socklen_t(cb.count)
+            msg.msg_flags = 0
+            return recvmsg(sockfd, &msg, 0)
+          }
+        }
+      }
+    }
+    if received < 0 { return nil }
+    let hopLimit = (msg.msg_flags & MSG_CTRUNC) == 0 ? extractIPv6HopLimit(msg: msg) : nil
+    let parsed = recvBuffer.withUnsafeBytes { raw -> ParsedICMP? in
+      let slice = UnsafeRawBufferPointer(start: raw.baseAddress, count: Int(received))
+      return parseICMPv6Message(buffer: slice, hopLimit: hopLimit, from: storage)
+    }
+    if let p = parsed { return (p, Int(received)) }
+    return nil
+  }
+  // v4 path — recvfrom + parseICMPv4Message
+  var addrlen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+  let n = recvBuffer.withUnsafeMutableBytes { rb -> ssize_t in
+    withUnsafeMutablePointer(to: &storage) { sp in
+      sp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+        recvfrom(sockfd, rb.baseAddress, rb.count, 0, sa, &addrlen)
+      }
+    }
+  }
+  if n < 0 { return nil }
+  let parsed = recvBuffer.withUnsafeBytes { raw -> ParsedICMP? in
+    let slice = UnsafeRawBufferPointer(start: raw.baseAddress, count: Int(n))
+    return parseICMPv4Message(buffer: slice, from: storage)
+  }
+  if let p = parsed { return (p, Int(n)) }
+  return nil
+}
+
 private enum Constants {
   /// Receive buffer size for incoming ICMP datagrams.
   static let receiveBufferSize = 2048
@@ -1228,6 +1305,7 @@ private struct TraceSendInfo {
 /// deadline expires.
 private final class TraceReceiveOperation: @unchecked Sendable {
   private let sockfd: Int32
+  private let family: Int32
   private let identifier: UInt16
   private let maxHops: Int
   private let enableLogging: Bool
@@ -1240,6 +1318,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
   private var readSource: DispatchSourceRead?
   private var timerSource: DispatchSourceTimer?
   private var recvBuffer = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
+  private var cmsgBuffer = [UInt8](repeating: 0, count: 64)
 
   private let queue: DispatchQueue
   private let lock = NSLock()
@@ -1248,6 +1327,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
 
   init(
     sockfd: Int32,
+    family: Int32,
     identifier: UInt16,
     outstanding: [UInt16: TraceSendInfo],
     maxHops: Int,
@@ -1255,6 +1335,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     enableLogging: Bool
   ) {
     self.sockfd = sockfd
+    self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
     self.maxHops = maxHops
@@ -1321,20 +1402,12 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     if checkFinishedSync() { return }
 
     while true {
-      var storage = sockaddr_storage()
-      var addrlen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-      let n = withUnsafeMutablePointer(to: &storage) { sptr -> ssize_t in
-        sptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-          recvfrom(sockfd, &recvBuffer, recvBuffer.count, 0, saptr, &addrlen)
-        }
-      }
-      if n < 0 { break }  // EAGAIN/EWOULDBLOCK
-
-      let parsedOpt: ParsedICMP? = recvBuffer.withUnsafeBytes { rawPtr in
-        let slice = UnsafeRawBufferPointer(rebasing: rawPtr.prefix(Int(n)))
-        return parseICMPv4Message(buffer: slice, from: storage)
-      }
-      guard let parsed = parsedOpt else { continue }
+      guard
+        let received = recvTraceMessage(
+          sockfd: sockfd, family: family,
+          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer)
+      else { break }  // EAGAIN/EWOULDBLOCK or parse-fail
+      let parsed = received.parsed
 
       switch parsed.kind {
       case .echoReply(let id, let seq):
@@ -1389,6 +1462,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
           return
         }
       }
+      _ = received.n  // n is captured by recvTraceMessage callers; unused here
     }
   }
 
@@ -1432,10 +1506,11 @@ private final class TraceReceiveOperation: @unchecked Sendable {
 /// of unresponsive TTLs via a secondary DispatchSourceTimer.
 private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private let sockfd: Int32
+  private let family: Int32
   private let identifier: UInt16
   private let maxHops: Int
   private let payloadSize: Int
-  private let destAddr: sockaddr_in
+  private let resolved: ResolvedHost
   private let streamConfig: StreamingTraceConfig
   private let enableLogging: Bool
   private let yieldHop: (StreamingHop) -> Void
@@ -1450,6 +1525,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private var deadlineTimer: DispatchSourceTimer?
   private var retryTimer: DispatchSourceTimer?
   private var recvBuffer = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
+  private var cmsgBuffer = [UInt8](repeating: 0, count: 64)
 
   private let queue: DispatchQueue
   private let lock = NSLock()
@@ -1457,21 +1533,23 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
 
   init(
     sockfd: Int32,
+    family: Int32,
     identifier: UInt16,
     outstanding: [UInt16: TraceSendInfo],
     maxHops: Int,
     payloadSize: Int,
-    destAddr: sockaddr_in,
+    resolved: ResolvedHost,
     streamConfig: StreamingTraceConfig,
     enableLogging: Bool,
     yield: @escaping (StreamingHop) -> Void
   ) {
     self.sockfd = sockfd
+    self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
     self.maxHops = maxHops
     self.payloadSize = payloadSize
-    self.destAddr = destAddr
+    self.resolved = resolved
     self.streamConfig = streamConfig
     self.enableLogging = enableLogging
     self.yieldHop = yield
@@ -1548,20 +1626,12 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     if checkFinishedSync() { return }
 
     while true {
-      var storage = sockaddr_storage()
-      var addrlen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-      let n = withUnsafeMutablePointer(to: &storage) { sptr -> ssize_t in
-        sptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-          recvfrom(sockfd, &recvBuffer, recvBuffer.count, 0, saptr, &addrlen)
-        }
-      }
-      if n < 0 { break }  // EAGAIN/EWOULDBLOCK
-
-      let parsedOpt: ParsedICMP? = recvBuffer.withUnsafeBytes { rawPtr in
-        let slice = UnsafeRawBufferPointer(rebasing: rawPtr.prefix(Int(n)))
-        return parseICMPv4Message(buffer: slice, from: storage)
-      }
-      guard let parsed = parsedOpt else { continue }
+      guard
+        let received = recvTraceMessage(
+          sockfd: sockfd, family: family,
+          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer)
+      else { break }
+      let parsed = received.parsed
 
       switch parsed.kind {
       case .echoReply(let id, let seq):
@@ -1596,7 +1666,6 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
         continue
       }
 
-      // Early exit: destination reached AND all earlier hops resolved
       if let rttl = reachedTTL {
         var done = true
         for i in 1..<rttl {
@@ -1610,6 +1679,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
           return
         }
       }
+      _ = received.n  // currently unused; recvTraceMessage already validated parse
     }
   }
 
@@ -1647,26 +1717,21 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     }
 
     for ttl in missingTTLs {
-      var ttlVar: Int32 = Int32(ttl)
-      if setsockopt(sockfd, IPPROTO_IP, IP_TTL, &ttlVar, socklen_t(MemoryLayout<Int32>.size)) != 0 {
+      do {
+        try setTraceHopLimit(sockfd: sockfd, family: family, ttl: ttl)
+      } catch {
         continue
       }
       let seq: UInt16 = UInt16(truncatingIfNeeded: ttl + maxHops)
-      let packet = makeICMPEchoRequest(
-        identifier: identifier, sequence: seq, payloadSize: payloadSize)
       let sentAt = monotonicNow()
-      var addr = destAddr
-      let sent = packet.withUnsafeBytes { rawBuf in
-        withUnsafePointer(to: &addr) { aptr -> ssize_t in
-          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
-            sendto(
-              sockfd, rawBuf.baseAddress!, rawBuf.count, 0, saPtr,
-              socklen_t(MemoryLayout<sockaddr_in>.size))
-          }
-        }
-      }
-      if sent > 0 {
+      do {
+        try sendTraceProbe(
+          sockfd: sockfd, resolved: resolved, identifier: identifier,
+          sequence: seq, payloadSize: payloadSize)
         outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
+      } catch {
+        // Best-effort retry — silently skip if send fails (will time out instead).
+        continue
       }
     }
   }
