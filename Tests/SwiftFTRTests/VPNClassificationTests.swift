@@ -32,6 +32,42 @@ struct VPNClassificationTests {
     #expect(nilContext.traceInterface == nil)
   }
 
+  /// `VPNContext.forInterface(_:)` now populates `vpnLocalIPs` by walking
+  /// `getifaddrs` and collecting every v4 and v6 address bound to an
+  /// interface that `NetworkInterfaceDiscovery.isVPNInterface` matches.
+  /// This test asserts the discovery doesn't crash and returns *something
+  /// shaped right*: any host running this test likely has at least one
+  /// `utun*` interface (Apple system services use them even without an
+  /// active VPN), so the set is usually non-empty — but we don't fail
+  /// if it is, because CI runners can be configured without them.
+  @Test("VPNContext.forInterface populates vpnLocalIPs from getifaddrs")
+  func testVPNContextPopulatesLocalIPs() {
+    let ctx = VPNContext.forInterface("utun0")
+    // Every entry should look like a valid IPv4 or IPv6 string.
+    for ip in ctx.vpnLocalIPs {
+      let isV4 = detectAddressFamily(ip) == AF_INET
+      // Strip %zone for v6 family check.
+      let bare = ip.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ip
+      let isV6 = detectAddressFamily(bare) == AF_INET6
+      #expect(isV4 || isV6, "Each vpnLocalIPs entry should be a valid v4 or v6 string: \(ip)")
+    }
+    // Same set is returned regardless of the specific interface argument;
+    // the population walks every VPN interface on the host, not just the
+    // named one. Sanity check that calling twice with different VPN-shaped
+    // names yields the same set.
+    let ctx2 = VPNContext.forInterface("utun1")
+    #expect(ctx.vpnLocalIPs == ctx2.vpnLocalIPs)
+    // And a non-VPN interface produces no context at all (empty set is fine).
+    let wifiCtx = VPNContext.forInterface("en0")
+    // For a non-VPN interface, vpnLocalIPs reflects the host's other VPN
+    // interfaces (still useful — the classifier needs them to recognize
+    // VPN hops in a split-tunnel trace going out en0).
+    for ip in wifiCtx.vpnLocalIPs {
+      let bare = ip.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ip
+      #expect(detectAddressFamily(bare) == AF_INET || detectAddressFamily(bare) == AF_INET6)
+    }
+  }
+
   // MARK: - HopCategory Tests
 
   @Test("VPN HopCategory exists")
