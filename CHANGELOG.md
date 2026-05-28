@@ -5,6 +5,20 @@ All notable changes to this project are documented here. This project follows Se
 
 Unreleased (0.13.0-dev)
 -----------------------
+### Features
+
+**NAT64 transparency for IPv4 literals on v6-only networks**
+
+In `.auto` mode (the default), v4 literals like `"1.1.1.1"` now go through `getaddrinfo` with `AI_V4MAPPED | AI_ADDRCONFIG` flags rather than the previous `inet_pton` fast path. macOS's resolver synthesizes a v4-mapped v6 address (typically under `64:ff9b::/96` per RFC 6147) when the system has detected a DNS64/NAT64 network — so `tracer.ping("1.1.1.1")` on a v6-only cellular network now "just works" via the gateway's translator rather than failing with `EHOSTUNREACH`.
+
+- Behavior on dual-stack networks is unchanged: `getaddrinfo` returns the v4 entry directly because v4 is locally routable.
+- Behavior on v6-only NAT64 networks: `getaddrinfo` returns the synthesized v6 address, the v6 socket is used transparently, and the trace/probe completes.
+- Force modes (`.v4` and `.v6`) keep the `inet_pton` fast path for literals — users that explicitly pinned a family opted out of NAT64 synthesis.
+- Cross-family literal rejection still throws (`.v4` against a v6 literal, `.v6` against a v4 literal) — preserved tests confirm.
+- Matches Apple's [SupportingIPv6DNS64NAT64](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/NetworkingOverview/SupportingIPv6DNS64NAT64/SupportingIPv6DNS64NAT64.html) guidance for IPv6-compatible apps.
+
+Verified end-to-end on a dual-stack host: `swift-ftr ping 1.1.1.1` still resolves to `1.1.1.1` and pings v4; `swift-ftr ping 2606:4700:4700::1111` pings v6; `swift-ftr ping cloudflare.com` picks v6 (system-preferred address per RFC 6724). All 168 unit tests pass.
+
 ### Bug Fix
 
 **Populate `VPNContext.vpnLocalIPs` from `getifaddrs`**
