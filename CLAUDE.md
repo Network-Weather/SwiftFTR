@@ -119,3 +119,28 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
   - `__`-prefixed `@_spi(Testing)` helpers (internal testing exposure)
 - **Commits**: Conventional Commits with scopes (`feat(tracer):`, `fix(dns):`, `docs:`)
 - **Dependencies**: SwiftPM only — `swift-argument-parser`, `swift-docc-plugin`, `swift-ip2asn`
+
+## Downstream consumer
+
+NetworkWeather (NWX, `~/dev/nwx`) is the primary SwiftFTR consumer. For non-trivial API changes:
+
+1. Read the `project-nwx-downstream-contracts` memory before designing. It captures the contracts NWX depends on (single dest-string entry points, canonical address form, link-local scope preservation, family-agnostic errors, concurrent-ping safety, unprivileged sockets only).
+2. Surface the relevant constraints up front in your plan, not during PR review.
+3. Save new constraints to that memory as you discover them.
+
+## After every PR merges
+
+1. Fast-forward main, remove the worktree, delete the local + remote branch.
+2. Update `ROADMAP.md` to drop items the PR completed. ROADMAP is forward-only and stack-ranked; no version numbers, no "current state" sections (see `feedback-roadmap-style` memory).
+3. Update `CHANGELOG.md` so `Unreleased` reflects what's actually merged. Strip stale "deferred" notes that the PR resolved (see `feedback-changelog-roadmap-discipline` memory).
+
+## When cutting a release
+
+- Consolidate the per-PR `Unreleased` entries into a single coherent release-notes section organized by **user-visible value** (e.g. "New public API", "Behavior changes", "Bug fixes", "Tooling", "Dependencies"), not by implementation stage. The CHANGELOG ships to API consumers; they don't care about your stage numbering.
+- Bump `Sources/SwiftFTR/Version.swift`.
+- Tag the release-prep merge commit (not the prep commit itself, so the tag points at a stable mainline commit).
+- `gh release create v<version>` with notes drawn from the consolidated CHANGELOG section.
+
+## Plan-mode plan file
+
+For non-trivial implementation tasks, the plan file under `~/.claude/plans/` is per-session scratch. For multi-PR efforts spanning sessions, the canonical sequenced plan lives in the repo under `docs/<EFFORT>.md` (e.g. `docs/IPV6.md` for the v6 parity work). Strikethrough completed stages as they ship.
