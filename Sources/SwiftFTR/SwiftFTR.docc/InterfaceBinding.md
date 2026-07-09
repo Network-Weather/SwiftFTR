@@ -138,6 +138,10 @@ print("DNS probe via en14: \(result.isReachable ? "reachable" : "unreachable")")
 
 ### Bufferbloat Test
 
+Interface and source-IP binding are supported only for a baseline-only latency measurement. A
+loaded bufferbloat test rejects effective per-operation or global bindings because its URLSession
+load traffic cannot be bound to the same route.
+
 ```swift
 import SwiftFTR
 
@@ -146,13 +150,17 @@ let result = try await ftr.testBufferbloat(
     config: BufferbloatConfig(
         target: "1.1.1.1",
         baselineDuration: 3.0,
-        loadDuration: 5.0,
-        interface: "en0"
+        loadDuration: 0,
+        interface: interfaceName
     )
 )
 
-print("Bufferbloat via en0: \(result.grade.rawValue)")
+print("Baseline latency via \(interfaceName): \(result.baseline.avgMs) ms")
 ```
+
+Only `result.baseline` and baseline entries in `result.pingResults` are usable in this mode.
+`result.loaded`, `result.latencyIncrease`, `result.rpm`, and `result.grade` require a loaded phase
+and are not meaningful for this result.
 
 ## Multi-Interface Monitoring
 
@@ -325,50 +333,30 @@ Common error scenarios:
 - **IP not assigned**: Source IP is not configured on the interface
 - **Interface index not found**: Interface exists but `if_nametoindex()` failed
 
-## Bufferbloat Comparison Example
+## Bufferbloat Limitation
 
-Compare bufferbloat quality across interfaces:
+Loaded bufferbloat tests cannot be bound to an interface or source IP. SwiftFTR uses
+`URLSession` to generate HTTP load, and its public API does not support binding a request to a
+specific route. Binding only the latency probes would compare traffic from potentially different
+routes and produce a misleading grade, so ``SwiftFTR/SwiftFTR/testBufferbloat(config:)`` throws
+``SwiftFTR/TracerouteError/invalidConfiguration(reason:)`` before starting network work.
+
+Interface binding remains available for a baseline-only latency measurement. The baseline
+statistics and baseline ping samples are usable, but loaded statistics, latency increase, RPM,
+grade, and the derived video-call assessment are not meaningful without a loaded phase:
 
 ```swift
 import SwiftFTR
 
 let ftr = SwiftFTR()
-
-// Test WiFi
-let wifiConfig = BufferbloatConfig(
+let config = BufferbloatConfig(
     target: "1.1.1.1",
     baselineDuration: 3.0,
-    loadDuration: 5.0,
+    loadDuration: 0,
     interface: "en0"
 )
-let wifiResult = try await ftr.testBufferbloat(config: wifiConfig)
-
-// Test Ethernet
-let ethConfig = BufferbloatConfig(
-    target: "1.1.1.1",
-    baselineDuration: 3.0,
-    loadDuration: 5.0,
-    interface: "en14"
-)
-let ethResult = try await ftr.testBufferbloat(config: ethConfig)
-
-// Compare
-print("WiFi Bufferbloat:")
-print("  Grade: \(wifiResult.grade.rawValue)")
-print("  Latency increase: +\(String(format: "%.1f", wifiResult.latencyIncrease.percentageIncrease))%")
-
-print("\nEthernet Bufferbloat:")
-print("  Grade: \(ethResult.grade.rawValue)")
-print("  Latency increase: +\(String(format: "%.1f", ethResult.latencyIncrease.percentageIncrease))%")
-
-// Determine better interface
-if wifiResult.grade < ethResult.grade {
-    print("\n✅ WiFi has better bufferbloat performance")
-} else if ethResult.grade < wifiResult.grade {
-    print("\n✅ Ethernet has better bufferbloat performance")
-} else {
-    print("\n🤝 Both interfaces perform similarly")
-}
+let result = try await ftr.testBufferbloat(config: config)
+print("Baseline latency: \(result.baseline.avgMs) ms")
 ```
 
 ## Implementation Details
@@ -381,7 +369,9 @@ SwiftFTR uses macOS's `IP_BOUND_IF` socket option for interface binding:
 - Works for `SOCK_DGRAM` (ICMP, DNS) and `SOCK_STREAM` (TCP)
 - Requires valid interface name and index
 
-The binding is applied consistently across all probe types, ensuring predictable routing behavior.
+The binding is applied to SwiftFTR's socket-based probes. Loaded bufferbloat tests reject
+route-specific configurations because binding only their latency probes would invalidate the
+measurement.
 
 ## Platform Support
 
@@ -408,3 +398,4 @@ The binding is applied consistently across all probe types, ensuring predictable
 
 - ``SwiftFTR/TracerouteError/interfaceBindFailed(interface:errno:details:)``
 - ``SwiftFTR/TracerouteError/sourceIPBindFailed(sourceIP:errno:details:)``
+- ``SwiftFTR/TracerouteError/invalidConfiguration(reason:)``

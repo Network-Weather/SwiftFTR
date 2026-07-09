@@ -867,14 +867,21 @@ public actor SwiftFTR {
   /// 3. Measures latency under load
   /// 4. Calculates bufferbloat grade (A-F) and RPM score
   ///
+  /// Set `config.loadDuration` to zero for a baseline-only latency measurement. That mode exposes
+  /// usable baseline statistics and samples, but loaded statistics, latency increase, RPM, grade,
+  /// and video-call impact are not meaningful.
+  ///
   /// Video conferencing is highly sensitive to latency spikes. Zoom/Teams require
   /// <150ms latency and <50ms jitter for good quality.
   ///
   /// **Test Duration:** ~15 seconds (5s baseline + 10s load by default)
   ///
   /// - Parameter config: Bufferbloat test configuration
-  /// - Returns: Bufferbloat test results with grading and video call impact assessment
-  /// - Throws: `TracerouteError` if ping operations fail
+  /// - Returns: Bufferbloat test results. Grading and video-call impact are meaningful only when
+  ///   the loaded phase produces samples.
+  /// - Throws: ``TracerouteError`` if ping operations fail, or if a loaded test has an effective
+  ///   per-operation or global interface/source-IP binding. URLSession cannot bind load traffic
+  ///   to that same route.
   ///
   /// # Example
   /// ```swift
@@ -894,9 +901,8 @@ public actor SwiftFTR {
   public func testBufferbloat(config: BufferbloatConfig = BufferbloatConfig()) async throws
     -> BufferbloatResult
   {
-    // Run the orchestrator on a detached executor so synchronous phases never block SwiftFTR.
     let runner = BufferbloatRunner(testConfig: config, swiftConfig: self.config)
-    return try await runner.runDetached()
+    return try await runner.run()
   }
 
   /// Discover public IP via STUN (with DNS fallback)

@@ -323,7 +323,7 @@ struct BufferbloatTests {
         print("⏭️  Bufferbloat baseline produced <2 samples; skipping timing assertions.")
         return
       }
-      // BufferbloatRunner runs detached now, so baseline-only runs should mirror real RTT windows.
+      // Baseline-only runs should mirror real RTT windows.
       // Relaxed from < 3.0 to < 10.0 to account for test runner load/network conditions.
       #expect(elapsed < 10.0, "Baseline-only bufferbloat run should complete near real time")
     }
