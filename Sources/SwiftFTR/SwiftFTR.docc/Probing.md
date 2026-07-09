@@ -92,7 +92,8 @@ Any DNS response (even NXDOMAIN) means the server is reachable. Only timeouts an
 
 ## Interface Binding
 
-All probe types support binding to a specific network interface:
+The TCP, UDP, and DNS probes support binding to a specific network interface or source IP. The
+HTTP probe uses URLSession, whose public API does not expose either binding control.
 
 ```swift
 // TCP probe through VPN
@@ -103,6 +104,10 @@ let config = TCPProbeConfig(
 )
 let result = try await tcpProbe(config: config)
 ```
+
+Use the corresponding `interface` and `sourceIP` properties on ``UDPProbeConfig`` or
+``DNSProbeConfig`` for those protocols. ``HTTPProbeConfig`` intentionally has no such properties;
+HTTP traffic follows URLSession's system-selected route.
 
 ## Topics
 

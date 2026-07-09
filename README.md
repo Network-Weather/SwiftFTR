@@ -104,8 +104,9 @@ Key Features
 - Flow identifier control for reproducible traces
 
 **Interface & Binding**
-- Per-operation interface binding (WiFi, Ethernet, VPN) — `IP_BOUND_IF` (v4) / `IPV6_BOUND_IF` (v6)
-- Source IP binding for multi-homed hosts, v4 or v6 (link-local `%zone` honored)
+- Ping, traceroute, TCP, UDP, and DNS support interface binding (WiFi, Ethernet, VPN) — `IP_BOUND_IF` (v4) / `IPV6_BOUND_IF` (v6)
+- Those socket-backed diagnostics also support source IP binding for multi-homed hosts, v4 or v6 (link-local `%zone` honored)
+- HTTP/HTTPS probes use URLSession, whose public API does not expose interface or source-IP binding
 - Resolution order: Operation → Global → System Default
 
 **Public IP Discovery**
@@ -124,7 +125,7 @@ Use It as a Library
 ```swift
 import SwiftFTR
 
-// Configure once, use everywhere
+// Configure defaults for supported socket-backed diagnostics
 let config = SwiftFTRConfig(
     maxHops: 40,        // Max TTL to probe
     maxWaitMs: 1000,    // Timeout in milliseconds
@@ -373,8 +374,9 @@ Options:
 Configuration and Flags
 -----------------------
 - Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
-- Use `SwiftFTRConfig(interface: "en0")` to bind to a specific network interface.
-- Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind to a specific source IP.
+- Use `SwiftFTRConfig(interface: interfaceName)` to bind supported socket-backed diagnostics to a caller-selected network interface.
+- Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind supported socket-backed diagnostics to a specific source IP.
+- HTTP/HTTPS probes use URLSession and do not support either binding option.
 - CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
 
 Design Details
