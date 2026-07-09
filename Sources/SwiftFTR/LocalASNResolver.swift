@@ -81,24 +81,31 @@ public actor LocalASNResolver: ASNResolver {
   #endif
   public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
   {
-    let publicIPs = Set(ipv4Addrs)
-      .filter { !$0.isEmpty && !isPrivateIPv4($0) && !isCGNATIPv4($0) }
-    guard !publicIPs.isEmpty else { return [:] }
+    let inputIPs = Set(ipv4Addrs)
+    let lookupIPs = Set(inputIPs.compactMap(asnLookupAddress))
+    guard !lookupIPs.isEmpty else { return [:] }
 
     guard let db = await getDatabase() else {
       return [:]  // Database failed to load
     }
 
-    var results: [String: ASNInfo] = [:]
-    for ip in publicIPs {
+    var lookupResults: [String: ASNInfo] = [:]
+    for ip in lookupIPs {
       if let (asn, name) = db.lookup(ip) {
-        results[ip] = ASNInfo(
+        lookupResults[ip] = ASNInfo(
           asn: Int(asn),
           name: name ?? "",
           prefix: nil,
           countryCode: nil,
           registry: nil
         )
+      }
+    }
+
+    var results: [String: ASNInfo] = [:]
+    for ip in inputIPs {
+      if let lookupIP = asnLookupAddress(for: ip), let info = lookupResults[lookupIP] {
+        results[ip] = info
       }
     }
     return results
