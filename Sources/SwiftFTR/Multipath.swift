@@ -26,7 +26,7 @@ public struct FlowIdentifier: Sendable, Hashable, Codable {
   public static func generate(variation: Int) -> FlowIdentifier {
     // Use timestamp as base, add prime-spaced variation
     let timestamp = UInt16(truncatingIfNeeded: UInt64(Date().timeIntervalSince1970 * 1000))
-    let variedID = timestamp &+ UInt16(variation * 173)  // Prime spacing
+    let variedID = timestamp &+ UInt16(truncatingIfNeeded: variation &* 173)  // Prime spacing
 
     return FlowIdentifier(icmpID: variedID, variation: variation)
   }
@@ -34,7 +34,9 @@ public struct FlowIdentifier: Sendable, Hashable, Codable {
 
 // MARK: - Multipath Configuration
 
-/// Configuration for multipath discovery (Dublin Traceroute)
+/// Configuration for multipath discovery (Dublin Traceroute).
+///
+/// Values are validated by ``SwiftFTR/discoverPaths(to:config:)`` before discovery starts.
 public struct MultipathConfig: Sendable {
   /// Number of different flow identifiers to try (default: 8)
   public let flowVariations: Int
@@ -512,6 +514,9 @@ extension SwiftFTR {
     config: MultipathConfig = MultipathConfig()
   ) async throws -> NetworkTopology {
     let swiftConfig = self.config
+    try swiftConfig.validateForOperation()
+    try config.validateForOperation()
+
     let spawner = MultipathWorkerSpawner(
       baseConfig: swiftConfig,
       rdnsCache: self.rdnsCache,
@@ -610,6 +615,8 @@ extension SwiftFTR {
     to host: String,
     flowIdentifier: UInt16
   ) async throws -> ClassifiedTrace {
+    try config.validateForOperation()
+
     // Similar to traceClassified but with flow ID override
     let handle = TraceHandle()
     activeTraces.insert(handle)

@@ -7,7 +7,9 @@ import Foundation
   import Glibc
 #endif
 
-/// Configuration for UDP probing
+/// Configuration for UDP probing.
+///
+/// Values are validated by ``udpProbe(config:)`` before resolution or socket creation.
 public struct UDPProbeConfig: Sendable {
   /// Target host (hostname or IP)
   public let host: String
@@ -111,6 +113,8 @@ public func udpProbe(
   @concurrent
 #endif
 public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
+  try config.validateForOperation()
+
   let startTime = Date()
 
   // Resolve via the shared dual-stack helper (Hostname.swift).
