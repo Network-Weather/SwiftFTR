@@ -367,10 +367,11 @@ public actor SwiftFTR {
     AsyncThrowingStream { continuation in
       let handle = TraceHandle()
 
-      Task { [self] in
+      let producerTask = Task { [self] in
+        guard !Task.isCancelled else { return }
+
         // Register active trace
         await self.registerActiveTrace(handle)
-        defer { Task { await self.unregisterActiveTrace(handle) } }
 
         do {
           try await self.performStreamingTrace(
@@ -378,16 +379,26 @@ public actor SwiftFTR {
             handle: handle,
             streamConfig: streamConfig,
             yield: { hop in
-              continuation.yield(hop)
+              switch continuation.yield(hop) {
+              case .enqueued, .dropped:
+                return true
+              case .terminated:
+                return false
+              @unknown default:
+                return false
+              }
             }
           )
+          await self.unregisterActiveTrace(handle)
           continuation.finish()
         } catch {
+          await self.unregisterActiveTrace(handle)
           continuation.finish(throwing: error)
         }
       }
 
       continuation.onTermination = { @Sendable _ in
+        producerTask.cancel()
         Task { await handle.cancel() }
       }
     }
@@ -408,8 +419,10 @@ public actor SwiftFTR {
     to host: String,
     handle: TraceHandle,
     streamConfig: StreamingTraceConfig,
-    yield: @escaping (StreamingHop) -> Void
+    yield: @Sendable @escaping (StreamingHop) -> Bool
   ) async throws {
+    try Task.checkCancellation()
+
     let maxHops = streamConfig.maxHops
     let payloadSize = config.payloadSize
 
@@ -489,13 +502,20 @@ public actor SwiftFTR {
       yield: yield
     )
 
-    try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Void, Error>) in
-        streamOperation.start(continuation: continuation)
+    await handle.installCancellationHandler { streamOperation.cancel() }
+    do {
+      try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation {
+          (continuation: CheckedContinuation<Void, Error>) in
+          streamOperation.start(continuation: continuation)
+        }
+      } onCancel: {
+        streamOperation.cancel()
       }
-    } onCancel: {
-      streamOperation.cancel()
+      await handle.clearCancellationHandler()
+    } catch {
+      await handle.clearCancellationHandler()
+      throw error
     }
 
     // Check TraceHandle cancellation
@@ -640,12 +660,20 @@ public actor SwiftFTR {
       enableLogging: config.enableLogging
     )
 
-    let receiveResult: TraceReceiveResult = try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation { continuation in
-        operation.start(continuation: continuation)
+    await handle.installCancellationHandler { operation.cancel() }
+    let receiveResult: TraceReceiveResult
+    do {
+      receiveResult = try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+          operation.start(continuation: continuation)
+        }
+      } onCancel: {
+        operation.cancel()
       }
-    } onCancel: {
-      operation.cancel()
+      await handle.clearCancellationHandler()
+    } catch {
+      await handle.clearCancellationHandler()
+      throw error
     }
 
     // Also check TraceHandle cancellation
@@ -672,6 +700,11 @@ public actor SwiftFTR {
     if !config.noReverseDNS {
       let ips = finalHops.compactMap { $0.ipAddress }
       let hostnames = await rdnsCache.batchLookup(ips)
+
+      try Task.checkCancellation()
+      if await handle.isCancelled {
+        throw TracerouteError.cancelled
+      }
 
       finalHops = finalHops.map { hop in
         TraceHop(
@@ -982,11 +1015,14 @@ public actor SwiftFTR {
   /// Call this method when the network configuration changes (e.g., WiFi to cellular,
   /// VPN connect/disconnect) to ensure fresh data for subsequent traces.
   public func networkChanged() async {
-    // Cancel all active traces
-    for trace in activeTraces {
+    // Snapshot and remove the current generation before awaiting another actor.
+    // Traces registered while cancellation is in progress remain tracked for a
+    // subsequent network change instead of being silently removed.
+    let tracesToCancel = activeTraces
+    activeTraces.removeAll()
+    for trace in tracesToCancel {
       await trace.cancel()
     }
-    activeTraces.removeAll()
 
     // Clear cached public IP
     cachedPublicIP = nil
@@ -1428,7 +1464,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private let resolved: ResolvedHost
   private let streamConfig: StreamingTraceConfig
   private let enableLogging: Bool
-  private let yieldHop: (StreamingHop) -> Void
+  private let yieldHop: @Sendable (StreamingHop) -> Bool
 
   private var outstanding: [UInt16: TraceSendInfo]
   private var receivedTTLs: Set<Int> = []
@@ -1456,7 +1492,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     resolved: ResolvedHost,
     streamConfig: StreamingTraceConfig,
     enableLogging: Bool,
-    yield: @escaping (StreamingHop) -> Void
+    yield: @Sendable @escaping (StreamingHop) -> Bool
   ) {
     self.sockfd = sockfd
     self.family = family
@@ -1556,9 +1592,15 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
           let rtt = monotonicNow() - info.sentAt
           if !receivedTTLs.contains(info.ttl) {
             receivedTTLs.insert(info.ttl)
-            yieldHop(
-              StreamingHop(
-                ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: true))
+            guard
+              yieldHop(
+                StreamingHop(
+                  ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt,
+                  reachedDestination: true))
+            else {
+              cancel()
+              return
+            }
             if reachedTTL == nil || info.ttl < reachedTTL! {
               reachedTTL = info.ttl
             }
@@ -1568,13 +1610,13 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       case .timeExceeded(let originalID, let originalSeq):
         guard originalID == nil || originalID == identifier else { continue }
         if let seq = originalSeq {
-          emitIntermediateHop(seq: seq, parsed: parsed)
+          if !emitIntermediateHop(seq: seq, parsed: parsed) { return }
         }
 
       case .destinationUnreachable(let originalID, let originalSeq):
         guard originalID == nil || originalID == identifier else { continue }
         if let seq = originalSeq {
-          emitIntermediateHop(seq: seq, parsed: parsed)
+          if !emitIntermediateHop(seq: seq, parsed: parsed) { return }
         }
 
       case .other:
@@ -1598,16 +1640,22 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     }
   }
 
-  private func emitIntermediateHop(seq: UInt16, parsed: ParsedICMP) {
-    guard let info = outstanding[seq] else { return }
-    if let destTTL = reachedTTL, info.ttl > destTTL { return }
-    if receivedTTLs.contains(info.ttl) { return }
+  private func emitIntermediateHop(seq: UInt16, parsed: ParsedICMP) -> Bool {
+    guard let info = outstanding[seq] else { return true }
+    if let destTTL = reachedTTL, info.ttl > destTTL { return true }
+    if receivedTTLs.contains(info.ttl) { return true }
 
     let rtt = monotonicNow() - info.sentAt
     receivedTTLs.insert(info.ttl)
-    yieldHop(
-      StreamingHop(
-        ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false))
+    guard
+      yieldHop(
+        StreamingHop(
+          ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false))
+    else {
+      cancel()
+      return false
+    }
+    return true
   }
 
   private func handleRetry() {
@@ -1678,8 +1726,10 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       let cutoff = reachedTTL ?? maxHops
       for ttl in 1...cutoff {
         if !receivedTTLs.contains(ttl) {
-          yieldHop(
-            StreamingHop(ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false))
+          guard
+            yieldHop(
+              StreamingHop(ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false))
+          else { break }
         }
       }
     }
