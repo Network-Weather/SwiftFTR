@@ -1755,37 +1755,73 @@ struct DNSClient {
     return answers
   }
 
-  // Returns (name, newOffset)
-  private static func parseName(_ bytes: [UInt8], _ offset: inout Int) -> (String, Int)? {
+  // Returns (name, newOffset). `encodedEnd` bounds the bytes used by the encoded
+  // name itself; compression pointers may still refer to names elsewhere in the message.
+  private static func parseName(
+    _ bytes: [UInt8],
+    _ offset: inout Int,
+    encodedEnd: Int? = nil
+  ) -> (String, Int)? {
+    let initialEnd = encodedEnd ?? bytes.count
+    guard offset >= 0, offset <= initialEnd, initialEnd <= bytes.count else { return nil }
+
     var labels: [String] = []
     var off = offset
     var jumpedTo: Int? = nil
-    var loops = 0
+    var visitedPointers: Set<Int> = []
+    var expandedLength = 1  // Include the terminating root label.
+
     while true {
-      if loops > 255 { return nil }  // prevent infinite loops
-      loops += 1
-      if off >= bytes.count { return nil }
+      let currentEnd = jumpedTo == nil ? initialEnd : bytes.count
+      guard off >= 0, off < currentEnd else { return nil }
+
       let len = Int(bytes[off])
       if len == 0 {
         off += 1
         break
       }
-      if (len & 0xC0) == 0xC0 {  // pointer
-        if off + 1 >= bytes.count { return nil }
+
+      switch len & 0xC0 {
+      case 0xC0:  // Compression pointer.
+        guard off + 1 < currentEnd else { return nil }
         let ptr = ((len & 0x3F) << 8) | Int(bytes[off + 1])
+        guard
+          ptr < off,
+          visitedPointers.insert(ptr).inserted
+        else { return nil }
         if jumpedTo == nil { jumpedTo = off + 2 }
         off = ptr
-        continue
-      } else {
-        if off + 1 + len > bytes.count { return nil }
+
+      case 0x00:  // Ordinary label (maximum length 63 by construction).
+        guard off + 1 + len <= currentEnd else { return nil }
+        expandedLength += 1 + len
+        guard expandedLength <= 255 else { return nil }
         let s = String(decoding: bytes[(off + 1)..<(off + 1 + len)], as: UTF8.self)
         labels.append(s)
         off += 1 + len
+
+      default:  // 01xxxxxx and 10xxxxxx are reserved label encodings.
+        return nil
       }
     }
+
     if let j = jumpedTo { offset = j } else { offset = off }
     let name = labels.joined(separator: ".")
     return (name, off)
+  }
+
+  private static func rdataEnd(
+    rdata: Data,
+    rdataOffsetInMessage: Int,
+    fullMessage: Data
+  ) -> Int? {
+    guard
+      rdataOffsetInMessage >= 0,
+      rdataOffsetInMessage <= fullMessage.count,
+      rdata.count <= fullMessage.count - rdataOffsetInMessage
+    else { return nil }
+
+    return rdataOffsetInMessage + rdata.count
   }
 
   // MARK: - RDATA Parsers
@@ -1867,7 +1903,15 @@ struct DNSClient {
   static func parsePTR(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> String? {
     let bytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage
-    guard let (name, _) = parseName(bytes, &offset) else { return nil }
+    guard
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      ),
+      let (name, _) = parseName(bytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
     return name
   }
 
@@ -1898,7 +1942,14 @@ struct DNSClient {
   static func parseMX(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> (
     UInt16, String
   )? {
-    guard rdata.count >= 2 else { return nil }
+    guard
+      rdata.count >= 2,
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      )
+    else { return nil }
     let bytes = [UInt8](rdata)
 
     // Read priority (2 bytes)
@@ -1907,7 +1958,10 @@ struct DNSClient {
     // Read exchange name (domain name with compression)
     let fullBytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage + 2  // Skip priority
-    guard let (exchange, _) = parseName(fullBytes, &offset) else { return nil }
+    guard
+      let (exchange, _) = parseName(fullBytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
 
     return (priority, exchange)
   }
@@ -1917,7 +1971,15 @@ struct DNSClient {
   static func parseNS(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> String? {
     let bytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage
-    guard let (name, _) = parseName(bytes, &offset) else { return nil }
+    guard
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      ),
+      let (name, _) = parseName(bytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
     return name
   }
 
@@ -1926,7 +1988,15 @@ struct DNSClient {
   static func parseCNAME(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> String? {
     let bytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage
-    guard let (name, _) = parseName(bytes, &offset) else { return nil }
+    guard
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      ),
+      let (name, _) = parseName(bytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
     return name
   }
 
@@ -1938,15 +2008,22 @@ struct DNSClient {
   )? {
     let bytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage
+    guard
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      )
+    else { return nil }
 
     // Parse primary name server
-    guard let (primaryNS, _) = parseName(bytes, &offset) else { return nil }
+    guard let (primaryNS, _) = parseName(bytes, &offset, encodedEnd: end) else { return nil }
 
     // Parse admin email
-    guard let (adminEmail, _) = parseName(bytes, &offset) else { return nil }
+    guard let (adminEmail, _) = parseName(bytes, &offset, encodedEnd: end) else { return nil }
 
     // Parse 5 32-bit values: serial, refresh, retry, expire, minimum
-    guard offset + 20 <= bytes.count else { return nil }
+    guard offset <= end, end - offset == 20 else { return nil }
 
     func read32(_ off: Int) -> UInt32 {
       return (UInt32(bytes[off]) << 24) | (UInt32(bytes[off + 1]) << 16)
@@ -1967,7 +2044,14 @@ struct DNSClient {
   static func parseSRV(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> (
     priority: UInt16, weight: UInt16, port: UInt16, target: String
   )? {
-    guard rdata.count >= 6 else { return nil }
+    guard
+      rdata.count >= 6,
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      )
+    else { return nil }
     let bytes = [UInt8](rdata)
 
     // Read priority, weight, port (2 bytes each)
@@ -1978,7 +2062,10 @@ struct DNSClient {
     // Read target name
     let fullBytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage + 6  // Skip priority, weight, port
-    guard let (target, _) = parseName(fullBytes, &offset) else { return nil }
+    guard
+      let (target, _) = parseName(fullBytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
 
     return (priority, weight, port, target)
   }
