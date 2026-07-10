@@ -89,7 +89,7 @@ Key Features
 - `PreferredFamily { .v4, .v6, .auto }` lets callers force a family; default `.auto` lets the OS decide
 - v4 literals on v6-only NAT64 networks transparently use the gateway's synthesized v6 mapping (RFC 6147)
 - All emitted addresses are in `inet_ntop` canonical form; link-local addresses keep their `%zone` suffix
-- `interface: "en0"` binds v6 sockets via `IPV6_BOUND_IF`
+- A caller-selected BSD interface name binds v6 sockets via `IPV6_BOUND_IF`
 
 **Network Probing**
 - **Ping**: ICMP/ICMPv6 echo with statistics (min/avg/max RTT, jitter, packet loss)
@@ -124,6 +124,10 @@ Use It as a Library
 ```swift
 import SwiftFTR
 
+// Discover names at runtime; BSD names do not imply WiFi or Ethernet.
+let interfaceSnapshot = await NetworkInterfaceDiscovery().discover()
+let selectedInterface = interfaceSnapshot.physicalInterfaces.first { $0.type == .wifi }
+
 // Configure once, use everywhere
 let config = SwiftFTRConfig(
     maxHops: 40,        // Max TTL to probe
@@ -131,8 +135,7 @@ let config = SwiftFTRConfig(
     payloadSize: 56,    // ICMP payload size
     publicIP: nil,      // Auto-detect via STUN (with DNS fallback)
     enableLogging: false, // Set true for debugging
-    interface: "en0",   // Optional: specific network interface
-    sourceIP: "192.168.1.100" // Optional: specific source IP
+    interface: selectedInterface?.name // Optional: caller-selected interface
 )
 
 let tracer = SwiftFTR(config: config)
@@ -193,23 +196,33 @@ for hop in topology.uniqueHops() {
 
 // Per-Operation Interface Binding
 // Override global interface for specific operations
-let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))  // Global: WiFi
+let interfaces = await NetworkInterfaceDiscovery().discover()
+if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }),
+   let ethernetInterface = interfaces.physicalInterfaces.first(where: { $0.type == .ethernet }) {
+    let boundTracer = SwiftFTR(config: SwiftFTRConfig(interface: wifiInterface.name))
 
-// Use global interface (en0)
-let wifiPing = try await tracer.ping(to: "1.1.1.1")
+    // Use the caller-selected global interface.
+    let wifiPing = try await boundTracer.ping(to: "1.1.1.1")
 
-// Override to use Ethernet for this operation only
-let ethPing = try await tracer.ping(
-    to: "1.1.1.1",
-    config: PingConfig(interface: "en14")
-)
+    // Override to use Ethernet for this operation only.
+    let ethPing = try await boundTracer.ping(
+        to: "1.1.1.1",
+        config: PingConfig(interface: ethernetInterface.name)
+    )
 
-// Concurrent multi-interface monitoring
-async let wifi = tracer.ping(to: "1.1.1.1", config: PingConfig(interface: "en0"))
-async let ethernet = tracer.ping(to: "1.1.1.1", config: PingConfig(interface: "en14"))
-let (wifiResult, ethResult) = try await (wifi, ethernet)
-print("WiFi loss: \(Int(wifiResult.statistics.packetLoss * 100))%")
-print("Ethernet loss: \(Int(ethResult.statistics.packetLoss * 100))%")
+    // Concurrent multi-interface monitoring.
+    async let wifi = boundTracer.ping(
+        to: "1.1.1.1",
+        config: PingConfig(interface: wifiInterface.name)
+    )
+    async let ethernet = boundTracer.ping(
+        to: "1.1.1.1",
+        config: PingConfig(interface: ethernetInterface.name)
+    )
+    let (wifiResult, ethResult) = try await (wifi, ethernet)
+    print("WiFi loss: \(Int(wifiResult.statistics.packetLoss * 100))%")
+    print("Ethernet loss: \(Int(ethResult.statistics.packetLoss * 100))%")
+}
 
 // DNS API with rich metadata
 // IPv4 address lookup
@@ -325,7 +338,7 @@ swift build -c release
 Options:
 - `-m, --max-hops N`: Max TTL/hops to probe (default 40)
 - `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
-- `-i, --interface IFACE`: Use specific network interface (e.g., en0)
+- `-i, --interface IFACE`: Use a BSD interface name reported by the operating system
 - `-s, --source IP`: Bind to specific source IP address
 - `-p, --payload-size N`: ICMP payload size in bytes (default 56)
 - `--json`: Emit JSON with ASN categories and public IP
@@ -373,7 +386,7 @@ Options:
 Configuration and Flags
 -----------------------
 - Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
-- Use `SwiftFTRConfig(interface: "en0")` to bind to a specific network interface.
+- Pass a name returned by `NetworkInterfaceDiscovery` to `SwiftFTRConfig(interface:)` to bind a specific interface.
 - Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind to a specific source IP.
 - CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
 

@@ -22,9 +22,9 @@ struct VPNClassificationTests {
     #expect(pppContext.isVPNTrace == true)
 
     // Non-VPN interfaces should not create VPN context
-    let wifiContext = VPNContext.forInterface("en0")
-    #expect(wifiContext.isVPNTrace == false)
-    #expect(wifiContext.traceInterface == "en0")
+    let physicalContext = VPNContext.forInterface("physical-interface")
+    #expect(physicalContext.isVPNTrace == false)
+    #expect(physicalContext.traceInterface == "physical-interface")
 
     // Nil interface should not create VPN context
     let nilContext = VPNContext.forInterface(nil)
@@ -58,11 +58,11 @@ struct VPNClassificationTests {
     let ctx2 = VPNContext.forInterface("utun1")
     #expect(ctx.vpnLocalIPs == ctx2.vpnLocalIPs)
     // And a non-VPN interface produces no context at all (empty set is fine).
-    let wifiCtx = VPNContext.forInterface("en0")
+    let physicalContext = VPNContext.forInterface("physical-interface")
     // For a non-VPN interface, vpnLocalIPs reflects the host's other VPN
     // interfaces (still useful — the classifier needs them to recognize
-    // VPN hops in a split-tunnel trace going out en0).
-    for ip in wifiCtx.vpnLocalIPs {
+    // VPN hops in a split-tunnel trace going out a physical interface).
+    for ip in physicalContext.vpnLocalIPs {
       let bare = ip.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ip
       #expect(detectAddressFamily(bare) == AF_INET || detectAddressFamily(bare) == AF_INET6)
     }

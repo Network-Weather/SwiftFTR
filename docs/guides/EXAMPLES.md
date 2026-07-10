@@ -85,19 +85,23 @@ let prodTracer = SwiftFTR(config: prodConfig)
 
 ### Network Interface Selection (v0.4.0+)
 ```swift
-// Use specific network interface
-let wifiConfig = SwiftFTRConfig(
-    maxHops: 40,
-    interface: "en0"  // WiFi interface on macOS
-)
-let wifiTracer = SwiftFTR(config: wifiConfig)
+let interfaces = await NetworkInterfaceDiscovery().discover()
 
-// Use ethernet interface
-let ethernetConfig = SwiftFTRConfig(
-    maxHops: 40,
-    interface: "en1"  // Ethernet interface
-)
-let ethernetTracer = SwiftFTR(config: ethernetConfig)
+if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }) {
+    let wifiConfig = SwiftFTRConfig(
+        maxHops: 40,
+        interface: wifiInterface.name
+    )
+    let wifiTracer = SwiftFTR(config: wifiConfig)
+}
+
+if let ethernetInterface = interfaces.physicalInterfaces.first(where: { $0.type == .ethernet }) {
+    let ethernetConfig = SwiftFTRConfig(
+        maxHops: 40,
+        interface: ethernetInterface.name
+    )
+    let ethernetTracer = SwiftFTR(config: ethernetConfig)
+}
 
 // Bind to specific source IP
 let sourceIPConfig = SwiftFTRConfig(
@@ -106,22 +110,25 @@ let sourceIPConfig = SwiftFTRConfig(
 )
 let sourceTracer = SwiftFTR(config: sourceIPConfig)
 
-// Combine interface and source IP for precise control
-let preciseConfig = SwiftFTRConfig(
-    maxHops: 40,
-    interface: "en0",
-    sourceIP: "192.168.1.100"  // Must be an IP on en0
-)
-let preciseTracer = SwiftFTR(config: preciseConfig)
+// Combine an interface with one of its reported source addresses.
+if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }),
+   let sourceIP = wifiInterface.ipv4Addresses.first {
+    let preciseConfig = SwiftFTRConfig(
+        maxHops: 40,
+        interface: wifiInterface.name,
+        sourceIP: sourceIP
+    )
+    let preciseTracer = SwiftFTR(config: preciseConfig)
 
-// Handle interface binding errors
-do {
-    let result = try await preciseTracer.trace(to: "example.com")
-    print("Trace completed via \(preciseConfig.interface ?? "default")")
-} catch TracerouteError.interfaceBindFailed(let iface, let errno, let details) {
-    print("Failed to bind to interface \(iface): \(details ?? "")")
-} catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
-    print("Failed to bind to source IP \(ip): \(details ?? "")")
+    // Handle interface binding errors.
+    do {
+        let result = try await preciseTracer.trace(to: "example.com")
+        print("Trace completed via \(preciseConfig.interface ?? "default")")
+    } catch TracerouteError.interfaceBindFailed(let iface, let errno, let details) {
+        print("Failed to bind to interface \(iface): \(details ?? "")")
+    } catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
+        print("Failed to bind to source IP \(ip): \(details ?? "")")
+    }
 }
 ```
 
@@ -392,12 +399,16 @@ if let record = gatewayPTR.records.first, case .ptr(let hostname) = record.data 
   print("Gateway hostname: \(hostname)")
 }
 
-// Query via specific interface
-let result = try await tracer.dns.a(
-  hostname: "example.com",
-  interface: "en0",
-  sourceIP: "192.168.1.100"
-)
+// Query via an interface and one of its reported source addresses.
+let interfaces = await NetworkInterfaceDiscovery().discover()
+if let selectedInterface = interfaces.physicalInterfaces.first,
+   let sourceIP = selectedInterface.ipv4Addresses.first {
+  let result = try await tracer.dns.a(
+    hostname: "example.com",
+    interface: selectedInterface.name,
+    sourceIP: sourceIP
+  )
+}
 ```
 
 ### Reverse DNS Lookup (PTR Records)
@@ -508,13 +519,16 @@ All DNS query functions support network interface and source IP binding.
 ```swift
 import SwiftFTR
 
-// Query via specific network interface (e.g., WiFi)
-let wifiResult = try await reverseDNS(
-  ip: "10.1.10.1",
-  server: "10.1.10.1",
-  interface: "en0"  // WiFi interface
-)
-print("Via WiFi: \(wifiResult.hostname ?? "no PTR")")
+let interfaces = await NetworkInterfaceDiscovery().discover()
+
+if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }) {
+  let wifiResult = try await reverseDNS(
+    ip: "10.1.10.1",
+    server: "10.1.10.1",
+    interface: wifiInterface.name
+  )
+  print("Via WiFi: \(wifiResult.hostname ?? "no PTR")")
+}
 
 // Query via specific source IP
 let cellResult = try await reverseDNS(
@@ -524,13 +538,15 @@ let cellResult = try await reverseDNS(
 )
 print("Via cellular: \(cellResult.hostname ?? "no PTR")")
 
-// Query IPv6 via specific interface
-let ethResult = try await queryAAAA(
-  hostname: "google.com",
-  server: "2001:4860:4860::8888",  // Google's IPv6 DNS
-  interface: "en1"  // Ethernet interface
-)
-print("Via ethernet: \(ethResult.addresses)")
+// Query IPv6 via an interface reported as Ethernet.
+if let ethernetInterface = interfaces.physicalInterfaces.first(where: { $0.type == .ethernet }) {
+  let ethResult = try await queryAAAA(
+    hostname: "google.com",
+    server: "2001:4860:4860::8888",  // Google's IPv6 DNS
+    interface: ethernetInterface.name
+  )
+  print("Via ethernet: \(ethResult.addresses)")
+}
 ```
 
 ### Network Device Identification Pattern

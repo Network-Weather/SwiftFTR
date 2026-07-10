@@ -13,6 +13,35 @@ SwiftFTR supports binding operations to specific network interfaces, giving you 
 
 Interface binding is available at two levels: global (set at initialization) and per-operation (override for specific calls).
 
+## Selecting Interface Names
+
+Discover interfaces at runtime and select by the operating system's reported type. BSD names are identifiers only; their numeric suffix does not identify WiFi or Ethernet hardware.
+
+```swift
+import SwiftFTR
+
+let interfaceSnapshot = await NetworkInterfaceDiscovery().discover()
+
+enum InterfaceSelectionError: Error {
+    case unavailable(InterfaceType)
+}
+
+func requireInterface(
+    _ type: InterfaceType,
+    from snapshot: NetworkInterfaceSnapshot
+) throws -> NetworkInterface {
+    guard let interface = snapshot.physicalInterfaces.first(where: { $0.type == type }) else {
+        throw InterfaceSelectionError.unavailable(type)
+    }
+    return interface
+}
+
+let wifiInterface = try requireInterface(.wifi, from: interfaceSnapshot)
+let ethernetInterface = try requireInterface(.ethernet, from: interfaceSnapshot)
+```
+
+The examples below use these discovered values. A `nil` operation-level interface inherits the global configuration; system routing is used only when both operation-level and global interface values are `nil`.
+
 ## Binding Levels
 
 SwiftFTR provides two levels of interface binding with a clear resolution order.
@@ -25,12 +54,12 @@ Set a default interface for all operations:
 import SwiftFTR
 
 let config = SwiftFTRConfig(
-    interface: "en0",              // Bind to en0 (WiFi)
-    sourceIP: "192.168.1.100"      // Optional: specific source IP
+    interface: wifiInterface.name,
+    sourceIP: wifiInterface.ipv4Addresses.first
 )
 let ftr = SwiftFTR(config: config)
 
-// All operations use en0
+// All operations use the selected interface when one was found.
 let trace = try await ftr.trace(to: "1.1.1.1")
 let ping = try await ftr.ping(to: "8.8.8.8")
 ```
@@ -42,18 +71,18 @@ Override the global interface for specific operations:
 ```swift
 import SwiftFTR
 
-let ftr = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))
+let ftr = SwiftFTR(config: SwiftFTRConfig(interface: wifiInterface.name))
 
-// Use global interface (en0)
+// Use the global interface selection.
 let wifiPing = try await ftr.ping(to: "1.1.1.1")
 
 // Override to use Ethernet for this operation only
 let ethPing = try await ftr.ping(
     to: "1.1.1.1",
-    config: PingConfig(interface: "en14")
+    config: PingConfig(interface: ethernetInterface.name)
 )
 
-// Back to global interface (en0)
+// Back to the global interface selection.
 let wifiPing2 = try await ftr.ping(to: "8.8.8.8")
 ```
 
@@ -67,14 +96,14 @@ SwiftFTR resolves interface and source IP binding in this priority order:
 import SwiftFTR
 
 // Example 1: Operation override wins
-let ftr1 = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))
+let ftr1 = SwiftFTR(config: SwiftFTRConfig(interface: wifiInterface.name))
 let result1 = try await ftr1.ping(
     to: "1.1.1.1",
-    config: PingConfig(interface: "en14")  // Uses en14, not en0
+    config: PingConfig(interface: ethernetInterface.name)
 )
 
 // Example 2: Global config used when no operation override
-let result2 = try await ftr1.ping(to: "1.1.1.1")  // Uses en0
+let result2 = try await ftr1.ping(to: "1.1.1.1")
 
 // Example 3: System routing used when neither specified
 let ftr2 = SwiftFTR()
@@ -95,11 +124,11 @@ let result = try await ftr.ping(
     to: "1.1.1.1",
     config: PingConfig(
         count: 5,
-        interface: "en14"
+        interface: ethernetInterface.name
     )
 )
 
-print("Ping via en14: \(result.statistics.avgRTT ?? 0)ms")
+print("Ping via selected interface: \(result.statistics.avgRTT ?? 0)ms")
 ```
 
 ### TCP Probe
@@ -112,11 +141,11 @@ let result = try await tcpProbe(
         host: "example.com",
         port: 443,
         timeout: 2.0,
-        interface: "en0"
+        interface: wifiInterface.name
     )
 )
 
-print("TCP probe via en0: \(result.isReachable ? "reachable" : "unreachable")")
+print("TCP probe via selected interface: \(result.isReachable ? "reachable" : "unreachable")")
 ```
 
 ### DNS Probe
@@ -129,11 +158,11 @@ let result = try await dnsProbe(
         server: "1.1.1.1",
         query: "example.com",
         timeout: 2.0,
-        interface: "en14"
+        interface: ethernetInterface.name
     )
 )
 
-print("DNS probe via en14: \(result.isReachable ? "reachable" : "unreachable")")
+print("DNS probe via selected interface: \(result.isReachable ? "reachable" : "unreachable")")
 ```
 
 ### Bufferbloat Test
@@ -147,11 +176,11 @@ let result = try await ftr.testBufferbloat(
         target: "1.1.1.1",
         baselineDuration: 3.0,
         loadDuration: 5.0,
-        interface: "en0"
+        interface: wifiInterface.name
     )
 )
 
-print("Bufferbloat via en0: \(result.grade.rawValue)")
+print("Bufferbloat via selected interface: \(result.grade.rawValue)")
 ```
 
 ## Multi-Interface Monitoring
@@ -166,11 +195,11 @@ let ftr = SwiftFTR()
 // Concurrent monitoring via WiFi and Ethernet
 async let wifiResult = ftr.ping(
     to: "1.1.1.1",
-    config: PingConfig(count: 10, interval: 0.5, interface: "en0")
+    config: PingConfig(count: 10, interval: 0.5, interface: wifiInterface.name)
 )
 async let ethResult = ftr.ping(
     to: "1.1.1.1",
-    config: PingConfig(count: 10, interval: 0.5, interface: "en14")
+    config: PingConfig(count: 10, interval: 0.5, interface: ethernetInterface.name)
 )
 
 let (wifi, ethernet) = try await (wifiResult, ethResult)
@@ -188,52 +217,18 @@ if let wifiRTT = wifi.statistics.avgRTT,
 
 ## Finding Interface Names
 
-Use `ifconfig` to list available network interfaces:
-
-```bash
-ifconfig | grep "^[a-z]"
-```
-
-Common interface naming conventions on macOS:
-
-- **en0**: Primary WiFi or Ethernet interface
-- **en1-en14**: Additional Ethernet/WiFi interfaces
-- **utun0-N**: VPN tunnels
-- **bridge0**: Virtual bridge interfaces
-- **lo0**: Loopback (localhost)
-
-Query interface names programmatically:
+Query interface names and system-reported types programmatically:
 
 ```swift
-import Foundation
+import SwiftFTR
 
-#if canImport(Darwin)
-func listInterfaces() -> [String] {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
-    process.arguments = ["-l"]
-
-    let pipe = Pipe()
-    process.standardOutput = pipe
-
-    try? process.run()
-    process.waitUntilExit()
-
-    guard let data = try? pipe.fileHandleForReading.readToEnd(),
-          let output = String(data: data, encoding: .utf8)
-    else {
-        return []
-    }
-
-    return output.trimmingCharacters(in: .whitespacesAndNewlines)
-        .split(separator: " ")
-        .map(String.init)
+let snapshot = await NetworkInterfaceDiscovery().discover()
+for interface in snapshot.interfaces {
+    print(interface.name, interface.type.rawValue, interface.isUp)
 }
-
-let interfaces = listInterfaces()
-print("Available interfaces: \(interfaces)")
-#endif
 ```
+
+Do not derive a physical interface's role from its BSD name. Names can change with hardware, OS configuration, and network topology.
 
 ## Source IP Binding
 
@@ -242,13 +237,13 @@ Bind to a specific source IP address on an interface (useful for multi-IP interf
 ```swift
 import SwiftFTR
 
-// Bind to specific source IP on WiFi interface
+// Bind to an address reported for the selected interface.
 let result = try await SwiftFTR().ping(
     to: "1.1.1.1",
     config: PingConfig(
         count: 5,
-        interface: "en0",
-        sourceIP: "192.168.1.100"  // Must be assigned to en0
+        interface: wifiInterface.name,
+        sourceIP: wifiInterface.ipv4Addresses.first
     )
 )
 
@@ -299,8 +294,8 @@ do {
     let result = try await ftr.ping(
         to: "1.1.1.1",
         config: PingConfig(
-            interface: "en0",
-            sourceIP: "192.0.2.1"  // IP not assigned to en0
+            interface: wifiInterface.name,
+            sourceIP: "192.0.2.1"  // Documentation-only address, normally unassigned
         )
     )
 } catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
@@ -339,7 +334,7 @@ let wifiConfig = BufferbloatConfig(
     target: "1.1.1.1",
     baselineDuration: 3.0,
     loadDuration: 5.0,
-    interface: "en0"
+    interface: wifiInterface.name
 )
 let wifiResult = try await ftr.testBufferbloat(config: wifiConfig)
 
@@ -348,7 +343,7 @@ let ethConfig = BufferbloatConfig(
     target: "1.1.1.1",
     baselineDuration: 3.0,
     loadDuration: 5.0,
-    interface: "en14"
+    interface: ethernetInterface.name
 )
 let ethResult = try await ftr.testBufferbloat(config: ethConfig)
 
