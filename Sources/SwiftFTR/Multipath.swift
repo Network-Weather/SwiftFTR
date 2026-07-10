@@ -148,6 +148,7 @@ public struct NetworkTopology: Sendable, Codable {
     guard uniquePathCount > 1 else { return nil }
 
     let maxTTL = paths.map { $0.trace.hops.count }.max() ?? 0
+    guard maxTTL > 0 else { return nil }
 
     for ttl in 1...maxTTL {
       let ipsAtTTL = Set(
