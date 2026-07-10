@@ -183,24 +183,83 @@ func monotonicNow() -> TimeInterval {
   return TimeInterval(ts.tv_sec) + TimeInterval(ts.tv_nsec) / 1_000_000_000
 }
 
-/// Runs a blocking syscall (socket I/O, STUN, legacy DNS clients) on a detached task so we do not
-/// monopolize the cooperative executor backing the caller (usually `SwiftFTR`'s actor).
-/// Callers should pass lightweight closures that capture only the values required by the syscall.
-#if compiler(>=6.2)
-  @concurrent
-#endif
-@inline(__always)
-func runDetachedBlockingIO<T>(
+/// Maximum number of blocking syscalls SwiftFTR allows to execute at once.
+///
+/// Eight workers preserve useful parallelism for DNS and ASN batches while placing a firm upper
+/// bound on the threads that can be occupied by slow system resolver and socket calls. Additional
+/// operations wait in `OperationQueue` without occupying a Dispatch or Swift cooperative-executor
+/// worker.
+private let blockingIOConcurrencyLimit = 8
+
+extension TaskPriority {
+  fileprivate var blockingIOQualityOfService: QualityOfService {
+    if self >= .high { return .userInitiated }
+    if self >= .medium { return .default }
+    if self >= .low { return .utility }
+    return .background
+  }
+
+  fileprivate var blockingIOQueuePriority: Operation.QueuePriority {
+    if self >= .high { return .veryHigh }
+    if self >= .medium { return .normal }
+    if self >= .low { return .low }
+    return .veryLow
+  }
+}
+
+/// A bounded bridge from Swift concurrency to synchronous system calls.
+///
+/// `OperationQueue` retains pending operations but submits no more than the configured number to
+/// its Dispatch-backed workers. The queue is private so no caller can cancel a queued operation and
+/// strand its checked continuation.
+final class BlockingIOExecutor: Sendable {
+  private let operationQueue: OperationQueue
+
+  init(maximumConcurrentOperations: Int, name: String) {
+    precondition(maximumConcurrentOperations > 0)
+
+    let operationQueue = OperationQueue()
+    operationQueue.name = name
+    operationQueue.maxConcurrentOperationCount = maximumConcurrentOperations
+    operationQueue.qualityOfService = .utility
+    self.operationQueue = operationQueue
+  }
+
+  func run<T: Sendable>(
+    priority: TaskPriority,
+    _ operation: @Sendable @escaping () throws -> T
+  ) async throws -> T {
+    try await withCheckedThrowingContinuation { continuation in
+      let queuedOperation = BlockOperation {
+        do {
+          continuation.resume(returning: try operation())
+        } catch {
+          continuation.resume(throwing: error)
+        }
+      }
+      queuedOperation.qualityOfService = priority.blockingIOQualityOfService
+      queuedOperation.queuePriority = priority.blockingIOQueuePriority
+      operationQueue.addOperation(queuedOperation)
+    }
+  }
+}
+
+private let blockingIOExecutor = BlockingIOExecutor(
+  maximumConcurrentOperations: blockingIOConcurrencyLimit,
+  name: "com.networkweather.SwiftFTR.blocking-io"
+)
+
+/// Runs a blocking syscall (socket I/O, STUN, legacy DNS clients) on a bounded Dispatch-backed
+/// executor rather than Swift's cooperative executor.
+///
+/// Cancellation neither removes a queued operation nor interrupts a synchronous syscall once it
+/// has started. After submission, cancelling the caller therefore does not resume it early: the
+/// caller remains suspended until the operation finishes, preserving single ownership of the
+/// operation's result and exact-once continuation resumption. Callers should pass lightweight
+/// closures that capture only the values required by the syscall.
+func runDetachedBlockingIO<T: Sendable>(
   priority: TaskPriority = .userInitiated,
   _ operation: @Sendable @escaping () throws -> T
 ) async throws -> T {
-  let boxed = try await Task.detached(priority: priority) {
-    try _UncheckedSendable(value: operation())
-  }.value
-  return boxed.value
-}
-
-@usableFromInline
-struct _UncheckedSendable<T>: @unchecked Sendable {
-  let value: T
+  try await blockingIOExecutor.run(priority: priority, operation)
 }
