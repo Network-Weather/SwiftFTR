@@ -2,6 +2,31 @@ import ArgumentParser
 import Foundation
 import SwiftFTR
 
+/// Resolves the unique addresses needed by the command-line JSON renderer.
+///
+/// The injectable lookup keeps the command's reverse-DNS policy deterministic in tests without
+/// invoking the system resolver.
+func resolveCLIHostnames(
+  for addresses: [String],
+  skipReverseDNS: Bool,
+  lookup: @escaping @Sendable (String) async -> String? = { reverseDNS($0) }
+) async -> [String: String] {
+  guard !skipReverseDNS else { return [:] }
+
+  var hostnames: [String: String] = [:]
+  await withTaskGroup(of: (String, String?).self) { group in
+    for address in Set(addresses) {
+      group.addTask { (address, await lookup(address)) }
+    }
+    for await (address, hostname) in group {
+      if let hostname {
+        hostnames[address] = hostname
+      }
+    }
+  }
+  return hostnames
+}
+
 @main
 struct SwiftFTRCommand: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
@@ -170,13 +195,10 @@ extension SwiftFTRCommand {
         }
       }
       func oneDecimal(_ v: Double) -> Double { (v * 10).rounded() / 10 }
-      // Concurrent reverse DNS for all relevant IPs
-      let rdnsIPs = Set(allIPs)
-      var hostnameMap: [String: String] = [:]
-      await withTaskGroup(of: (String, String?).self) { group in
-        for ip in rdnsIPs { group.addTask { (ip, reverseDNS(ip)) } }
-        for await (ip, name) in group { if let n = name { hostnameMap[ip] = n } }
-      }
+      let hostnameMap = await resolveCLIHostnames(
+        for: allIPs,
+        skipReverseDNS: noRDNS
+      )
       var hops: [HopObj] = []
       for h in classified.hops {
         if let ip = h.ip {
