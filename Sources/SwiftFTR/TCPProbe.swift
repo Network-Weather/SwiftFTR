@@ -123,10 +123,17 @@ public struct TCPProbeResult: Sendable, Codable {
   }
 }
 
-/// TCP SYN probe implementation
-/// Attempts to establish a TCP connection to test host/port reachability
-/// Returns success if connection succeeds OR port is explicitly closed (RST)
-/// Returns failure only on timeout or network unreachable
+/// Tests TCP reachability by attempting a connection to a host and port.
+///
+/// A successful connection reports `.open`; an explicit reset reports `.closed`
+/// while still marking the host reachable.
+///
+/// - Parameters:
+///   - host: The destination hostname or numeric IP address.
+///   - port: The destination TCP port.
+///   - timeout: The maximum time to wait for a pending connection, in seconds.
+/// - Returns: The reachability result and observed connection state.
+/// - Throws: `CancellationError` when the calling task is cancelled.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -142,7 +149,14 @@ public func tcpProbe(
 #if compiler(>=6.2)
   @concurrent
 #endif
+/// Tests TCP reachability using a complete probe configuration.
+///
+/// - Parameter config: The destination, timeout, address-family, and route settings.
+/// - Returns: The reachability result and observed connection state.
+/// - Throws: `CancellationError` when the calling task is cancelled.
 public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
+  try Task.checkCancellation()
+
   let startTime = Date()
 
   // Resolve via the shared dual-stack helper (Hostname.swift).
@@ -150,6 +164,7 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
   do {
     resolved = try resolveHost(host: config.host, prefer: config.preferredFamily)
   } catch {
+    try Task.checkCancellation()
     return TCPProbeResult(
       host: config.host,
       resolvedIP: config.host,
@@ -161,6 +176,8 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
       timestamp: startTime
     )
   }
+
+  try Task.checkCancellation()
 
   let result = try await performTCPProbe(
     resolved: resolved,
@@ -185,11 +202,23 @@ public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
 
 // MARK: - Private Implementation
 
-private struct ProbeResult {
+struct ProbeResult: Sendable {
   let isReachable: Bool
   let connectionState: TCPConnectionState
   let rtt: TimeInterval?
   let error: String?
+}
+
+/// Runs setup-owned cleanup before reporting task cancellation.
+///
+/// Kept internal so tests can verify that cancellation closes an owned socket
+/// before control leaves the synchronous setup phase.
+func checkTCPProbeSetupCancellation(onCancel: () -> Void) throws {
+  guard Task.isCancelled else {
+    return
+  }
+  onCancel()
+  throw CancellationError()
 }
 
 private func performTCPProbe(
@@ -200,6 +229,8 @@ private func performTCPProbe(
   interface: String?,
   sourceIP: String?
 ) async throws -> ProbeResult {
+  try Task.checkCancellation()
+
   // Family-aware socket. v4 → AF_INET, v6 → AF_INET6.
   let sockfd = socket(resolved.family, SOCK_STREAM, 0)
   guard sockfd >= 0 else {
@@ -272,6 +303,14 @@ private func performTCPProbe(
       connect(sockfd, $0, destLen)
     }
   }
+  let connectError = errno
+
+  // This function owns the descriptor until it either returns an immediate
+  // result or hands it to TCPProbeOperation below. Cancellation can arrive
+  // during the synchronous bind/connect setup, so close before throwing.
+  try checkTCPProbeSetupCancellation {
+    _ = close(sockfd)
+  }
 
   // If connection succeeded immediately (unlikely but possible)
   if connectResult == 0 {
@@ -281,8 +320,8 @@ private func performTCPProbe(
   }
 
   // Check if connection is in progress
-  guard errno == EINPROGRESS else {
-    let errorCode = errno
+  guard connectError == EINPROGRESS else {
+    let errorCode = connectError
     let errorMsg = String(cString: strerror(errorCode))
     close(sockfd)
     // ECONNREFUSED means port is closed but host is up - still success!
@@ -293,16 +332,14 @@ private func performTCPProbe(
     return ProbeResult(isReachable: false, connectionState: .error, rtt: nil, error: errorMsg)
   }
 
-  // Use DispatchSource for non-blocking async I/O
+  // Use DispatchSource for non-blocking async I/O.
   let operation = TCPProbeOperation(
     sockfd: sockfd,
     timeout: timeout,
     probeStartTime: probeStartTime
   )
 
-  return await withCheckedContinuation { continuation in
-    operation.start(continuation: continuation)
-  }
+  return try await operation.run()
 }
 
 // MARK: - Monotonic Time
@@ -317,130 +354,240 @@ private func monotonicTime() -> TimeInterval {
 
 // MARK: - TCP Probe Operation
 
-/// Manages a single TCP probe operation using DispatchSource for non-blocking I/O
-private final class TCPProbeOperation: @unchecked Sendable {
+/// The pair of Dispatch sources owned by a pending TCP connection.
+///
+/// The cancellation closure is only created and invoked on the operation's
+/// private serial queue. The unchecked conformance is limited to this wrapper
+/// because Dispatch source protocols do not expose Sendable conformances on all
+/// supported toolchains.
+struct TCPProbeEventSources: @unchecked Sendable {
+  let cancel: () -> Void
+}
+
+/// Injectable system operations used by `TCPProbeOperation`.
+///
+/// The production implementation below uses Dispatch sources and socket calls.
+/// Tests inject a deterministic event source so cancellation races do not depend
+/// on Internet routing or wall-clock time.
+struct TCPProbeOperationDependencies: Sendable {
+  let makeEventSources:
+    @Sendable (
+      Int32,
+      TimeInterval,
+      DispatchQueue,
+      @escaping @Sendable () -> Void,
+      @escaping @Sendable () -> Void
+    ) -> TCPProbeEventSources
+  let socketError: @Sendable (Int32) -> Int32
+  let closeSocket: @Sendable (Int32) -> Void
+  let now: @Sendable () -> TimeInterval
+
+  static let live = TCPProbeOperationDependencies(
+    makeEventSources: { sockfd, timeout, queue, connectCompleted, timedOut in
+      let writeSource = DispatchSource.makeWriteSource(fileDescriptor: sockfd, queue: queue)
+      writeSource.setEventHandler(handler: connectCompleted)
+      writeSource.setCancelHandler {}
+      writeSource.activate()
+
+      let timerSource = DispatchSource.makeTimerSource(queue: queue)
+      timerSource.schedule(deadline: .now() + timeout)
+      timerSource.setEventHandler(handler: timedOut)
+      timerSource.activate()
+
+      return TCPProbeEventSources {
+        writeSource.cancel()
+        timerSource.cancel()
+      }
+    },
+    socketError: { sockfd in
+      var error: Int32 = 0
+      var errorLength = socklen_t(MemoryLayout<Int32>.size)
+      guard getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &errorLength) == 0 else {
+        return errno
+      }
+      return error
+    },
+    closeSocket: { sockfd in
+      _ = close(sockfd)
+    },
+    now: { monotonicTime() }
+  )
+}
+
+/// Manages a single TCP probe operation using DispatchSource for non-blocking I/O.
+///
+/// All Dispatch source and descriptor access is confined to `queue`. Cancellation
+/// intent is recorded synchronously under `stateLock`, then cleanup is enqueued on
+/// `queue`. This ensures a callback queued before cancellation either completes
+/// first or observes cancellation before touching the descriptor; a callback can
+/// never run socket operations after the descriptor has been closed and reused.
+final class TCPProbeOperation: @unchecked Sendable {
   private let sockfd: Int32
   private let timeout: TimeInterval
   private let probeStartTime: TimeInterval
+  private let dependencies: TCPProbeOperationDependencies
 
-  private var continuation: CheckedContinuation<ProbeResult, Never>?
-  private var writeSource: DispatchSourceWrite?
-  private var timerSource: DispatchSourceTimer?
+  private var continuation: CheckedContinuation<ProbeResult, Error>?
+  private var eventSources: TCPProbeEventSources?
 
   private let queue: DispatchQueue
-  private let lock = NSLock()
+  private let stateLock = NSLock()
   private var isFinished = false
+  private var cancellationRequested = false
 
-  init(sockfd: Int32, timeout: TimeInterval, probeStartTime: TimeInterval) {
+  init(
+    sockfd: Int32,
+    timeout: TimeInterval,
+    probeStartTime: TimeInterval,
+    dependencies: TCPProbeOperationDependencies = .live
+  ) {
     self.sockfd = sockfd
     self.timeout = timeout
     self.probeStartTime = probeStartTime
+    self.dependencies = dependencies
     self.queue = DispatchQueue(
       label: "com.swiftftr.tcpprobe.\(UInt64.random(in: 0...UInt64.max))",
       qos: .userInitiated
     )
   }
 
-  func start(continuation: CheckedContinuation<ProbeResult, Never>) {
-    lock.lock()
-    if isFinished {
-      lock.unlock()
-      continuation.resume(
-        returning: ProbeResult(
-          isReachable: false, connectionState: .error, rtt: nil,
-          error: "Operation already finished"))
+  func run() async throws -> ProbeResult {
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        start(continuation: continuation)
+      }
+    } onCancel: {
+      cancel()
+    }
+  }
+
+  private func start(continuation: CheckedContinuation<ProbeResult, Error>) {
+    queue.async {
+      if self.finished {
+        continuation.resume(throwing: CancellationError())
+        return
+      }
+
+      self.continuation = continuation
+
+      if self.cancelRequested {
+        self.finish(.failure(CancellationError()))
+        return
+      }
+
+      self.setupSources()
+
+      // Cancellation can arrive while the source factory is installing its
+      // callbacks. Check again so the operation does not wait for the queued
+      // cancellation block before releasing the descriptor.
+      if self.cancelRequested {
+        self.finish(.failure(CancellationError()))
+      }
+    }
+  }
+
+  func cancel() {
+    stateLock.lock()
+    guard !isFinished else {
+      stateLock.unlock()
       return
     }
-    self.continuation = continuation
-    lock.unlock()
+    cancellationRequested = true
+    stateLock.unlock()
 
     queue.async {
-      self.setupSources()
+      self.finish(.failure(CancellationError()))
     }
   }
 
   private func setupSources() {
-    // DispatchSourceWrite fires when socket becomes writable (connect completes)
-    let source = DispatchSource.makeWriteSource(fileDescriptor: sockfd, queue: queue)
-    source.setEventHandler { [weak self] in
-      self?.handleConnectComplete()
-    }
-    source.setCancelHandler {}
-    source.activate()
-    self.writeSource = source
-
-    // Timer for timeout
-    let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + timeout)
-    timer.setEventHandler { [weak self] in
-      self?.handleTimeout()
-    }
-    timer.activate()
-    self.timerSource = timer
+    eventSources = dependencies.makeEventSources(
+      sockfd,
+      timeout,
+      queue,
+      { [weak self] in self?.handleConnectComplete() },
+      { [weak self] in self?.handleTimeout() }
+    )
   }
 
   private func handleConnectComplete() {
-    lock.lock()
-    if isFinished {
-      lock.unlock()
+    guard !finished else {
       return
     }
-    lock.unlock()
 
     // Check if connection succeeded or failed via SO_ERROR
-    var error: Int32 = 0
-    var errorLen = socklen_t(MemoryLayout<Int32>.size)
-    getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &error, &errorLen)
+    let error = dependencies.socketError(sockfd)
 
-    let rtt = monotonicTime() - probeStartTime
+    let rtt = dependencies.now() - probeStartTime
 
     if error == 0 {
       // Connection succeeded (SYN-ACK received)
       finish(
-        result: ProbeResult(
-          isReachable: true, connectionState: .open, rtt: rtt, error: nil))
+        .success(
+          ProbeResult(
+            isReachable: true, connectionState: .open, rtt: rtt, error: nil))
+      )
     } else if error == ECONNREFUSED {
       // Port closed but host reachable (RST received)
       finish(
-        result: ProbeResult(
-          isReachable: true, connectionState: .closed, rtt: rtt, error: nil))
+        .success(
+          ProbeResult(
+            isReachable: true, connectionState: .closed, rtt: rtt, error: nil))
+      )
     } else {
       // Other error (network unreachable, etc.)
       let errorMsg = String(cString: strerror(error))
       finish(
-        result: ProbeResult(
-          isReachable: false, connectionState: .error, rtt: nil, error: errorMsg))
+        .success(
+          ProbeResult(
+            isReachable: false, connectionState: .error, rtt: nil, error: errorMsg))
+      )
     }
   }
 
   private func handleTimeout() {
     finish(
-      result: ProbeResult(
-        isReachable: false, connectionState: .filtered, rtt: nil, error: "Connection timeout"))
+      .success(
+        ProbeResult(
+          isReachable: false, connectionState: .filtered, rtt: nil,
+          error: "Connection timeout"))
+    )
   }
 
-  private func finish(result: ProbeResult) {
-    lock.lock()
-    if isFinished {
-      lock.unlock()
+  private func finish(_ proposedResult: Result<ProbeResult, Error>) {
+    stateLock.lock()
+    guard !isFinished else {
+      stateLock.unlock()
       return
     }
     isFinished = true
-    let currentContinuation = self.continuation
-    self.continuation = nil
-    lock.unlock()
+    let result: Result<ProbeResult, Error> =
+      cancellationRequested ? .failure(CancellationError()) : proposedResult
+    stateLock.unlock()
 
-    // Cancel sources
-    writeSource?.cancel()
-    timerSource?.cancel()
-    writeSource = nil
-    timerSource = nil
+    // Source cancellation, descriptor closure, and continuation resumption stay
+    // on the same serial queue, in that order. Late source callbacks first see
+    // `isFinished` and therefore cannot inspect a reused descriptor.
+    eventSources?.cancel()
+    eventSources = nil
+    dependencies.closeSocket(sockfd)
 
-    // Close socket
-    close(sockfd)
+    let currentContinuation = continuation
+    continuation = nil
 
-    // Resume continuation
-    currentContinuation?.resume(returning: result)
+    currentContinuation?.resume(with: result)
+  }
+
+  private var finished: Bool {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return isFinished
+  }
+
+  private var cancelRequested: Bool {
+    stateLock.lock()
+    defer { stateLock.unlock() }
+    return cancellationRequested
   }
 }
 
