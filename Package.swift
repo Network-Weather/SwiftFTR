@@ -61,7 +61,7 @@ let package = Package(
         .executableTarget(name: "integrationtest", dependencies: ["SwiftFTR"]),
         .testTarget(
             name: "SwiftFTRTests",
-            dependencies: ["SwiftFTR"],
+            dependencies: ["SwiftFTR", "swift-ftr"],
             path: "Tests/SwiftFTRTests"
         ),
         .executableTarget(
