@@ -21,8 +21,8 @@ let tracer = SwiftFTR()
 let result = try await tracer.testBufferbloat()
 
 print("Grade: \(result.grade.rawValue)")           // A, B, C, D, or F
-print("Baseline: \(result.baseline.medianMs) ms")
-print("Loaded: \(result.loaded.medianMs) ms")
+print("Baseline: \(result.baseline.p50Ms) ms")
+print("Loaded: \(result.loaded.p50Ms) ms")
 print("Increase: \(result.latencyIncrease.absoluteMs) ms")
 
 if let rpm = result.rpm {
@@ -45,15 +45,17 @@ let config = BufferbloatConfig(
 let result = try await tracer.testBufferbloat(config: config)
 ```
 
+> Important: `BufferbloatConfig.interface` and `sourceIP` bind the baseline and loaded latency pings only. The HTTP upload/download load follows system routing, so these settings do not make the complete test interface-specific.
+
 ## Grading Scale
 
 | Grade | Latency Increase | Video Call Impact |
 |-------|-------------------|-------------------|
-| A     | < 5 ms            | Excellent — no issues expected |
-| B     | 5–30 ms           | Good — occasional minor glitches possible |
-| C     | 30–60 ms          | Fair — noticeable quality degradation |
-| D     | 60–200 ms         | Poor — frequent freezing and audio drops |
-| F     | > 200 ms          | Failing — calls essentially unusable under load |
+| A     | < 25 ms           | Excellent — no issues expected |
+| B     | 25–75 ms          | Good — occasional minor glitches possible |
+| C     | 75–150 ms         | Fair — noticeable quality degradation |
+| D     | 150–300 ms        | Poor — frequent freezing and audio drops |
+| F     | ≥ 300 ms          | Failing — calls essentially unusable under load |
 
 ## Video Call Impact
 

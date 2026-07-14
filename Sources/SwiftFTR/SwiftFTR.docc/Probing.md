@@ -92,7 +92,7 @@ Any DNS response (even NXDOMAIN) means the server is reachable. Only timeouts an
 
 ## Interface Binding
 
-All probe types support binding to a specific network interface:
+TCP and DNS probes support per-operation interface and source-address binding. UDP and HTTP probes currently follow system routing and don't expose binding configuration.
 
 ```swift
 // TCP probe through VPN
