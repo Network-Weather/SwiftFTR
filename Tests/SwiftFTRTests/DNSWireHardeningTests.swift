@@ -1,9 +1,10 @@
 import Darwin
+import Dispatch
 import Foundation
 @_spi(Test) import SwiftFTR
 import Testing
 
-@Suite("DNS wire hardening")
+@Suite("DNS wire hardening", .serialized)
 struct DNSWireHardeningTests {
   @Test("Compressed HTTPS targets keep SvcParams within RDATA")
   func compressedHTTPSTargetUsesWireBytesConsumed() throws {
@@ -51,8 +52,7 @@ struct DNSWireHardeningTests {
       try fixture.respond(with: .success(address: [192, 0, 2, 42]))
     }
 
-    let answers = try __dnsQuery(
-      server: "127.0.0.1",
+    let answers = try await runDNSFixtureQuery(
       port: fixture.port,
       name: "owner.example.com",
       type: 1,
@@ -76,9 +76,8 @@ struct DNSWireHardeningTests {
       try fixture.respond(with: invalidHeader.scenario)
     }
 
-    #expect {
-      try __dnsQuery(
-        server: "127.0.0.1",
+    await #expect {
+      try await runDNSFixtureQuery(
         port: fixture.port,
         name: "header.example.com",
         type: 1,
@@ -95,9 +94,8 @@ struct DNSWireHardeningTests {
   @Test("Production query rejects datagrams from an unexpected source")
   func productionQueryRejectsUnexpectedSource() async throws {
     let fixture = try DNSUDPFixture()
-    let query = Task.detached {
-      try __dnsQuery(
-        server: "127.0.0.1",
+    let query = Task {
+      try await runDNSFixtureQuery(
         port: fixture.port,
         name: "source.example.com",
         type: 1,
@@ -115,6 +113,34 @@ struct DNSWireHardeningTests {
       guard let dnsError = error as? DNSError else { return false }
       if case .timeout = dnsError { return true }
       return false
+    }
+  }
+}
+
+/// Runs the synchronous DNS SPI outside Swift's cooperative executor.
+///
+/// The fixture responder is a Swift task. Blocking a cooperative worker in `recv()` can starve
+/// that responder on constrained CI runners and turn a deterministic loopback test into a timeout.
+private func runDNSFixtureQuery(
+  port: UInt16,
+  name: String,
+  type: UInt16,
+  timeout: TimeInterval
+) async throws -> [__DNSAnswer] {
+  try await withCheckedThrowingContinuation { continuation in
+    DispatchQueue.global(qos: .userInitiated).async {
+      do {
+        continuation.resume(
+          returning: try __dnsQuery(
+            server: "127.0.0.1",
+            port: port,
+            name: name,
+            type: type,
+            timeout: timeout
+          ))
+      } catch {
+        continuation.resume(throwing: error)
+      }
     }
   }
 }
