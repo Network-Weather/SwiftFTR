@@ -122,9 +122,26 @@ public func isCGNATIPv4(_ ip: String) -> Bool {
   return a == 100 && (64...127).contains(b)
 }
 
+typealias NameInfoLookup = (
+  UnsafePointer<sockaddr>?,
+  socklen_t,
+  UnsafeMutablePointer<CChar>?,
+  socklen_t,
+  UnsafeMutablePointer<CChar>?,
+  socklen_t,
+  Int32
+) -> Int32
+
 /// Performs a best-effort reverse DNS lookup for the given IP string (IPv4 or IPv6).
+///
+/// Numeric fallback text is not a hostname and is therefore rejected.
 /// - Returns: A hostname if one exists, otherwise nil. Blocking but bounded by system resolver.
 public func reverseDNS(_ ip: String) -> String? {
+  reverseDNS(ip, using: getnameinfo)
+}
+
+/// Testable implementation that accepts the platform name-info lookup function.
+func reverseDNS(_ ip: String, using lookup: NameInfoLookup) -> String? {
   let family = detectAddressFamily(ip)
   if family == AF_INET {
     var sin = sockaddr_in()
@@ -135,8 +152,9 @@ public func reverseDNS(_ ip: String) -> String? {
     var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
     let res = withUnsafePointer(to: &sin) { aptr in
       aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-        getnameinfo(
-          saptr, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0, 0
+        lookup(
+          saptr, socklen_t(MemoryLayout<sockaddr_in>.size), &host, socklen_t(host.count), nil, 0,
+          NI_NAMEREQD
         )
       }
     }
@@ -157,9 +175,9 @@ public func reverseDNS(_ ip: String) -> String? {
     var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
     let res = withUnsafePointer(to: &sin6) { aptr in
       aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-        getnameinfo(
+        lookup(
           saptr, socklen_t(MemoryLayout<sockaddr_in6>.size), &host, socklen_t(host.count), nil, 0,
-          0)
+          NI_NAMEREQD)
       }
     }
     if res == 0 {
