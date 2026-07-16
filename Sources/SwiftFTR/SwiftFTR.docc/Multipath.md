@@ -24,7 +24,7 @@ let config = MultipathConfig(flowVariations: 8, maxPaths: 16)
 let topology = try await tracer.discoverPaths(to: "8.8.8.8", config: config)
 
 print("Discovered \(topology.uniquePathCount) unique paths")
-print("Total flows probed: \(topology.totalFlows)")
+print("Total flows probed: \(topology.paths.count)")
 
 for (index, path) in topology.paths.enumerated() {
     if path.isUnique {
@@ -152,7 +152,7 @@ if let jsonString = String(data: jsonData, encoding: .utf8) {
 
 ### ICMP vs UDP Multipath
 
-**Current implementation (v0.5.0) uses ICMP-based multipath discovery**, which has important limitations:
+**The current implementation uses ICMP-based multipath discovery**, which has important limitations:
 
 - Discovery is deliberately IPv4-only; IPv6 destinations and source addresses are rejected
 - Many ECMP routers **do not hash ICMP ID field** for load balancing decisions
@@ -165,9 +165,7 @@ if let jsonString = String(data: jsonData, encoding: .utf8) {
 
 **When to use:**
 - **ICMP multipath**: Accurately reflects diversity of ICMP ping monitoring paths
-- **UDP multipath**: Accurately reflects diversity of TCP/UDP application paths (planned v0.5.5)
-
-See `docs/development/ROADMAP.md` for UDP multipath implementation plans.
+- **UDP multipath**: Accurately reflects diversity of TCP/UDP application paths, but is not currently implemented by SwiftFTR
 
 ## Topics
 

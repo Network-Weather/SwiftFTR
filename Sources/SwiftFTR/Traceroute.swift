@@ -134,10 +134,11 @@ public struct SwiftFTRConfig: Sendable {
   public let rdnsCacheTTL: TimeInterval?
   /// Maximum rDNS cache size (default: 1000 entries)
   public let rdnsCacheSize: Int?
-  /// Network interface to use for sending probes (e.g. "en0"). If nil, uses system default.
+  /// Default BSD interface name for operations that support binding.
+  /// If nil, those operations use system routing.
   public let interface: String?
 
-  /// Source IP address to bind to for all operations.
+  /// Default source IP address for operations that support binding.
   ///
   /// When specified, outgoing packets will use this IP as the source address.
   /// The IP must be assigned to the network interface (either globally configured
