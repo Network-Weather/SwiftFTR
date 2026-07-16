@@ -66,6 +66,20 @@ public struct MultipathConfig: Sendable {
   }
 }
 
+/// Multipath probing currently varies IPv4 ICMP identifiers. Reject an
+/// incompatible family before launching detached workers so every flow uses
+/// the same address family as its configured source.
+internal func validateMultipathAddressFamily(_ config: SwiftFTRConfig) throws {
+  if case .v6 = config.preferredFamily {
+    throw TracerouteError.invalidConfiguration(
+      reason: "Multipath discovery currently supports IPv4 destinations only")
+  }
+  if let sourceIP = config.sourceIP, detectAddressFamily(sourceIP) == AF_INET6 {
+    throw TracerouteError.invalidConfiguration(
+      reason: "Multipath discovery requires an IPv4 source address")
+  }
+}
+
 // MARK: - Network Topology
 
 /// Network topology with discovered paths
@@ -492,6 +506,7 @@ extension SwiftFTR {
   ///   fewer paths than UDP-based methods. The discovered paths accurately represent
   ///   ICMP routing behavior, which is ideal for ping monitoring. For TCP/UDP
   ///   application path discovery, a future UDP-based implementation would be preferred.
+  ///   Multipath discovery currently supports IPv4 destinations and source addresses only.
   ///
   /// ## Example
   /// ```swift
@@ -512,6 +527,7 @@ extension SwiftFTR {
     config: MultipathConfig = MultipathConfig()
   ) async throws -> NetworkTopology {
     let swiftConfig = self.config
+    try validateMultipathAddressFamily(swiftConfig)
     let spawner = MultipathWorkerSpawner(
       baseConfig: swiftConfig,
       rdnsCache: self.rdnsCache,
@@ -547,7 +563,8 @@ extension SwiftFTR {
         enableLogging: baseConfig.enableLogging,
         noReverseDNS: baseConfig.noReverseDNS,
         interface: baseConfig.interface,
-        sourceIP: baseConfig.sourceIP
+        sourceIP: baseConfig.sourceIP,
+        preferredFamily: .v4
       )
 
       let cachedIP = baseConfig.publicIP ?? cachedPublicIP
@@ -589,7 +606,8 @@ extension SwiftFTR {
       enableLogging: self.config.enableLogging,
       noReverseDNS: self.config.noReverseDNS,
       interface: self.config.interface,
-      sourceIP: self.config.sourceIP
+      sourceIP: self.config.sourceIP,
+      preferredFamily: .v4
     )
 
     let tempTracer = SwiftFTR(
@@ -640,10 +658,10 @@ extension SwiftFTR {
       Task { await handle.cancel() }
     }
 
-    // Resolve destination IP via the shared dual-stack resolver. Multipath stays
-    // v4-only by design (ECMP probing is heavily tied to IPv4 paris-traceroute /
-    // 5-tuple semantics), so we force `.v4` rather than auto-detecting.
-    let destIP = try resolveHost(host: host, prefer: .v4).canonical
+    guard let destIP = tr.resolvedIP else {
+      throw TracerouteError.resolutionFailed(
+        host: host, details: "Trace completed without a resolved destination address")
+    }
 
     // Collect IPs for batch operations
     var allIPs = Set(tr.hops.compactMap { $0.ipAddress })

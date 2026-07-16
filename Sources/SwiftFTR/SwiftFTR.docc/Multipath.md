@@ -154,6 +154,7 @@ if let jsonString = String(data: jsonData, encoding: .utf8) {
 
 **The current implementation uses ICMP-based multipath discovery**, which has important limitations:
 
+- Discovery is deliberately IPv4-only; IPv6 destinations and source addresses are rejected
 - Many ECMP routers **do not hash ICMP ID field** for load balancing decisions
 - ICMP-based discovery may find **significantly fewer paths** than UDP-based tools
 - UDP varies destination port (5-tuple hashing) which routers actively use for ECMP
