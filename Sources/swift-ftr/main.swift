@@ -1324,8 +1324,8 @@ extension SwiftFTRCommand {
     @Flag(name: .customLong("physical-only"), help: "Show only physical interfaces")
     var physicalOnly: Bool = false
 
-    @Flag(name: .customLong("active-only"), help: "Show only active (up) interfaces")
-    var activeOnly: Bool = true
+    @Flag(name: .customLong("include-inactive"), help: "Include inactive (down) interfaces")
+    var includeInactive: Bool = false
 
     mutating func run() async throws {
       let tracer = SwiftFTR()
@@ -1340,7 +1340,7 @@ extension SwiftFTRCommand {
         interfaces = interfaces.filter { $0.type.isPhysical }
       }
 
-      if activeOnly {
+      if !includeInactive {
         interfaces = interfaces.filter { $0.isUp }
       }
 
