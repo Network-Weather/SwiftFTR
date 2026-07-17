@@ -8,16 +8,65 @@ struct NetworkInterfaceTests {
 
   // MARK: - Interface Classification Tests
 
-  @Test("Classifies WiFi interface")
-  func testWiFiClassification() {
-    #expect(NetworkInterfaceDiscovery.classifyInterface("en0") == .wifi)
+  @Test("Classifies physical interfaces from system metadata")
+  func testSystemPhysicalClassification() {
+    let systemInterfaceTypes: [String: InterfaceType] = [
+      "system-wifi": .wifi,
+      "system-ethernet": .ethernet,
+    ]
+
+    #expect(
+      NetworkInterfaceDiscovery.classifyInterface(
+        "system-wifi",
+        systemInterfaceTypes: systemInterfaceTypes
+      ) == .wifi
+    )
+    #expect(
+      NetworkInterfaceDiscovery.classifyInterface(
+        "system-ethernet",
+        systemInterfaceTypes: systemInterfaceTypes
+      ) == .ethernet
+    )
   }
 
-  @Test("Classifies Ethernet interfaces")
-  func testEthernetClassification() {
-    #expect(NetworkInterfaceDiscovery.classifyInterface("en1") == .ethernet)
-    #expect(NetworkInterfaceDiscovery.classifyInterface("en2") == .ethernet)
-    #expect(NetworkInterfaceDiscovery.classifyInterface("en14") == .ethernet)
+  @Test("Leaves interfaces absent from system metadata unclassified")
+  func testUnknownPhysicalClassification() {
+    let systemInterfaceTypes: [String: InterfaceType] = [:]
+
+    #expect(
+      NetworkInterfaceDiscovery.classifyInterface(
+        "unreported-interface",
+        systemInterfaceTypes: systemInterfaceTypes
+      ) == .other
+    )
+  }
+
+  @Test("Keeps semantic interface types ahead of physical metadata")
+  func testSemanticClassificationPrecedence() {
+    let systemInterfaceTypes: [String: InterfaceType] = [
+      "utun0": .wifi,
+      "lo0": .ethernet,
+      "bridge0": .wifi,
+    ]
+
+    #expect(
+      NetworkInterfaceDiscovery.classifyInterface(
+        "utun0",
+        systemInterfaceTypes: systemInterfaceTypes
+      ) == .vpnTunnel
+    )
+    #expect(
+      NetworkInterfaceDiscovery.classifyInterface(
+        "lo0",
+        systemInterfaceTypes: systemInterfaceTypes
+      ) == .loopback
+    )
+    #expect(
+      NetworkInterfaceDiscovery.classifyInterface(
+        "bridge0",
+        systemInterfaceTypes: systemInterfaceTypes
+      ) == .bridge
+    )
   }
 
   @Test("Classifies VPN tunnel interfaces")
@@ -78,8 +127,8 @@ struct NetworkInterfaceTests {
     #expect(NetworkInterfaceDiscovery.isVPNInterface("ztun0") == true)
 
     // Non-VPN interfaces
-    #expect(NetworkInterfaceDiscovery.isVPNInterface("en0") == false)
-    #expect(NetworkInterfaceDiscovery.isVPNInterface("en1") == false)
+    #expect(NetworkInterfaceDiscovery.isVPNInterface("wired-interface") == false)
+    #expect(NetworkInterfaceDiscovery.isVPNInterface("wireless-interface") == false)
     #expect(NetworkInterfaceDiscovery.isVPNInterface("lo0") == false)
     #expect(NetworkInterfaceDiscovery.isVPNInterface("bridge0") == false)
     #expect(NetworkInterfaceDiscovery.isVPNInterface("awdl0") == false)
