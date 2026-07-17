@@ -117,6 +117,9 @@ public enum TracerouteError: Error, CustomStringConvertible {
 }
 
 /// Configuration options for SwiftFTR operations.
+///
+/// Values are retained by the initializer and validated when a throwing operation starts.
+/// Invalid values fail with ``TracerouteError/invalidConfiguration(reason:)``.
 public struct SwiftFTRConfig: Sendable {
   /// Maximum TTL/hops to probe (default: 40)
   public let maxHops: Int
@@ -212,9 +215,6 @@ public struct SwiftFTRConfig: Sendable {
     asnResolverStrategy: ASNResolverStrategy = .dns,
     preferredFamily: PreferredFamily = .auto
   ) {
-    precondition(maxHops >= 1 && maxHops <= 255, "maxHops must be 1...255")
-    precondition(maxWaitMs > 0, "maxWaitMs must be positive")
-    precondition(payloadSize >= 0, "payloadSize must be non-negative")
     self.maxHops = maxHops
     self.maxWaitMs = maxWaitMs
     self.payloadSize = payloadSize
@@ -267,8 +267,8 @@ public actor SwiftFTR {
   public init(config: SwiftFTRConfig = SwiftFTRConfig()) {
     self.config = config
     self.rdnsCache = RDNSCache(
-      ttl: config.rdnsCacheTTL ?? 86400,
-      maxSize: config.rdnsCacheSize ?? 1000
+      ttl: config.cacheTTLForConstruction,
+      maxSize: config.cacheSizeForConstruction
     )
     self.asnResolver = Self.createResolver(for: config.asnResolverStrategy)
   }
@@ -422,6 +422,9 @@ public actor SwiftFTR {
     streamConfig: StreamingTraceConfig,
     yield: @escaping (StreamingHop) -> Void
   ) async throws {
+    try config.validateForOperation()
+    try streamConfig.validateForOperation()
+
     let maxHops = streamConfig.maxHops
     let payloadSize = config.payloadSize
 
@@ -548,6 +551,8 @@ public actor SwiftFTR {
     handle: TraceHandle,
     flowIdentifier: UInt16? = nil
   ) async throws -> TraceResult {
+    try config.validateForOperation()
+
     let maxHops = config.maxHops
     let timeout = TimeInterval(config.maxWaitMs) / 1000.0
     let payloadSize = config.payloadSize
@@ -722,6 +727,8 @@ public actor SwiftFTR {
     vpnContext: VPNContext? = nil,
     resolver: ASNResolver? = nil
   ) async throws -> ClassifiedTrace {
+    try config.validateForOperation()
+
     // Validate interface early if specified (before any network operations)
     if let interfaceName = config.interface {
       if config.enableLogging {
@@ -899,6 +906,9 @@ public actor SwiftFTR {
   public func testBufferbloat(config: BufferbloatConfig = BufferbloatConfig()) async throws
     -> BufferbloatResult
   {
+    try self.config.validateForOperation()
+    try config.validateForOperation()
+
     // Run the orchestrator on a detached executor so synchronous phases never block SwiftFTR.
     let runner = BufferbloatRunner(testConfig: config, swiftConfig: self.config)
     return try await runner.runDetached()
