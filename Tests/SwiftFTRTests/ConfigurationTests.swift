@@ -5,7 +5,15 @@ import XCTest
 @available(macOS 13.0, *)
 final class ConfigurationTests: XCTestCase {
 
+  private func requireNetworkTests() throws {
+    try XCTSkipIf(
+      ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil,
+      "Live network tests are disabled by SKIP_NETWORK_TESTS")
+  }
+
   func testNoEnvironmentVariableDependency() async throws {
+    try requireNetworkTests()
+
     // Clear any potential environment variables to ensure they're not used
     unsetenv("PTR_SKIP_STUN")
     unsetenv("PTR_PUBLIC_IP")
@@ -54,6 +62,8 @@ final class ConfigurationTests: XCTestCase {
   }
 
   func testThreadSafetyWithMultipleConfigs() async throws {
+    try requireNetworkTests()
+
     // Create multiple tracers with different configs concurrently
     await withTaskGroup(of: Void.self) { group in
       for i in 0..<5 {
@@ -88,6 +98,8 @@ final class ConfigurationTests: XCTestCase {
   }
 
   func testClassificationWithCustomPublicIP() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(
       maxHops: 20,
       maxWaitMs: 1000,
@@ -124,6 +136,8 @@ final class ConfigurationTests: XCTestCase {
   }
 
   func testNonIsolatedAPI() async throws {
+    try requireNetworkTests()
+
     // This test validates that we can call SwiftFTR from any context
     // without MainActor requirements
 
@@ -147,6 +161,8 @@ final class ConfigurationTests: XCTestCase {
   }
 
   func testPayloadSizeConfiguration() async throws {
+    try requireNetworkTests()
+
     // Test various payload sizes
     let sizes = [32, 56, 128, 256]
 
