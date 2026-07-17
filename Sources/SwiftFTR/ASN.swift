@@ -257,10 +257,10 @@ public struct CymruDNSResolver: ASNResolver {
       q = "\(rev).origin.asn.cymru.com"
     }
 
-    // Wrap blocking DNS call in detached task
-    let txts = await Task.detached(priority: .userInitiated) {
+    // Keep the synchronous resolver off Swift's cooperative executor.
+    let txts = try? await runDetachedBlockingIO(priority: .userInitiated) {
       DNSClient.queryTXT(name: q, timeout: timeout)
-    }.value
+    }
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Format: "AS | BGP Prefix | CC | Registry | Allocated"
@@ -284,10 +284,10 @@ public struct CymruDNSResolver: ASNResolver {
   private func lookupASName(asn: Int, timeout: TimeInterval) async -> String? {
     let qn = "AS\(asn).asn.cymru.com"
 
-    // Wrap blocking DNS call in detached task
-    let txts = await Task.detached(priority: .userInitiated) {
+    // Keep the synchronous resolver off Swift's cooperative executor.
+    let txts = try? await runDetachedBlockingIO(priority: .userInitiated) {
       DNSClient.queryTXT(name: qn, timeout: timeout)
-    }.value
+    }
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Typical format: "AS | AS Name | CC | Registry | Allocated"
