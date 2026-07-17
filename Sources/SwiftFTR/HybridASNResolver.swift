@@ -33,7 +33,7 @@ public struct HybridASNResolver: ASNResolver, Sendable {
   {
     // Filter and deduplicate input
     let publicIPs = Set(ipv4Addrs)
-      .filter { !$0.isEmpty && !isPrivateIPv4($0) && !isCGNATIPv4($0) }
+      .filter(isGloballyRoutableIPAddress)
     guard !publicIPs.isEmpty else { return [:] }
 
     // Try local first
