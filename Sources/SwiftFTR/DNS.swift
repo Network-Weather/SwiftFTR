@@ -1345,6 +1345,51 @@ private struct DNSProbeResultInternal {
   let error: String?
 }
 
+/// Connect a UDP socket to a DNS server so the kernel only accepts datagrams
+/// from the queried address and port.
+private func connectDNSSocket(
+  _ fd: Int32,
+  server: String,
+  port: UInt16,
+  family: Int32
+) throws {
+  let result: Int32
+
+  if family == AF_INET6 {
+    let (bare6, scopeID) = parseIPv6Scoped(server)
+    var address = sockaddr_in6()
+    address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+    address.sin6_family = sa_family_t(AF_INET6)
+    address.sin6_port = in_port_t(port).bigEndian
+    address.sin6_scope_id = scopeID
+    guard inet_pton(AF_INET6, bare6, &address.sin6_addr) == 1 else {
+      throw DNSError.invalidIP(server)
+    }
+    result = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+        connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in6>.size))
+      }
+    }
+  } else {
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = in_port_t(port).bigEndian
+    guard inet_pton(AF_INET, server, &address.sin_addr) == 1 else {
+      throw DNSError.invalidIP(server)
+    }
+    result = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+        connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+  }
+
+  guard result == 0 else {
+    throw DNSError.sendFailed
+  }
+}
+
 /// Shared DNS query implementation that returns parsed answers
 /// - Parameters:
 ///   - server: DNS server IP address
@@ -1361,7 +1406,8 @@ private func performDNSQueryInternal(
   queryType: UInt16,
   timeout: TimeInterval,
   interface: String?,
-  sourceIP: String?
+  sourceIP: String?,
+  serverPort: UInt16 = 53
 ) throws -> [DNSClient.Answer] {
   try _validateDNSTimeout(timeout)
   let encodedQuery = try _encodeQName(query)
@@ -1452,6 +1498,9 @@ private func performDNSQueryInternal(
 
   try _applyDNSSocketTimeout(fd: fd, timeout: timeout)
 
+  // A connected UDP socket only receives responses from this DNS server and port.
+  try connectDNSSocket(fd, server: server, port: serverPort, family: serverFamily)
+
   // Build DNS query message
   var msg = Data()
   let id = UInt16.random(in: 0...UInt16.max)
@@ -1474,58 +1523,18 @@ private func performDNSQueryInternal(
   append16(queryType)  // QTYPE
   append16(1)  // QCLASS IN
 
-  // Prepare destination and send
-  let sent: ssize_t
-  if serverFamily == AF_INET6 {
-    let (bare6, scopeID) = parseIPv6Scoped(server)
-    var dst6 = sockaddr_in6()
-    dst6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-    dst6.sin6_family = sa_family_t(AF_INET6)
-    dst6.sin6_port = in_port_t(53).bigEndian
-    dst6.sin6_scope_id = scopeID
-    guard inet_pton(AF_INET6, bare6, &dst6.sin6_addr) == 1 else {
-      throw DNSError.invalidIP(server)
-    }
-    sent = msg.withUnsafeBytes { raw in
-      withUnsafePointer(to: &dst6) { aptr in
-        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-          sendto(
-            fd, raw.baseAddress!, raw.count, 0, saptr,
-            socklen_t(MemoryLayout<sockaddr_in6>.size))
-        }
-      }
-    }
-  } else {
-    var dst4 = sockaddr_in()
-    dst4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    dst4.sin_family = sa_family_t(AF_INET)
-    dst4.sin_port = in_port_t(53).bigEndian
-    guard server.withCString({ cs in inet_pton(AF_INET, cs, &dst4.sin_addr) }) == 1 else {
-      throw DNSError.invalidIP(server)
-    }
-    sent = msg.withUnsafeBytes { raw in
-      withUnsafePointer(to: &dst4) { aptr in
-        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-          sendto(
-            fd, raw.baseAddress!, raw.count, 0, saptr,
-            socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-      }
-    }
+  let sent = msg.withUnsafeBytes { raw in
+    send(fd, raw.baseAddress, raw.count, 0)
   }
 
-  guard sent > 0 else {
+  guard sent == msg.count else {
     throw DNSError.sendFailed
   }
 
-  // Receive response (sockaddr_storage is large enough for both families)
+  // Receive from the connected peer.
   var buf = [UInt8](repeating: 0, count: 2048)
-  var fromStorage = sockaddr_storage()
-  var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
-  let n = withUnsafeMutablePointer(to: &fromStorage) { aptr -> ssize_t in
-    aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-      recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
-    }
+  let n = buf.withUnsafeMutableBytes { raw in
+    recv(fd, raw.baseAddress, raw.count, 0)
   }
 
   guard n > 0 else {
@@ -1535,25 +1544,7 @@ private func performDNSQueryInternal(
   // Parse response
   let responseData = Data(buf.prefix(n))
 
-  guard n >= 12 else {
-    throw DNSError.malformedResponse
-  }
-
-  // Extract RCODE from flags (bits 0-3 of byte 3)
-  let flags = UInt16(buf[2]) << 8 | UInt16(buf[3])
-  let rcode = Int(flags & 0x000F)
-
-  // Check for DNS errors (RCODE != 0)
-  guard rcode == 0 else {
-    throw DNSError.serverError(rcode: rcode)
-  }
-
-  // Parse answers
-  guard let answers = DNSClient.parseAnswers(message: responseData) else {
-    throw DNSError.malformedResponse
-  }
-
-  return answers
+  return try DNSClient.validateResponse(message: responseData, expectedID: id)
 }
 
 /// Legacy wrapper for dnsProbe() that preserves behavior of returning success even for NXDOMAIN
@@ -1743,103 +1734,16 @@ struct DNSClient {
 
   private static func queryTXTOnce(name: String, timeout: TimeInterval, server: String) -> [String]?
   {
-    do {
-      try _validateDNSTimeout(timeout)
-    } catch {
-      return nil
-    }
-    guard let encodedName = try? _encodeQName(name) else {
-      return nil
-    }
-
-    let serverFamily = detectAddressFamily(server)
-    guard serverFamily == AF_INET || serverFamily == AF_INET6 else { return nil }
-
-    let fd = socket(serverFamily, SOCK_DGRAM, IPPROTO_UDP)
-    if fd < 0 { return nil }
-    defer { close(fd) }
-    do {
-      try _applyDNSSocketTimeout(fd: fd, timeout: timeout)
-    } catch {
-      return nil
-    }
-
-    var msg = Data()
-    let id = UInt16.random(in: 0...UInt16.max)
-    func append16(_ v: UInt16) {
-      var b = v.bigEndian
-      withUnsafeBytes(of: &b) { msg.append(contentsOf: $0) }
-    }
-    func append32(_ v: UInt32) {
-      var b = v.bigEndian
-      withUnsafeBytes(of: &b) { msg.append(contentsOf: $0) }
-    }
-
-    // Header
-    append16(id)  // ID
-    append16(0x0100)  // RD
-    append16(1)  // QDCOUNT
-    append16(0)  // ANCOUNT
-    append16(0)  // NSCOUNT
-    append16(0)  // ARCOUNT
-
-    // Question
-    msg.append(contentsOf: encodedName)
-    append16(16)  // QTYPE TXT
-    append16(1)  // QCLASS IN
-
-    // Send to server (IPv4 or IPv6)
-    let sent: ssize_t
-    if serverFamily == AF_INET6 {
-      let (bare6, scopeID) = parseIPv6Scoped(server)
-      var dst6 = sockaddr_in6()
-      dst6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-      dst6.sin6_family = sa_family_t(AF_INET6)
-      dst6.sin6_port = in_port_t(53).bigEndian
-      dst6.sin6_scope_id = scopeID
-      guard inet_pton(AF_INET6, bare6, &dst6.sin6_addr) == 1 else { return nil }
-      sent = msg.withUnsafeBytes { raw in
-        withUnsafePointer(to: &dst6) { aptr in
-          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-            sendto(
-              fd, raw.baseAddress!, raw.count, 0, saptr,
-              socklen_t(MemoryLayout<sockaddr_in6>.size))
-          }
-        }
-      }
-    } else {
-      var dst4 = sockaddr_in()
-      dst4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-      dst4.sin_family = sa_family_t(AF_INET)
-      dst4.sin_port = in_port_t(53).bigEndian
-      guard server.withCString({ cs in inet_pton(AF_INET, cs, &dst4.sin_addr) }) == 1 else {
-        return nil
-      }
-      sent = msg.withUnsafeBytes { raw in
-        withUnsafePointer(to: &dst4) { aptr in
-          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-            sendto(
-              fd, raw.baseAddress!, raw.count, 0, saptr,
-              socklen_t(MemoryLayout<sockaddr_in>.size))
-          }
-        }
-      }
-    }
-    if sent <= 0 { return nil }
-
-    // Receive response (sockaddr_storage handles both families)
-    var buf = [UInt8](repeating: 0, count: 2048)
-    var fromStorage = sockaddr_storage()
-    var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
-    let n = withUnsafeMutablePointer(to: &fromStorage) { aptr -> ssize_t in
-      aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-        recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
-      }
-    }
-    if n <= 0 { return nil }
-    let data = Data(buf.prefix(Int(n)))
-
-    guard let answers = parseAnswers(message: data) else { return nil }
+    guard
+      let answers = try? performDNSQueryInternal(
+        server: server,
+        query: name,
+        queryType: DNSRecordType.txt.rawValue,
+        timeout: timeout,
+        interface: nil,
+        sourceIP: nil
+      )
+    else { return nil }
     var out: [String] = []
     for ans in answers where ans.type == 16 && ans.klass == 1 {
       // TXT RDATA: one or more <character-string>; join all chunks into a single string per answer
@@ -1857,6 +1761,39 @@ struct DNSClient {
       if !chunks.isEmpty { out.append(chunks.joined()) }
     }
     return out.isEmpty ? nil : out
+  }
+
+  fileprivate static func validateResponse(message: Data, expectedID: UInt16) throws -> [Answer] {
+    guard message.count >= 12 else {
+      throw DNSError.malformedResponse
+    }
+
+    let bytes = [UInt8](message)
+    func read16(_ offset: Int) -> UInt16 {
+      (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
+    }
+
+    guard read16(0) == expectedID else {
+      throw DNSError.malformedResponse
+    }
+
+    let flags = read16(2)
+    let isResponse = (flags & 0x8000) != 0
+    let opcode = flags & 0x7800
+    let isTruncated = (flags & 0x0200) != 0
+    guard isResponse, opcode == 0, !isTruncated else {
+      throw DNSError.malformedResponse
+    }
+
+    let responseCode = Int(flags & 0x000F)
+    guard responseCode == 0 else {
+      throw DNSError.serverError(rcode: responseCode)
+    }
+
+    guard let answers = parseAnswers(message: message) else {
+      throw DNSError.malformedResponse
+    }
+    return answers
   }
 
   fileprivate static func parseAnswers(message: Data) -> [Answer]? {
@@ -1879,7 +1816,7 @@ struct DNSClient {
     }
     var answers: [Answer] = []
     for _ in 0..<an {
-      guard parseName(bytes, &off) != nil else { return nil }
+      guard let (name, _) = parseName(bytes, &off) else { return nil }
       if off + 10 > bytes.count { return nil }
       let typ = r16(off)
       let cls = r16(off + 2)
@@ -1892,7 +1829,7 @@ struct DNSClient {
       off += rdlen
       answers.append(
         Answer(
-          name: "",
+          name: name,
           type: typ,
           klass: cls,
           ttl: ttl,
@@ -1905,11 +1842,11 @@ struct DNSClient {
     return answers
   }
 
-  // Returns (name, newOffset)
+  // Returns the decoded name and the offset immediately after its on-wire encoding.
   private static func parseName(_ bytes: [UInt8], _ offset: inout Int) -> (String, Int)? {
     var labels: [String] = []
     var off = offset
-    var jumpedTo: Int? = nil
+    var consumedOffset: Int?
     var loops = 0
     while true {
       if loops > 255 { return nil }  // prevent infinite loops
@@ -1923,19 +1860,22 @@ struct DNSClient {
       if (len & 0xC0) == 0xC0 {  // pointer
         if off + 1 >= bytes.count { return nil }
         let ptr = ((len & 0x3F) << 8) | Int(bytes[off + 1])
-        if jumpedTo == nil { jumpedTo = off + 2 }
+        if consumedOffset == nil { consumedOffset = off + 2 }
         off = ptr
         continue
-      } else {
+      } else if (len & 0xC0) == 0 {
         if off + 1 + len > bytes.count { return nil }
         let s = String(decoding: bytes[(off + 1)..<(off + 1 + len)], as: UTF8.self)
         labels.append(s)
         off += 1 + len
+      } else {
+        return nil
       }
     }
-    if let j = jumpedTo { offset = j } else { offset = off }
+    let newOffset = consumedOffset ?? off
+    offset = newOffset
     let name = labels.joined(separator: ".")
-    return (name, off)
+    return (name, newOffset)
   }
 
   // MARK: - RDATA Parsers
@@ -2166,7 +2106,12 @@ struct DNSClient {
   static func parseHTTPS(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> (
     priority: UInt16, target: String, svcParams: Data
   )? {
-    guard rdata.count >= 2 else { return nil }
+    guard
+      rdata.count >= 2,
+      rdataOffsetInMessage >= 0,
+      rdataOffsetInMessage <= fullMessage.count,
+      rdata.count <= fullMessage.count - rdataOffsetInMessage
+    else { return nil }
     let bytes = [UInt8](rdata)
 
     // Read priority (2 bytes)
@@ -2175,12 +2120,12 @@ struct DNSClient {
     // Read target name
     let fullBytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage + 2  // Skip priority
-    guard let (target, newOffset) = parseName(fullBytes, &offset) else { return nil }
+    guard let (target, consumedOffset) = parseName(fullBytes, &offset) else { return nil }
 
     // Remaining bytes are SvcParams (keep as raw data for now - parsing is complex)
-    let svcParamsStart = newOffset - rdataOffsetInMessage
-    let svcParams =
-      svcParamsStart < rdata.count ? rdata.subdata(in: svcParamsStart..<rdata.count) : Data()
+    let svcParamsStart = consumedOffset - rdataOffsetInMessage
+    guard svcParamsStart >= 2, svcParamsStart <= rdata.count else { return nil }
+    let svcParams = rdata.subdata(in: svcParamsStart..<rdata.count)
 
     return (priority, target, svcParams)
   }
@@ -2193,6 +2138,43 @@ public struct __TXTAnswer: Sendable {
   public let type: UInt16
   public let klass: UInt16
   public let rdata: Data
+}
+
+@_spi(Test)
+public struct __DNSAnswer: Sendable {
+  public let name: String
+  public let type: UInt16
+  public let klass: UInt16
+  public let ttl: UInt32
+  public let rdata: Data
+}
+
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
+public func __dnsQuery(
+  server: String,
+  port: UInt16,
+  name: String,
+  type: UInt16,
+  timeout: TimeInterval = 1.0
+) throws -> [__DNSAnswer] {
+  try performDNSQueryInternal(
+    server: server,
+    query: name,
+    queryType: type,
+    timeout: timeout,
+    interface: nil,
+    sourceIP: nil,
+    serverPort: port
+  ).map { answer in
+    __DNSAnswer(
+      name: answer.name,
+      type: answer.type,
+      klass: answer.klass,
+      ttl: answer.ttl,
+      rdata: answer.rdata
+    )
+  }
 }
 
 // swift-format-ignore: AlwaysUseLowerCamelCase

@@ -118,11 +118,8 @@ jobs:
           rm -f /tmp/perf-test.swift /tmp/perf-test
       
       - name: Test External Package Integration
-        run: |
-          echo "📦 Testing as external package..."
-          cd test-external-package
-          swift run
-          cd ..
+        working-directory: IntegrationPackage
+        run: swift run
       
       - name: Stress Test - Concurrent Traces
         run: |

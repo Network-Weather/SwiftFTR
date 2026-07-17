@@ -184,15 +184,10 @@ public struct CymruDNSResolver: ASNResolver {
     let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
     if ips.isEmpty { return [:] }
 
-    // Filter out v4 private/CGNAT; v6 strings pass through (no equivalent
-    // filtering — link-local v6 like fe80::/10 won't have ASN data anyway and
-    // returns nil from Cymru cleanly). Cymru's origin6.asn.cymru.com handles
-    // the v6 nibble-reversed lookup; see `lookupOriginASN`.
-    let publicIPs = ips.filter { ip -> Bool in
-      if detectAddressFamily(ip) == AF_INET6 { return true }
-      return !isPrivateIPv4(ip) && !isCGNATIPv4(ip)
-    }
-    if publicIPs.isEmpty { return [:] }
+    // Cymru only has meaningful origin data for globally routable addresses.
+    // Mapped IPv4 is normalized so it uses origin.asn.cymru.com, not origin6.
+    let lookupIPs = Array(Set(ips.compactMap(asnLookupAddress)))
+    if lookupIPs.isEmpty { return [:] }
 
     let semaphore = _ConcurrencySemaphore(maxConcurrent: 8)
 
@@ -200,7 +195,7 @@ public struct CymruDNSResolver: ASNResolver {
     let originResults: [String: _OriginASNResult] = await withTaskGroup(
       of: (String, _OriginASNResult?).self
     ) { group in
-      for ip in publicIPs {
+      for ip in lookupIPs {
         group.addTask {
           await semaphore.wait()
           defer { Task { await semaphore.signal() } }
@@ -236,15 +231,24 @@ public struct CymruDNSResolver: ASNResolver {
     }
 
     // Combine results
-    var result: [String: ASNInfo] = [:]
+    var lookupResults: [String: ASNInfo] = [:]
     for (ip, origin) in originResults {
-      result[ip] = ASNInfo(
+      lookupResults[ip] = ASNInfo(
         asn: origin.asn,
         name: asnNames[origin.asn] ?? "",
         prefix: origin.prefix,
         countryCode: origin.cc,
         registry: origin.registry
       )
+    }
+
+    // Preserve the protocol contract that results are keyed by the caller's
+    // input presentation, even when the network query used a normalized key.
+    var result: [String: ASNInfo] = [:]
+    for ip in ips {
+      if let lookupIP = asnLookupAddress(for: ip), let info = lookupResults[lookupIP] {
+        result[ip] = info
+      }
     }
     return result
   }
@@ -264,10 +268,10 @@ public struct CymruDNSResolver: ASNResolver {
       q = "\(rev).origin.asn.cymru.com"
     }
 
-    // Wrap blocking DNS call in detached task
-    let txts = await Task.detached(priority: .userInitiated) {
+    // Keep the synchronous resolver off Swift's cooperative executor.
+    let txts = try? await runDetachedBlockingIO(priority: .userInitiated) {
       DNSClient.queryTXT(name: q, timeout: timeout)
-    }.value
+    }
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Format: "AS | BGP Prefix | CC | Registry | Allocated"
@@ -291,10 +295,10 @@ public struct CymruDNSResolver: ASNResolver {
   private func lookupASName(asn: Int, timeout: TimeInterval) async -> String? {
     let qn = "AS\(asn).asn.cymru.com"
 
-    // Wrap blocking DNS call in detached task
-    let txts = await Task.detached(priority: .userInitiated) {
+    // Keep the synchronous resolver off Swift's cooperative executor.
+    let txts = try? await runDetachedBlockingIO(priority: .userInitiated) {
       DNSClient.queryTXT(name: qn, timeout: timeout)
-    }.value
+    }
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Typical format: "AS | AS Name | CC | Registry | Allocated"
