@@ -88,6 +88,35 @@ extension StreamingTraceConfig {
   }
 }
 
+extension PingConfig {
+  /// Validates values before constructing packets, sequence numbers, sleeps, or timers.
+  func validateForOperation() throws {
+    guard (1...ConfigurationLimits.maximumPingCount).contains(count) else {
+      throw TracerouteError.invalidConfiguration(
+        reason: "count must be in 1...\(ConfigurationLimits.maximumPingCount)")
+    }
+    try validateNonnegativeDuration(interval, named: "interval")
+    try validatePositiveTimeout(timeout, named: "timeout")
+    guard (0...ConfigurationLimits.maximumProbePayloadSize).contains(payloadSize) else {
+      throw TracerouteError.invalidConfiguration(
+        reason:
+          "payloadSize must be in 0...\(ConfigurationLimits.maximumProbePayloadSize)"
+      )
+    }
+
+    // Ping's safety timer is twice the send schedule plus the reply timeout,
+    // with five seconds of cleanup headroom. Bound that derived value before
+    // converting it to integer nanoseconds.
+    let sendSchedule = TimeInterval(count - 1) * interval
+    let safetyBudget = 2 * (sendSchedule + timeout) + 5
+    let maximumNanosecondInterval = TimeInterval(Int.max / 1_000_000_000)
+    guard safetyBudget.isFinite, safetyBudget <= maximumNanosecondInterval else {
+      throw TracerouteError.invalidConfiguration(
+        reason: "count, interval, and timeout produce an unsupported operation duration")
+    }
+  }
+}
+
 extension TCPProbeConfig {
   /// Validates values before narrowing the port or scheduling a timer.
   func validateForOperation() throws {

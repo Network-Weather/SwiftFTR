@@ -33,7 +33,9 @@ public enum PreferredFamily: Sendable, Codable {
   case v6
 }
 
-/// Configuration for ping operations
+/// Configuration for ping operations.
+///
+/// Values are validated by ``SwiftFTR/ping(to:config:)`` before socket creation.
 public struct PingConfig: Sendable {
   /// Number of pings to send (default: 5)
   public let count: Int
@@ -210,6 +212,7 @@ struct PingExecutor: Sendable {
   /// own ephemeral socket, so concurrent `ping()` calls from a shared `SwiftFTR`
   /// instance never share identifier/sequence space (NWX contract).
   func ping(to target: String, config: PingConfig) async throws -> PingResult {
+    try config.validateForOperation()
     guard !Task.isCancelled else { throw TracerouteError.cancelled }
 
     // 1. Resolve target, honoring PreferredFamily.
