@@ -41,16 +41,16 @@ How Fast Is It?
 ---------------
 Classic traceroute often probes sequentially and waits per hop; SwiftFTR probes all hops in one burst and waits once.
 
-- Time complexity: O(1) with respect to hop count. Wall‑clock time is bounded by your chosen `timeout` (for example, `timeout = 1.0` typically completes in about ~1 second rather than ~30 seconds for 30 sequential probes).
+- Latency model: Probe transmission and result processing scale with `maxHops`, but all replies share one receive deadline instead of waiting once per hop. The ICMP receive phase is bounded by `maxWaitMs`; hostname resolution and optional rDNS, STUN, and ASN classification perform separate I/O.
 - Efficient I/O: Single socket, kqueue-backed `DispatchSourceRead`, reused receive buffer, and monotonic timing reduce overhead and jitter.
 
-If you need even tighter runs, lower `timeout` (e.g., `0.5`) or cap `maxHops` (e.g., `20`). You can also tune `payloadSize` in advanced scenarios.
+If you need tighter runs, lower `maxWaitMs` (for example, to `500`) or cap `maxHops` (for example, at `20`). You can also tune `payloadSize` in advanced scenarios.
 
 Requirements
 ------------
 - Swift 6.1+ (requires Xcode 16.4 or later)
 - macOS 13+
-- IPv4 and IPv6 supported across all surfaces (ICMPv4 Echo, ICMPv6 Echo per RFC 4443). On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS's ICMP datagram behavior.
+- Core ping, traceroute, TCP, and UDP paths support IPv4 and IPv6 (including ICMPv6 Echo per RFC 4443). Multipath discovery remains IPv4-only. On Linux, typical ICMP requires raw sockets (root/CAP_NET_RAW); SwiftFTR targets macOS's ICMP datagram behavior.
 
 Install (SwiftPM)
 -----------------
@@ -77,7 +77,7 @@ SwiftFTR is fully compliant with Swift 6.1 concurrency requirements:
 Key Features
 ------------
 **Traceroute**
-- Parallel ICMP/ICMPv6 probing with O(1) time complexity (~1 second for 30 hops)
+- Parallel ICMP/ICMPv6 probing with a single receive deadline for all hops
 - Streaming API with real-time hop updates via `AsyncThrowingStream`
 - ASN-based hop classification: LOCAL, ISP, TRANSIT, VPN, DESTINATION
 - v6 hops get full ASN annotations via Team Cymru `origin6.asn.cymru.com` or the embedded swift-ip2asn database
@@ -85,7 +85,7 @@ Key Features
 - Automatic rDNS lookups with 24-hour caching
 
 **Dual-stack IPv4 / IPv6 (v0.13.0)**
-- Every diagnostic accepts v4 literals, v6 literals, and hostnames through the same entry points
+- Ping, traceroute, TCP probes, and UDP probes accept v4 literals, v6 literals, and hostnames through the same entry points
 - `PreferredFamily { .v4, .v6, .auto }` lets callers force a family; default `.auto` lets the OS decide
 - v4 literals on v6-only NAT64 networks transparently use the gateway's synthesized v6 mapping (RFC 6147)
 - All emitted addresses are in `inet_ntop` canonical form; link-local addresses keep their `%zone` suffix
@@ -104,9 +104,9 @@ Key Features
 - Flow identifier control for reproducible traces
 
 **Interface & Binding**
-- Per-operation interface binding (WiFi, Ethernet, VPN) — `IP_BOUND_IF` (v4) / `IPV6_BOUND_IF` (v6)
-- Source IP binding for multi-homed hosts, v4 or v6 (link-local `%zone` honored)
-- Resolution order: Operation → Global → System Default
+- Traceroute and ping honor global interface/source-address settings; ping also supports a per-operation override
+- TCP and DNS probes expose operation-level binding; UDP and HTTP probes currently follow system routing
+- Bufferbloat binding applies to its latency pings only; generated HTTP load follows system routing
 
 **Public IP Discovery**
 - STUN over both v4 and v6 with multi-server fallback (Google, Cloudflare)
@@ -301,10 +301,10 @@ for try await hop in tracer.traceStream(to: "example.com", config: streamConfig)
 
 Notes for Embedding
 -------------------
-- **Thread Safety**: SwiftFTR is fully thread-safe and `nonisolated`. Call from any actor, task, or queue.
+- **Thread Safety**: The `SwiftFTR` actor protects shared state, while operations designed for parallel use keep independent per-operation state. Its async API can be called from any actor or task.
 - **Public IP**: Configure via `SwiftFTRConfig(publicIP: "x.y.z.w")` to bypass STUN discovery.
 - **ASN Lookups**: `traceClassified` uses DNS‑based Team Cymru with caching. Inject custom `ASNResolver` for offline lookups.
-- **Timeout Behavior**: Operations complete within configured `maxWaitMs`, guaranteed non-blocking.
+- **Timeout Behavior**: `maxWaitMs` bounds the ICMP receive phase of `trace`. Resolution and optional STUN, rDNS, or ASN enrichment have their own I/O and timeout behavior.
 - **Error Handling**: Detailed `TracerouteError` with context about failures (permissions, network, platform).
 - **SwiftUI Ready**: No MainActor requirements - integrate directly into SwiftUI views and view models.
 

@@ -3,6 +3,12 @@ import XCTest
 
 final class ComprehensiveIntegrationTests: XCTestCase {
 
+  private func requireNetworkTests() throws {
+    try XCTSkipIf(
+      ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil,
+      "Live network tests are disabled by SKIP_NETWORK_TESTS")
+  }
+
   // MARK: - Configuration Tests
 
   func testDefaultConfiguration() async throws {
@@ -33,6 +39,8 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   // MARK: - Basic Trace Tests
 
   func testTraceToValidIPv4() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 5, maxWaitMs: 2000)
     let tracer = SwiftFTR(config: config)
 
@@ -56,19 +64,23 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   }
 
   func testTraceToLocalhost() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 1, maxWaitMs: 500)
     let tracer = SwiftFTR(config: config)
 
     let result = try await tracer.trace(to: "127.0.0.1")
 
     XCTAssertEqual(result.destination, "127.0.0.1")
-    // Localhost might be reached in 1 hop or might not respond to ICMP
-    XCTAssertGreaterThanOrEqual(result.hops.count, 0)
+    XCTAssertEqual(result.maxHops, 1)
+    XCTAssertLessThanOrEqual(result.hops.count, 1)
   }
 
   // MARK: - Error Handling Tests
 
   func testInvalidHostname() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 3)
     let tracer = SwiftFTR(config: config)
 
@@ -85,6 +97,8 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   }
 
   func testInvalidIPv4Format() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig()
     let tracer = SwiftFTR(config: config)
 
@@ -101,6 +115,8 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   // MARK: - Classification Tests
 
   func testClassifiedTrace() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(
       maxHops: 10,
       publicIP: "8.8.8.8"  // Override to avoid STUN in tests
@@ -140,6 +156,8 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   }
 
   func testClassifiedTraceWithoutPublicIP() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 5)
     let tracer = SwiftFTR(config: config)
 
@@ -154,6 +172,8 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   // MARK: - Boundary and Edge Cases
 
   func testMinimalHops() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 1, maxWaitMs: 500)
     let tracer = SwiftFTR(config: config)
 
@@ -164,6 +184,8 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   }
 
   func testMaximalHops() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 64, maxWaitMs: 3000)
     let tracer = SwiftFTR(config: config)
 
@@ -174,31 +196,39 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   }
 
   func testVeryShortTimeout() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 5, maxWaitMs: 100)  // 100ms is very short
     let tracer = SwiftFTR(config: config)
 
     let result = try await tracer.trace(to: "8.8.8.8")
 
-    // With very short timeout, some hops might timeout
-    let timeouts = result.hops.filter { $0.ipAddress == nil }.count
-    XCTAssertGreaterThanOrEqual(timeouts, 0)
+    XCTAssertEqual(result.destination, "8.8.8.8")
+    XCTAssertEqual(result.maxHops, 5)
+    XCTAssertLessThanOrEqual(result.hops.count, 5)
+    XCTAssertLessThan(result.duration, 1.0, "A 100ms trace should finish within a broad tolerance")
   }
 
   func testLargePayloadSize() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(
       maxHops: 3,
       payloadSize: 1024  // Large payload
     )
     let tracer = SwiftFTR(config: config)
 
-    // Should not crash with large payload
     let result = try await tracer.trace(to: "1.1.1.1")
-    XCTAssertNotNil(result)
+    XCTAssertEqual(result.destination, "1.1.1.1")
+    XCTAssertEqual(result.maxHops, 3)
+    XCTAssertLessThanOrEqual(result.hops.count, 3)
   }
 
   // MARK: - Concurrent Execution Tests
 
   func testConcurrentTraces() async throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 5)
     let tracer = SwiftFTR(config: config)
 
@@ -222,6 +252,8 @@ final class ComprehensiveIntegrationTests: XCTestCase {
   // MARK: - Performance Tests
 
   func testTracePerformance() throws {
+    try requireNetworkTests()
+
     let config = SwiftFTRConfig(maxHops: 10, maxWaitMs: 1000)
     let tracer = SwiftFTR(config: config)
 
