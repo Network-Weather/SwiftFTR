@@ -990,7 +990,10 @@ internal func swiftftrParsePingMessage(
   let first = bytes[0]
   if (first >> 4) == 4 {
     let ihl = Int(first & 0x0F) * 4
-    if ihl >= 20 && ihl < buffer.count { icmpOffset = ihl }
+    guard ihl >= 20, ihl <= buffer.count, bytes[9] == UInt8(IPPROTO_ICMP) else {
+      return nil
+    }
+    icmpOffset = ihl
   }
 
   guard buffer.count - icmpOffset >= 8 else { return nil }
@@ -1011,6 +1014,7 @@ internal func swiftftrParsePingMessage(
 
   switch type {
   case ICMPv4Type.echoReply.rawValue:
+    guard code == 0 else { return nil }
     let id = read16(icmpOffset + 4)
     guard id == expectedIdentifier else { return nil }
     let seq = read16(icmpOffset + 6)
@@ -1023,8 +1027,12 @@ internal func swiftftrParsePingMessage(
     let embeddedFirstByte = bytes[embeddedIPHeaderStart]
     guard (embeddedFirstByte >> 4) == 4 else { return nil }
     let embeddedIHL = Int(embeddedFirstByte & 0x0F) * 4
+    guard embeddedIHL >= 20 else { return nil }
     let embeddedICMPHeaderStart = embeddedIPHeaderStart + embeddedIHL
     guard buffer.count - embeddedICMPHeaderStart >= 8 else { return nil }
+    guard bytes[embeddedIPHeaderStart + 9] == UInt8(IPPROTO_ICMP) else { return nil }
+    guard bytes[embeddedICMPHeaderStart] == ICMPv4Type.echoRequest.rawValue else { return nil }
+    guard bytes[embeddedICMPHeaderStart + 1] == 0 else { return nil }
     let embeddedID = read16(embeddedICMPHeaderStart + 4)
     guard embeddedID == expectedIdentifier else { return nil }
     let originalSeq = read16(embeddedICMPHeaderStart + 6)
@@ -1056,6 +1064,7 @@ internal func swiftftrParseV6PingMessage(
 
   switch type {
   case ICMPv6Type.echoReply.rawValue:
+    guard code == 0 else { return nil }
     let id = read16(4)
     guard id == expectedIdentifier else { return nil }
     let seq = read16(6)
@@ -1067,8 +1076,11 @@ internal func swiftftrParseV6PingMessage(
     guard buffer.count - embedStart >= 48 else { return nil }
     let ipFirst = bytes[embedStart]
     guard (ipFirst >> 4) == 6 else { return nil }
+    guard bytes[embedStart + 6] == UInt8(IPPROTO_ICMPV6) else { return nil }
     let innerICMP = embedStart + 40
     guard buffer.count - innerICMP >= 8 else { return nil }
+    guard bytes[innerICMP] == ICMPv6Type.echoRequest.rawValue else { return nil }
+    guard bytes[innerICMP + 1] == 0 else { return nil }
     let embeddedID = read16(innerICMP + 4)
     guard embeddedID == expectedIdentifier else { return nil }
     let originalSeq = read16(innerICMP + 6)
