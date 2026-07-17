@@ -515,7 +515,10 @@ extension SwiftFTRCommand {
     @Option(name: [.short, .customLong("payload-size")], help: "ICMP payload size (default: 56)")
     var payloadSize: Int = 56
 
-    @Option(name: [.short, .customLong("interface")], help: "Network interface (e.g., en0)")
+    @Option(
+      name: [.customShort("I"), .customLong("interface")],
+      help: "BSD network interface name"
+    )
     var interface: String?
 
     @Option(name: [.short, .customLong("source")], help: "Source IP address")

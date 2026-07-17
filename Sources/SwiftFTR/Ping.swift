@@ -33,7 +33,9 @@ public enum PreferredFamily: Sendable, Codable {
   case v6
 }
 
-/// Configuration for ping operations
+/// Configuration for ping operations.
+///
+/// Values are validated by ``SwiftFTR/ping(to:config:)`` before socket creation.
 public struct PingConfig: Sendable {
   /// Number of pings to send (default: 5)
   public let count: Int
@@ -192,9 +194,14 @@ final class ResponseCollector: @unchecked Sendable {
 /// Internal ping implementation
 struct PingExecutor: Sendable {
   private let swiftFTRConfig: SwiftFTRConfig
+  private let closeSocket: @Sendable (Int32) -> Void
 
-  init(config: SwiftFTRConfig) {
+  init(
+    config: SwiftFTRConfig,
+    closeSocket: @escaping @Sendable (Int32) -> Void = { sockfd in _ = close(sockfd) }
+  ) {
     self.swiftFTRConfig = config
+    self.closeSocket = closeSocket
   }
 
   #if compiler(>=6.2)
@@ -205,11 +212,22 @@ struct PingExecutor: Sendable {
   /// own ephemeral socket, so concurrent `ping()` calls from a shared `SwiftFTR`
   /// instance never share identifier/sequence space (NWX contract).
   func ping(to target: String, config: PingConfig) async throws -> PingResult {
+    try config.validateForOperation()
+    guard !Task.isCancelled else { throw TracerouteError.cancelled }
+
     // 1. Resolve target, honoring PreferredFamily.
     let resolved = try resolveHost(host: target, prefer: config.preferredFamily)
+    guard !Task.isCancelled else { throw TracerouteError.cancelled }
 
     // 2. Create datagram ICMP socket for the resolved family.
     let sockfd = try createICMPSocket(family: resolved.family)
+    var operationOwnsSocket = false
+    defer {
+      if !operationOwnsSocket {
+        closeSocket(sockfd)
+      }
+    }
+    guard !Task.isCancelled else { throw TracerouteError.cancelled }
 
     // 3. Apply interface/sourceIP bindings (operation config overrides global).
     try applyBindings(sockfd: sockfd, family: resolved.family, pingConfig: config)
@@ -220,6 +238,7 @@ struct PingExecutor: Sendable {
     // 4b. Increase receive buffer.
     var recvBufSize: Int32 = 256 * 1024
     _ = setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &recvBufSize, socklen_t(MemoryLayout<Int32>.size))
+    guard !Task.isCancelled else { throw TracerouteError.cancelled }
 
     // 4c. Unique identifier per ping session to avoid cross-socket collisions.
     let identifier = generateIdentifier()
@@ -231,16 +250,15 @@ struct PingExecutor: Sendable {
       resolved: resolved,
       config: config,
       identifier: identifier,
-      executor: self
+      sendPacket: { sockfd, packet, resolved in
+        try self.sendPacket(sockfd: sockfd, packet: packet, to: resolved)
+      },
+      monotonicTime: { self.monotonicTime() },
+      closeSocket: closeSocket
     )
+    operationOwnsSocket = true
 
-    return try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation { continuation in
-        operation.start(continuation: continuation)
-      }
-    } onCancel: {
-      operation.cancel()
-    }
+    return try await operation.run()
   }
 
   // MARK: - Socket Operations
@@ -416,30 +434,39 @@ struct PingExecutor: Sendable {
 
 }
 
-/// Manages a single ping operation using DispatchSource for efficient I/O
-private final class PingOperation: @unchecked Sendable {
-  let sockfd: Int32
-  let target: String
-  let resolved: ResolvedHost
-  let config: PingConfig
-  let executor: PingExecutor
-  let identifier: UInt16
-  var family: Int32 { resolved.family }
+/// Manages a single ping operation using DispatchSource for efficient I/O.
+///
+/// The socket, dispatch sources, send task, and response collections are owned by
+/// `queue`. Cancellation only changes `state` synchronously; all resource cleanup
+/// is then serialized on `queue`, so a descriptor can never be closed underneath
+/// an in-flight or already-enqueued read/send operation.
+final class PingOperation: @unchecked Sendable {
+  private enum State: Equatable {
+    case running
+    case cancelled
+    case completed
+  }
+
+  private let sockfd: Int32
+  private let target: String
+  private let resolved: ResolvedHost
+  private let config: PingConfig
+  private let identifier: UInt16
+  private let sendPacket: @Sendable (Int32, [UInt8], ResolvedHost) throws -> Void
+  private let monotonicTime: @Sendable () -> TimeInterval
+  private let closeSocket: @Sendable (Int32) -> Void
+  private var family: Int32 { resolved.family }
 
   private var continuation: CheckedContinuation<PingResult, Error>?
   private var readSource: DispatchSourceRead?
   private var timerSource: DispatchSourceTimer?
 
-  // Guarded by lock
+  // Queue-owned operation data.
   private var sentTimes: [Int: TimeInterval] = [:]
   private var receiveTimes: [Int: TimeInterval] = [:]
   private var ttls: [Int: Int] = [:]
 
-  // Thread-local or protected by serial execution guarantees?
-  // recvBuffer is only used in handleRead. handleRead is serial with respect to itself.
-  // BUT we are on a concurrent queue now.
-  // DispatchSource guarantees that the event handler is not re-entered concurrently.
-  // So recvBuffer is safe.
+  // Queue-owned receive buffers, used only by the serialized read handler.
   private var recvBuffer = [UInt8](repeating: 0, count: 1500)
   // Ancillary buffer for recvmsg cmsg data (v6 hop limit). 64 bytes is comfortably
   // larger than CMSG_SPACE(sizeof(int)) = 20 on Darwin; leaves headroom in case the
@@ -449,8 +476,22 @@ private final class PingOperation: @unchecked Sendable {
   // Private serial queue for this operation to ensure race-free execution and reliable event delivery
   private let queue: DispatchQueue
   private let lock = NSLock()
-  private var isFinished = false
-  private var isStarted = false
+  // Guarded by lock: cancellation can arrive from any executor while start and
+  // normal completion run on `queue`.
+  private var state = State.running
+  private var hasStarted = false
+
+  // Queue-owned resource state.
+  private var sendTask: Task<Void, Never>?
+  private var senderIsRunning = false
+  private var descriptorState = DescriptorState.open
+  private var cleanupCompletion: (() -> Void)?
+
+  private enum DescriptorState: Equatable {
+    case open
+    case waitingForReadSourceCancellation
+    case closed
+  }
 
   init(
     sockfd: Int32,
@@ -458,45 +499,88 @@ private final class PingOperation: @unchecked Sendable {
     resolved: ResolvedHost,
     config: PingConfig,
     identifier: UInt16,
-    executor: PingExecutor
+    sendPacket: @escaping @Sendable (Int32, [UInt8], ResolvedHost) throws -> Void,
+    monotonicTime: @escaping @Sendable () -> TimeInterval,
+    closeSocket: @escaping @Sendable (Int32) -> Void
   ) {
     self.sockfd = sockfd
     self.target = target
     self.resolved = resolved
     self.config = config
     self.identifier = identifier
-    self.executor = executor
+    self.sendPacket = sendPacket
+    self.monotonicTime = monotonicTime
+    self.closeSocket = closeSocket
     self.queue = DispatchQueue(
       label: "com.swiftftr.ping.\(UInt64.random(in: 0...UInt64.max))", qos: .userInitiated)
   }
 
+  func run() async throws -> PingResult {
+    try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        start(continuation: continuation)
+      }
+    } onCancel: {
+      cancel()
+    }
+  }
+
   func start(continuation: CheckedContinuation<PingResult, Error>) {
     lock.lock()
-    if isFinished {
-      lock.unlock()
-      continuation.resume(throwing: TracerouteError.cancelled)
-      return
-    }
+    precondition(!hasStarted, "PingOperation can only be started once")
+    hasStarted = true
     self.continuation = continuation
-    self.isStarted = true
+    let currentState = state
     lock.unlock()
 
-    queue.async {
-      self.setupSources()
-      self.startSending()
+    if currentState == .running {
+      queue.async { self.setupAndStart() }
+    } else {
+      // Cancellation may win before run() registers its continuation. Always
+      // enqueue completion again: cleanup is idempotent, and this second pass
+      // will resume a continuation registered after the first pass ran.
+      queue.async { self.completeCancellation() }
     }
   }
 
   func cancel() {
-    finish()
+    lock.lock()
+    if state != .running {
+      lock.unlock()
+      return
+    }
+    state = .cancelled
+    lock.unlock()
+
+    // Cleanup must run on the same serial queue as setup, reads, and sends.
+    queue.async { self.completeCancellation() }
+  }
+
+  private func setupAndStart() {
+    guard isRunning else {
+      completeCancellation()
+      return
+    }
+
+    setupSources()
+
+    // cancel() can change state while setupSources() is executing. Do not
+    // launch an unstructured sender after cancellation has already won.
+    guard isRunning else {
+      completeCancellation()
+      return
+    }
+    startSending()
   }
 
   private func setupSources() {
     let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
     // Strong self capture to keep operation alive until finish()
     source.setEventHandler { self.handleRead() }
-    // Socket closure handled in finish()
-    source.setCancelHandler {}
+    // The descriptor is closed from the source's cancellation handler. Dispatch
+    // guarantees this runs after any in-flight event handler has returned and the
+    // source no longer references the descriptor, avoiding descriptor-reuse races.
+    source.setCancelHandler { self.readSourceDidCancel() }
     source.activate()
     self.readSource = source
 
@@ -514,82 +598,99 @@ private final class PingOperation: @unchecked Sendable {
       2.0 * (Double(max(config.count - 1, 0)) * max(config.interval, 0) + config.timeout) + 5.0
     let timer = DispatchSource.makeTimerSource(queue: queue)
     timer.schedule(deadline: .now() + .nanoseconds(Int(safetyBudget * 1_000_000_000)))
-    timer.setEventHandler { self.finish() }
+    timer.setEventHandler { self.finishNormally() }
     timer.activate()
     self.timerSource = timer
   }
 
   private func startSending() {
-    Task.detached {
-      for seq in 1...self.config.count {
-        if await self.checkFinished() { break }
-
-        let packet: [UInt8]
-        if self.family == AF_INET6 {
-          packet = makeICMPv6EchoRequest(
-            identifier: self.identifier,
-            sequence: UInt16(seq),
-            payloadSize: self.config.payloadSize
-          )
-        } else {
-          packet = makeICMPEchoRequest(
-            identifier: self.identifier,
-            sequence: UInt16(seq),
-            payloadSize: self.config.payloadSize
-          )
-        }
-
-        // Dispatch send to serial queue. sendTime is captured on the queue, immediately
-        // before sendto, so it reflects what actually went on the wire (not when this
-        // Task.detached iteration enqueued the work).
-        self.queue.async {
-          if self.checkFinishedSync() { return }
-          do {
-            let sendTime = self.executor.monotonicTime()
-            try self.executor.sendPacket(
-              sockfd: self.sockfd, packet: packet, to: self.resolved)
-
-            self.lock.lock()
-            self.sentTimes[seq] = sendTime
-            self.lock.unlock()
-          } catch {
-            // Send error (e.g., ENOBUFS): leave sentTimes[seq] unset so this packet is
-            // excluded from the "sent" count rather than masquerading as transport loss.
-          }
-        }
-
-        if seq < self.config.count && self.config.interval > 0 {
-          try? await Task.sleep(nanoseconds: UInt64(self.config.interval * 1_000_000_000))
-        }
-      }
-
-      // All sends have been attempted. On the serial queue (so we observe a consistent
-      // snapshot of sentTimes), anchor the deadline timer to (last send time + timeout).
-      // If no send ever succeeded, finish immediately — there is nothing more to wait
-      // for, and the timeout-budget assumption ("at least one packet went out") is moot.
-      self.queue.async {
-        if self.checkFinishedSync() { return }
-        self.lock.lock()
-        let lastSendTime = self.sentTimes.values.max()
-        self.lock.unlock()
-
-        guard let lastSendTime = lastSendTime else {
-          self.finish()
-          return
-        }
-
-        let nowMono = self.executor.monotonicTime()
-        let deadlineDelta = max(0, lastSendTime + self.config.timeout - nowMono)
-        self.timerSource?.schedule(
-          deadline: .now() + .nanoseconds(Int(deadlineDelta * 1_000_000_000)))
-      }
+    senderIsRunning = true
+    sendTask = Task {
+      await self.sendLoop()
     }
   }
 
+  private func sendLoop() async {
+    var completedAllSends = false
+    defer {
+      queue.async { [completedAllSends] in
+        self.sendLoopDidFinish(completedAllSends: completedAllSends)
+      }
+    }
+
+    for seq in 1...config.count {
+      guard !Task.isCancelled, isRunning else { return }
+
+      let packet: [UInt8]
+      if family == AF_INET6 {
+        packet = makeICMPv6EchoRequest(
+          identifier: identifier,
+          sequence: UInt16(seq),
+          payloadSize: config.payloadSize
+        )
+      } else {
+        packet = makeICMPEchoRequest(
+          identifier: identifier,
+          sequence: UInt16(seq),
+          payloadSize: config.payloadSize
+        )
+      }
+
+      // Capture sendTime on the serial queue, immediately before sendto, so it
+      // reflects what actually went on the wire rather than enqueue time.
+      queue.async {
+        guard self.isRunning, self.descriptorState == .open else { return }
+        do {
+          let sendTime = self.monotonicTime()
+          try self.sendPacket(self.sockfd, packet, self.resolved)
+          self.sentTimes[seq] = sendTime
+        } catch {
+          // Send error (e.g. ENOBUFS): leave sentTimes[seq] unset so this
+          // packet is excluded from the sent count rather than reported as loss.
+        }
+      }
+
+      if seq < config.count && config.interval > 0 {
+        do {
+          try await Task.sleep(nanoseconds: UInt64(config.interval * 1_000_000_000))
+        } catch is CancellationError {
+          return
+        } catch {
+          return
+        }
+      }
+    }
+
+    completedAllSends = true
+  }
+
+  /// Called on `queue` after the sender task has exited. Queue ordering guarantees
+  /// all send closures enqueued by the task have already run before this callback.
+  private func sendLoopDidFinish(completedAllSends: Bool) {
+    sendTask = nil
+    senderIsRunning = false
+
+    guard completedAllSends, isRunning else {
+      finishCleanupIfReady()
+      return
+    }
+
+    guard let lastSendTime = sentTimes.values.max() else {
+      finishNormally()
+      return
+    }
+
+    let nowMono = monotonicTime()
+    let deadlineDelta = max(0, lastSendTime + config.timeout - nowMono)
+    timerSource?.schedule(
+      deadline: .now() + .nanoseconds(Int(deadlineDelta * 1_000_000_000)))
+  }
+
   private func handleRead() {
-    if checkFinishedSync() { return }
+    guard isRunning, descriptorState == .open else { return }
 
     while true {
+      guard isRunning, descriptorState == .open else { return }
       var fromAddr = sockaddr_storage()
       var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
       var hopLimit: Int? = nil
@@ -656,9 +757,8 @@ private final class PingOperation: @unchecked Sendable {
       }
 
       if let parsed = parsedMessage {
-        let receiveTime = executor.monotonicTime()
+        let receiveTime = monotonicTime()
 
-        lock.lock()
         switch parsed {
         case .echoReply(let sequence, let ttl):
           receiveTimes[Int(sequence)] = receiveTime
@@ -684,52 +784,124 @@ private final class PingOperation: @unchecked Sendable {
         // Do not record a receive time for Destination Unreachable.
         }
         let count = receiveTimes.count
-        lock.unlock()
 
         if count >= config.count {
-          finish()
+          finishNormally()
           return
         }
       }
     }
   }
 
-  private func finish() {
+  /// Called only on `queue` by the deadline timer or read handler.
+  private func finishNormally() {
     lock.lock()
-    if isFinished {
+    guard state == .running else {
       lock.unlock()
       return
     }
-    isFinished = true
+    state = .completed
     let currentContinuation = self.continuation
     self.continuation = nil
-
-    // Capture data under lock for result building
-    let finalSentTimes = self.sentTimes
-    let finalReceiveTimes = self.receiveTimes
-    let finalTtls = self.ttls
-
     lock.unlock()
 
-    timerSource?.cancel()
-    readSource?.cancel()
-    timerSource = nil
-    readSource = nil
-
-    // Close socket AFTER sources are cancelled and we're done with them.
-    close(self.sockfd)
-
-    guard let continuation = currentContinuation else { return }
-
-    // Build result without lock (we have copies) on private serial queue
-    queue.async {
+    let finalSentTimes = sentTimes
+    let finalReceiveTimes = receiveTimes
+    let finalTtls = ttls
+    guard let currentContinuation else {
+      cleanupResources()
+      return
+    }
+    cleanupResources {
       self.buildAndResume(
-        continuation: continuation,
+        continuation: currentContinuation,
         sentTimes: finalSentTimes,
         receiveTimes: finalReceiveTimes,
         ttls: finalTtls
       )
     }
+  }
+
+  /// Called only on `queue`. Idempotence is required for cancel-before-start:
+  /// cancellation can clean up before run() registers its continuation, and
+  /// start() then enqueues a second pass to resume it.
+  private func completeCancellation() {
+    lock.lock()
+    guard state == .cancelled else {
+      lock.unlock()
+      return
+    }
+    let currentContinuation = continuation
+    continuation = nil
+    lock.unlock()
+
+    if let currentContinuation {
+      cleanupResources {
+        currentContinuation.resume(throwing: TracerouteError.cancelled)
+      }
+    } else {
+      cleanupResources()
+    }
+  }
+
+  /// Queue-owned, idempotent teardown. Completion runs only after the read source's
+  /// cancellation handler has closed the descriptor, so returning from `run()`
+  /// means the operation no longer owns any kernel or task resources.
+  private func cleanupResources(then completion: (() -> Void)? = nil) {
+    if let completion {
+      precondition(cleanupCompletion == nil, "PingOperation cleanup completed twice")
+      cleanupCompletion = completion
+    }
+
+    sendTask?.cancel()
+
+    timerSource?.setEventHandler {}
+    timerSource?.cancel()
+    timerSource = nil
+
+    switch descriptorState {
+    case .open:
+      if let source = readSource {
+        descriptorState = .waitingForReadSourceCancellation
+        readSource = nil
+        source.setEventHandler {}
+        source.cancel()
+      } else {
+        closeDescriptorAndCompleteCleanup()
+      }
+    case .waitingForReadSourceCancellation:
+      break
+    case .closed:
+      finishCleanupIfReady()
+    }
+  }
+
+  /// Dispatch invokes this on `queue` only after the read source is fully
+  /// cancelled and no event handler can still be using the descriptor.
+  private func readSourceDidCancel() {
+    guard descriptorState == .waitingForReadSourceCancellation else { return }
+    closeDescriptorAndCompleteCleanup()
+  }
+
+  private func closeDescriptorAndCompleteCleanup() {
+    guard descriptorState != .closed else {
+      finishCleanupIfReady()
+      return
+    }
+    descriptorState = .closed
+    closeSocket(sockfd)
+    finishCleanupIfReady()
+  }
+
+  private func finishCleanupIfReady() {
+    guard descriptorState == .closed, !senderIsRunning else { return }
+    runCleanupCompletion()
+  }
+
+  private func runCleanupCompletion() {
+    let completion = cleanupCompletion
+    cleanupCompletion = nil
+    completion?()
   }
 
   private func buildAndResume(
@@ -760,11 +932,10 @@ private final class PingOperation: @unchecked Sendable {
     continuation.resume(returning: result)
   }
 
-  private func checkFinished() async -> Bool { checkFinishedSync() }
-  private func checkFinishedSync() -> Bool {
+  private var isRunning: Bool {
     lock.lock()
     defer { lock.unlock() }
-    return isFinished
+    return state == .running
   }
 
   private func parsePingMessage(buffer: UnsafeRawBufferPointer, expectedIdentifier: UInt16)
@@ -819,7 +990,10 @@ internal func swiftftrParsePingMessage(
   let first = bytes[0]
   if (first >> 4) == 4 {
     let ihl = Int(first & 0x0F) * 4
-    if ihl >= 20 && ihl < buffer.count { icmpOffset = ihl }
+    guard ihl >= 20, ihl <= buffer.count, bytes[9] == UInt8(IPPROTO_ICMP) else {
+      return nil
+    }
+    icmpOffset = ihl
   }
 
   guard buffer.count - icmpOffset >= 8 else { return nil }
@@ -840,6 +1014,7 @@ internal func swiftftrParsePingMessage(
 
   switch type {
   case ICMPv4Type.echoReply.rawValue:
+    guard code == 0 else { return nil }
     let id = read16(icmpOffset + 4)
     guard id == expectedIdentifier else { return nil }
     let seq = read16(icmpOffset + 6)
@@ -852,8 +1027,12 @@ internal func swiftftrParsePingMessage(
     let embeddedFirstByte = bytes[embeddedIPHeaderStart]
     guard (embeddedFirstByte >> 4) == 4 else { return nil }
     let embeddedIHL = Int(embeddedFirstByte & 0x0F) * 4
+    guard embeddedIHL >= 20 else { return nil }
     let embeddedICMPHeaderStart = embeddedIPHeaderStart + embeddedIHL
     guard buffer.count - embeddedICMPHeaderStart >= 8 else { return nil }
+    guard bytes[embeddedIPHeaderStart + 9] == UInt8(IPPROTO_ICMP) else { return nil }
+    guard bytes[embeddedICMPHeaderStart] == ICMPv4Type.echoRequest.rawValue else { return nil }
+    guard bytes[embeddedICMPHeaderStart + 1] == 0 else { return nil }
     let embeddedID = read16(embeddedICMPHeaderStart + 4)
     guard embeddedID == expectedIdentifier else { return nil }
     let originalSeq = read16(embeddedICMPHeaderStart + 6)
@@ -885,6 +1064,7 @@ internal func swiftftrParseV6PingMessage(
 
   switch type {
   case ICMPv6Type.echoReply.rawValue:
+    guard code == 0 else { return nil }
     let id = read16(4)
     guard id == expectedIdentifier else { return nil }
     let seq = read16(6)
@@ -896,8 +1076,11 @@ internal func swiftftrParseV6PingMessage(
     guard buffer.count - embedStart >= 48 else { return nil }
     let ipFirst = bytes[embedStart]
     guard (ipFirst >> 4) == 6 else { return nil }
+    guard bytes[embedStart + 6] == UInt8(IPPROTO_ICMPV6) else { return nil }
     let innerICMP = embedStart + 40
     guard buffer.count - innerICMP >= 8 else { return nil }
+    guard bytes[innerICMP] == ICMPv6Type.echoRequest.rawValue else { return nil }
+    guard bytes[innerICMP + 1] == 0 else { return nil }
     let embeddedID = read16(innerICMP + 4)
     guard embeddedID == expectedIdentifier else { return nil }
     let originalSeq = read16(innerICMP + 6)
