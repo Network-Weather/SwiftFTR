@@ -343,7 +343,7 @@ Options:
 - `-i, --interval SEC`: Interval between pings (default 1.0)
 - `-t, --timeout SEC`: Timeout per ping (default 2.0)
 - `--payload-size N`: ICMP payload size (default 56)
-- `--interface IFACE`: Network interface to use
+- `-I, --interface IFACE`: Network interface to use
 - `--json`: Output JSON format
 
 ### Multipath Discovery
