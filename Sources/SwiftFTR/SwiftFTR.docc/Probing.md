@@ -71,6 +71,7 @@ if let tcpRTT = result.tcpHandshakeRTT {
 ```
 
 Any HTTP response (even 4xx/5xx) counts as reachable — the probe tests network connectivity, not content availability.
+The probe stops the transfer after receiving response headers, so large or streaming response bodies are not buffered.
 
 ## DNS Probe
 
@@ -92,7 +93,7 @@ Any DNS response (even NXDOMAIN) means the server is reachable. Only timeouts an
 
 ## Interface Binding
 
-All probe types support binding to a specific network interface:
+TCP and DNS probes support per-operation interface and source-address binding. UDP and HTTP probes currently follow system routing and don't expose binding configuration.
 
 ```swift
 // TCP probe through VPN

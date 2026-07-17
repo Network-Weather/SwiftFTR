@@ -4,10 +4,14 @@ import Foundation
   import Darwin
 #endif
 
+#if os(macOS) && canImport(SystemConfiguration)
+  import SystemConfiguration
+#endif
+
 /// Type of network interface
 public enum InterfaceType: String, Sendable, Codable {
-  case wifi  // en0 typically on Mac
-  case ethernet  // en1+ or Thunderbolt adapters
+  case wifi
+  case ethernet
   case vpnTunnel  // utun* (WireGuard, Tailscale, OpenVPN, etc.)
   case vpnIPSec  // ipsec* interfaces
   case vpnPPP  // ppp* (L2TP, legacy)
@@ -40,7 +44,7 @@ public enum InterfaceType: String, Sendable, Codable {
 public struct NetworkInterface: Sendable, Codable, Identifiable {
   public var id: String { name }
 
-  /// Interface name (e.g., "en0", "utun3")
+  /// BSD interface name reported by the operating system.
   public let name: String
 
   /// Classified interface type
@@ -124,8 +128,15 @@ public actor NetworkInterfaceDiscovery {
     return vpnPrefixes.contains { name.hasPrefix($0) }
   }
 
-  /// Classify interface type from its name
+  /// Classify an interface type using its name and system-provided interface metadata.
   public static func classifyInterface(_ name: String) -> InterfaceType {
+    classifyInterface(name, systemInterfaceTypes: discoverSystemInterfaceTypes())
+  }
+
+  static func classifyInterface(
+    _ name: String,
+    systemInterfaceTypes: [String: InterfaceType]
+  ) -> InterfaceType {
     // VPN tunnels
     if name.hasPrefix("utun") { return .vpnTunnel }
     if name.hasPrefix("tun") { return .vpnTunnel }
@@ -140,11 +151,9 @@ public actor NetworkInterfaceDiscovery {
     if name == "lo0" || name.hasPrefix("lo") { return .loopback }
     if name.hasPrefix("bridge") { return .bridge }
 
-    // Physical interfaces
-    // On macOS: en0 is typically WiFi on laptops, en1+ are additional adapters
-    // This is a heuristic - precise detection would require IOKit
-    if name == "en0" { return .wifi }
-    if name.hasPrefix("en") { return .ethernet }
+    if let type = systemInterfaceTypes[name], type == .wifi || type == .ethernet {
+      return type
+    }
 
     return .other
   }
@@ -161,6 +170,8 @@ public actor NetworkInterfaceDiscovery {
 
   #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     private func discoverDarwin() -> NetworkInterfaceSnapshot {
+      let systemInterfaceTypes = Self.discoverSystemInterfaceTypes()
+
       var ifaddrsPtr: UnsafeMutablePointer<ifaddrs>?
       guard getifaddrs(&ifaddrsPtr) == 0, let firstAddr = ifaddrsPtr else {
         return NetworkInterfaceSnapshot(interfaces: [])
@@ -219,12 +230,41 @@ public actor NetworkInterfaceDiscovery {
       }
 
       // Build final interface list
-      let interfaces = interfaceData.values.map { $0.build() }
-        .sorted { $0.name < $1.name }
+      let interfaces = interfaceData.values.map {
+        $0.build(systemInterfaceTypes: systemInterfaceTypes)
+      }
+      .sorted { $0.name < $1.name }
 
       return NetworkInterfaceSnapshot(interfaces: interfaces)
     }
+
   #endif
+
+  private static func discoverSystemInterfaceTypes() -> [String: InterfaceType] {
+    #if os(macOS) && canImport(SystemConfiguration)
+      let interfaces = SCNetworkInterfaceCopyAll() as NSArray as? [SCNetworkInterface] ?? []
+      var interfaceTypes: [String: InterfaceType] = [:]
+
+      for interface in interfaces {
+        guard let name = SCNetworkInterfaceGetBSDName(interface) as String? else { continue }
+
+        switch SCNetworkInterfaceGetInterfaceType(interface) {
+        case kSCNetworkInterfaceTypeIEEE80211:
+          interfaceTypes[name] = .wifi
+        case kSCNetworkInterfaceTypeEthernet:
+          if interfaceTypes[name] == nil {
+            interfaceTypes[name] = .ethernet
+          }
+        default:
+          break
+        }
+      }
+
+      return interfaceTypes
+    #else
+      return [:]
+    #endif
+  }
 }
 
 // MARK: - Internal Builder
@@ -239,13 +279,16 @@ private struct InterfaceBuilder {
     self.name = name
   }
 
-  func build() -> NetworkInterface {
+  func build(systemInterfaceTypes: [String: InterfaceType]) -> NetworkInterface {
     let isUp = (flags & UInt32(IFF_UP)) != 0
     let isPointToPoint = (flags & UInt32(IFF_POINTOPOINT)) != 0
 
     return NetworkInterface(
       name: name,
-      type: NetworkInterfaceDiscovery.classifyInterface(name),
+      type: NetworkInterfaceDiscovery.classifyInterface(
+        name,
+        systemInterfaceTypes: systemInterfaceTypes
+      ),
       ipv4Addresses: ipv4Addresses,
       ipv6Addresses: ipv6Addresses,
       isUp: isUp,
