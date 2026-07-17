@@ -646,17 +646,8 @@ extension SwiftFTR {
       _ = try validateInterface(interfaceName)
     }
 
-    // Get or discover public IP with caching
-    let effectivePublicIP: String?
-    if let configIP = config.publicIP {
-      effectivePublicIP = configIP
-    } else if let cached = cachedPublicIP {
-      effectivePublicIP = cached
-    } else if let discovered = try? await discoverPublicIP() {
-      cachedPublicIP = discovered
-      effectivePublicIP = discovered
-    } else {
-      effectivePublicIP = nil
+    let effectivePublicIP = await effectivePublicIPForClassification {
+      try? await self.discoverPublicIP()
     }
 
     // Perform base trace with flow ID

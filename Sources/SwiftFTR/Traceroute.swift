@@ -240,6 +240,7 @@ public actor SwiftFTR {
 
   // Cache storage
   internal var cachedPublicIP: String?
+  private var cacheGeneration: UInt64 = 0
   internal let rdnsCache: RDNSCache
   internal let asnResolver: ASNResolver
 
@@ -772,17 +773,8 @@ public actor SwiftFTR {
       }
     }
 
-    // Get or discover public IP with caching
-    let effectivePublicIP: String?
-    if let configIP = config.publicIP {
-      effectivePublicIP = configIP
-    } else if let cached = cachedPublicIP {
-      effectivePublicIP = cached
-    } else if let discovered = try? await discoverPublicIP() {
-      cachedPublicIP = discovered
-      effectivePublicIP = discovered
-    } else {
-      effectivePublicIP = nil
+    let effectivePublicIP = await effectivePublicIPForClassification {
+      try? await self.discoverPublicIP()
     }
 
     // Perform base trace (includes rDNS if enabled)
@@ -962,6 +954,23 @@ public actor SwiftFTR {
     }
   }
 
+  /// Returns a configured/cached public IP or discovers one for the current
+  /// cache generation. A network change while discovery is suspended makes the
+  /// result stale, so it is neither returned nor cached.
+  internal func effectivePublicIPForClassification(
+    discover: @Sendable () async -> String?
+  ) async -> String? {
+    if let configured = config.publicIP { return configured }
+    if let cachedPublicIP { return cachedPublicIP }
+
+    let discoveryGeneration = cacheGeneration
+    guard let discovered = await discover() else { return nil }
+    guard discoveryGeneration == cacheGeneration else { return nil }
+
+    cachedPublicIP = discovered
+    return discovered
+  }
+
   // MARK: - Network Interface Discovery
 
   /// Discover all network interfaces on the system.
@@ -1032,17 +1041,15 @@ public actor SwiftFTR {
     // Snapshot and remove the current generation before awaiting another actor.
     // Traces registered while cancellation is in progress remain tracked for a
     // subsequent network change instead of being silently removed.
+    cacheGeneration &+= 1
+    cachedPublicIP = nil
     let tracesToCancel = activeTraces
     activeTraces.removeAll()
+    await rdnsCache.clear()
+
     for trace in tracesToCancel {
       await trace.cancel()
     }
-
-    // Clear cached public IP
-    cachedPublicIP = nil
-
-    // Clear rDNS cache
-    await rdnsCache.clear()
 
     // Note: ASN cache could optionally be cleared too
   }
@@ -1058,6 +1065,7 @@ public actor SwiftFTR {
   ///
   /// This clears both the public IP cache and the rDNS cache.
   public func clearCaches() async {
+    cacheGeneration &+= 1
     cachedPublicIP = nil
     await rdnsCache.clear()
   }
@@ -1066,6 +1074,7 @@ public actor SwiftFTR {
   ///
   /// Forces re-discovery via STUN on the next trace.
   public func invalidatePublicIP() {
+    cacheGeneration &+= 1
     cachedPublicIP = nil
   }
 }
