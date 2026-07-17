@@ -22,7 +22,7 @@ let tracer = SwiftFTR()
 let config = PingConfig(count: 1, timeout: 2.0)
 let result = try await tracer.ping(to: "1.1.1.1", config: config)
 
-if let rtt = result.roundTripTimes.first {
+if let rtt = result.responses.compactMap(\.rtt).first {
     print("RTT: \(rtt * 1000) ms")
 } else {
     print("No response")
@@ -94,7 +94,7 @@ print(isReachable ? "✓ Host reachable" : "✗ Host unreachable")
 
 ## Concurrent Ping Operations
 
-The `ping()` method is nonisolated and runs concurrently without serialization. Multiple ping operations execute in parallel with independent sockets:
+The `ping()` entry point can run concurrently without actor serialization. Multiple ping operations use independent sockets:
 
 ```swift
 import SwiftFTR

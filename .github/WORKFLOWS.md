@@ -12,7 +12,7 @@ This repository uses GitHub Actions for CI/CD automation. The workflows are desi
 
 **Jobs:**
 - **format**: Swift format linting (required before merge)
-- **macos**: Build debug + release, run tests with network isolation
+- **macos**: Build debug + release, run tests with network isolation, and compile the external-consumer fixture
 
 **Environment Variables:**
 - `PTR_SKIP_STUN=1` - Skip STUN tests in CI
@@ -98,7 +98,7 @@ This repository uses GitHub Actions for CI/CD automation. The workflows are desi
 
 ```
 ci.yml (on every push/PR)
-  └─> format check → build → test
+  └─> format check → build → isolated test → external-consumer build
 
 release.yml (on tag push or manual)
   └─> build release → attestations → GitHub Release

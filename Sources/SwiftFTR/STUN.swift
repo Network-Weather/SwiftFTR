@@ -50,8 +50,11 @@ let stunServers: [(host: String, port: UInt16)] = [
 enum STUNError: Error, CustomStringConvertible {
   case resolveFailed(errno: Int32, details: String?)
   case socketFailed(errno: Int32, details: String?)
+  case connectFailed(errno: Int32, details: String?)
   case sendFailed(errno: Int32, details: String?)
   case recvTimeout
+  case invalidTimeout(TimeInterval)
+  case invalidResponse(String)
   case interfaceBindFailed(interface: String, errno: Int32, details: String?)
   case sourceIPBindFailed(sourceIP: String, errno: Int32, details: String?)
 
@@ -65,12 +68,20 @@ enum STUNError: Error, CustomStringConvertible {
       let errStr = String(cString: strerror(errno))
       let baseMsg = "Failed to create UDP socket for STUN (errno=\(errno)): \(errStr)"
       return details.map { "\(baseMsg). \($0)" } ?? baseMsg
+    case .connectFailed(let errno, let details):
+      let errStr = String(cString: strerror(errno))
+      let baseMsg = "Failed to connect STUN socket (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
     case .sendFailed(let errno, let details):
       let errStr = String(cString: strerror(errno))
       let baseMsg = "Failed to send STUN request (errno=\(errno)): \(errStr)"
       return details.map { "\(baseMsg). \($0)" } ?? baseMsg
     case .recvTimeout:
       return "STUN request timed out"
+    case .invalidTimeout(let timeout):
+      return "Invalid STUN timeout: \(timeout). Timeout must be finite and greater than zero"
+    case .invalidResponse(let reason):
+      return "Invalid STUN response: \(reason)"
     case .interfaceBindFailed(let interface, let errno, let details):
       let errStr = String(cString: strerror(errno))
       let baseMsg =
@@ -100,6 +111,10 @@ internal func stunGetPublicIP(
   sourceIP: String? = nil,
   enableLogging: Bool = false
 ) throws -> STUNPublicIP {
+  guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
+    throw STUNError.invalidTimeout(timeout)
+  }
+
   var hints = addrinfo(
     ai_flags: AI_ADDRCONFIG, ai_family: family, ai_socktype: SOCK_DGRAM,
     ai_protocol: IPPROTO_UDP, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
@@ -118,7 +133,7 @@ internal func stunGetPublicIP(
   // single family-agnostic value.
   var server = sockaddr_storage()
   let serverLen = socklen_t(min(MemoryLayout<sockaddr_storage>.size, Int(info.pointee.ai_addrlen)))
-  withUnsafeMutablePointer(to: &server) { dst in
+  _ = withUnsafeMutablePointer(to: &server) { dst in
     memcpy(dst, sa, Int(serverLen))
   }
 
@@ -171,14 +186,37 @@ internal func stunGetPublicIP(
     if enableLogging { print("[STUN] Bound to source IP '\(srcIP)'") }
   }
 
-  // Set timeouts
+  // Connect the datagram socket before sending. Besides simplifying I/O, this
+  // makes the kernel discard datagrams from peers other than the resolved STUN
+  // server, so an unrelated packet cannot win the response race.
+  let connectResult = withUnsafePointer(to: &server) { aptr in
+    aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+      connect(fd, saptr, serverLen)
+    }
+  }
+  guard connectResult == 0 else {
+    let error = errno
+    throw STUNError.connectFailed(
+      errno: error, details: "Failed to connect to \(host):\(port)")
+  }
+
+  // Set timeouts. A zero timeval disables SO_RCVTIMEO, so invalid values are
+  // rejected above and option failures are surfaced rather than ignored.
   var tv = timeval(
     tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000))
-  _ = withUnsafePointer(to: &tv) { p in
+  let receiveTimeoutResult = withUnsafePointer(to: &tv) { p in
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
   }
-  _ = withUnsafePointer(to: &tv) { p in
+  guard receiveTimeoutResult == 0 else {
+    let error = errno
+    throw STUNError.socketFailed(errno: error, details: "Failed to configure receive timeout")
+  }
+  let sendTimeoutResult = withUnsafePointer(to: &tv) { p in
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
+  }
+  guard sendTimeoutResult == 0 else {
+    let error = errno
+    throw STUNError.socketFailed(errno: error, details: "Failed to configure send timeout")
   }
 
   // Build STUN Binding Request (RFC 5389 §6).
@@ -201,16 +239,8 @@ internal func stunGetPublicIP(
     req[8 + i] = transactionID[i]
   }
 
-  let serverAddrLen =
-    family == AF_INET6
-    ? socklen_t(MemoryLayout<sockaddr_in6>.size)
-    : socklen_t(MemoryLayout<sockaddr_in>.size)
   let sent = req.withUnsafeBytes { raw in
-    withUnsafePointer(to: &server) { aptr in
-      aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-        sendto(fd, raw.baseAddress!, raw.count, 0, saptr, serverAddrLen)
-      }
-    }
+    send(fd, raw.baseAddress!, raw.count, 0)
   }
   if sent < 0 {
     let error = errno
@@ -218,47 +248,84 @@ internal func stunGetPublicIP(
       errno: error, details: "Failed to send STUN request to \(host):\(port)")
   }
 
-  // Receive response into a family-agnostic storage.
+  // The connected UDP socket accepts responses only from the selected server.
   var buf = [UInt8](repeating: 0, count: 512)
-  var from = sockaddr_storage()
-  var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
-  let n = withUnsafeMutablePointer(to: &from) { aptr -> ssize_t in
-    aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-      recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
-    }
-  }
+  let n = recv(fd, &buf, buf.count, 0)
   if n <= 0 { throw STUNError.recvTimeout }
 
-  // Parse XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001) per RFC 5389 §15.
-  if n < 20 { throw STUNError.recvTimeout }
+  return try parseSTUNBindingResponse(
+    Array(buf.prefix(Int(n))), transactionID: transactionID, expectedFamily: family)
+}
+
+/// Validates and parses a STUN Binding Success Response (RFC 5389).
+///
+/// Kept separate from socket I/O so malformed and mismatched responses can be
+/// regression-tested deterministically.
+internal func parseSTUNBindingResponse(
+  _ response: [UInt8], transactionID: [UInt8], expectedFamily: Int32
+) throws -> STUNPublicIP {
+  guard transactionID.count == 12 else {
+    throw STUNError.invalidResponse("request transaction ID must contain 12 bytes")
+  }
+  guard response.count >= 20 else {
+    throw STUNError.invalidResponse("header is shorter than 20 bytes")
+  }
+
+  let messageType = UInt16(response[0]) << 8 | UInt16(response[1])
+  guard messageType == 0x0101 else {
+    throw STUNError.invalidResponse(
+      String(format: "unexpected message type 0x%04x", messageType))
+  }
+
+  let messageLength = Int(UInt16(response[2]) << 8 | UInt16(response[3]))
+  guard messageLength.isMultiple(of: 4), response.count == 20 + messageLength else {
+    throw STUNError.invalidResponse("declared message length does not match datagram")
+  }
+
+  let cookie =
+    UInt32(response[4]) << 24 | UInt32(response[5]) << 16
+    | UInt32(response[6]) << 8 | UInt32(response[7])
   let magic: UInt32 = 0x2112_A442
+  guard cookie == magic else {
+    throw STUNError.invalidResponse("magic cookie mismatch")
+  }
+  guard Array(response[8..<20]) == transactionID else {
+    throw STUNError.invalidResponse("transaction ID mismatch")
+  }
+
+  // Parse XOR-MAPPED-ADDRESS (0x0020) or MAPPED-ADDRESS (0x0001) per RFC 5389 §15.
   var ofs = 20
-  while ofs + 4 <= n {
-    let atype = UInt16(buf[ofs]) << 8 | UInt16(buf[ofs + 1])
-    let alen = Int(UInt16(buf[ofs + 2]) << 8 | UInt16(buf[ofs + 3]))
+  while ofs < response.count {
+    guard ofs + 4 <= response.count else {
+      throw STUNError.invalidResponse("truncated attribute header")
+    }
+    let atype = UInt16(response[ofs]) << 8 | UInt16(response[ofs + 1])
+    let alen = Int(UInt16(response[ofs + 2]) << 8 | UInt16(response[ofs + 3]))
     ofs += 4
-    if ofs + alen > n { break }
+    guard ofs + alen <= response.count else {
+      throw STUNError.invalidResponse("attribute exceeds declared message length")
+    }
     if atype == 0x0020 || atype == 0x0001 {
       if alen >= 8 {
-        let attrFamily = buf[ofs + 1]
+        let attrFamily = response[ofs + 1]
         // Reserved/port handling — we don't use the port, just skip past it.
-        if attrFamily == 0x01 && alen >= 8 {
+        if attrFamily == 0x01 && alen == 8 && expectedFamily == AF_INET {
           // IPv4 — 4 bytes of address after the 4-byte family/port header.
           var addr: UInt32 =
-            (UInt32(buf[ofs + 4]) << 24) | (UInt32(buf[ofs + 5]) << 16)
-            | (UInt32(buf[ofs + 6]) << 8) | UInt32(buf[ofs + 7])
+            (UInt32(response[ofs + 4]) << 24) | (UInt32(response[ofs + 5]) << 16)
+            | (UInt32(response[ofs + 6]) << 8) | UInt32(response[ofs + 7])
           if atype == 0x0020 { addr ^= magic }
           let oct1 = (addr >> 24) & 0xFF
           let oct2 = (addr >> 16) & 0xFF
           let oct3 = (addr >> 8) & 0xFF
           let oct4 = addr & 0xFF
           return STUNPublicIP(ip: "\(oct1).\(oct2).\(oct3).\(oct4)", family: AF_INET)
-        } else if attrFamily == 0x02 && alen >= 20 {
+        } else if attrFamily == 0x02 && alen == 20 && expectedFamily == AF_INET6 {
           // IPv6 — 16 bytes of address. For XOR-MAPPED-ADDRESS the first 4
           // bytes XOR against the magic cookie; the remaining 12 bytes XOR
           // against the request transaction ID (RFC 5389 §15.2).
           var v6Bytes = [UInt8](repeating: 0, count: 16)
-          for i in 0..<16 { v6Bytes[i] = buf[ofs + 4 + i] }
+          for i in 0..<16 { v6Bytes[i] = response[ofs + 4 + i] }
           if atype == 0x0020 {
             v6Bytes[0] ^= UInt8((magic >> 24) & 0xFF)
             v6Bytes[1] ^= UInt8((magic >> 16) & 0xFF)
@@ -281,9 +348,13 @@ internal func stunGetPublicIP(
       }
     }
     // Attributes are padded to 4.
-    ofs += ((alen + 3) / 4) * 4
+    let paddedLength = ((alen + 3) / 4) * 4
+    guard ofs + paddedLength <= response.count else {
+      throw STUNError.invalidResponse("attribute padding exceeds message length")
+    }
+    ofs += paddedLength
   }
-  throw STUNError.recvTimeout
+  throw STUNError.invalidResponse("missing mapped address for requested family")
 }
 
 /// Back-compat wrapper for v4-only callers. Same signature/behavior as before

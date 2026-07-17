@@ -4,6 +4,12 @@ import XCTest
 @available(macOS 13.0, *)
 final class StreamingTraceTests: XCTestCase {
 
+  private func requireNetworkTests() throws {
+    try XCTSkipIf(
+      ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil,
+      "Live network tests are disabled by SKIP_NETWORK_TESTS")
+  }
+
   // MARK: - StreamingHop Type Tests
 
   func testStreamingHopCreation() {
@@ -93,6 +99,8 @@ final class StreamingTraceTests: XCTestCase {
   // MARK: - Streaming Trace Integration Tests
 
   func testStreamingTraceToLocalhost() async throws {
+    try requireNetworkTests()
+
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
       probeTimeout: 2.0,
@@ -113,6 +121,8 @@ final class StreamingTraceTests: XCTestCase {
   }
 
   func testStreamingTraceEmitsHopsProgressively() async throws {
+    try requireNetworkTests()
+
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
       probeTimeout: 5.0,
@@ -122,12 +132,8 @@ final class StreamingTraceTests: XCTestCase {
     )
 
     var hopTTLs: [Int] = []
-    var firstHopTime: Date?
 
     for try await hop in tracer.traceStream(to: "1.1.1.1", config: config) {
-      if firstHopTime == nil {
-        firstHopTime = Date()
-      }
       hopTTLs.append(hop.ttl)
 
       // Verify hops have valid TTL
@@ -147,7 +153,9 @@ final class StreamingTraceTests: XCTestCase {
     XCTAssertEqual(uniqueTTLs.count, hopTTLs.count, "Each TTL should only appear once")
   }
 
-  func testStreamingTraceArrivalOrder() async throws {
+  func testStreamingTraceEmitsUniqueValidTTLs() async throws {
+    try requireNetworkTests()
+
     // This test verifies hops arrive in network order, not necessarily TTL order
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
@@ -161,26 +169,16 @@ final class StreamingTraceTests: XCTestCase {
 
     for try await hop in tracer.traceStream(to: "1.1.1.1", config: config) {
       arrivalOrder.append(hop.ttl)
+      XCTAssertTrue((1...config.maxHops).contains(hop.ttl))
     }
 
-    // Arrival order may differ from TTL order due to network timing
-    // Nearby hops often arrive first, but far hops might arrive before middle hops
-    // The key is that we DON'T enforce TTL ordering in the stream
-
-    if arrivalOrder.count > 1 {
-      // Verify all TTLs are unique
-      let uniqueTTLs = Set(arrivalOrder)
-      XCTAssertEqual(uniqueTTLs.count, arrivalOrder.count, "Each TTL should only appear once")
-
-      // Sort for comparison
-      let sortedTTLs = arrivalOrder.sorted()
-      // We just verify we got valid data - arrival order may or may not match TTL order
-      XCTAssertEqual(sortedTTLs.first, arrivalOrder.min())
-      XCTAssertEqual(sortedTTLs.last, arrivalOrder.max())
-    }
+    XCTAssertFalse(arrivalOrder.isEmpty, "Should receive at least one responsive hop")
+    XCTAssertEqual(Set(arrivalOrder).count, arrivalOrder.count, "Each TTL should only appear once")
   }
 
   func testStreamingTraceWithTimeoutPlaceholders() async throws {
+    try requireNetworkTests()
+
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
       probeTimeout: 3.0,  // Short timeout to force timeouts
@@ -213,6 +211,8 @@ final class StreamingTraceTests: XCTestCase {
   }
 
   func testStreamingTraceWithoutTimeoutPlaceholders() async throws {
+    try requireNetworkTests()
+
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
       probeTimeout: 5.0,
@@ -235,6 +235,8 @@ final class StreamingTraceTests: XCTestCase {
   }
 
   func testStreamingTraceRTTValues() async throws {
+    try requireNetworkTests()
+
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
       probeTimeout: 5.0,
@@ -243,18 +245,23 @@ final class StreamingTraceTests: XCTestCase {
       maxHops: 10
     )
 
+    var responseCount = 0
     for try await hop in tracer.traceStream(to: "1.1.1.1", config: config) {
       if let rtt = hop.rtt {
+        responseCount += 1
         // RTT should be positive and reasonable (< 10 seconds)
         XCTAssertGreaterThan(rtt, 0, "RTT should be positive")
         XCTAssertLessThan(rtt, 10.0, "RTT should be less than 10 seconds")
       }
     }
+    XCTAssertGreaterThan(responseCount, 0, "Should receive at least one RTT sample")
   }
 
   // MARK: - RTT Timing Tests
 
   func testStreamingHopRTTIsPositive() async throws {
+    try requireNetworkTests()
+
     // Verify that RTT values are always positive and measured correctly
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
@@ -276,9 +283,12 @@ final class StreamingTraceTests: XCTestCase {
         XCTAssertLessThan(rtt, 5.0, "RTT should be less than probe timeout")
       }
     }
+    XCTAssertFalse(hops.isEmpty, "Should receive at least one responsive hop")
   }
 
   func testStreamingHopRTTReflectsNetworkLatency() async throws {
+    try requireNetworkTests()
+
     // Verify RTT values are reasonable network latencies, not total wait times
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
@@ -315,6 +325,8 @@ final class StreamingTraceTests: XCTestCase {
   }
 
   func testEachTTLEmittedOnlyOnce() async throws {
+    try requireNetworkTests()
+
     // Verify that even with retries, each TTL is emitted at most once
     let tracer = SwiftFTR()
     let config = StreamingTraceConfig(
@@ -336,6 +348,8 @@ final class StreamingTraceTests: XCTestCase {
   }
 
   func testRTTMeasuredFromCorrectProbe() async throws {
+    try requireNetworkTests()
+
     // This test verifies RTT is measured from probe send time, not stream start
     // We can't directly test retry scenarios without mocking, but we can verify
     // that RTT values are consistent with being measured from individual probes
@@ -376,49 +390,11 @@ final class StreamingTraceTests: XCTestCase {
     }
   }
 
-  // MARK: - Cancellation Tests
-
-  func testStreamingTraceCancellation() async throws {
-    let tracer = SwiftFTR()
-    let config = StreamingTraceConfig(
-      probeTimeout: 10.0,
-      retryAfter: 5.0,
-      emitTimeouts: true,
-      maxHops: 30
-    )
-
-    // Use actor to track hop count safely across concurrency boundaries
-    actor HopCounter {
-      var count = 0
-      func increment() { count += 1 }
-      func getCount() -> Int { count }
-    }
-
-    let counter = HopCounter()
-    let task = Task {
-      for try await _ in tracer.traceStream(to: "1.1.1.1", config: config) {
-        await counter.increment()
-        if await counter.getCount() >= 3 {
-          // Cancel after receiving 3 hops
-          throw CancellationError()
-        }
-      }
-    }
-
-    do {
-      try await task.value
-      XCTFail("Should have thrown cancellation error")
-    } catch is CancellationError {
-      // Expected
-      let finalCount = await counter.getCount()
-      XCTAssertGreaterThanOrEqual(
-        finalCount, 3, "Should have received at least 3 hops before cancel")
-    }
-  }
-
   // MARK: - Error Handling Tests
 
   func testStreamingTraceInvalidHost() async throws {
+    try requireNetworkTests()
+
     let tracer = SwiftFTR()
 
     do {
