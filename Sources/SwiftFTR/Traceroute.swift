@@ -37,6 +37,11 @@ public struct TraceHop: Sendable {
 public struct TraceResult: Sendable {
   /// Destination hostname or IP string as provided by the caller.
   public let destination: String
+  /// Numeric destination address used for this trace.
+  ///
+  /// This is the exact resolver result used to send the probes. It is `nil`
+  /// only for results manually constructed without supplying an address.
+  public let resolvedIP: String?
   /// Maximum TTL probed in this run.
   public let maxHops: Int
   /// Whether the destination responded.
@@ -46,9 +51,15 @@ public struct TraceResult: Sendable {
   /// Total wall-clock duration (seconds) measured for the trace.
   public let duration: TimeInterval
   public init(
-    destination: String, maxHops: Int, reached: Bool, hops: [TraceHop], duration: TimeInterval = 0
+    destination: String,
+    maxHops: Int,
+    reached: Bool,
+    hops: [TraceHop],
+    duration: TimeInterval = 0,
+    resolvedIP: String? = nil
   ) {
     self.destination = destination
+    self.resolvedIP = resolvedIP
     self.maxHops = maxHops
     self.reached = reached
     self.hops = hops
@@ -106,6 +117,9 @@ public enum TracerouteError: Error, CustomStringConvertible {
 }
 
 /// Configuration options for SwiftFTR operations.
+///
+/// Values are retained by the initializer and validated when a throwing operation starts.
+/// Invalid values fail with ``TracerouteError/invalidConfiguration(reason:)``.
 public struct SwiftFTRConfig: Sendable {
   /// Maximum TTL/hops to probe (default: 40)
   public let maxHops: Int
@@ -123,10 +137,11 @@ public struct SwiftFTRConfig: Sendable {
   public let rdnsCacheTTL: TimeInterval?
   /// Maximum rDNS cache size (default: 1000 entries)
   public let rdnsCacheSize: Int?
-  /// Network interface to use for sending probes (e.g. "en0"). If nil, uses system default.
+  /// Default BSD interface name for operations that support binding.
+  /// If nil, those operations use system routing.
   public let interface: String?
 
-  /// Source IP address to bind to for all operations.
+  /// Default source IP address for operations that support binding.
   ///
   /// When specified, outgoing packets will use this IP as the source address.
   /// The IP must be assigned to the network interface (either globally configured
@@ -200,9 +215,6 @@ public struct SwiftFTRConfig: Sendable {
     asnResolverStrategy: ASNResolverStrategy = .dns,
     preferredFamily: PreferredFamily = .auto
   ) {
-    precondition(maxHops >= 1 && maxHops <= 255, "maxHops must be 1...255")
-    precondition(maxWaitMs > 0, "maxWaitMs must be positive")
-    precondition(payloadSize >= 0, "payloadSize must be non-negative")
     self.maxHops = maxHops
     self.maxWaitMs = maxWaitMs
     self.payloadSize = payloadSize
@@ -255,8 +267,8 @@ public actor SwiftFTR {
   public init(config: SwiftFTRConfig = SwiftFTRConfig()) {
     self.config = config
     self.rdnsCache = RDNSCache(
-      ttl: config.rdnsCacheTTL ?? 86400,
-      maxSize: config.rdnsCacheSize ?? 1000
+      ttl: config.cacheTTLForConstruction,
+      maxSize: config.cacheSizeForConstruction
     )
     self.asnResolver = Self.createResolver(for: config.asnResolverStrategy)
   }
@@ -422,6 +434,8 @@ public actor SwiftFTR {
     yield: @Sendable @escaping (StreamingHop) -> Bool
   ) async throws {
     try Task.checkCancellation()
+    try config.validateForOperation()
+    try streamConfig.validateForOperation()
 
     let maxHops = streamConfig.maxHops
     let payloadSize = config.payloadSize
@@ -440,6 +454,10 @@ public actor SwiftFTR {
 
     if await handle.isCancelled {
       throw TracerouteError.cancelled
+    }
+
+    if let sourceIP = config.sourceIP {
+      try validateSourceIPFamily(sourceIP, destinationFamily: resolved.family)
     }
 
     let fd = try createTraceSocket(family: resolved.family, enableLogging: config.enableLogging)
@@ -552,6 +570,8 @@ public actor SwiftFTR {
     handle: TraceHandle,
     flowIdentifier: UInt16? = nil
   ) async throws -> TraceResult {
+    try config.validateForOperation()
+
     let maxHops = config.maxHops
     let timeout = TimeInterval(config.maxWaitMs) / 1000.0
     let payloadSize = config.payloadSize
@@ -570,25 +590,6 @@ public actor SwiftFTR {
       }
     }
 
-    // Validate source IP early if specified
-    if let sourceIP = config.sourceIP {
-      if config.enableLogging {
-        print("[SwiftFTR] Validating source IP '\(sourceIP)'...")
-      }
-
-      var testAddr = sockaddr_in()
-      if inet_pton(AF_INET, sourceIP, &testAddr.sin_addr) != 1 {
-        let details =
-          "Invalid source IP address '\(sourceIP)'. Must be a valid IPv4 address in dotted decimal notation (e.g., 192.168.1.100)."
-        throw TracerouteError.sourceIPBindFailed(
-          sourceIP: sourceIP, errno: EINVAL, details: details)
-      }
-
-      if config.enableLogging {
-        print("[SwiftFTR] Source IP '\(sourceIP)' format validated")
-      }
-    }
-
     if config.enableLogging {
       print(
         "[SwiftFTR] Starting trace to \(host) with maxHops=\(maxHops), timeout=\(timeout)s, payloadSize=\(payloadSize)"
@@ -599,6 +600,10 @@ public actor SwiftFTR {
     if config.enableLogging {
       let famName = resolved.family == AF_INET6 ? "v6" : "v4"
       print("[SwiftFTR] Resolved \(host) → \(resolved.canonical) (\(famName))")
+    }
+
+    if let sourceIP = config.sourceIP {
+      try validateSourceIPFamily(sourceIP, destinationFamily: resolved.family)
     }
 
     let fd = try createTraceSocket(family: resolved.family, enableLogging: config.enableLogging)
@@ -657,6 +662,7 @@ public actor SwiftFTR {
       outstanding: outstanding,
       maxHops: maxHops,
       timeout: timeout,
+      destinationIP: resolved.canonical,
       enableLogging: config.enableLogging
     )
 
@@ -722,7 +728,8 @@ public actor SwiftFTR {
       maxHops: maxHops,
       reached: reachedTTL != nil,
       hops: finalHops,
-      duration: Date().timeIntervalSince(startWall)
+      duration: Date().timeIntervalSince(startWall),
+      resolvedIP: resolved.canonical
     )
     return result
   }
@@ -752,6 +759,8 @@ public actor SwiftFTR {
     vpnContext: VPNContext? = nil,
     resolver: ASNResolver? = nil
   ) async throws -> ClassifiedTrace {
+    try config.validateForOperation()
+
     // Validate interface early if specified (before any network operations)
     if let interfaceName = config.interface {
       if config.enableLogging {
@@ -779,8 +788,10 @@ public actor SwiftFTR {
     // Perform base trace (includes rDNS if enabled)
     let tr = try await trace(to: host)
 
-    // Resolve destination IP (dual-stack; honors config.preferredFamily).
-    let destIP = try resolveHost(host: host, prefer: config.preferredFamily).canonical
+    guard let destIP = tr.resolvedIP else {
+      throw TracerouteError.resolutionFailed(
+        host: host, details: "Trace completed without a resolved destination address")
+    }
 
     // Collect IPs for batch operations
     var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
@@ -927,6 +938,9 @@ public actor SwiftFTR {
   public func testBufferbloat(config: BufferbloatConfig = BufferbloatConfig()) async throws
     -> BufferbloatResult
   {
+    try self.config.validateForOperation()
+    try config.validateForOperation()
+
     // Run the orchestrator on a detached executor so synchronous phases never block SwiftFTR.
     let runner = BufferbloatRunner(testConfig: config, swiftConfig: self.config)
     return try await runner.runDetached()
@@ -1259,6 +1273,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
   private let family: Int32
   private let identifier: UInt16
   private let maxHops: Int
+  private let destinationIP: String
   private let enableLogging: Bool
 
   private var outstanding: [UInt16: TraceSendInfo]
@@ -1283,6 +1298,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     outstanding: [UInt16: TraceSendInfo],
     maxHops: Int,
     timeout: TimeInterval,
+    destinationIP: String,
     enableLogging: Bool
   ) {
     self.sockfd = sockfd
@@ -1291,6 +1307,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     self.outstanding = outstanding
     self.maxHops = maxHops
     self.timeout = timeout
+    self.destinationIP = destinationIP
     self.enableLogging = enableLogging
     self.hops = Array(repeating: nil, count: maxHops)
     self.queue = DispatchQueue(
@@ -1362,7 +1379,9 @@ private final class TraceReceiveOperation: @unchecked Sendable {
 
       switch parsed.kind {
       case .echoReply(let id, let seq):
-        guard id == identifier else { continue }
+        guard id == identifier, ipAddressesAreEqual(parsed.sourceAddress, destinationIP) else {
+          continue
+        }
         if let info = outstanding.removeValue(forKey: seq) {
           let rtt = monotonicNow() - info.sentAt
           let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
@@ -1586,7 +1605,9 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
 
       switch parsed.kind {
       case .echoReply(let id, let seq):
-        guard id == identifier else { continue }
+        guard id == identifier, ipAddressesAreEqual(parsed.sourceAddress, resolved.canonical) else {
+          continue
+        }
         if let info = outstanding.removeValue(forKey: seq) {
           if let destTTL = reachedTTL, info.ttl > destTTL { continue }
           let rtt = monotonicNow() - info.sentAt

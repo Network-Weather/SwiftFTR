@@ -212,12 +212,17 @@ public struct TraceClassifier: Sendable {
       }
     }
 
-    // Lookup ASNs in batch
-    let asnMap = try? await resolver.resolve(ipv4Addrs: Array(allIPs), timeout: timeout)
-    let clientAS = resolvedPublicIP.flatMap { asnMap?[$0] }
+    // Lookup only globally routable addresses. Private and other non-global
+    // addresses do not have meaningful origin ASN data and must not reach a
+    // network-backed resolver.
+    let resolverIPs = Set(allIPs.compactMap(asnLookupAddress))
+    let asnMap = try? await resolver.resolve(ipv4Addrs: Array(resolverIPs), timeout: timeout)
+    let clientAS = resolvedPublicIP.flatMap { ip in
+      asnLookupAddress(for: ip).flatMap { asnMap?[$0] }
+    }
     let clientASN = clientAS?.asn
     let clientASName = clientAS?.name
-    let destAS = asnMap?[destinationIP]
+    let destAS = asnLookupAddress(for: destinationIP).flatMap { asnMap?[$0] }
     let destASN = destAS?.asn
     let destASName = destAS?.name
 
@@ -226,6 +231,7 @@ public struct TraceClassifier: Sendable {
     var seenPublicIP = false  // Track if we've seen any public IP yet
     var lastPublicASN: Int? = nil  // Track the last public ASN we saw
     let isVPNTrace = vpnContext?.isVPNTrace ?? false
+    let vpnLocalAddresses = vpnContext?.vpnLocalIPs ?? []
 
     for hop in trace.hops {
       let ip = hop.ipAddress
@@ -233,23 +239,34 @@ public struct TraceClassifier: Sendable {
       var asn: Int? = nil
       var name: String? = nil
       if let ip = ip {
-        let isPrivate = isPrivateIPv4(ip)
-        let isCGNAT = isCGNATIPv4(ip)
+        let address = ParsedIPAddress(ip)
+        let scope = address?.scope
+        let isCGNAT = scope == .carrierGradeNAT
+        let isNonGlobal = scope != nil && scope != .global
+        let isDestination = ipAddressesAreEqual(ip, destinationIP)
+        let isVPNLocal = vpnLocalAddresses.contains { ipAddressesAreEqual(ip, $0) }
 
-        // Get ASN info regardless of IP type
-        asn = asnMap?[ip]?.asn
-        name = asnMap?[ip]?.name
+        // Only globally routable IPs are eligible for ASN metadata.
+        if let lookupAddress = asnLookupAddress(for: ip) {
+          asn = asnMap?[lookupAddress]?.asn
+          name = asnMap?[lookupAddress]?.name
+        }
 
+        // Exact address matches take precedence over network heuristics and ASN
+        // matching. This also handles alternate IPv6 presentations and mapped v4.
+        if isDestination {
+          cat = .destination
+        } else if isVPNLocal {
+          cat = .vpn
+        }
         // VPN-aware classification: when tracing through a VPN interface,
         // private IPs (including CGNAT) are VPN infrastructure. Public IPs
         // are classified normally (they're the exit node's upstream ISP/transit).
-        if isVPNTrace {
-          if ip == destinationIP {
-            cat = .destination
-          } else if isPrivate || isCGNAT {
+        else if isVPNTrace {
+          if isNonGlobal {
             // Private/CGNAT IPs in VPN trace = VPN infrastructure
             cat = .vpn
-          } else {
+          } else if scope == .global {
             // Public IP in VPN trace = exit node's upstream, classify normally
             seenPublicIP = true
             if let asn = asn {
@@ -266,13 +283,13 @@ public struct TraceClassifier: Sendable {
           }
         }
         // Standard (non-VPN) classification
-        else if isPrivate {
-          // Private IP classification depends on context
+        else if isNonGlobal && !isCGNAT {
+          // Non-global IP classification depends on path context.
           if !seenPublicIP {
-            // Private IP before any public IP = LOCAL (LAN)
+            // Non-global IP before any public IP = LOCAL (LAN or host scope).
             cat = .local
           } else {
-            // Private IP after public IP = likely ISP internal routing
+            // Non-global IP after public IP = likely ISP internal routing.
             // If the last public ASN was the client's ISP, this is ISP routing
             if let lastASN = lastPublicASN, let cASN = clientASN, lastASN == cASN {
               cat = .isp
@@ -284,7 +301,7 @@ public struct TraceClassifier: Sendable {
         } else if isCGNAT {
           // CGNAT indicates ISP (in non-VPN context)
           cat = .isp
-        } else {
+        } else if scope == .global {
           // Public IP
           seenPublicIP = true
           if let asn = asn {

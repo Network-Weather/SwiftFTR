@@ -65,6 +65,9 @@ public struct StreamingHop: Sendable, Equatable {
 ///
 /// This allows immediate notification of fast hops while retrying unresponsive middle-hops
 /// that may have been dropped or rate-limited.
+///
+/// Values are retained by the initializer and validated when the stream starts producing values.
+/// Invalid values terminate the stream with ``TracerouteError/invalidConfiguration(reason:)``.
 public struct StreamingTraceConfig: Sendable {
   /// Total timeout for the trace (default: 10 seconds).
   /// The trace will complete after this time, emitting timeout placeholders for any
@@ -91,8 +94,6 @@ public struct StreamingTraceConfig: Sendable {
     emitTimeouts: Bool = true,
     maxHops: Int = 40
   ) {
-    precondition(maxHops >= 1 && maxHops <= 255, "maxHops must be 1...255")
-    precondition(probeTimeout > 0, "probeTimeout must be positive")
     self.probeTimeout = probeTimeout
     self.retryAfter = retryAfter
     self.emitTimeouts = emitTimeouts

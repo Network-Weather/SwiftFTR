@@ -1,16 +1,22 @@
 import Foundation
 
-/// Configuration for HTTP/HTTPS probe
+/// Configuration for an HTTP or HTTPS probe.
 public struct HTTPProbeConfig: Sendable {
-  /// URL to probe
+  /// The URL to probe.
   public let url: String
 
-  /// Timeout in seconds (default: 2.0)
+  /// The timeout in seconds.
   public let timeout: TimeInterval
 
-  /// Whether to follow redirects (default: false)
+  /// A Boolean value that indicates whether the probe follows redirects.
   public let followRedirects: Bool
 
+  /// Creates a configuration for an HTTP or HTTPS probe.
+  ///
+  /// - Parameters:
+  ///   - url: The URL to probe.
+  ///   - timeout: The timeout in seconds. The value must be finite and greater than zero.
+  ///   - followRedirects: Whether the probe follows redirects.
   public init(
     url: String,
     timeout: TimeInterval = 2.0,
@@ -22,35 +28,43 @@ public struct HTTPProbeConfig: Sendable {
   }
 }
 
-/// Result from HTTP/HTTPS probe
+/// The result of an HTTP or HTTPS probe.
 public struct HTTPProbeResult: Sendable, Codable {
-  /// Target URL
+  /// The target URL.
   public let url: String
 
-  /// Whether server responded (success even on 4xx/5xx)
+  /// A Boolean value that indicates whether the server responded.
   public let isReachable: Bool
 
-  /// HTTP status code (nil if timeout or connection error)
+  /// The HTTP status code, or `nil` if the server did not return HTTP headers.
   public let statusCode: Int?
 
-  /// Round-trip time (nil if timeout)
-  /// NOTE: This is total time including DNS, TCP, TLS setup
+  /// The elapsed time through receipt of the response headers, including connection setup.
   public let rtt: TimeInterval?
 
-  /// Network RTT (request start → response start) on established connection
-  /// This is the true network latency after TCP+TLS handshake
+  /// The elapsed time from completing the request to receiving the response headers.
   public let networkRTT: TimeInterval?
 
-  /// TCP handshake time (SYN → SYN-ACK)
-  /// This is the purest measure of network latency without application overhead
+  /// The TCP connection-establishment time reported by URLSession.
   public let tcpHandshakeRTT: TimeInterval?
 
-  /// Error message (if any)
+  /// The error message, if the probe failed.
   public let error: String?
 
-  /// Timestamp
+  /// The time at which the probe started.
   public let timestamp: Date
 
+  /// Creates an HTTP probe result.
+  ///
+  /// - Parameters:
+  ///   - url: The target URL.
+  ///   - isReachable: Whether the server responded.
+  ///   - statusCode: The HTTP status code, if available.
+  ///   - rtt: The elapsed time through receipt of the response headers.
+  ///   - networkRTT: The request-to-response timing reported by URLSession.
+  ///   - tcpHandshakeRTT: The connection-establishment timing reported by URLSession.
+  ///   - error: The error message, if the probe failed.
+  ///   - timestamp: The time at which the probe started.
   public init(
     url: String,
     isReachable: Bool,
@@ -72,9 +86,15 @@ public struct HTTPProbeResult: Sendable, Codable {
   }
 }
 
-/// HTTP/HTTPS probe - tests if web server responds
-/// Returns success if ANY HTTP response received (even 4xx/5xx)
-/// Returns failure only on timeout or connection error
+/// Tests whether a web server returns HTTP response headers.
+///
+/// Any HTTP response, including a 4xx or 5xx response, indicates reachability. The probe stops
+/// downloading after the response headers arrive.
+///
+/// - Parameters:
+///   - url: The HTTP or HTTPS URL to probe.
+///   - timeout: The timeout in seconds. The value must be finite and greater than zero.
+/// - Returns: The probe result.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -86,163 +106,302 @@ public func httpProbe(
   return try await httpProbe(config: config)
 }
 
+/// Tests whether a web server returns HTTP response headers using the specified configuration.
+///
+/// Any HTTP response, including a 4xx or 5xx response, indicates reachability. The probe stops
+/// downloading after the response headers arrive.
+///
+/// - Parameter config: The probe configuration.
+/// - Returns: The probe result.
 #if compiler(>=6.2)
   @concurrent
 #endif
 public func httpProbe(config: HTTPProbeConfig) async throws -> HTTPProbeResult {
+  try await httpProbe(config: config, sessionConfiguration: .ephemeral)
+}
+
+/// Test seam for deterministic URL loading tests.
+func httpProbe(
+  config: HTTPProbeConfig,
+  sessionConfiguration: URLSessionConfiguration
+) async throws -> HTTPProbeResult {
   let startTime = Date()
 
-  guard let url = URL(string: config.url) else {
+  guard config.timeout.isFinite, config.timeout > 0 else {
+    return failedHTTPProbe(
+      config: config,
+      startedAt: startTime,
+      error: "Invalid timeout: expected a finite value greater than zero")
+  }
+
+  guard let url = validatedHTTPURL(from: config.url) else {
+    return failedHTTPProbe(config: config, startedAt: startTime, error: "Invalid HTTP URL")
+  }
+
+  sessionConfiguration.timeoutIntervalForRequest = config.timeout
+  sessionConfiguration.timeoutIntervalForResource = config.timeout
+  sessionConfiguration.requestCachePolicy = .reloadIgnoringLocalCacheData
+
+  let delegate = HTTPHeaderProbeDelegate(followRedirects: config.followRedirects)
+  let session = URLSession(
+    configuration: sessionConfiguration,
+    delegate: delegate,
+    delegateQueue: nil)
+  defer { session.invalidateAndCancel() }
+
+  do {
+    let response = try await delegate.response(for: url, using: session)
     return HTTPProbeResult(
       url: config.url,
-      isReachable: false,
-      statusCode: nil,
-      rtt: nil,
-      error: "Invalid URL",
+      isReachable: true,
+      statusCode: response.statusCode,
+      rtt: response.receivedAt.timeIntervalSince(startTime),
+      networkRTT: response.networkRTT,
+      tcpHandshakeRTT: response.tcpHandshakeRTT,
+      error: nil,
       timestamp: startTime
     )
-  }
-
-  // Configure URLSession
-  let sessionConfig = URLSessionConfiguration.ephemeral
-  sessionConfig.timeoutIntervalForRequest = config.timeout
-  sessionConfig.timeoutIntervalForResource = config.timeout
-  sessionConfig.requestCachePolicy = .reloadIgnoringLocalCacheData
-
-  if !config.followRedirects {
-    // Use custom delegate to prevent redirects AND capture metrics
-    let delegate = NoRedirectDelegate()
-    let session = URLSession(configuration: sessionConfig, delegate: delegate, delegateQueue: nil)
-    defer { session.finishTasksAndInvalidate() }
-    return await performProbe(
-      url: url, session: session, startTime: startTime, config: config, delegate: delegate)
-  } else {
-    // Use metrics delegate to capture timing
-    let delegate = MetricsDelegate()
-    let session = URLSession(configuration: sessionConfig, delegate: delegate, delegateQueue: nil)
-    defer { session.finishTasksAndInvalidate() }
-    return await performProbe(
-      url: url, session: session, startTime: startTime, config: config, delegate: delegate)
+  } catch {
+    return resultForHTTPProbeError(error, config: config, startedAt: startTime)
   }
 }
 
-private func performProbe<D: URLSessionTaskDelegate>(
-  url: URL,
-  session: URLSession,
-  startTime: Date,
-  config: HTTPProbeConfig,
-  delegate: D
-) async -> HTTPProbeResult where D: AnyObject {
-  do {
-    let (_, response) = try await session.data(from: url)
-
-    let rtt = Date().timeIntervalSince(startTime)
-
-    // Extract network RTT and TCP handshake RTT from URLSessionTaskMetrics
-    let (networkRTT, tcpHandshakeRTT) = extractTimingMetrics(from: delegate)
-
-    if let httpResponse = response as? HTTPURLResponse {
-      // Any HTTP response (even 4xx/5xx) means server is reachable
-      return HTTPProbeResult(
-        url: config.url,
-        isReachable: true,
-        statusCode: httpResponse.statusCode,
-        rtt: rtt,
-        networkRTT: networkRTT,
-        tcpHandshakeRTT: tcpHandshakeRTT,
-        error: nil,
-        timestamp: startTime
-      )
-    } else {
-      // Non-HTTP response (shouldn't happen for http/https URLs)
-      return HTTPProbeResult(
-        url: config.url,
-        isReachable: true,
-        statusCode: nil,
-        rtt: rtt,
-        networkRTT: networkRTT,
-        tcpHandshakeRTT: tcpHandshakeRTT,
-        error: "Non-HTTP response",
-        timestamp: startTime
-      )
-    }
-  } catch let error as NSError {
-    let rtt = Date().timeIntervalSince(startTime)
-
-    // Check error type
-    if error.code == NSURLErrorTimedOut {
-      return HTTPProbeResult(
-        url: config.url,
-        isReachable: false,
-        statusCode: nil,
-        rtt: nil,
-        error: "Timeout",
-        timestamp: startTime
-      )
-    } else if error.code == NSURLErrorCannotConnectToHost
-      || error.code == NSURLErrorNetworkConnectionLost
-    {
-      return HTTPProbeResult(
-        url: config.url,
-        isReachable: false,
-        statusCode: nil,
-        rtt: rtt,
-        error: "Connection failed: \(error.localizedDescription)",
-        timestamp: startTime
-      )
-    } else if error.code == NSURLErrorServerCertificateUntrusted
-      || error.code == NSURLErrorSecureConnectionFailed
-    {
-      // SSL/TLS error - server is reachable but certificate invalid
-      // This counts as success for reachability testing!
-      return HTTPProbeResult(
-        url: config.url,
-        isReachable: true,
-        statusCode: nil,
-        rtt: rtt,
-        error: "SSL/TLS error (server reachable): \(error.localizedDescription)",
-        timestamp: startTime
-      )
-    } else {
-      // Other error
-      return HTTPProbeResult(
-        url: config.url,
-        isReachable: false,
-        statusCode: nil,
-        rtt: rtt,
-        error: error.localizedDescription,
-        timestamp: startTime
-      )
-    }
-  }
-}
-
-/// Extract timing metrics from URLSessionTaskMetrics
-/// Returns (networkRTT, tcpHandshakeRTT)
-/// - networkRTT: responseStartDate - requestEndDate (request sent → response arrives)
-/// - tcpHandshakeRTT: connectEnd - connectStart (TCP 3-way handshake = ~1 RTT)
-private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterval?, TimeInterval?)
-{
-  // Try to access taskMetrics via reflection
-  guard let metricsDelegate = delegate as? (any URLSessionTaskDelegate),
-    let taskMetrics = (metricsDelegate as? NoRedirectDelegate)?.taskMetrics
-      ?? (metricsDelegate as? MetricsDelegate)?.taskMetrics
+private func validatedHTTPURL(from value: String) -> URL? {
+  guard
+    let components = URLComponents(string: value),
+    let scheme = components.scheme?.lowercased(),
+    scheme == "http" || scheme == "https",
+    let host = components.host,
+    !host.isEmpty,
+    let url = components.url
   else {
+    return nil
+  }
+  return url
+}
+
+private func failedHTTPProbe(
+  config: HTTPProbeConfig,
+  startedAt: Date,
+  rtt: TimeInterval? = nil,
+  isReachable: Bool = false,
+  error: String
+) -> HTTPProbeResult {
+  HTTPProbeResult(
+    url: config.url,
+    isReachable: isReachable,
+    statusCode: nil,
+    rtt: rtt,
+    error: error,
+    timestamp: startedAt)
+}
+
+private func resultForHTTPProbeError(
+  _ error: any Error,
+  config: HTTPProbeConfig,
+  startedAt: Date
+) -> HTTPProbeResult {
+  if error is CancellationError {
+    return failedHTTPProbe(
+      config: config,
+      startedAt: startedAt,
+      rtt: Date().timeIntervalSince(startedAt),
+      error: "Cancelled")
+  }
+
+  let urlError = error as? URLError
+  switch urlError?.code {
+  case .timedOut:
+    return failedHTTPProbe(config: config, startedAt: startedAt, error: "Timeout")
+  case .cannotConnectToHost, .networkConnectionLost:
+    return failedHTTPProbe(
+      config: config,
+      startedAt: startedAt,
+      rtt: Date().timeIntervalSince(startedAt),
+      error: "Connection failed: \(error.localizedDescription)")
+  case .serverCertificateUntrusted, .secureConnectionFailed:
+    return failedHTTPProbe(
+      config: config,
+      startedAt: startedAt,
+      rtt: Date().timeIntervalSince(startedAt),
+      isReachable: true,
+      error: "SSL/TLS error (server reachable): \(error.localizedDescription)")
+  default:
+    return failedHTTPProbe(
+      config: config,
+      startedAt: startedAt,
+      rtt: Date().timeIntervalSince(startedAt),
+      error: error.localizedDescription)
+  }
+}
+
+private struct HTTPHeaderProbeResponse: Sendable {
+  let statusCode: Int
+  let receivedAt: Date
+  let networkRTT: TimeInterval?
+  let tcpHandshakeRTT: TimeInterval?
+}
+
+private struct HTTPResponseHeaders: Sendable {
+  let statusCode: Int
+  let receivedAt: Date
+}
+
+private final class HTTPHeaderProbeDelegate: NSObject, URLSessionDataDelegate,
+  @unchecked Sendable
+{
+  private struct State {
+    var continuation: CheckedContinuation<HTTPHeaderProbeResponse, any Error>?
+    var task: URLSessionDataTask?
+    var headers: HTTPResponseHeaders?
+    var metrics: URLSessionTaskMetrics?
+    var isCancellationRequested = false
+    var isComplete = false
+  }
+
+  private let followRedirects: Bool
+  private let lock = NSLock()
+  private var state = State()
+
+  init(followRedirects: Bool) {
+    self.followRedirects = followRedirects
+  }
+
+  func response(for url: URL, using session: URLSession) async throws -> HTTPHeaderProbeResponse {
+    try Task.checkCancellation()
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { continuation in
+        let task = session.dataTask(with: url)
+        install(task: task, continuation: continuation)
+      }
+    } onCancel: {
+      self.cancel()
+    }
+  }
+
+  private func install(
+    task: URLSessionDataTask,
+    continuation: CheckedContinuation<HTTPHeaderProbeResponse, any Error>
+  ) {
+    lock.lock()
+    if state.isCancellationRequested {
+      state.isComplete = true
+      lock.unlock()
+      task.cancel()
+      continuation.resume(throwing: CancellationError())
+      return
+    }
+
+    state.task = task
+    state.continuation = continuation
+    lock.unlock()
+    task.resume()
+  }
+
+  private func cancel() {
+    lock.lock()
+    state.isCancellationRequested = true
+    guard !state.isComplete, let continuation = state.continuation else {
+      lock.unlock()
+      return
+    }
+
+    state.isComplete = true
+    let task = state.task
+    state.task = nil
+    state.continuation = nil
+    lock.unlock()
+
+    task?.cancel()
+    continuation.resume(throwing: CancellationError())
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping @Sendable (URLRequest?) -> Void
+  ) {
+    completionHandler(followRedirects ? request : nil)
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    dataTask: URLSessionDataTask,
+    didReceive response: URLResponse,
+    completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+  ) {
+    lock.lock()
+    if !state.isComplete, let response = response as? HTTPURLResponse {
+      state.headers = HTTPResponseHeaders(statusCode: response.statusCode, receivedAt: Date())
+    }
+    lock.unlock()
+
+    // Reachability only needs response headers. Cancelling here prevents URLSession from buffering
+    // an arbitrarily large or unbounded response body.
+    completionHandler(.cancel)
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    didFinishCollecting metrics: URLSessionTaskMetrics
+  ) {
+    lock.lock()
+    state.metrics = metrics
+    lock.unlock()
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    didCompleteWithError error: (any Error)?
+  ) {
+    lock.lock()
+    guard !state.isComplete, let continuation = state.continuation else {
+      lock.unlock()
+      return
+    }
+
+    state.isComplete = true
+    state.task = nil
+    state.continuation = nil
+    let headers = state.headers
+    let metrics = state.metrics
+    lock.unlock()
+
+    if let headers {
+      let timing = extractTimingMetrics(from: metrics)
+      continuation.resume(
+        returning: HTTPHeaderProbeResponse(
+          statusCode: headers.statusCode,
+          receivedAt: headers.receivedAt,
+          networkRTT: timing.networkRTT,
+          tcpHandshakeRTT: timing.tcpHandshakeRTT))
+    } else if let error {
+      continuation.resume(throwing: error)
+    } else {
+      continuation.resume(throwing: URLError(.badServerResponse))
+    }
+  }
+}
+
+private func extractTimingMetrics(from taskMetrics: URLSessionTaskMetrics?) -> (
+  networkRTT: TimeInterval?, tcpHandshakeRTT: TimeInterval?
+) {
+  guard let transaction = taskMetrics?.transactionMetrics.last else {
     return (nil, nil)
   }
 
-  // Get last transaction metrics (in case of redirects)
-  guard let transaction = taskMetrics.transactionMetrics.last else {
-    return (nil, nil)
-  }
-
-  // Calculate TCP handshake RTT (SYN → SYN-ACK → ACK)
-  var tcpHandshakeRTT: TimeInterval? = nil
-  if let connectStart = transaction.connectStartDate,
-    let connectEnd = transaction.connectEndDate
-  {
-    tcpHandshakeRTT = connectEnd.timeIntervalSince(connectStart)
-  }
+  let tcpHandshakeRTT: TimeInterval? =
+    if let connectStart = transaction.connectStartDate,
+      let connectEnd = transaction.connectEndDate
+    {
+      connectEnd.timeIntervalSince(connectStart)
+    } else {
+      nil
+    }
 
   #if DEBUG
     if ProcessInfo.processInfo.environment["SWIFTFTR_VERBOSE_HTTP_TIMING"] == "1",
@@ -283,85 +442,15 @@ private func extractTimingMetrics<D: AnyObject>(from delegate: D) -> (TimeInterv
     }
   #endif
 
-  // Calculate network RTT: responseStartDate - requestEndDate
-  // This includes network latency + server processing time
-  var networkRTT: TimeInterval? = nil
-  if let requestEndDate = transaction.requestEndDate,
+  let networkRTT: TimeInterval?
+  if let requestEnd = transaction.requestEndDate,
     let responseStartDate = transaction.responseStartDate
   {
-    let rtt = responseStartDate.timeIntervalSince(requestEndDate)
-    // Sanity check: should be positive and reasonable
-    if rtt > 0 && rtt < 60.0 {
-      networkRTT = rtt
-    }
+    let rtt = responseStartDate.timeIntervalSince(requestEnd)
+    networkRTT = rtt > 0 && rtt < 60 ? rtt : nil
+  } else {
+    networkRTT = nil
   }
 
   return (networkRTT, tcpHandshakeRTT)
-}
-
-// MARK: - No Redirect Delegate
-
-private final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-  private let _lock = NSLock()
-  private var _taskMetrics: URLSessionTaskMetrics?
-  var taskMetrics: URLSessionTaskMetrics? {
-    get {
-      _lock.lock()
-      defer { _lock.unlock() }
-      return _taskMetrics
-    }
-    set {
-      _lock.lock()
-      defer { _lock.unlock() }
-      _taskMetrics = newValue
-    }
-  }
-
-  func urlSession(
-    _ session: URLSession,
-    task: URLSessionTask,
-    willPerformHTTPRedirection response: HTTPURLResponse,
-    newRequest request: URLRequest,
-    completionHandler: @escaping (URLRequest?) -> Void
-  ) {
-    // Prevent redirect by returning nil
-    completionHandler(nil)
-  }
-
-  func urlSession(
-    _ session: URLSession,
-    task: URLSessionTask,
-    didFinishCollecting metrics: URLSessionTaskMetrics
-  ) {
-    // Capture metrics for network RTT calculation
-    self.taskMetrics = metrics
-  }
-}
-
-// MARK: - Metrics Delegate
-
-private final class MetricsDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
-  private let _lock = NSLock()
-  private var _taskMetrics: URLSessionTaskMetrics?
-  var taskMetrics: URLSessionTaskMetrics? {
-    get {
-      _lock.lock()
-      defer { _lock.unlock() }
-      return _taskMetrics
-    }
-    set {
-      _lock.lock()
-      defer { _lock.unlock() }
-      _taskMetrics = newValue
-    }
-  }
-
-  func urlSession(
-    _ session: URLSession,
-    task: URLSessionTask,
-    didFinishCollecting metrics: URLSessionTaskMetrics
-  ) {
-    // Capture metrics for network RTT calculation
-    self.taskMetrics = metrics
-  }
 }

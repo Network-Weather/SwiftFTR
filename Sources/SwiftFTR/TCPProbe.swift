@@ -7,7 +7,9 @@ import Foundation
   import Glibc
 #endif
 
-/// Configuration for TCP probing
+/// Configuration for TCP probing.
+///
+/// Values are validated by ``tcpProbe(config:)`` before resolution or socket creation.
 public struct TCPProbeConfig: Sendable {
   /// Target host (hostname or IP)
   public let host: String
@@ -143,6 +145,8 @@ public func tcpProbe(
   @concurrent
 #endif
 public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
+  try config.validateForOperation()
+
   let startTime = Date()
 
   // Resolve via the shared dual-stack helper (Hostname.swift).
