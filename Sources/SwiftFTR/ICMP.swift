@@ -131,7 +131,10 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
   // Detect IPv4 header
   if (first >> 4) == 4 {
     let ihl = Int(first & 0x0F) * 4
-    if ihl >= 20 && ihl < buffer.count { icmpOffset = ihl }
+    guard ihl >= 20, ihl <= buffer.count, bytes[9] == UInt8(IPPROTO_ICMP) else {
+      return nil
+    }
+    icmpOffset = ihl
   }
   if buffer.count - icmpOffset < 8 { return nil }
   let type = bytes[icmpOffset]
@@ -145,7 +148,7 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
 
   switch type {
   case ICMPv4Type.echoReply.rawValue:
-    if buffer.count - icmpOffset >= 8 {
+    if code == 0, buffer.count - icmpOffset >= 8 {
       let id = read16(icmpOffset + 4)
       let seq = read16(icmpOffset + 6)
       return ParsedICMP(kind: .echoReply(id: id, seq: seq), sourceAddress: addrStr)
@@ -163,10 +166,17 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
     let ipFirst = bytes[embedStart]
     if (ipFirst >> 4) == 4 {
       let ihl = Int(ipFirst & 0x0F) * 4
+      guard ihl >= 20, bytes[embedStart + 9] == UInt8(IPPROTO_ICMP) else {
+        return ParsedICMP(
+          kind: (type == ICMPv4Type.timeExceeded.rawValue)
+            ? .timeExceeded(originalID: nil, originalSeq: nil)
+            : .destinationUnreachable(originalID: nil, originalSeq: nil),
+          sourceAddress: addrStr)
+      }
       let innerICMP = embedStart + ihl
       if buffer.count - innerICMP >= 8 {
         let innerType = bytes[innerICMP]
-        if innerType == ICMPv4Type.echoRequest.rawValue {
+        if innerType == ICMPv4Type.echoRequest.rawValue, bytes[innerICMP + 1] == 0 {
           let id = read16(innerICMP + 4)
           let seq = read16(innerICMP + 6)
           if type == ICMPv4Type.timeExceeded.rawValue {
@@ -267,6 +277,7 @@ func parseICMPv6Message(
 
   switch type {
   case ICMPv6Type.echoReply.rawValue:
+    guard code == 0 else { return nil }
     let id = read16(4)
     let seq = read16(6)
     return ParsedICMP(kind: .echoReply(id: id, seq: seq), sourceAddress: addrStr)
@@ -292,6 +303,13 @@ func parseICMPv6Message(
           : .destinationUnreachable(originalID: nil, originalSeq: nil),
         sourceAddress: addrStr)
     }
+    guard bytes[embedStart + 6] == UInt8(IPPROTO_ICMPV6) else {
+      return ParsedICMP(
+        kind: (type == ICMPv6Type.timeExceeded.rawValue)
+          ? .timeExceeded(originalID: nil, originalSeq: nil)
+          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+        sourceAddress: addrStr)
+    }
     // Next Header at embedStart+6 should be IPPROTO_ICMPV6 (58) for the embedded
     // ICMPv6 echo request we sent. If it's an extension header chain, we don't
     // currently walk it — stick to the common case (no extension headers).
@@ -304,7 +322,7 @@ func parseICMPv6Message(
         sourceAddress: addrStr)
     }
     let innerType = bytes[innerICMP]
-    if innerType == ICMPv6Type.echoRequest.rawValue {
+    if innerType == ICMPv6Type.echoRequest.rawValue, bytes[innerICMP + 1] == 0 {
       let id = read16(innerICMP + 4)
       let seq = read16(innerICMP + 6)
       if type == ICMPv6Type.timeExceeded.rawValue {

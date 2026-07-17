@@ -246,6 +246,33 @@ struct NetworkTopologyTests {
     #expect(divergence == nil)
   }
 
+  @Test("divergencePoint returns nil for multiple empty paths")
+  func testDivergencePointMultipleEmptyPaths() {
+    let paths = (0..<2).map { variation in
+      DiscoveredPath(
+        flowIdentifier: FlowIdentifier(
+          icmpID: UInt16(variation + 1),
+          variation: variation
+        ),
+        trace: makeTestTrace(hops: []),
+        fingerprint: "empty-\(variation)",
+        isUnique: true
+      )
+    }
+    let topology = NetworkTopology(
+      destination: "example.com",
+      destinationIP: "93.184.216.34",
+      sourceAdapter: nil,
+      sourceIP: nil,
+      publicIP: nil,
+      paths: paths,
+      uniquePathCount: paths.count,
+      discoveryDuration: 0
+    )
+
+    #expect(topology.divergencePoint() == nil)
+  }
+
   @Test("divergencePoint returns nil for identical paths")
   func testDivergencePointIdenticalPaths() {
     let hops = [

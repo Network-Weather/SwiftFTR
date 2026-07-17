@@ -6,7 +6,7 @@ Massively parallel, async/await traceroute for macOS using ICMP datagram sockets
 
 ``SwiftFTR`` provides a single-socket, parallel traceroute implementation that sends one ICMP Echo per TTL and collects ICMP Time Exceeded and Echo Reply messages concurrently.
 
-- IPv4, macOS-focused (uses `SOCK_DGRAM` with `IPPROTO_ICMP`).
+- IPv4 and IPv6 on macOS, using ICMP datagram sockets (`IPPROTO_ICMP` and `IPPROTO_ICMPV6`).
 - Async/await API returning structured hop results.
 - Optional classification into segments (LOCAL, ISP, TRANSIT, DESTINATION) using ASN lookups and heuristics.
 - STUN-based public IP discovery (can be bypassed via configuration).
@@ -67,12 +67,12 @@ let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
 
 ## Configuration
 
-- Use ``SwiftFTRConfig(publicIP:)`` to override/bypass STUN public IP discovery.
+- Set ``SwiftFTR/SwiftFTRConfig/publicIP`` when creating ``SwiftFTR/SwiftFTRConfig`` to override/bypass STUN public IP discovery.
 - Inject a custom ``SwiftFTR/ASNResolver`` for offline or deterministic lookups.
 
 ## Topics
 
-### Tracing
+### Traceroute APIs
 
 - ``SwiftFTR/SwiftFTR``
 - ``SwiftFTR/TraceResult``
@@ -95,7 +95,7 @@ let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
 - ``SwiftFTR/StreamingTraceConfig``
 - <doc:StreamingTrace>
 
-### Ping
+### Ping APIs
 
 - ``SwiftFTR/PingConfig``
 - ``SwiftFTR/PingResult``

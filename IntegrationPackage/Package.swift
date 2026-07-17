@@ -8,12 +8,14 @@ let package = Package(
     ],
     dependencies: [
         // Use the local SwiftFTR package
-        .package(path: "../")
+        .package(name: "SwiftFTR", path: "../")
     ],
     targets: [
         .executableTarget(
             name: "IntegrationPackage",
-            dependencies: ["SwiftFTR"]
+            dependencies: [
+                .product(name: "SwiftFTR", package: "SwiftFTR")
+            ]
         )
     ]
 )
