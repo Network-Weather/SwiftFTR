@@ -40,8 +40,12 @@ public enum DNSError: Error, Sendable {
   case invalidIP(String)
   /// Invalid hostname format
   case invalidHostname(String)
+  /// Invalid query timeout
+  case invalidTimeout(TimeInterval)
   /// Failed to create socket
   case socketCreationFailed
+  /// Failed to configure a socket option
+  case setsockoptFailed(option: String, errno: Int32)
   /// Failed to bind to interface or source IP
   case bindFailed(String)
   /// Failed to send DNS query
@@ -54,6 +58,50 @@ public enum DNSError: Error, Sendable {
   case noRecords
   /// DNS server returned an error code
   case serverError(rcode: Int)
+}
+
+/// Validates a timeout before it reaches a socket API or an integer conversion.
+///
+/// Kept internal so DNS-backed resolvers outside this file can enforce the same contract.
+func _validateDNSTimeout(_ timeout: TimeInterval) throws {
+  guard timeout.isFinite, timeout > 0, timeout < TimeInterval(Int.max) else {
+    throw DNSError.invalidTimeout(timeout)
+  }
+}
+
+private func _dnsSocketTimeout(_ timeout: TimeInterval) throws -> timeval {
+  try _validateDNSTimeout(timeout)
+
+  let wholeSeconds = floor(timeout)
+  let seconds = Int(wholeSeconds)
+  var microseconds = Int((timeout - wholeSeconds) * 1_000_000)
+
+  // A positive sub-microsecond duration would otherwise become a zero timeval,
+  // which disables SO_RCVTIMEO/SO_SNDTIMEO instead of setting a short timeout.
+  if seconds == 0, microseconds == 0 {
+    microseconds = 1
+  }
+
+  return timeval(tv_sec: seconds, tv_usec: __darwin_suseconds_t(microseconds))
+}
+
+private func _applyDNSSocketTimeout(fd: Int32, timeout: TimeInterval) throws {
+  var socketTimeout = try _dnsSocketTimeout(timeout)
+  let optionSize = socklen_t(MemoryLayout<timeval>.size)
+  let options = [
+    (value: SO_RCVTIMEO, name: "SO_RCVTIMEO"),
+    (value: SO_SNDTIMEO, name: "SO_SNDTIMEO"),
+  ]
+
+  for option in options {
+    let result = withUnsafePointer(to: &socketTimeout) { pointer in
+      setsockopt(fd, SOL_SOCKET, option.value, pointer, optionSize)
+    }
+    if result != 0 {
+      let errorCode = errno
+      throw DNSError.setsockoptFailed(option: option.name, errno: errorCode)
+    }
+  }
 }
 
 /// DNS record types supported by SwiftFTR
@@ -151,11 +199,14 @@ public struct DNSQueries: Sendable {
   /// - Parameters:
   ///   - hostname: Domain name to query
   ///   - server: DNS server to use (defaults to config or 8.8.8.8)
-  ///   - timeout: Query timeout in seconds (defaults to config or 3.0)
+  ///   - timeout: An optional query timeout in seconds. When provided, it must be finite and
+  ///     greater than zero. Defaults to 3.0.
   ///   - interface: Network interface to bind to (defaults to config)
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with A records
-  /// - Throws: DNSError on query failure
+  /// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid;
+  ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
+  ///   response is malformed or contains a server error.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -223,11 +274,14 @@ public struct DNSQueries: Sendable {
   /// - Parameters:
   ///   - hostname: Domain name to query
   ///   - server: DNS server to use (defaults to config or 8.8.8.8)
-  ///   - timeout: Query timeout in seconds (defaults to config or 3.0)
+  ///   - timeout: An optional query timeout in seconds. When provided, it must be finite and
+  ///     greater than zero. Defaults to 3.0.
   ///   - interface: Network interface to bind to (defaults to config)
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with AAAA records
-  /// - Throws: DNSError on query failure
+  /// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid;
+  ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
+  ///   response is malformed or contains a server error.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -295,11 +349,14 @@ public struct DNSQueries: Sendable {
   /// - Parameters:
   ///   - ip: IPv4 address to look up
   ///   - server: DNS server to use (defaults to config or 8.8.8.8)
-  ///   - timeout: Query timeout in seconds (defaults to config or 3.0)
+  ///   - timeout: An optional query timeout in seconds. When provided, it must be finite and
+  ///     greater than zero. Defaults to 3.0.
   ///   - interface: Network interface to bind to (defaults to config)
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with PTR records
-  /// - Throws: DNSError on query failure
+  /// - Throws: ``DNSError`` if the IP address, server or source address, or timeout is invalid;
+  ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
+  ///   response is malformed or contains a server error.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -314,7 +371,7 @@ public struct DNSQueries: Sendable {
     let startTime = Date()
 
     // Format IP to in-addr.arpa
-    guard let arpaQuery = _formatReverseDNS(ip) else {
+    guard let arpaQuery = _formatReverseDNS(ip, expectedFamily: AF_INET) else {
       throw DNSError.invalidIP(ip)
     }
 
@@ -372,11 +429,14 @@ public struct DNSQueries: Sendable {
   /// - Parameters:
   ///   - ip: IPv6 address to look up (e.g. "2001:4860:4860::8888")
   ///   - server: DNS server to use (defaults to config or 8.8.8.8)
-  ///   - timeout: Query timeout in seconds (defaults to config or 3.0)
+  ///   - timeout: An optional query timeout in seconds. When provided, it must be finite and
+  ///     greater than zero. Defaults to 3.0.
   ///   - interface: Network interface to bind to (defaults to config)
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with PTR records
-  /// - Throws: DNSError on query failure
+  /// - Throws: ``DNSError`` if the IP address, server or source address, or timeout is invalid;
+  ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
+  ///   response is malformed or contains a server error.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -391,7 +451,7 @@ public struct DNSQueries: Sendable {
     let startTime = Date()
 
     // Format IP to ip6.arpa
-    guard let arpaQuery = _formatReverseDNS(ip) else {
+    guard let arpaQuery = _formatReverseDNS(ip, expectedFamily: AF_INET6) else {
       throw DNSError.invalidIP(ip)
     }
 
@@ -449,11 +509,14 @@ public struct DNSQueries: Sendable {
   /// - Parameters:
   ///   - hostname: Domain name to query
   ///   - server: DNS server to use (defaults to config or 8.8.8.8)
-  ///   - timeout: Query timeout in seconds (defaults to config or 3.0)
+  ///   - timeout: An optional query timeout in seconds. When provided, it must be finite and
+  ///     greater than zero. Defaults to 3.0.
   ///   - interface: Network interface to bind to (defaults to config)
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with TXT records
-  /// - Throws: DNSError on query failure
+  /// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid;
+  ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
+  ///   response is malformed or contains a server error.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -522,11 +585,14 @@ public struct DNSQueries: Sendable {
   ///   - name: Domain name or IP to query
   ///   - type: DNS record type to query
   ///   - server: DNS server to use (defaults to config or 8.8.8.8)
-  ///   - timeout: Query timeout in seconds (defaults to config or 3.0)
+  ///   - timeout: An optional query timeout in seconds. When provided, it must be finite and
+  ///     greater than zero. Defaults to 3.0.
   ///   - interface: Network interface to bind to (defaults to config)
   ///   - sourceIP: Source IP address to bind to (defaults to config)
   /// - Returns: DNS query result with records of the requested type
-  /// - Throws: DNSError on query failure
+  /// - Throws: ``DNSError`` if the name, server or source address, or timeout is invalid; if
+  ///   socket creation, configuration, binding, sending, or receiving fails; or if the response
+  ///   is malformed or contains a server error.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -715,7 +781,9 @@ public struct DNSProbeConfig: Sendable {
   /// Query type (1 = A, 16 = TXT, 28 = AAAA)
   public let queryType: UInt16
 
-  /// Timeout in seconds
+  /// The query timeout in seconds.
+  ///
+  /// The value must be finite and greater than zero when this configuration is used.
   public let timeout: TimeInterval
 
   /// Network interface to bind to for this DNS probe.
@@ -743,6 +811,18 @@ public struct DNSProbeConfig: Sendable {
   /// **Note**: Most users only need to set ``interface``.
   public let sourceIP: String?
 
+  /// Creates a DNS probe configuration.
+  ///
+  /// Validation occurs when the configuration is passed to ``dnsProbe(config:)``.
+  ///
+  /// - Parameters:
+  ///   - server: The DNS server IP address.
+  ///   - query: The domain name to query.
+  ///   - queryType: The numeric DNS record type.
+  ///   - timeout: The query timeout in seconds. It must be finite and greater than zero when the
+  ///     configuration is used.
+  ///   - interface: The network interface to bind to, or `nil` to use system routing.
+  ///   - sourceIP: The source IP address to bind to, or `nil` to let the system choose one.
   public init(
     server: String,
     query: String = "example.com",
@@ -802,9 +882,18 @@ public struct DNSProbeResult: Sendable, Codable {
   }
 }
 
-/// DNS probe - tests if DNS server responds
-/// Returns success if ANY response received (even NXDOMAIN or errors)
-/// Returns failure only on timeout
+/// Tests whether a DNS server responds.
+///
+/// Any DNS response, including NXDOMAIN, marks the server as reachable. Network and socket
+/// failures are reported in the returned result.
+///
+/// - Parameters:
+///   - server: The DNS server IP address.
+///   - query: The domain name to query.
+///   - timeout: The query timeout in seconds. It must be finite and greater than zero.
+/// - Returns: A result describing reachability and any network or socket failure.
+/// - Throws: ``DNSError/invalidTimeout(_:)`` if `timeout` is not finite and greater than zero,
+///   or ``DNSError/invalidHostname(_:)`` if `query` cannot be encoded as a DNS name.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -817,10 +906,22 @@ public func dnsProbe(
   return try await dnsProbe(config: config)
 }
 
+/// Tests whether a DNS server responds using a configuration.
+///
+/// Any DNS response, including NXDOMAIN, marks the server as reachable. Network and socket
+/// failures are reported in the returned result.
+///
+/// - Parameter config: The probe configuration. Its timeout must be finite and greater than zero.
+/// - Returns: A result describing reachability and any network or socket failure.
+/// - Throws: ``DNSError/invalidTimeout(_:)`` if `config.timeout` is not finite and greater than
+///   zero, or ``DNSError/invalidHostname(_:)`` if `config.query` cannot be encoded as a DNS name.
 #if compiler(>=6.2)
   @concurrent
 #endif
 public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult {
+  try _validateDNSTimeout(config.timeout)
+  _ = try _encodeQName(config.query)
+
   let startTime = Date()
 
   // Perform DNS query
@@ -957,11 +1058,13 @@ public struct AQueryResult: Sendable, Codable {
 /// - Parameters:
 ///   - ip: IPv4 address to resolve (e.g., "10.1.10.1")
 ///   - server: DNS server to query (can be the IP itself!)
-///   - timeout: Query timeout in seconds (default: 2.0)
+///   - timeout: Query timeout in seconds. It must be finite and greater than zero (default: 2.0).
 ///   - interface: Network interface to bind to (macOS only, optional)
 ///   - sourceIP: Source IP address to bind to (optional)
 /// - Returns: ReverseDNSResult containing hostname (or nil) and timing information
-/// - Throws: DNSError on network failures or invalid input
+/// - Throws: ``DNSError`` if the IP address, server or source address, or timeout is invalid; if
+///   socket creation, configuration, binding, sending, or receiving fails; or if the response is
+///   malformed or contains a server error.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -975,7 +1078,7 @@ public func reverseDNS(
   let startTime = Date()
 
   // Convert IP to reverse DNS format (e.g., "10.1.10.1" -> "1.10.1.10.in-addr.arpa")
-  guard let reverseName = _formatReverseDNS(ip) else {
+  guard let reverseName = _formatReverseDNS(ip, expectedFamily: AF_INET) else {
     throw DNSError.invalidIP(ip)
   }
 
@@ -1024,11 +1127,13 @@ public func reverseDNS(
 /// - Parameters:
 ///   - ip: IPv6 address to resolve (e.g., "2001:4860:4860::8888")
 ///   - server: DNS server to query
-///   - timeout: Query timeout in seconds (default: 2.0)
+///   - timeout: Query timeout in seconds. It must be finite and greater than zero (default: 2.0).
 ///   - interface: Network interface to bind to (macOS only, optional)
 ///   - sourceIP: Source IP address to bind to (optional)
 /// - Returns: ReverseDNSResult containing hostname (or nil) and timing information
-/// - Throws: DNSError on network failures or invalid input
+/// - Throws: ``DNSError`` if the IP address, server or source address, or timeout is invalid; if
+///   socket creation, configuration, binding, sending, or receiving fails; or if the response is
+///   malformed or contains a server error.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -1042,7 +1147,7 @@ public func reverseIPv6(
   let startTime = Date()
 
   // Convert IPv6 to reverse DNS format (ip6.arpa)
-  guard let reverseName = _formatReverseDNS(ip) else {
+  guard let reverseName = _formatReverseDNS(ip, expectedFamily: AF_INET6) else {
     throw DNSError.invalidIP(ip)
   }
 
@@ -1105,11 +1210,13 @@ public func reverseIPv6(
 /// - Parameters:
 ///   - hostname: Domain name to resolve (e.g., "google.com")
 ///   - server: DNS server to query
-///   - timeout: Query timeout in seconds (default: 2.0)
+///   - timeout: Query timeout in seconds. It must be finite and greater than zero (default: 2.0).
 ///   - interface: Network interface to bind to (macOS only, optional)
 ///   - sourceIP: Source IP address to bind to (optional)
 /// - Returns: AAAAQueryResult containing IPv6 addresses and timing information
-/// - Throws: DNSError on network failures or invalid input
+/// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid; if
+///   socket creation, configuration, binding, sending, or receiving fails; or if the response is
+///   malformed or contains a server error.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -1176,11 +1283,13 @@ public func queryAAAA(
 /// - Parameters:
 ///   - hostname: Domain name to resolve (e.g., "example.com")
 ///   - server: DNS server to query
-///   - timeout: Query timeout in seconds (default: 2.0)
+///   - timeout: Query timeout in seconds. It must be finite and greater than zero (default: 2.0).
 ///   - interface: Network interface to bind to (macOS only, optional)
 ///   - sourceIP: Source IP address to bind to (optional)
 /// - Returns: AQueryResult containing IPv4 addresses and timing information
-/// - Throws: DNSError on network failures or invalid input
+/// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid; if
+///   socket creation, configuration, binding, sending, or receiving fails; or if the response is
+///   malformed or contains a server error.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -1236,6 +1345,51 @@ private struct DNSProbeResultInternal {
   let error: String?
 }
 
+/// Connect a UDP socket to a DNS server so the kernel only accepts datagrams
+/// from the queried address and port.
+private func connectDNSSocket(
+  _ fd: Int32,
+  server: String,
+  port: UInt16,
+  family: Int32
+) throws {
+  let result: Int32
+
+  if family == AF_INET6 {
+    let (bare6, scopeID) = parseIPv6Scoped(server)
+    var address = sockaddr_in6()
+    address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+    address.sin6_family = sa_family_t(AF_INET6)
+    address.sin6_port = in_port_t(port).bigEndian
+    address.sin6_scope_id = scopeID
+    guard inet_pton(AF_INET6, bare6, &address.sin6_addr) == 1 else {
+      throw DNSError.invalidIP(server)
+    }
+    result = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+        connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in6>.size))
+      }
+    }
+  } else {
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = in_port_t(port).bigEndian
+    guard inet_pton(AF_INET, server, &address.sin_addr) == 1 else {
+      throw DNSError.invalidIP(server)
+    }
+    result = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+        connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+  }
+
+  guard result == 0 else {
+    throw DNSError.sendFailed
+  }
+}
+
 /// Shared DNS query implementation that returns parsed answers
 /// - Parameters:
 ///   - server: DNS server IP address
@@ -1252,8 +1406,12 @@ private func performDNSQueryInternal(
   queryType: UInt16,
   timeout: TimeInterval,
   interface: String?,
-  sourceIP: String?
+  sourceIP: String?,
+  serverPort: UInt16 = 53
 ) throws -> [DNSClient.Answer] {
+  try _validateDNSTimeout(timeout)
+  let encodedQuery = try _encodeQName(query)
+
   // Detect server address family (IPv4 vs IPv6)
   let serverFamily = detectAddressFamily(server)
   guard serverFamily == AF_INET || serverFamily == AF_INET6 else {
@@ -1338,17 +1496,10 @@ private func performDNSQueryInternal(
     }
   }
 
-  // Set timeout
-  var tv = timeval(
-    tv_sec: Int(timeout),
-    tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000)
-  )
-  _ = withUnsafePointer(to: &tv) { p in
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
-  }
-  _ = withUnsafePointer(to: &tv) { p in
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
-  }
+  try _applyDNSSocketTimeout(fd: fd, timeout: timeout)
+
+  // A connected UDP socket only receives responses from this DNS server and port.
+  try connectDNSSocket(fd, server: server, port: serverPort, family: serverFamily)
 
   // Build DNS query message
   var msg = Data()
@@ -1368,62 +1519,22 @@ private func performDNSQueryInternal(
   append16(0)  // ARCOUNT
 
   // Question
-  msg.append(contentsOf: _encodeQName(query))
+  msg.append(contentsOf: encodedQuery)
   append16(queryType)  // QTYPE
   append16(1)  // QCLASS IN
 
-  // Prepare destination and send
-  let sent: ssize_t
-  if serverFamily == AF_INET6 {
-    let (bare6, scopeID) = parseIPv6Scoped(server)
-    var dst6 = sockaddr_in6()
-    dst6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-    dst6.sin6_family = sa_family_t(AF_INET6)
-    dst6.sin6_port = in_port_t(53).bigEndian
-    dst6.sin6_scope_id = scopeID
-    guard inet_pton(AF_INET6, bare6, &dst6.sin6_addr) == 1 else {
-      throw DNSError.invalidIP(server)
-    }
-    sent = msg.withUnsafeBytes { raw in
-      withUnsafePointer(to: &dst6) { aptr in
-        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-          sendto(
-            fd, raw.baseAddress!, raw.count, 0, saptr,
-            socklen_t(MemoryLayout<sockaddr_in6>.size))
-        }
-      }
-    }
-  } else {
-    var dst4 = sockaddr_in()
-    dst4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    dst4.sin_family = sa_family_t(AF_INET)
-    dst4.sin_port = in_port_t(53).bigEndian
-    guard server.withCString({ cs in inet_pton(AF_INET, cs, &dst4.sin_addr) }) == 1 else {
-      throw DNSError.invalidIP(server)
-    }
-    sent = msg.withUnsafeBytes { raw in
-      withUnsafePointer(to: &dst4) { aptr in
-        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-          sendto(
-            fd, raw.baseAddress!, raw.count, 0, saptr,
-            socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-      }
-    }
+  let sent = msg.withUnsafeBytes { raw in
+    send(fd, raw.baseAddress, raw.count, 0)
   }
 
-  guard sent > 0 else {
+  guard sent == msg.count else {
     throw DNSError.sendFailed
   }
 
-  // Receive response (sockaddr_storage is large enough for both families)
+  // Receive from the connected peer.
   var buf = [UInt8](repeating: 0, count: 2048)
-  var fromStorage = sockaddr_storage()
-  var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
-  let n = withUnsafeMutablePointer(to: &fromStorage) { aptr -> ssize_t in
-    aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-      recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
-    }
+  let n = buf.withUnsafeMutableBytes { raw in
+    recv(fd, raw.baseAddress, raw.count, 0)
   }
 
   guard n > 0 else {
@@ -1433,25 +1544,7 @@ private func performDNSQueryInternal(
   // Parse response
   let responseData = Data(buf.prefix(n))
 
-  guard n >= 12 else {
-    throw DNSError.malformedResponse
-  }
-
-  // Extract RCODE from flags (bits 0-3 of byte 3)
-  let flags = UInt16(buf[2]) << 8 | UInt16(buf[3])
-  let rcode = Int(flags & 0x000F)
-
-  // Check for DNS errors (RCODE != 0)
-  guard rcode == 0 else {
-    throw DNSError.serverError(rcode: rcode)
-  }
-
-  // Parse answers
-  guard let answers = DNSClient.parseAnswers(message: responseData) else {
-    throw DNSError.malformedResponse
-  }
-
-  return answers
+  return try DNSClient.validateResponse(message: responseData, expectedID: id)
 }
 
 /// Legacy wrapper for dnsProbe() that preserves behavior of returning success even for NXDOMAIN
@@ -1500,6 +1593,13 @@ private func performDNSProbe(
       responseCode: nil,
       error: "Failed to create socket"
     )
+  } catch DNSError.setsockoptFailed(let option, let errorCode) {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      responseCode: nil,
+      error:
+        "Failed to configure \(option) (errno=\(errorCode)): \(String(cString: strerror(errorCode)))"
+    )
   } catch DNSError.bindFailed(let msg) {
     return DNSProbeResultInternal(
       isReachable: false,
@@ -1536,14 +1636,38 @@ private func performDNSProbe(
 // MARK: - Existing DNS Client
 
 // Fileprivate helper so tests can call an SPI wrapper without exposing the type.
-private func _encodeQName(_ name: String) -> [UInt8] {
+private func _encodeQName(_ name: String) throws -> [UInt8] {
+  if name == "." {
+    return [0]
+  }
+
+  guard !name.isEmpty else {
+    throw DNSError.invalidHostname(name)
+  }
+
+  var labels = name.split(separator: ".", omittingEmptySubsequences: false)
+  if labels.last?.isEmpty == true {
+    labels.removeLast()
+  }
+
+  guard !labels.isEmpty, labels.allSatisfy({ !$0.isEmpty }) else {
+    throw DNSError.invalidHostname(name)
+  }
+
   var out: [UInt8] = []
-  for label in name.trimmingCharacters(in: CharacterSet(charactersIn: ".")).split(separator: ".") {
+  for label in labels {
     let lb = Array(label.utf8)
-    guard lb.count < 64 else { continue }
+    guard lb.count <= 63 else {
+      throw DNSError.invalidHostname(name)
+    }
     out.append(UInt8(lb.count))
     out.append(contentsOf: lb)
   }
+
+  guard out.count < 255 else {
+    throw DNSError.invalidHostname(name)
+  }
+
   out.append(0)  // terminator
   return out
 }
@@ -1551,15 +1675,26 @@ private func _encodeQName(_ name: String) -> [UInt8] {
 /// Format an IP address for reverse DNS (PTR) query.
 /// - IPv4 example: `"10.1.10.1"` → `"1.10.1.10.in-addr.arpa"`
 /// - IPv6 example: `"2001:4860:4860::8888"` → `"8.8.8.8.0.0.0.0...0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa"`
-private func _formatReverseDNS(_ ip: String) -> String? {
-  // Try IPv4 first
-  let octets = ip.split(separator: ".").compactMap { Int($0) }
-  if octets.count == 4, octets.allSatisfy({ $0 >= 0 && $0 <= 255 }) {
-    return "\(octets[3]).\(octets[2]).\(octets[1]).\(octets[0]).in-addr.arpa"
+private func _formatReverseDNS(_ ip: String, expectedFamily: Int32? = nil) -> String? {
+  var addr4 = in_addr()
+  if ip.withCString({ inet_pton(AF_INET, $0, &addr4) }) == 1 {
+    guard expectedFamily == nil || expectedFamily == AF_INET else { return nil }
+    let octets = withUnsafeBytes(of: &addr4) { Array($0) }
+    return octets.reversed().map(String.init).joined(separator: ".") + ".in-addr.arpa"
   }
 
   // Try IPv6 — expand via inet_pton to get 16 raw bytes
-  let bare = ip.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ip
+  guard expectedFamily == nil || expectedFamily == AF_INET6 else { return nil }
+  let scopedParts = ip.split(separator: "%", omittingEmptySubsequences: false)
+  guard scopedParts.count <= 2,
+    let addressPart = scopedParts.first,
+    !addressPart.isEmpty,
+    scopedParts.count == 1 || scopedParts[1].isEmpty == false
+  else {
+    return nil
+  }
+
+  let bare = String(addressPart)
   var addr6 = in6_addr()
   guard inet_pton(AF_INET6, bare, &addr6) == 1 else { return nil }
 
@@ -1599,97 +1734,16 @@ struct DNSClient {
 
   private static func queryTXTOnce(name: String, timeout: TimeInterval, server: String) -> [String]?
   {
-    let serverFamily = detectAddressFamily(server)
-    guard serverFamily == AF_INET || serverFamily == AF_INET6 else { return nil }
-
-    let fd = socket(serverFamily, SOCK_DGRAM, IPPROTO_UDP)
-    if fd < 0 { return nil }
-    defer { close(fd) }
-    var tv = timeval(
-      tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000))
-    _ = withUnsafePointer(to: &tv) { p in
-      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
-    }
-    _ = withUnsafePointer(to: &tv) { p in
-      setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
-    }
-
-    var msg = Data()
-    let id = UInt16.random(in: 0...UInt16.max)
-    func append16(_ v: UInt16) {
-      var b = v.bigEndian
-      withUnsafeBytes(of: &b) { msg.append(contentsOf: $0) }
-    }
-    func append32(_ v: UInt32) {
-      var b = v.bigEndian
-      withUnsafeBytes(of: &b) { msg.append(contentsOf: $0) }
-    }
-
-    // Header
-    append16(id)  // ID
-    append16(0x0100)  // RD
-    append16(1)  // QDCOUNT
-    append16(0)  // ANCOUNT
-    append16(0)  // NSCOUNT
-    append16(0)  // ARCOUNT
-
-    // Question
-    msg.append(contentsOf: _encodeQName(name))
-    append16(16)  // QTYPE TXT
-    append16(1)  // QCLASS IN
-
-    // Send to server (IPv4 or IPv6)
-    let sent: ssize_t
-    if serverFamily == AF_INET6 {
-      let (bare6, scopeID) = parseIPv6Scoped(server)
-      var dst6 = sockaddr_in6()
-      dst6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-      dst6.sin6_family = sa_family_t(AF_INET6)
-      dst6.sin6_port = in_port_t(53).bigEndian
-      dst6.sin6_scope_id = scopeID
-      guard inet_pton(AF_INET6, bare6, &dst6.sin6_addr) == 1 else { return nil }
-      sent = msg.withUnsafeBytes { raw in
-        withUnsafePointer(to: &dst6) { aptr in
-          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-            sendto(
-              fd, raw.baseAddress!, raw.count, 0, saptr,
-              socklen_t(MemoryLayout<sockaddr_in6>.size))
-          }
-        }
-      }
-    } else {
-      var dst4 = sockaddr_in()
-      dst4.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-      dst4.sin_family = sa_family_t(AF_INET)
-      dst4.sin_port = in_port_t(53).bigEndian
-      guard server.withCString({ cs in inet_pton(AF_INET, cs, &dst4.sin_addr) }) == 1 else {
-        return nil
-      }
-      sent = msg.withUnsafeBytes { raw in
-        withUnsafePointer(to: &dst4) { aptr in
-          aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-            sendto(
-              fd, raw.baseAddress!, raw.count, 0, saptr,
-              socklen_t(MemoryLayout<sockaddr_in>.size))
-          }
-        }
-      }
-    }
-    if sent <= 0 { return nil }
-
-    // Receive response (sockaddr_storage handles both families)
-    var buf = [UInt8](repeating: 0, count: 2048)
-    var fromStorage = sockaddr_storage()
-    var fromlen: socklen_t = socklen_t(MemoryLayout<sockaddr_storage>.size)
-    let n = withUnsafeMutablePointer(to: &fromStorage) { aptr -> ssize_t in
-      aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-        recvfrom(fd, &buf, buf.count, 0, saptr, &fromlen)
-      }
-    }
-    if n <= 0 { return nil }
-    let data = Data(buf.prefix(Int(n)))
-
-    guard let answers = parseAnswers(message: data) else { return nil }
+    guard
+      let answers = try? performDNSQueryInternal(
+        server: server,
+        query: name,
+        queryType: DNSRecordType.txt.rawValue,
+        timeout: timeout,
+        interface: nil,
+        sourceIP: nil
+      )
+    else { return nil }
     var out: [String] = []
     for ans in answers where ans.type == 16 && ans.klass == 1 {
       // TXT RDATA: one or more <character-string>; join all chunks into a single string per answer
@@ -1707,6 +1761,39 @@ struct DNSClient {
       if !chunks.isEmpty { out.append(chunks.joined()) }
     }
     return out.isEmpty ? nil : out
+  }
+
+  fileprivate static func validateResponse(message: Data, expectedID: UInt16) throws -> [Answer] {
+    guard message.count >= 12 else {
+      throw DNSError.malformedResponse
+    }
+
+    let bytes = [UInt8](message)
+    func read16(_ offset: Int) -> UInt16 {
+      (UInt16(bytes[offset]) << 8) | UInt16(bytes[offset + 1])
+    }
+
+    guard read16(0) == expectedID else {
+      throw DNSError.malformedResponse
+    }
+
+    let flags = read16(2)
+    let isResponse = (flags & 0x8000) != 0
+    let opcode = flags & 0x7800
+    let isTruncated = (flags & 0x0200) != 0
+    guard isResponse, opcode == 0, !isTruncated else {
+      throw DNSError.malformedResponse
+    }
+
+    let responseCode = Int(flags & 0x000F)
+    guard responseCode == 0 else {
+      throw DNSError.serverError(rcode: responseCode)
+    }
+
+    guard let answers = parseAnswers(message: message) else {
+      throw DNSError.malformedResponse
+    }
+    return answers
   }
 
   fileprivate static func parseAnswers(message: Data) -> [Answer]? {
@@ -1729,7 +1816,7 @@ struct DNSClient {
     }
     var answers: [Answer] = []
     for _ in 0..<an {
-      guard parseName(bytes, &off) != nil else { return nil }
+      guard let (name, _) = parseName(bytes, &off) else { return nil }
       if off + 10 > bytes.count { return nil }
       let typ = r16(off)
       let cls = r16(off + 2)
@@ -1742,7 +1829,7 @@ struct DNSClient {
       off += rdlen
       answers.append(
         Answer(
-          name: "",
+          name: name,
           type: typ,
           klass: cls,
           ttl: ttl,
@@ -1755,37 +1842,73 @@ struct DNSClient {
     return answers
   }
 
-  // Returns (name, newOffset)
-  private static func parseName(_ bytes: [UInt8], _ offset: inout Int) -> (String, Int)? {
+  // Returns (name, newOffset). `encodedEnd` bounds the bytes used by the encoded
+  // name itself; compression pointers may still refer to names elsewhere in the message.
+  private static func parseName(
+    _ bytes: [UInt8],
+    _ offset: inout Int,
+    encodedEnd: Int? = nil
+  ) -> (String, Int)? {
+    let initialEnd = encodedEnd ?? bytes.count
+    guard offset >= 0, offset <= initialEnd, initialEnd <= bytes.count else { return nil }
+
     var labels: [String] = []
     var off = offset
     var jumpedTo: Int? = nil
-    var loops = 0
+    var visitedPointers: Set<Int> = []
+    var expandedLength = 1  // Include the terminating root label.
+
     while true {
-      if loops > 255 { return nil }  // prevent infinite loops
-      loops += 1
-      if off >= bytes.count { return nil }
+      let currentEnd = jumpedTo == nil ? initialEnd : bytes.count
+      guard off >= 0, off < currentEnd else { return nil }
+
       let len = Int(bytes[off])
       if len == 0 {
         off += 1
         break
       }
-      if (len & 0xC0) == 0xC0 {  // pointer
-        if off + 1 >= bytes.count { return nil }
+
+      switch len & 0xC0 {
+      case 0xC0:  // Compression pointer.
+        guard off + 1 < currentEnd else { return nil }
         let ptr = ((len & 0x3F) << 8) | Int(bytes[off + 1])
+        guard
+          ptr < off,
+          visitedPointers.insert(ptr).inserted
+        else { return nil }
         if jumpedTo == nil { jumpedTo = off + 2 }
         off = ptr
-        continue
-      } else {
-        if off + 1 + len > bytes.count { return nil }
+
+      case 0x00:  // Ordinary label (maximum length 63 by construction).
+        guard off + 1 + len <= currentEnd else { return nil }
+        expandedLength += 1 + len
+        guard expandedLength <= 255 else { return nil }
         let s = String(decoding: bytes[(off + 1)..<(off + 1 + len)], as: UTF8.self)
         labels.append(s)
         off += 1 + len
+
+      default:  // 01xxxxxx and 10xxxxxx are reserved label encodings.
+        return nil
       }
     }
+
     if let j = jumpedTo { offset = j } else { offset = off }
     let name = labels.joined(separator: ".")
-    return (name, off)
+    return (name, offset)
+  }
+
+  private static func rdataEnd(
+    rdata: Data,
+    rdataOffsetInMessage: Int,
+    fullMessage: Data
+  ) -> Int? {
+    guard
+      rdataOffsetInMessage >= 0,
+      rdataOffsetInMessage <= fullMessage.count,
+      rdata.count <= fullMessage.count - rdataOffsetInMessage
+    else { return nil }
+
+    return rdataOffsetInMessage + rdata.count
   }
 
   // MARK: - RDATA Parsers
@@ -1867,7 +1990,15 @@ struct DNSClient {
   static func parsePTR(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> String? {
     let bytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage
-    guard let (name, _) = parseName(bytes, &offset) else { return nil }
+    guard
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      ),
+      let (name, _) = parseName(bytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
     return name
   }
 
@@ -1898,7 +2029,14 @@ struct DNSClient {
   static func parseMX(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> (
     UInt16, String
   )? {
-    guard rdata.count >= 2 else { return nil }
+    guard
+      rdata.count >= 2,
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      )
+    else { return nil }
     let bytes = [UInt8](rdata)
 
     // Read priority (2 bytes)
@@ -1907,7 +2045,10 @@ struct DNSClient {
     // Read exchange name (domain name with compression)
     let fullBytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage + 2  // Skip priority
-    guard let (exchange, _) = parseName(fullBytes, &offset) else { return nil }
+    guard
+      let (exchange, _) = parseName(fullBytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
 
     return (priority, exchange)
   }
@@ -1917,7 +2058,15 @@ struct DNSClient {
   static func parseNS(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> String? {
     let bytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage
-    guard let (name, _) = parseName(bytes, &offset) else { return nil }
+    guard
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      ),
+      let (name, _) = parseName(bytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
     return name
   }
 
@@ -1926,7 +2075,15 @@ struct DNSClient {
   static func parseCNAME(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> String? {
     let bytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage
-    guard let (name, _) = parseName(bytes, &offset) else { return nil }
+    guard
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      ),
+      let (name, _) = parseName(bytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
     return name
   }
 
@@ -1938,15 +2095,22 @@ struct DNSClient {
   )? {
     let bytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage
+    guard
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      )
+    else { return nil }
 
     // Parse primary name server
-    guard let (primaryNS, _) = parseName(bytes, &offset) else { return nil }
+    guard let (primaryNS, _) = parseName(bytes, &offset, encodedEnd: end) else { return nil }
 
     // Parse admin email
-    guard let (adminEmail, _) = parseName(bytes, &offset) else { return nil }
+    guard let (adminEmail, _) = parseName(bytes, &offset, encodedEnd: end) else { return nil }
 
     // Parse 5 32-bit values: serial, refresh, retry, expire, minimum
-    guard offset + 20 <= bytes.count else { return nil }
+    guard offset <= end, end - offset == 20 else { return nil }
 
     func read32(_ off: Int) -> UInt32 {
       return (UInt32(bytes[off]) << 24) | (UInt32(bytes[off + 1]) << 16)
@@ -1967,7 +2131,14 @@ struct DNSClient {
   static func parseSRV(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> (
     priority: UInt16, weight: UInt16, port: UInt16, target: String
   )? {
-    guard rdata.count >= 6 else { return nil }
+    guard
+      rdata.count >= 6,
+      let end = rdataEnd(
+        rdata: rdata,
+        rdataOffsetInMessage: rdataOffsetInMessage,
+        fullMessage: fullMessage
+      )
+    else { return nil }
     let bytes = [UInt8](rdata)
 
     // Read priority, weight, port (2 bytes each)
@@ -1978,7 +2149,10 @@ struct DNSClient {
     // Read target name
     let fullBytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage + 6  // Skip priority, weight, port
-    guard let (target, _) = parseName(fullBytes, &offset) else { return nil }
+    guard
+      let (target, _) = parseName(fullBytes, &offset, encodedEnd: end),
+      offset == end
+    else { return nil }
 
     return (priority, weight, port, target)
   }
@@ -2016,7 +2190,12 @@ struct DNSClient {
   static func parseHTTPS(rdata: Data, rdataOffsetInMessage: Int, fullMessage: Data) -> (
     priority: UInt16, target: String, svcParams: Data
   )? {
-    guard rdata.count >= 2 else { return nil }
+    guard
+      rdata.count >= 2,
+      rdataOffsetInMessage >= 0,
+      rdataOffsetInMessage <= fullMessage.count,
+      rdata.count <= fullMessage.count - rdataOffsetInMessage
+    else { return nil }
     let bytes = [UInt8](rdata)
 
     // Read priority (2 bytes)
@@ -2025,12 +2204,12 @@ struct DNSClient {
     // Read target name
     let fullBytes = [UInt8](fullMessage)
     var offset = rdataOffsetInMessage + 2  // Skip priority
-    guard let (target, newOffset) = parseName(fullBytes, &offset) else { return nil }
+    guard let (target, consumedOffset) = parseName(fullBytes, &offset) else { return nil }
 
     // Remaining bytes are SvcParams (keep as raw data for now - parsing is complex)
-    let svcParamsStart = newOffset - rdataOffsetInMessage
-    let svcParams =
-      svcParamsStart < rdata.count ? rdata.subdata(in: svcParamsStart..<rdata.count) : Data()
+    let svcParamsStart = consumedOffset - rdataOffsetInMessage
+    guard svcParamsStart >= 2, svcParamsStart <= rdata.count else { return nil }
+    let svcParams = rdata.subdata(in: svcParamsStart..<rdata.count)
 
     return (priority, target, svcParams)
   }
@@ -2045,9 +2224,56 @@ public struct __TXTAnswer: Sendable {
   public let rdata: Data
 }
 
+@_spi(Test)
+public struct __DNSAnswer: Sendable {
+  public let name: String
+  public let type: UInt16
+  public let klass: UInt16
+  public let ttl: UInt32
+  public let rdata: Data
+}
+
 // swift-format-ignore: AlwaysUseLowerCamelCase
 @_spi(Test)
-public func __dnsEncodeQName(_ name: String) -> [UInt8] { _encodeQName(name) }
+public func __dnsQuery(
+  server: String,
+  port: UInt16,
+  name: String,
+  type: UInt16,
+  timeout: TimeInterval = 1.0
+) throws -> [__DNSAnswer] {
+  try performDNSQueryInternal(
+    server: server,
+    query: name,
+    queryType: type,
+    timeout: timeout,
+    interface: nil,
+    sourceIP: nil,
+    serverPort: port
+  ).map { answer in
+    __DNSAnswer(
+      name: answer.name,
+      type: answer.type,
+      klass: answer.klass,
+      ttl: answer.ttl,
+      rdata: answer.rdata
+    )
+  }
+}
+
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
+public func __dnsEncodeQName(_ name: String) -> [UInt8] {
+  // Preserve the original nonthrowing SPI used by parser fixtures. Production query paths call
+  // the throwing encoder directly and surface invalid names as `DNSError.invalidHostname`.
+  (try? _encodeQName(name)) ?? []
+}
+
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
+public func __dnsApplySocketTimeout(fd: Int32, timeout: TimeInterval) throws {
+  try _applyDNSSocketTimeout(fd: fd, timeout: timeout)
+}
 
 // swift-format-ignore: AlwaysUseLowerCamelCase
 @_spi(Test)
