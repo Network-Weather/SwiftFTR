@@ -9,27 +9,32 @@ import Testing
 
   @Suite("UDP probe routing and lifecycle")
   struct UDPProbeBindingTests {
-    @Test("Routes empty datagrams through the requested interface and source IP")
-    func emptyDatagramPreservesPayloadAndRoute() async throws {
-      let server = try LoopbackUDPServer(reply: Data())
+    @Test(
+      "Routes empty datagrams through the requested interface and source IP",
+      arguments: LoopbackFamily.allCases
+    )
+    func emptyDatagramPreservesPayloadAndRoute(family: LoopbackFamily) async throws {
+      let route = try await discoverLoopbackRoute(for: family)
+      let server = try LoopbackUDPServer(route: route, reply: Data())
       var datagrams = server.datagrams.makeAsyncIterator()
 
-      let probe = Task {
-        try await udpProbe(
-          host: "127.0.0.1",
+      let result = try await udpProbe(
+        config: UDPProbeConfig(
+          host: route.address,
           port: server.port,
           timeout: 2,
           payload: Data(),
-          interface: "lo0",
-          sourceIP: "127.0.0.1"
+          interface: route.interfaceName,
+          sourceIP: route.address,
+          preferredFamily: family.preferredFamily
         )
-      }
+      )
 
       let datagram = try #require(await datagrams.next())
-      let result = try await probe.value
 
       #expect(datagram.isEmpty)
       #expect(result.isReachable)
+      #expect(result.resolvedIP == route.address)
       #expect(result.responseType == "udp_reply")
       #expect(result.error == nil)
     }
@@ -69,16 +74,18 @@ import Testing
 
     @Test("Cancellation closes a waiting probe without waiting for its timeout")
     func cancellationFinishesPromptly() async throws {
-      let server = try LoopbackUDPServer(reply: nil)
+      let route = try await discoverLoopbackRoute(for: .ipv4)
+      let server = try LoopbackUDPServer(route: route, reply: nil)
       var datagrams = server.datagrams.makeAsyncIterator()
       let probe = Task {
         try await udpProbe(
           config: UDPProbeConfig(
-            host: "127.0.0.1",
+            host: route.address,
             port: server.port,
             timeout: 30,
-            interface: "lo0",
-            sourceIP: "127.0.0.1"
+            interface: route.interfaceName,
+            sourceIP: route.address,
+            preferredFamily: .v4
           )
         )
       }
@@ -94,53 +101,85 @@ import Testing
     }
   }
 
+  enum LoopbackFamily: CaseIterable, Sendable, CustomTestStringConvertible {
+    case ipv4
+    case ipv6
+
+    var preferredFamily: PreferredFamily {
+      switch self {
+      case .ipv4: .v4
+      case .ipv6: .v6
+      }
+    }
+
+    var socketFamily: Int32 {
+      switch self {
+      case .ipv4: AF_INET
+      case .ipv6: AF_INET6
+      }
+    }
+
+    func addresses(on interface: NetworkInterface) -> [String] {
+      switch self {
+      case .ipv4: interface.ipv4Addresses
+      case .ipv6: interface.ipv6Addresses
+      }
+    }
+
+    var testDescription: String {
+      switch self {
+      case .ipv4: "IPv4"
+      case .ipv6: "IPv6"
+      }
+    }
+  }
+
+  private struct LoopbackRoute: Sendable {
+    let family: LoopbackFamily
+    let interfaceName: String
+    let address: String
+  }
+
+  private func discoverLoopbackRoute(for family: LoopbackFamily) async throws -> LoopbackRoute {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    let route = snapshot.interfaces.lazy.compactMap { interface -> LoopbackRoute? in
+      guard
+        interface.isUp,
+        let address = family.addresses(on: interface).first(where: {
+          ipAddressScope(of: $0) == .loopback
+        })
+      else {
+        return nil
+      }
+
+      return LoopbackRoute(
+        family: family,
+        interfaceName: interface.name,
+        address: address
+      )
+    }.first
+
+    return try #require(route, "No active \(family.testDescription) loopback route was discovered")
+  }
+
   private final class LoopbackUDPServer: @unchecked Sendable {
     let datagrams: AsyncStream<Data>
     let port: Int
 
     private let source: DispatchSourceRead
 
-    init(reply: Data?) throws {
-      let socketFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    init(route: LoopbackRoute, reply: Data?) throws {
+      let socketFD = socket(route.family.socketFamily, SOCK_DGRAM, IPPROTO_UDP)
       guard socketFD >= 0 else {
         throw LoopbackUDPServerError.posix(errno)
       }
 
-      var address = sockaddr_in()
-      address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-      address.sin_family = sa_family_t(AF_INET)
-      address.sin_port = 0
-      guard inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1 else {
+      let boundPort: Int
+      do {
+        boundPort = try Self.bind(socketFD, to: route)
+      } catch {
         close(socketFD)
-        throw LoopbackUDPServerError.posix(EINVAL)
-      }
-
-      let bindResult = withUnsafePointer(to: &address) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-          Darwin.bind(
-            socketFD,
-            socketAddress,
-            socklen_t(MemoryLayout<sockaddr_in>.size)
-          )
-        }
-      }
-      guard bindResult == 0 else {
-        let error = errno
-        close(socketFD)
-        throw LoopbackUDPServerError.posix(error)
-      }
-
-      var boundAddress = sockaddr_in()
-      var boundAddressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
-      let addressResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-          getsockname(socketFD, socketAddress, &boundAddressLength)
-        }
-      }
-      guard addressResult == 0 else {
-        let error = errno
-        close(socketFD)
-        throw LoopbackUDPServerError.posix(error)
+        throw error
       }
 
       let (datagrams, continuation) = AsyncStream<Data>.makeStream()
@@ -194,8 +233,80 @@ import Testing
       source.activate()
 
       self.datagrams = datagrams
-      self.port = Int(UInt16(bigEndian: boundAddress.sin_port))
+      self.port = boundPort
       self.source = source
+    }
+
+    private static func bind(_ socketFD: Int32, to route: LoopbackRoute) throws -> Int {
+      switch route.family {
+      case .ipv4:
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        guard inet_pton(AF_INET, route.address, &address.sin_addr) == 1 else {
+          throw LoopbackUDPServerError.posix(EINVAL)
+        }
+
+        let bindResult = withUnsafePointer(to: &address) { pointer in
+          pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            Darwin.bind(
+              socketFD,
+              socketAddress,
+              socklen_t(MemoryLayout<sockaddr_in>.size)
+            )
+          }
+        }
+        guard bindResult == 0 else {
+          throw LoopbackUDPServerError.posix(errno)
+        }
+
+        var boundAddress = sockaddr_in()
+        var boundAddressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let addressResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+          pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            getsockname(socketFD, socketAddress, &boundAddressLength)
+          }
+        }
+        guard addressResult == 0 else {
+          throw LoopbackUDPServerError.posix(errno)
+        }
+        return Int(UInt16(bigEndian: boundAddress.sin_port))
+
+      case .ipv6:
+        var address = sockaddr_in6()
+        address.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        address.sin6_family = sa_family_t(AF_INET6)
+        address.sin6_port = 0
+        guard inet_pton(AF_INET6, route.address, &address.sin6_addr) == 1 else {
+          throw LoopbackUDPServerError.posix(EINVAL)
+        }
+
+        let bindResult = withUnsafePointer(to: &address) { pointer in
+          pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            Darwin.bind(
+              socketFD,
+              socketAddress,
+              socklen_t(MemoryLayout<sockaddr_in6>.size)
+            )
+          }
+        }
+        guard bindResult == 0 else {
+          throw LoopbackUDPServerError.posix(errno)
+        }
+
+        var boundAddress = sockaddr_in6()
+        var boundAddressLength = socklen_t(MemoryLayout<sockaddr_in6>.size)
+        let addressResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+          pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            getsockname(socketFD, socketAddress, &boundAddressLength)
+          }
+        }
+        guard addressResult == 0 else {
+          throw LoopbackUDPServerError.posix(errno)
+        }
+        return Int(UInt16(bigEndian: boundAddress.sin6_port))
+      }
     }
 
     deinit {

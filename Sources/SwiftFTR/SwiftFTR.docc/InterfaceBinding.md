@@ -1,25 +1,27 @@
 # Interface and Source IP Binding
 
-Control which network interface SwiftFTR uses for socket-backed network operations.
+Control which network interface supported SwiftFTR operations use.
 
 ## Overview
 
-SwiftFTR supports binding its socket-backed operations to specific network interfaces, giving you precise control over routing in multi-interface scenarios like:
+SwiftFTR supports binding selected socket-backed operations to specific network interfaces, giving you routing control in multi-interface scenarios like:
 
 - Simultaneous WiFi and Ethernet connections
 - VPN tunnel selection
 - Multi-homed servers
 - Network testing and troubleshooting
 
-For supported operations, interface binding is available at two levels: global (set at initialization) and per-operation (override for specific calls).
+Support varies by API. Traceroute uses the global ``SwiftFTRConfig`` setting, ping supports global
+and per-operation settings, and TCP, UDP, and DNS probes expose operation-level settings. HTTP
+probes follow system routing because URLSession does not expose interface binding.
 
 ## Binding Levels
 
-SwiftFTR provides two levels of interface binding with a clear resolution order.
+Some SwiftFTR APIs provide both global and per-operation binding with a clear resolution order.
 
 ### Global Binding
 
-Set a default interface for supported socket-backed operations:
+Set a default interface for supported operations launched through a ``SwiftFTR/SwiftFTR`` instance, including traceroute, ping, and the DNS query helpers:
 
 ```swift
 import SwiftFTR
@@ -30,7 +32,7 @@ let config = SwiftFTRConfig(
 )
 let ftr = SwiftFTR(config: config)
 
-// These socket-backed operations use the configured interface
+// Traceroute and ping use the configured interface
 let trace = try await ftr.trace(to: "1.1.1.1")
 let ping = try await ftr.ping(to: "8.8.8.8")
 ```
@@ -59,7 +61,7 @@ let wifiPing2 = try await ftr.ping(to: "8.8.8.8")
 
 ## Resolution Order
 
-SwiftFTR resolves interface and source IP binding in this priority order:
+For APIs that expose both global and operation settings, SwiftFTR resolves interface and source IP binding in this priority order:
 
 **Operation Config → Global Config → System Default**
 
@@ -83,8 +85,14 @@ let result3 = try await ftr2.ping(to: "1.1.1.1")  // Uses system routing
 
 ## Supported Operations
 
-Ping, traceroute, TCP, UDP, and DNS use sockets that support interface and source-IP binding. HTTP
-probes use URLSession, whose public API does not expose those controls.
+Binding support is not uniform across every transport:
+
+- Traceroute and streaming traceroute use ``SwiftFTR/SwiftFTRConfig/interface`` and ``SwiftFTR/SwiftFTRConfig/sourceIP``.
+- Ping uses the global settings and supports overrides through ``SwiftFTR/PingConfig``.
+- The DNS query helpers use global settings and support call-level overrides. The standalone DNS probe uses ``SwiftFTR/DNSProbeConfig``.
+- The standalone TCP and UDP probes use ``SwiftFTR/TCPProbeConfig`` and ``SwiftFTR/UDPProbeConfig``.
+- Bufferbloat applies its binding settings only to latency pings; its HTTP load traffic follows system routing.
+- HTTP probes don't expose binding settings.
 
 ### Ping
 
@@ -292,7 +300,7 @@ let result2 = try await SwiftFTR().ping(
 **Requirements**:
 - Source IP must be assigned to the network interface
 - Interface must be up and reachable
-- IP must be valid IPv4 address
+- IP must be a valid IPv4 or IPv6 address; link-local IPv6 addresses may include a `%zone` suffix
 
 ## Error Handling
 
@@ -360,12 +368,12 @@ route. SwiftFTR does not claim that setting a global binding changes URLSession 
 
 ## Implementation Details
 
-SwiftFTR uses macOS's `IP_BOUND_IF` socket option for interface binding:
+SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for interface binding:
 
-- Socket option 25 (`IP_BOUND_IF`) is macOS/iOS specific
+- Socket option 25 (`IP_BOUND_IF`) is Darwin-specific
 - Takes interface index from `if_nametoindex()`
 - Applied after `socket()` but before network operations
-- Works for `SOCK_DGRAM` (ICMP, DNS) and `SOCK_STREAM` (TCP)
+- Applied to ICMP, DNS, TCP, and UDP sockets by the APIs listed above
 - Requires valid interface name and index
 
 The binding applies to ping, traceroute, TCP, UDP, and DNS sockets. It does not apply to
@@ -374,8 +382,6 @@ URLSession-backed HTTP/HTTPS probes or bufferbloat load requests.
 ## Platform Support
 
 - **macOS**: Supported socket operations use `IP_BOUND_IF` / `IPV6_BOUND_IF`
-- **iOS**: Supported socket operations use the corresponding interface socket options (network
-  entitlements may be required)
 - **Linux**: Not yet supported (would require `SO_BINDTODEVICE`)
 
 ## Topics

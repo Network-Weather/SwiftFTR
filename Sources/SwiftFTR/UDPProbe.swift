@@ -7,7 +7,9 @@ import Foundation
   import Glibc
 #endif
 
-/// Configuration for UDP probing
+/// Configuration for UDP probing.
+///
+/// Values are validated by ``udpProbe(config:)`` before resolution or socket creation.
 public struct UDPProbeConfig: Sendable {
   /// Target host (hostname or IP)
   public let host: String
@@ -123,7 +125,8 @@ public struct UDPProbeResult: Sendable, Codable {
 ///   - interface: The network interface to use, or `nil` to use system routing.
 ///   - sourceIP: The source address to use, or `nil` to let the system choose.
 /// - Returns: The probe result, including reachability, timing, and any operation error.
-/// - Throws: `CancellationError` if the calling task is canceled.
+/// - Throws: `CancellationError` if the calling task is canceled, or
+///   ``TracerouteError/invalidConfiguration(reason:)`` for invalid numeric settings.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -150,11 +153,13 @@ public func udpProbe(
 ///
 /// - Parameter config: The destination, payload, routing, and timeout settings.
 /// - Returns: The probe result, including reachability, timing, and any operation error.
-/// - Throws: `CancellationError` if the calling task is canceled.
+/// - Throws: `CancellationError` if the calling task is canceled, or
+///   ``TracerouteError/invalidConfiguration(reason:)`` for invalid numeric settings.
 #if compiler(>=6.2)
   @concurrent
 #endif
 public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
+  try config.validateForOperation()
   try Task.checkCancellation()
   let startTime = Date()
 

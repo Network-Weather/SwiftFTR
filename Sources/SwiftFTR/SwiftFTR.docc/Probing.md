@@ -71,6 +71,7 @@ if let tcpRTT = result.tcpHandshakeRTT {
 ```
 
 Any HTTP response (even 4xx/5xx) counts as reachable — the probe tests network connectivity, not content availability.
+The probe stops the transfer after receiving response headers, so large or streaming response bodies are not buffered.
 
 ## DNS Probe
 
