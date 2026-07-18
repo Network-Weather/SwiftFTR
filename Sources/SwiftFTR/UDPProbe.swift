@@ -23,21 +23,44 @@ public struct UDPProbeConfig: Sendable {
   /// Payload to send (default: empty)
   public let payload: Data
 
+  /// Network interface to use for this UDP probe, or `nil` to use system routing.
+  public let interface: String?
+
+  /// Source IP address to use for this UDP probe, or `nil` to let the system choose.
+  ///
+  /// The address must match the resolved destination's address family and be assigned
+  /// to the selected interface when ``interface`` is also set.
+  public let sourceIP: String?
+
   /// IP family preference. Defaults to `.auto` (let the resolved address decide).
   /// See `PreferredFamily` and `docs/IPV6.md`.
   public let preferredFamily: PreferredFamily
 
+  /// Creates a UDP probe configuration.
+  ///
+  /// - Parameters:
+  ///   - host: The destination hostname or IP address.
+  ///   - port: The destination UDP port.
+  ///   - timeout: The maximum time to wait for a response, in seconds.
+  ///   - payload: The datagram payload. An empty value sends a zero-byte datagram.
+  ///   - interface: The network interface to use, or `nil` to use system routing.
+  ///   - sourceIP: The source address to use, or `nil` to let the system choose.
+  ///   - preferredFamily: The address family to prefer during resolution.
   public init(
     host: String,
     port: Int,
     timeout: TimeInterval = 2.0,
     payload: Data = Data(),
+    interface: String? = nil,
+    sourceIP: String? = nil,
     preferredFamily: PreferredFamily = .auto
   ) {
     self.host = host
     self.port = port
     self.timeout = timeout
     self.payload = payload
+    self.interface = interface
+    self.sourceIP = sourceIP
     self.preferredFamily = preferredFamily
   }
 }
@@ -89,13 +112,21 @@ public struct UDPProbeResult: Sendable, Codable {
   }
 }
 
-/// UDP probe implementation using connected UDP socket (no root required)
-/// Sends UDP packet and waits for response or ICMP Port Unreachable
-/// Returns success if ANY response received (UDP reply or ICMP Port Unreachable)
-/// Returns failure only on timeout (no response)
+/// Sends a UDP datagram and waits for a response or ICMP port-unreachable message.
 ///
-/// Implementation: Uses connect() on UDP socket so kernel delivers ICMP errors
-/// as ECONNREFUSED on recv(), avoiding need for raw ICMP socket
+/// The probe uses a connected UDP socket so the kernel can deliver ICMP errors
+/// without requiring a raw socket.
+///
+/// - Parameters:
+///   - host: The destination hostname or IP address.
+///   - port: The destination UDP port.
+///   - timeout: The maximum time to wait for a response, in seconds.
+///   - payload: The datagram payload. An empty value sends a zero-byte datagram.
+///   - interface: The network interface to use, or `nil` to use system routing.
+///   - sourceIP: The source address to use, or `nil` to let the system choose.
+/// - Returns: The probe result, including reachability, timing, and any operation error.
+/// - Throws: `CancellationError` if the calling task is canceled, or
+///   ``TracerouteError/invalidConfiguration(reason:)`` for invalid numeric settings.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -103,18 +134,33 @@ public func udpProbe(
   host: String,
   port: Int,
   timeout: TimeInterval = 2.0,
-  payload: Data = Data()
+  payload: Data = Data(),
+  interface: String? = nil,
+  sourceIP: String? = nil
 ) async throws -> UDPProbeResult {
-  let config = UDPProbeConfig(host: host, port: port, timeout: timeout, payload: payload)
+  let config = UDPProbeConfig(
+    host: host,
+    port: port,
+    timeout: timeout,
+    payload: payload,
+    interface: interface,
+    sourceIP: sourceIP
+  )
   return try await udpProbe(config: config)
 }
 
+/// Sends a UDP probe using the supplied configuration.
+///
+/// - Parameter config: The destination, payload, routing, and timeout settings.
+/// - Returns: The probe result, including reachability, timing, and any operation error.
+/// - Throws: `CancellationError` if the calling task is canceled, or
+///   ``TracerouteError/invalidConfiguration(reason:)`` for invalid numeric settings.
 #if compiler(>=6.2)
   @concurrent
 #endif
 public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
   try config.validateForOperation()
-
+  try Task.checkCancellation()
   let startTime = Date()
 
   // Resolve via the shared dual-stack helper (Hostname.swift).
@@ -122,6 +168,7 @@ public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
   do {
     resolved = try resolveHost(host: config.host, prefer: config.preferredFamily)
   } catch {
+    try Task.checkCancellation()
     return UDPProbeResult(
       host: config.host,
       resolvedIP: config.host,
@@ -139,7 +186,8 @@ public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
     port: config.port,
     payload: config.payload,
     timeout: config.timeout,
-    startTime: startTime
+    interface: config.interface,
+    sourceIP: config.sourceIP
   )
 
   return UDPProbeResult(
@@ -168,8 +216,11 @@ private func performUDPProbe(
   port: Int,
   payload: Data,
   timeout: TimeInterval,
-  startTime: Date
+  interface: String?,
+  sourceIP: String?
 ) async throws -> UDPProbeResultInternal {
+  try Task.checkCancellation()
+
   // Family-aware socket. v4 → AF_INET, v6 → AF_INET6.
   let sockfd = socket(resolved.family, SOCK_DGRAM, IPPROTO_UDP)
   guard sockfd >= 0 else {
@@ -177,6 +228,63 @@ private func performUDPProbe(
       isReachable: false, rtt: nil, responseType: nil,
       error: "Failed to create UDP socket")
   }
+
+  var operationOwnsSocket = false
+  defer {
+    if !operationOwnsSocket {
+      close(sockfd)
+    }
+  }
+
+  if let interface {
+    #if canImport(Darwin)
+      let interfaceIndex = if_nametoindex(interface)
+      guard interfaceIndex != 0 else {
+        return UDPProbeResultInternal(
+          isReachable: false,
+          rtt: nil,
+          responseType: nil,
+          error: "Interface '\(interface)' not found"
+        )
+      }
+      if let error = bindInterface(
+        sockfd: sockfd,
+        family: resolved.family,
+        ifIndex: interfaceIndex
+      ) {
+        return UDPProbeResultInternal(
+          isReachable: false,
+          rtt: nil,
+          responseType: nil,
+          error: "Failed to bind to interface '\(interface)': \(error)"
+        )
+      }
+    #else
+      return UDPProbeResultInternal(
+        isReachable: false,
+        rtt: nil,
+        responseType: nil,
+        error: "Interface binding is not supported on this platform"
+      )
+    #endif
+  }
+
+  if let sourceIP,
+    let error = bindSourceIP(
+      sockfd: sockfd,
+      family: resolved.family,
+      sourceIP: sourceIP
+    )
+  {
+    return UDPProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseType: nil,
+      error: error
+    )
+  }
+
+  try Task.checkCancellation()
 
   var flags = fcntl(sockfd, F_GETFL, 0)
   flags |= O_NONBLOCK
@@ -210,7 +318,6 @@ private func performUDPProbe(
   }
 
   guard connectResult == 0 else {
-    close(sockfd)
     return UDPProbeResultInternal(
       isReachable: false,
       rtt: nil,
@@ -223,13 +330,11 @@ private func performUDPProbe(
   let probeStartTime = udpMonotonicTime()
 
   // Send UDP packet using send() (not sendto() - socket is connected)
-  let payloadBytes = payload.count > 0 ? Array(payload) : [0x00]
-  let sendResult = payloadBytes.withUnsafeBufferPointer { buffer in
+  let sendResult = payload.withUnsafeBytes { buffer -> ssize_t in
     send(sockfd, buffer.baseAddress, buffer.count, 0)
   }
 
   guard sendResult >= 0 else {
-    close(sockfd)
     return UDPProbeResultInternal(
       isReachable: false,
       rtt: nil,
@@ -244,9 +349,14 @@ private func performUDPProbe(
     timeout: timeout,
     probeStartTime: probeStartTime
   )
+  operationOwnsSocket = true
 
-  return await withCheckedContinuation { continuation in
-    operation.start(continuation: continuation)
+  return try await withTaskCancellationHandler {
+    try await withCheckedThrowingContinuation { continuation in
+      operation.start(continuation: continuation)
+    }
+  } onCancel: {
+    operation.cancel()
   }
 }
 
@@ -262,19 +372,24 @@ private func udpMonotonicTime() -> TimeInterval {
 
 // MARK: - UDP Probe Operation
 
-/// Manages a single UDP probe operation using DispatchSource for non-blocking I/O
+/// Manages a single UDP probe operation using DispatchSource for non-blocking I/O.
+///
+/// Cross-task completion state is protected by `lock`; descriptor I/O and source
+/// ownership are confined to `queue`. The unchecked conformance records those
+/// synchronization guarantees for Dispatch callbacks.
 private final class UDPProbeOperation: @unchecked Sendable {
   private let sockfd: Int32
   private let timeout: TimeInterval
   private let probeStartTime: TimeInterval
 
-  private var continuation: CheckedContinuation<UDPProbeResultInternal, Never>?
+  private var continuation: CheckedContinuation<UDPProbeResultInternal, Error>?
+  private var terminalResult: Result<UDPProbeResultInternal, Error>?
   private var readSource: DispatchSourceRead?
   private var timerSource: DispatchSourceTimer?
+  private var isCleanedUp = false
 
   private let queue: DispatchQueue
   private let lock = NSLock()
-  private var isFinished = false
 
   // Receive buffer for UDP responses
   private var recvBuffer = [UInt8](repeating: 0, count: 1024)
@@ -289,13 +404,11 @@ private final class UDPProbeOperation: @unchecked Sendable {
     )
   }
 
-  func start(continuation: CheckedContinuation<UDPProbeResultInternal, Never>) {
+  func start(continuation: CheckedContinuation<UDPProbeResultInternal, Error>) {
     lock.lock()
-    if isFinished {
+    if let terminalResult {
       lock.unlock()
-      continuation.resume(
-        returning: UDPProbeResultInternal(
-          isReachable: false, rtt: nil, responseType: nil, error: "Operation already finished"))
+      continuation.resume(with: terminalResult)
       return
     }
     self.continuation = continuation
@@ -306,15 +419,28 @@ private final class UDPProbeOperation: @unchecked Sendable {
     }
   }
 
+  func cancel() {
+    queue.async {
+      self.finish(error: CancellationError())
+    }
+  }
+
   private func setupSources() {
+    lock.lock()
+    let isFinished = terminalResult != nil
+    lock.unlock()
+    guard !isFinished else { return }
+
     // DispatchSourceRead fires when socket becomes readable (response arrives or ICMP error)
     let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
     source.setEventHandler { [weak self] in
       self?.handleRead()
     }
-    source.setCancelHandler {}
-    source.activate()
+    source.setCancelHandler { [self] in
+      completeCleanup()
+    }
     self.readSource = source
+    source.activate()
 
     // Timer for timeout
     let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -328,7 +454,7 @@ private final class UDPProbeOperation: @unchecked Sendable {
 
   private func handleRead() {
     lock.lock()
-    if isFinished {
+    if terminalResult != nil {
       lock.unlock()
       return
     }
@@ -337,8 +463,8 @@ private final class UDPProbeOperation: @unchecked Sendable {
     // Try to receive data
     let bytesRead = recv(sockfd, &recvBuffer, recvBuffer.count, 0)
 
-    if bytesRead > 0 {
-      // Got UDP reply
+    if bytesRead >= 0 {
+      // Got a UDP reply. A zero-byte UDP datagram is a valid reply.
       let rtt = udpMonotonicTime() - probeStartTime
       finish(
         result: UDPProbeResultInternal(
@@ -405,27 +531,49 @@ private final class UDPProbeOperation: @unchecked Sendable {
   }
 
   private func finish(result: UDPProbeResultInternal) {
+    finish(with: .success(result))
+  }
+
+  private func finish(error: any Error) {
+    finish(with: .failure(error))
+  }
+
+  private func finish(with result: Result<UDPProbeResultInternal, Error>) {
     lock.lock()
-    if isFinished {
+    if terminalResult != nil {
       lock.unlock()
       return
     }
-    isFinished = true
-    let currentContinuation = self.continuation
-    self.continuation = nil
+    terminalResult = result
     lock.unlock()
 
-    // Cancel sources
-    readSource?.cancel()
+    // Cancel the timer first, then use the read source's cancellation handler
+    // as a barrier before closing the descriptor. This prevents an already
+    // enqueued read handler from observing a reused descriptor.
     timerSource?.cancel()
-    readSource = nil
     timerSource = nil
 
-    // Close socket
-    close(sockfd)
+    if let readSource {
+      self.readSource = nil
+      readSource.cancel()
+    } else {
+      completeCleanup()
+    }
+  }
 
-    // Resume continuation
-    currentContinuation?.resume(returning: result)
+  private func completeCleanup() {
+    lock.lock()
+    guard !isCleanedUp, let terminalResult else {
+      lock.unlock()
+      return
+    }
+    isCleanedUp = true
+    let currentContinuation = continuation
+    continuation = nil
+    lock.unlock()
+
+    close(sockfd)
+    currentContinuation?.resume(with: terminalResult)
   }
 }
 

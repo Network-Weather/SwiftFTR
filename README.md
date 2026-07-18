@@ -105,7 +105,8 @@ Key Features
 
 **Interface & Binding**
 - Traceroute and ping honor global interface/source-address settings; ping also supports a per-operation override
-- TCP and DNS probes expose operation-level binding; UDP and HTTP probes currently follow system routing
+- TCP, UDP, and DNS probes expose operation-level binding; HTTP/HTTPS probes follow system routing
+- Supported socket-backed diagnostics accept family-matched IPv4 or IPv6 source addresses (link-local `%zone` honored)
 - Bufferbloat binding applies to its latency pings only; generated HTTP load follows system routing
 
 **Public IP Discovery**
@@ -124,7 +125,7 @@ Use It as a Library
 ```swift
 import SwiftFTR
 
-// Configure once, use everywhere
+// Configure defaults for supported socket-backed diagnostics
 let config = SwiftFTRConfig(
     maxHops: 40,        // Max TTL to probe
     maxWaitMs: 1000,    // Timeout in milliseconds
@@ -373,8 +374,9 @@ Options:
 Configuration and Flags
 -----------------------
 - Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
-- Use `SwiftFTRConfig(interface: "en0")` to bind to a specific network interface.
-- Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind to a specific source IP.
+- Use `SwiftFTRConfig(interface: interfaceName)` to bind supported socket-backed diagnostics to a caller-selected network interface.
+- Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind supported socket-backed diagnostics to a specific source IP.
+- HTTP/HTTPS probes use URLSession and do not support either binding option.
 - CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
 
 Design Details

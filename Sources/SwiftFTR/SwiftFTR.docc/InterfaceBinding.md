@@ -4,18 +4,20 @@ Control which network interface supported SwiftFTR operations use.
 
 ## Overview
 
-SwiftFTR supports binding selected operations to specific network interfaces, giving you routing control in multi-interface scenarios like:
+SwiftFTR supports binding selected socket-backed operations to specific network interfaces, giving you routing control in multi-interface scenarios like:
 
 - Simultaneous WiFi and Ethernet connections
 - VPN tunnel selection
 - Multi-homed servers
 - Network testing and troubleshooting
 
-Support varies by API. Traceroute uses the global ``SwiftFTRConfig`` setting, ping supports global and per-operation settings, TCP and DNS probes expose operation-level settings, and UDP and HTTP probes currently follow system routing.
+Support varies by API. Traceroute uses the global ``SwiftFTRConfig`` setting, ping supports global
+and per-operation settings, and TCP, UDP, and DNS probes expose operation-level settings. HTTP
+probes follow system routing because URLSession does not expose interface binding.
 
 ## Binding Levels
 
-SwiftFTR provides two levels of interface binding with a clear resolution order.
+Some SwiftFTR APIs provide both global and per-operation binding with a clear resolution order.
 
 ### Global Binding
 
@@ -88,9 +90,9 @@ Binding support is not uniform across every transport:
 - Traceroute and streaming traceroute use ``SwiftFTR/SwiftFTRConfig/interface`` and ``SwiftFTR/SwiftFTRConfig/sourceIP``.
 - Ping uses the global settings and supports overrides through ``SwiftFTR/PingConfig``.
 - The DNS query helpers use global settings and support call-level overrides. The standalone DNS probe uses ``SwiftFTR/DNSProbeConfig``.
-- The standalone TCP probe uses ``SwiftFTR/TCPProbeConfig``.
+- The standalone TCP and UDP probes use ``SwiftFTR/TCPProbeConfig`` and ``SwiftFTR/UDPProbeConfig``.
 - Bufferbloat applies its binding settings only to latency pings; its HTTP load traffic follows system routing.
-- UDP and HTTP probes don't currently expose binding settings.
+- HTTP probes don't expose binding settings.
 
 ### Ping
 
@@ -126,6 +128,23 @@ let result = try await tcpProbe(
 print("TCP probe via en0: \(result.isReachable ? "reachable" : "unreachable")")
 ```
 
+### UDP Probe
+
+```swift
+import SwiftFTR
+
+let result = try await udpProbe(
+    config: UDPProbeConfig(
+        host: "1.1.1.1",
+        port: 53,
+        timeout: 2.0,
+        interface: interfaceName
+    )
+)
+
+print("UDP probe via \(interfaceName): \(result.isReachable ? "reachable" : "unreachable")")
+```
+
 ### DNS Probe
 
 ```swift
@@ -143,9 +162,32 @@ let result = try await dnsProbe(
 print("DNS probe via en14: \(result.isReachable ? "reachable" : "unreachable")")
 ```
 
-### Bufferbloat Latency Pings
+### HTTP Probe
 
-``BufferbloatConfig/interface`` and ``BufferbloatConfig/sourceIP`` bind the baseline and loaded latency pings. They do not bind the generated HTTP upload/download traffic, so a bufferbloat result must not be presented as an end-to-end measurement of one selected interface.
+HTTP and HTTPS probes use URLSession and do not support interface or source-IP binding. Their
+traffic follows the system-selected route.
+
+### Bufferbloat Test
+
+Only bufferbloat's latency probes can be bound; its HTTP load uses URLSession and is not bound to
+the same route. Do not interpret a loaded, bound result as a route-specific bufferbloat comparison.
+Use a zero load duration when you need only a bound baseline latency measurement:
+
+```swift
+import SwiftFTR
+
+let ftr = SwiftFTR()
+let result = try await ftr.testBufferbloat(
+    config: BufferbloatConfig(
+        target: "1.1.1.1",
+        baselineDuration: 3.0,
+        loadDuration: 0,
+        interface: interfaceName
+    )
+)
+
+print("Baseline latency via \(interfaceName): \(result.baseline.avgMs) ms")
+```
 
 ## Multi-Interface Monitoring
 
@@ -318,21 +360,28 @@ Common error scenarios:
 - **IP not assigned**: Source IP is not configured on the interface
 - **Interface index not found**: Interface exists but `if_nametoindex()` failed
 
+## URLSession Limitation
+
+HTTP/HTTPS probes and bufferbloat load generation use URLSession. URLSession's public API does not
+provide an interface or source-IP binding option, so those requests follow the system-selected
+route. SwiftFTR does not claim that setting a global binding changes URLSession traffic.
+
 ## Implementation Details
 
 SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for interface binding:
 
-- Socket option 25 (`IP_BOUND_IF`) is macOS/iOS specific
+- Socket option 25 (`IP_BOUND_IF`) is Darwin-specific
 - Takes interface index from `if_nametoindex()`
 - Applied after `socket()` but before network operations
-- Applied to ICMP, DNS, and TCP sockets by the APIs listed above
+- Applied to ICMP, DNS, TCP, and UDP sockets by the APIs listed above
 - Requires valid interface name and index
 
-UDP and HTTP probes don't currently apply these settings. Bufferbloat applies them only to its ICMP latency measurements.
+The binding applies to ping, traceroute, TCP, UDP, and DNS sockets. It does not apply to
+URLSession-backed HTTP/HTTPS probes or bufferbloat load requests.
 
 ## Platform Support
 
-- **macOS**: Supported by the operations listed above via `IP_BOUND_IF` and `IPV6_BOUND_IF`
+- **macOS**: Supported socket operations use `IP_BOUND_IF` / `IPV6_BOUND_IF`
 - **Linux**: Not yet supported (would require `SO_BINDTODEVICE`)
 
 ## Topics
@@ -345,6 +394,8 @@ UDP and HTTP probes don't currently apply these settings. Bufferbloat applies th
 - ``SwiftFTR/PingConfig/sourceIP``
 - ``SwiftFTR/TCPProbeConfig/interface``
 - ``SwiftFTR/TCPProbeConfig/sourceIP``
+- ``SwiftFTR/UDPProbeConfig/interface``
+- ``SwiftFTR/UDPProbeConfig/sourceIP``
 - ``SwiftFTR/DNSProbeConfig/interface``
 - ``SwiftFTR/DNSProbeConfig/sourceIP``
 - ``SwiftFTR/BufferbloatConfig/interface``
