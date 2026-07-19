@@ -81,7 +81,15 @@ actor _ASNMemoryCache {
   private struct LookupKey: Hashable {
     let scope: _ASNResolverScope
     let address: String
-    let timeout: TimeInterval
+
+    /// Preserve exact timeout identity while keeping dictionary equality reflexive for NaN.
+    let timeoutBitPattern: UInt64
+
+    init(scope: _ASNResolverScope, address: String, timeout: TimeInterval) {
+      self.scope = scope
+      self.address = address
+      self.timeoutBitPattern = timeout.bitPattern
+    }
   }
 
   private struct Flight {
@@ -303,6 +311,9 @@ actor _ASNMemoryCache {
   var inFlightJoinCount: Int {
     flightsByID.values.reduce(0) { $0 + $1.joinCount }
   }
+
+  /// Number of keys currently reserved by in-flight work. Internal for deterministic tests.
+  var inFlightReservationCount: Int { flightIDByKey.count }
 }
 
 /// Decorator that caches results from an underlying ASNResolver in-memory.

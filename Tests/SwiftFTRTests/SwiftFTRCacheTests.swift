@@ -48,6 +48,12 @@ final class SwiftFTRCacheTests: XCTestCase {
     case requestedFailure
   }
 
+  private struct ImmediateFailureResolver: ASNResolver {
+    func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+      throw ControlledResolverError.requestedFailure
+    }
+  }
+
   /// Resolver whose calls remain suspended until a test explicitly completes them.
   private actor ControlledResolver: ASNResolver {
     private var batches: [[String]] = []
@@ -385,6 +391,22 @@ final class SwiftFTRCacheTests: XCTestCase {
     _ = try await long.value
     let callCount = await base.callCount()
     XCTAssertEqual(callCount, 2)
+  }
+
+  func testRejectedNaNTimeoutReleasesFlightReservation() async {
+    let caching = CachingASNResolver(base: ImmediateFailureResolver())
+
+    do {
+      _ = try await caching.resolve(ipv4Addrs: ["203.0.113.7"], timeout: .nan)
+      XCTFail("The base resolver should reject the lookup")
+    } catch ControlledResolverError.requestedFailure {
+      // Expected.
+    } catch {
+      XCTFail("Unexpected error: \(error)")
+    }
+
+    let reservationCount = await _ASNMemoryCache.shared.inFlightReservationCount
+    XCTAssertEqual(reservationCount, 0, "A rejected timeout must not leak its flight key")
   }
 
   func testCachingResolverReleasesFailedFlightsForRetry() async throws {
