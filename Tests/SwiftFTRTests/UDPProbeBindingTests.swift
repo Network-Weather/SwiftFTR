@@ -11,6 +11,7 @@ import Testing
   struct UDPProbeBindingTests {
     @Test(
       "Routes empty datagrams through the requested interface and source IP",
+      .timeLimit(.minutes(1)),
       arguments: LoopbackFamily.allCases
     )
     func emptyDatagramPreservesPayloadAndRoute(family: LoopbackFamily) async throws {
@@ -30,12 +31,15 @@ import Testing
         )
       )
 
+      try #require(
+        result.responseType == "udp_reply",
+        "Probe ended before the loopback server returned a UDP reply: \(result.error ?? "no error")"
+      )
       let datagram = try #require(await datagrams.next())
 
       #expect(datagram.isEmpty)
       #expect(result.isReachable)
       #expect(result.resolvedIP == route.address)
-      #expect(result.responseType == "udp_reply")
       #expect(result.error == nil)
     }
 
@@ -72,11 +76,13 @@ import Testing
       #expect(result.error == "Invalid source IPv4 address '::1'")
     }
 
-    @Test("Cancellation closes a waiting probe without waiting for its timeout")
+    @Test(
+      "Cancellation closes a waiting probe without waiting for its timeout",
+      .timeLimit(.minutes(1))
+    )
     func cancellationFinishesPromptly() async throws {
       let route = try await discoverLoopbackRoute(for: .ipv4)
       let server = try LoopbackUDPServer(route: route, reply: nil)
-      var datagrams = server.datagrams.makeAsyncIterator()
       let probe = Task {
         try await udpProbe(
           config: UDPProbeConfig(
@@ -90,14 +96,72 @@ import Testing
         )
       }
 
-      _ = try #require(await datagrams.next())
-      let start = ContinuousClock.now
-      probe.cancel()
+      let (_, start) = try await cancelProbeAfterFirstDatagram(
+        from: server.datagrams,
+        probe: probe
+      )
 
       await #expect(throws: CancellationError.self) {
         try await probe.value
       }
       #expect(ContinuousClock.now - start < .seconds(1))
+    }
+  }
+
+  private enum ProbeStartEvent: Sendable {
+    case datagram(Data?)
+    case probeCompleted
+    case timedOut
+    case cancelled
+  }
+
+  private enum ProbeStartError: Error {
+    case datagramStreamEnded
+    case probeCompletedBeforeDatagram
+    case timedOut
+  }
+
+  private func cancelProbeAfterFirstDatagram(
+    from datagrams: AsyncStream<Data>,
+    probe: Task<UDPProbeResult, Error>
+  ) async throws -> (Data, ContinuousClock.Instant) {
+    try await withThrowingTaskGroup(of: ProbeStartEvent.self) { group in
+      defer {
+        probe.cancel()
+        group.cancelAll()
+      }
+
+      group.addTask {
+        var iterator = datagrams.makeAsyncIterator()
+        return .datagram(await iterator.next())
+      }
+      group.addTask {
+        _ = try? await probe.value
+        return .probeCompleted
+      }
+      group.addTask {
+        do {
+          try await Task.sleep(for: .seconds(1))
+          return .timedOut
+        } catch {
+          return .cancelled
+        }
+      }
+
+      guard let event = try await group.next() else {
+        throw ProbeStartError.datagramStreamEnded
+      }
+      switch event {
+      case .datagram(let datagram):
+        guard let datagram else {
+          throw ProbeStartError.datagramStreamEnded
+        }
+        return (datagram, ContinuousClock.now)
+      case .probeCompleted:
+        throw ProbeStartError.probeCompletedBeforeDatagram
+      case .timedOut, .cancelled:
+        throw ProbeStartError.timedOut
+      }
     }
   }
 
