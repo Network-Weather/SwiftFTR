@@ -6,7 +6,9 @@ import Foundation
 
 // MARK: - Configuration
 
-/// Configuration for bufferbloat/responsiveness test
+/// Configuration for a bufferbloat/responsiveness test.
+///
+/// Values are validated by ``SwiftFTR/testBufferbloat(config:)`` before the test starts.
 public struct BufferbloatConfig: Sendable {
   /// Target to ping for latency measurement (default: 1.1.1.1)
   public let target: String

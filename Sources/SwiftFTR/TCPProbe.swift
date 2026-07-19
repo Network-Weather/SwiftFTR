@@ -7,7 +7,9 @@ import Foundation
   import Glibc
 #endif
 
-/// Configuration for TCP probing
+/// Configuration for TCP probing.
+///
+/// Values are validated by ``tcpProbe(config:)`` before resolution or socket creation.
 public struct TCPProbeConfig: Sendable {
   /// Target host (hostname or IP)
   public let host: String
@@ -24,14 +26,16 @@ public struct TCPProbeConfig: Sendable {
   ///
   /// Example:
   /// ```swift
-  /// // Test TCP connectivity via specific interface
-  /// let result = try await tcpProbe(
-  ///   config: TCPProbeConfig(
-  ///     host: "example.com",
-  ///     port: 443,
-  ///     interface: "en14"
+  /// let snapshot = await NetworkInterfaceDiscovery().discover()
+  /// if let selectedInterface = snapshot.activeInterfaces.first {
+  ///   let result = try await tcpProbe(
+  ///     config: TCPProbeConfig(
+  ///       host: "example.com",
+  ///       port: 443,
+  ///       interface: selectedInterface.name
+  ///     )
   ///   )
-  /// )
+  /// }
   /// ```
   public let interface: String?
 
@@ -155,6 +159,7 @@ public func tcpProbe(
 /// - Returns: The reachability result and observed connection state.
 /// - Throws: `CancellationError` when the calling task is cancelled.
 public func tcpProbe(config: TCPProbeConfig) async throws -> TCPProbeResult {
+  try config.validateForOperation()
   try Task.checkCancellation()
 
   let startTime = Date()
@@ -356,10 +361,11 @@ private func monotonicTime() -> TimeInterval {
 
 /// The pair of Dispatch sources owned by a pending TCP connection.
 ///
-/// The cancellation closure is only created and invoked on the operation's
-/// private serial queue. The unchecked conformance is limited to this wrapper
-/// because Dispatch source protocols do not expose Sendable conformances on all
-/// supported toolchains.
+/// The cancellation closure requests cancellation of both sources on the
+/// operation's private serial queue. Descriptor cleanup is deferred until the
+/// write source invokes the cancellation callback supplied to its factory. The
+/// unchecked conformance is limited to this wrapper because Dispatch source
+/// protocols do not expose Sendable conformances on all supported toolchains.
 struct TCPProbeEventSources: @unchecked Sendable {
   let cancel: () -> Void
 }
@@ -376,6 +382,7 @@ struct TCPProbeOperationDependencies: Sendable {
       TimeInterval,
       DispatchQueue,
       @escaping @Sendable () -> Void,
+      @escaping @Sendable () -> Void,
       @escaping @Sendable () -> Void
     ) -> TCPProbeEventSources
   let socketError: @Sendable (Int32) -> Int32
@@ -383,10 +390,11 @@ struct TCPProbeOperationDependencies: Sendable {
   let now: @Sendable () -> TimeInterval
 
   static let live = TCPProbeOperationDependencies(
-    makeEventSources: { sockfd, timeout, queue, connectCompleted, timedOut in
+    makeEventSources: {
+      sockfd, timeout, queue, connectCompleted, timedOut, writeSourceDidCancel in
       let writeSource = DispatchSource.makeWriteSource(fileDescriptor: sockfd, queue: queue)
       writeSource.setEventHandler(handler: connectCompleted)
-      writeSource.setCancelHandler {}
+      writeSource.setCancelHandler(handler: writeSourceDidCancel)
       writeSource.activate()
 
       let timerSource = DispatchSource.makeTimerSource(queue: queue)
@@ -418,9 +426,11 @@ struct TCPProbeOperationDependencies: Sendable {
 ///
 /// All Dispatch source and descriptor access is confined to `queue`. Cancellation
 /// intent is recorded synchronously under `stateLock`, then cleanup is enqueued on
-/// `queue`. This ensures a callback queued before cancellation either completes
-/// first or observes cancellation before touching the descriptor; a callback can
-/// never run socket operations after the descriptor has been closed and reused.
+/// `queue`. The descriptor is closed only after the write source's cancellation
+/// handler fires, when Dispatch no longer references it. This ensures a callback
+/// queued before cancellation either completes first or observes cancellation
+/// before touching the descriptor; a callback can never run socket operations
+/// after the descriptor has been closed and reused.
 final class TCPProbeOperation: @unchecked Sendable {
   private let sockfd: Int32
   private let timeout: TimeInterval
@@ -429,6 +439,7 @@ final class TCPProbeOperation: @unchecked Sendable {
 
   private var continuation: CheckedContinuation<ProbeResult, Error>?
   private var eventSources: TCPProbeEventSources?
+  private var resultAwaitingSourceCancellation: Result<ProbeResult, Error>?
 
   private let queue: DispatchQueue
   private let stateLock = NSLock()
@@ -478,8 +489,8 @@ final class TCPProbeOperation: @unchecked Sendable {
       self.setupSources()
 
       // Cancellation can arrive while the source factory is installing its
-      // callbacks. Check again so the operation does not wait for the queued
-      // cancellation block before releasing the descriptor.
+      // callbacks. Check again so source cancellation begins without waiting
+      // for the cancellation block already queued behind this setup block.
       if self.cancelRequested {
         self.finish(.failure(CancellationError()))
       }
@@ -506,7 +517,10 @@ final class TCPProbeOperation: @unchecked Sendable {
       timeout,
       queue,
       { [weak self] in self?.handleConnectComplete() },
-      { [weak self] in self?.handleTimeout() }
+      { [weak self] in self?.handleTimeout() },
+      // Keep the operation alive until Dispatch has stopped referencing the
+      // descriptor. `writeSourceDidCancel` breaks this ownership cycle.
+      { self.writeSourceDidCancel() }
     )
   }
 
@@ -565,11 +579,30 @@ final class TCPProbeOperation: @unchecked Sendable {
       cancellationRequested ? .failure(CancellationError()) : proposedResult
     stateLock.unlock()
 
-    // Source cancellation, descriptor closure, and continuation resumption stay
-    // on the same serial queue, in that order. Late source callbacks first see
-    // `isFinished` and therefore cannot inspect a reused descriptor.
-    eventSources?.cancel()
+    // A Dispatch source may continue referencing its descriptor after cancel()
+    // returns. Keep the sources and continuation alive until the write source's
+    // cancellation handler confirms that the descriptor is safe to close.
+    if let eventSources {
+      resultAwaitingSourceCancellation = result
+      eventSources.cancel()
+      return
+    }
+
+    closeSocketAndResume(with: result)
+  }
+
+  /// Called on `queue` after Dispatch has released the write source's descriptor.
+  private func writeSourceDidCancel() {
+    guard let result = resultAwaitingSourceCancellation else {
+      return
+    }
+
+    resultAwaitingSourceCancellation = nil
     eventSources = nil
+    closeSocketAndResume(with: result)
+  }
+
+  private func closeSocketAndResume(with result: Result<ProbeResult, Error>) {
     dependencies.closeSocket(sockfd)
 
     let currentContinuation = continuation

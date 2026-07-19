@@ -1,25 +1,27 @@
 # Interface and Source IP Binding
 
-Control which network interface SwiftFTR uses for network operations.
+Control which network interface supported SwiftFTR operations use.
 
 ## Overview
 
-SwiftFTR supports binding operations to specific network interfaces, giving you precise control over routing in multi-interface scenarios like:
+SwiftFTR supports binding selected socket-backed operations to specific network interfaces, giving you routing control in multi-interface scenarios like:
 
 - Simultaneous WiFi and Ethernet connections
 - VPN tunnel selection
 - Multi-homed servers
 - Network testing and troubleshooting
 
-Interface binding is available at two levels: global (set at initialization) and per-operation (override for specific calls).
+Support varies by API. Traceroute uses the global ``SwiftFTRConfig`` setting, ping supports global
+and per-operation settings, and TCP, UDP, and DNS probes expose operation-level settings. HTTP
+probes follow system routing because URLSession does not expose interface binding.
 
 ## Binding Levels
 
-SwiftFTR provides two levels of interface binding with a clear resolution order.
+Some SwiftFTR APIs provide both global and per-operation binding with a clear resolution order.
 
 ### Global Binding
 
-Set a default interface for all operations:
+Set a default interface for supported operations launched through a ``SwiftFTR/SwiftFTR`` instance, including traceroute, ping, and the DNS query helpers:
 
 ```swift
 import SwiftFTR
@@ -30,7 +32,7 @@ let config = SwiftFTRConfig(
 )
 let ftr = SwiftFTR(config: config)
 
-// All operations use en0
+// Traceroute and ping use the configured interface
 let trace = try await ftr.trace(to: "1.1.1.1")
 let ping = try await ftr.ping(to: "8.8.8.8")
 ```
@@ -59,7 +61,7 @@ let wifiPing2 = try await ftr.ping(to: "8.8.8.8")
 
 ## Resolution Order
 
-SwiftFTR resolves interface and source IP binding in this priority order:
+For APIs that expose both global and operation settings, SwiftFTR resolves interface and source IP binding in this priority order:
 
 **Operation Config → Global Config → System Default**
 
@@ -83,7 +85,14 @@ let result3 = try await ftr2.ping(to: "1.1.1.1")  // Uses system routing
 
 ## Supported Operations
 
-All probe operations support per-operation interface binding.
+Binding support is not uniform across every transport:
+
+- Traceroute and streaming traceroute use ``SwiftFTR/SwiftFTRConfig/interface`` and ``SwiftFTR/SwiftFTRConfig/sourceIP``.
+- Ping uses the global settings and supports overrides through ``SwiftFTR/PingConfig``.
+- The DNS query helpers use global settings and support call-level overrides. The standalone DNS probe uses ``SwiftFTR/DNSProbeConfig``.
+- The standalone TCP and UDP probes use ``SwiftFTR/TCPProbeConfig`` and ``SwiftFTR/UDPProbeConfig``.
+- Bufferbloat applies its binding settings only to latency pings; its HTTP load traffic follows system routing.
+- HTTP probes don't expose binding settings.
 
 ### Ping
 
@@ -119,6 +128,23 @@ let result = try await tcpProbe(
 print("TCP probe via en0: \(result.isReachable ? "reachable" : "unreachable")")
 ```
 
+### UDP Probe
+
+```swift
+import SwiftFTR
+
+let result = try await udpProbe(
+    config: UDPProbeConfig(
+        host: "1.1.1.1",
+        port: 53,
+        timeout: 2.0,
+        interface: interfaceName
+    )
+)
+
+print("UDP probe via \(interfaceName): \(result.isReachable ? "reachable" : "unreachable")")
+```
+
 ### DNS Probe
 
 ```swift
@@ -136,7 +162,16 @@ let result = try await dnsProbe(
 print("DNS probe via en14: \(result.isReachable ? "reachable" : "unreachable")")
 ```
 
+### HTTP Probe
+
+HTTP and HTTPS probes use URLSession and do not support interface or source-IP binding. Their
+traffic follows the system-selected route.
+
 ### Bufferbloat Test
+
+Only bufferbloat's latency probes can be bound; its HTTP load uses URLSession and is not bound to
+the same route. Do not interpret a loaded, bound result as a route-specific bufferbloat comparison.
+Use a zero load duration when you need only a bound baseline latency measurement:
 
 ```swift
 import SwiftFTR
@@ -146,12 +181,12 @@ let result = try await ftr.testBufferbloat(
     config: BufferbloatConfig(
         target: "1.1.1.1",
         baselineDuration: 3.0,
-        loadDuration: 5.0,
-        interface: "en0"
+        loadDuration: 0,
+        interface: interfaceName
     )
 )
 
-print("Bufferbloat via en0: \(result.grade.rawValue)")
+print("Baseline latency via \(interfaceName): \(result.baseline.avgMs) ms")
 ```
 
 ## Multi-Interface Monitoring
@@ -265,7 +300,7 @@ let result2 = try await SwiftFTR().ping(
 **Requirements**:
 - Source IP must be assigned to the network interface
 - Interface must be up and reachable
-- IP must be valid IPv4 address
+- IP must be a valid IPv4 or IPv6 address; link-local IPv6 addresses may include a `%zone` suffix
 
 ## Error Handling
 
@@ -325,68 +360,28 @@ Common error scenarios:
 - **IP not assigned**: Source IP is not configured on the interface
 - **Interface index not found**: Interface exists but `if_nametoindex()` failed
 
-## Bufferbloat Comparison Example
+## URLSession Limitation
 
-Compare bufferbloat quality across interfaces:
-
-```swift
-import SwiftFTR
-
-let ftr = SwiftFTR()
-
-// Test WiFi
-let wifiConfig = BufferbloatConfig(
-    target: "1.1.1.1",
-    baselineDuration: 3.0,
-    loadDuration: 5.0,
-    interface: "en0"
-)
-let wifiResult = try await ftr.testBufferbloat(config: wifiConfig)
-
-// Test Ethernet
-let ethConfig = BufferbloatConfig(
-    target: "1.1.1.1",
-    baselineDuration: 3.0,
-    loadDuration: 5.0,
-    interface: "en14"
-)
-let ethResult = try await ftr.testBufferbloat(config: ethConfig)
-
-// Compare
-print("WiFi Bufferbloat:")
-print("  Grade: \(wifiResult.grade.rawValue)")
-print("  Latency increase: +\(String(format: "%.1f", wifiResult.latencyIncrease.percentageIncrease))%")
-
-print("\nEthernet Bufferbloat:")
-print("  Grade: \(ethResult.grade.rawValue)")
-print("  Latency increase: +\(String(format: "%.1f", ethResult.latencyIncrease.percentageIncrease))%")
-
-// Determine better interface
-if wifiResult.grade < ethResult.grade {
-    print("\n✅ WiFi has better bufferbloat performance")
-} else if ethResult.grade < wifiResult.grade {
-    print("\n✅ Ethernet has better bufferbloat performance")
-} else {
-    print("\n🤝 Both interfaces perform similarly")
-}
-```
+HTTP/HTTPS probes and bufferbloat load generation use URLSession. URLSession's public API does not
+provide an interface or source-IP binding option, so those requests follow the system-selected
+route. SwiftFTR does not claim that setting a global binding changes URLSession traffic.
 
 ## Implementation Details
 
-SwiftFTR uses macOS's `IP_BOUND_IF` socket option for interface binding:
+SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for interface binding:
 
-- Socket option 25 (`IP_BOUND_IF`) is macOS/iOS specific
+- Socket option 25 (`IP_BOUND_IF`) is Darwin-specific
 - Takes interface index from `if_nametoindex()`
 - Applied after `socket()` but before network operations
-- Works for `SOCK_DGRAM` (ICMP, DNS) and `SOCK_STREAM` (TCP)
+- Applied to ICMP, DNS, TCP, and UDP sockets by the APIs listed above
 - Requires valid interface name and index
 
-The binding is applied consistently across all probe types, ensuring predictable routing behavior.
+The binding applies to ping, traceroute, TCP, UDP, and DNS sockets. It does not apply to
+URLSession-backed HTTP/HTTPS probes or bufferbloat load requests.
 
 ## Platform Support
 
-- **macOS**: Full support via `IP_BOUND_IF` socket option
-- **iOS**: Full support (requires network entitlements)
+- **macOS**: Supported socket operations use `IP_BOUND_IF` / `IPV6_BOUND_IF`
 - **Linux**: Not yet supported (would require `SO_BINDTODEVICE`)
 
 ## Topics
@@ -399,6 +394,8 @@ The binding is applied consistently across all probe types, ensuring predictable
 - ``SwiftFTR/PingConfig/sourceIP``
 - ``SwiftFTR/TCPProbeConfig/interface``
 - ``SwiftFTR/TCPProbeConfig/sourceIP``
+- ``SwiftFTR/UDPProbeConfig/interface``
+- ``SwiftFTR/UDPProbeConfig/sourceIP``
 - ``SwiftFTR/DNSProbeConfig/interface``
 - ``SwiftFTR/DNSProbeConfig/sourceIP``
 - ``SwiftFTR/BufferbloatConfig/interface``

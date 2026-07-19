@@ -100,6 +100,43 @@ struct TCPProbeCancellationTests {
     #expect(driver.socketErrorReadCount == 0)
   }
 
+  @Test("socket close waits for the write source cancellation handler")
+  func socketCloseWaitsForSourceCancellationHandler() async throws {
+    let driver = TCPProbeTestDriver(
+      socketError: 0,
+      delaySourceCancellationHandler: true
+    )
+    let operation = makeOperation(driver: driver, descriptor: 103)
+    let task = Task { try await operation.run() }
+
+    await driver.waitUntilInstalled()
+    task.cancel()
+    await driver.waitUntilSourceCancellationRequested()
+    try await driver.drainEventQueue()
+
+    // DispatchSource.cancel() is asynchronous. Even after finish() returns,
+    // the descriptor and continuation remain owned until the source's
+    // cancellation handler confirms that Dispatch has released the descriptor.
+    #expect(driver.sourceCancellationCount == 1)
+    #expect(driver.socketCloseCount == 0)
+    #expect(driver.cleanupEvents.isEmpty)
+    #expect(driver.socketErrorReadCount == 0)
+
+    try await driver.triggerSourceCancellationHandler()
+
+    do {
+      _ = try await task.value
+      Issue.record("Expected the operation to throw CancellationError")
+    } catch {
+      #expect(error is CancellationError)
+    }
+
+    #expect(driver.cleanupEvents == [.sourcesCancelled, .socketClosed])
+    #expect(driver.sourceCancellationCount == 1)
+    #expect(driver.socketCloseCount == 1)
+    #expect(driver.socketErrorReadCount == 0)
+  }
+
   @Test("completion and cancellation races resume once and never inspect a reused descriptor")
   func completionCancellationRaces() async throws {
     for descriptor in 200..<250 {
@@ -184,6 +221,7 @@ struct TCPProbeCancellationTests {
 
 private enum TCPProbeTestDriverError: Error {
   case sourcesNotInstalled
+  case sourceCancellationNotRequested
 }
 
 private enum TCPProbeCleanupEvent: Equatable, Sendable {
@@ -197,6 +235,7 @@ private final class TCPProbeTestDriver: @unchecked Sendable {
     var queue: DispatchQueue?
     var connectCompleted: (@Sendable () -> Void)?
     var timedOut: (@Sendable () -> Void)?
+    var writeSourceDidCancel: (@Sendable () -> Void)?
     var didInstallSources = false
     var sourceCancellationCount = 0
     var socketCloseCount = 0
@@ -206,34 +245,57 @@ private final class TCPProbeTestDriver: @unchecked Sendable {
   }
 
   private let socketErrorValue: Int32
+  private let delaySourceCancellationHandler: Bool
   private let lock = NSLock()
   private var state = State()
   private let installedEvents: AsyncStream<Void>
   private let installedContinuation: AsyncStream<Void>.Continuation
+  private let sourceCancellationRequests: AsyncStream<Void>
+  private let sourceCancellationRequestContinuation: AsyncStream<Void>.Continuation
 
-  init(socketError: Int32) {
+  init(socketError: Int32, delaySourceCancellationHandler: Bool = false) {
     socketErrorValue = socketError
+    self.delaySourceCancellationHandler = delaySourceCancellationHandler
+
     let (stream, continuation) = AsyncStream<Void>.makeStream()
     installedEvents = stream
     installedContinuation = continuation
+
+    let (cancellationStream, cancellationContinuation) = AsyncStream<Void>.makeStream()
+    sourceCancellationRequests = cancellationStream
+    sourceCancellationRequestContinuation = cancellationContinuation
   }
 
   var dependencies: TCPProbeOperationDependencies {
     TCPProbeOperationDependencies(
-      makeEventSources: { [self] _, _, queue, connectCompleted, timedOut in
+      makeEventSources: {
+        [self] _, _, queue, connectCompleted, timedOut, writeSourceDidCancel in
         withState { state in
           state.queue = queue
           state.connectCompleted = connectCompleted
           state.timedOut = timedOut
+          state.writeSourceDidCancel = writeSourceDidCancel
           state.didInstallSources = true
         }
         installedContinuation.yield()
         installedContinuation.finish()
 
         return TCPProbeEventSources { [self] in
-          withState { state in
+          let immediateCancellationHandler: (@Sendable () -> Void)? = withState { state in
             state.sourceCancellationCount += 1
-            state.cleanupEvents.append(.sourcesCancelled)
+            guard !delaySourceCancellationHandler else {
+              return nil
+            }
+            let handler = state.writeSourceDidCancel
+            state.writeSourceDidCancel = nil
+            return handler
+          }
+
+          sourceCancellationRequestContinuation.yield()
+          sourceCancellationRequestContinuation.finish()
+
+          if let immediateCancellationHandler {
+            invokeSourceCancellationHandler(immediateCancellationHandler)
           }
         }
       },
@@ -290,6 +352,48 @@ private final class TCPProbeTestDriver: @unchecked Sendable {
     }
   }
 
+  func waitUntilSourceCancellationRequested() async {
+    if sourceCancellationCount > 0 {
+      return
+    }
+
+    for await _ in sourceCancellationRequests {
+      return
+    }
+  }
+
+  func drainEventQueue() async throws {
+    guard let queue = withState({ $0.queue }) else {
+      throw TCPProbeTestDriverError.sourcesNotInstalled
+    }
+    await invoke({}, on: queue)
+  }
+
+  func triggerSourceCancellationHandler() async throws {
+    let event: (queue: DispatchQueue, callback: @Sendable () -> Void)? = withState { state in
+      guard
+        state.sourceCancellationCount > 0,
+        let queue = state.queue,
+        let callback = state.writeSourceDidCancel
+      else {
+        return nil
+      }
+
+      state.writeSourceDidCancel = nil
+      return (queue, callback)
+    }
+    guard let (queue, callback) = event else {
+      throw TCPProbeTestDriverError.sourceCancellationNotRequested
+    }
+
+    await invoke(
+      { [self] in
+        invokeSourceCancellationHandler(callback)
+      },
+      on: queue
+    )
+  }
+
   func triggerConnectCompletion() async throws {
     let event = withState { state in
       state.queue.flatMap { queue in
@@ -324,6 +428,15 @@ private final class TCPProbeTestDriver: @unchecked Sendable {
         continuation.resume()
       }
     }
+  }
+
+  private func invokeSourceCancellationHandler(
+    _ callback: @escaping @Sendable () -> Void
+  ) {
+    withState { state in
+      state.cleanupEvents.append(.sourcesCancelled)
+    }
+    callback()
   }
 
   private func withState<T>(_ body: (inout State) -> T) -> T {
