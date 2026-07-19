@@ -21,8 +21,8 @@ let tracer = SwiftFTR()
 let result = try await tracer.testBufferbloat()
 
 print("Grade: \(result.grade.rawValue)")           // A, B, C, D, or F
-print("Baseline: \(result.baseline.medianMs) ms")
-print("Loaded: \(result.loaded.medianMs) ms")
+print("Baseline: \(result.baseline.p50Ms) ms")
+print("Loaded: \(result.loaded.p50Ms) ms")
 print("Increase: \(result.latencyIncrease.absoluteMs) ms")
 
 if let rpm = result.rpm {
@@ -45,15 +45,43 @@ let config = BufferbloatConfig(
 let result = try await tracer.testBufferbloat(config: config)
 ```
 
+## Bound Baseline-Only Measurements
+
+Set `loadDuration` to zero when you need latency measurements bound to an interface or source IP:
+
+```swift
+let tracer = SwiftFTR(config: SwiftFTRConfig(interface: interfaceName))
+let result = try await tracer.testBufferbloat(
+    config: BufferbloatConfig(
+        target: "1.1.1.1",
+        baselineDuration: 5.0,
+        loadDuration: 0
+    )
+)
+
+print("Baseline: \(result.baseline.avgMs) ms")
+```
+
+This mode provides usable `result.baseline` statistics and baseline entries in
+`result.pingResults`. It does not perform a loaded phase, so `result.loaded`,
+`result.latencyIncrease`, `result.rpm`, and `result.grade` are compatibility placeholders and are
+not meaningful. The video-call assessment is derived from the same unavailable loaded metrics and
+must not be interpreted either.
+
+A test with `loadDuration > 0` rejects any effective `interface` or `sourceIP` binding, whether it
+comes from ``BufferbloatConfig`` or the enclosing ``SwiftFTR/SwiftFTR`` configuration. URLSession
+cannot bind the generated HTTP load to that route, and comparing unbound load with bound latency
+would not be a valid bufferbloat measurement.
+
 ## Grading Scale
 
 | Grade | Latency Increase | Video Call Impact |
 |-------|-------------------|-------------------|
-| A     | < 5 ms            | Excellent — no issues expected |
-| B     | 5–30 ms           | Good — occasional minor glitches possible |
-| C     | 30–60 ms          | Fair — noticeable quality degradation |
-| D     | 60–200 ms         | Poor — frequent freezing and audio drops |
-| F     | > 200 ms          | Failing — calls essentially unusable under load |
+| A     | < 25 ms           | Excellent — no issues expected |
+| B     | 25–75 ms          | Good — occasional minor glitches possible |
+| C     | 75–150 ms         | Fair — noticeable quality degradation |
+| D     | 150–300 ms        | Poor — frequent freezing and audio drops |
+| F     | ≥ 300 ms          | Failing — calls essentially unusable under load |
 
 ## Video Call Impact
 

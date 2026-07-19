@@ -6,6 +6,8 @@ import Foundation
 /// expiration and size-based eviction. It uses Swift 6.1's actor isolation for
 /// thread safety and the Clock API for accurate timing.
 actor RDNSCache {
+  typealias Resolver = @Sendable (String) async -> String?
+
   private struct CacheEntry {
     let hostname: String?
     let timestamp: ContinuousClock.Instant
@@ -15,14 +17,25 @@ actor RDNSCache {
   private let ttl: Duration
   private let maxSize: Int
   private let clock = ContinuousClock()
+  private let resolver: Resolver
+  private var generation: UInt64 = 0
 
   /// Initialize a new rDNS cache.
   /// - Parameters:
   ///   - ttl: Time to live for cache entries in seconds (default: 86400 = 1 day)
   ///   - maxSize: Maximum number of entries to cache (default: 1000)
-  init(ttl: TimeInterval = 86400, maxSize: Int = 1000) {
+  init(
+    ttl: TimeInterval = 86400,
+    maxSize: Int = 1000,
+    resolver: @escaping Resolver = { ip in
+      try? await runDetachedBlockingIO(priority: .background) {
+        reverseDNS(ip)
+      }
+    }
+  ) {
     self.ttl = .seconds(ttl)
     self.maxSize = maxSize
+    self.resolver = resolver
   }
 
   /// Look up a hostname for an IP address, using cache if available.
@@ -36,13 +49,16 @@ actor RDNSCache {
       return entry.hostname
     }
 
-    // Perform lookup in background using utility that properly wraps blocking I/O
-    let hostname = try? await runDetachedBlockingIO(priority: .background) {
-      reverseDNS(ip)
-    }
+    let lookupGeneration = generation
+    let hostname = await resolver(ip)
+
+    // `clear()` may run while the resolver is suspended. A result from the old
+    // network generation must neither escape to the caller nor repopulate the
+    // newly invalidated cache.
+    guard lookupGeneration == generation else { return nil }
 
     // Cache the result
-    cache[ip] = CacheEntry(hostname: hostname, timestamp: now)
+    cache[ip] = CacheEntry(hostname: hostname, timestamp: clock.now)
 
     // Evict oldest entry if cache is too large
     if cache.count > maxSize {
@@ -75,6 +91,7 @@ actor RDNSCache {
 
   /// Clear all cached entries.
   func clear() {
+    generation &+= 1
     cache.removeAll()
   }
 
