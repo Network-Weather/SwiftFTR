@@ -16,7 +16,12 @@ public struct BufferbloatConfig: Sendable {
   /// Duration of baseline (idle) measurement in seconds
   public let baselineDuration: TimeInterval
 
-  /// Duration of load generation in seconds
+  /// Duration of load generation in seconds.
+  ///
+  /// Set this to zero for a baseline-only latency measurement. In that mode, only
+  /// ``BufferbloatResult/baseline`` and baseline entries in ``BufferbloatResult/pingResults`` are
+  /// meaningful; loaded statistics and derived bufferbloat metrics are placeholders and must not
+  /// be interpreted.
   public let loadDuration: TimeInterval
 
   /// Type of load to generate
@@ -37,31 +42,33 @@ public struct BufferbloatConfig: Sendable {
   /// Custom download URL (default: Cloudflare speed test)
   public let downloadURL: String?
 
-  /// Network interface to bind to for ping measurements during bufferbloat test.
+  /// Network interface to bind to for latency measurements during a baseline-only test.
   ///
-  /// When specified, all ping measurements (baseline and loaded) use only this interface.
-  /// If `nil`, uses system routing.
-  ///
-  /// **Note**: Load generation (HTTP upload/download) is not bound to the interface - only latency measurements.
+  /// URLSession does not expose a public API for binding HTTP traffic to an interface. To avoid
+  /// comparing latency and load from different routes, loaded tests reject this option (and a
+  /// globally configured interface) with ``TracerouteError/invalidConfiguration(reason:)``.
+  /// A bound baseline-only run exposes usable baseline latency, but its loaded statistics,
+  /// latency increase, RPM score, and grade are not meaningful.
   ///
   /// Example:
   /// ```swift
-  /// // Test bufferbloat via specific interface
+  /// // Measure baseline latency via a specific interface without generating load.
   /// let result = try await ftr.testBufferbloat(
   ///   config: BufferbloatConfig(
   ///     target: "1.1.1.1",
-  ///     interface: "en0"
+  ///     loadDuration: 0,
+  ///     interface: interfaceName
   ///   )
   /// )
   /// ```
   public let interface: String?
 
-  /// Source IP address to bind to for ping measurements during bufferbloat test.
+  /// Source IP address to bind to for latency measurements during a baseline-only test.
   ///
-  /// When specified, ping packets use this IP as the source address.
-  /// The IP must be assigned to the selected interface.
-  ///
-  /// **Note**: Most users only need to set ``interface``.
+  /// Loaded tests reject this option (and a globally configured source IP), because their HTTP
+  /// traffic cannot be bound to the same source using public URLSession APIs.
+  /// A bound baseline-only run exposes usable baseline latency, but its loaded statistics,
+  /// latency increase, RPM score, and grade are not meaningful.
   public let sourceIP: String?
 
   public init(
@@ -100,7 +107,12 @@ public enum LoadType: String, Sendable, Codable {
 
 // MARK: - Results
 
-/// Result from bufferbloat test
+/// Result from a bufferbloat test or baseline-only latency measurement.
+///
+/// When the configuration's load duration is zero, only ``baseline`` and baseline entries in
+/// ``pingResults`` are meaningful. The loaded statistics, latency increase, RPM score, grade, and
+/// video-call assessment require a loaded phase and must not be interpreted for a baseline-only
+/// result.
 public struct BufferbloatResult: Sendable, Codable {
   /// Target tested
   public let target: String
@@ -111,16 +123,18 @@ public struct BufferbloatResult: Sendable, Codable {
   /// Baseline (idle) measurements
   public let baseline: LatencyMeasurements
 
-  /// Loaded measurements
+  /// Loaded measurements, meaningful only when a loaded phase produced samples.
   public let loaded: LatencyMeasurements
 
-  /// Latency increase statistics
+  /// Latency increase statistics, meaningful only when baseline and loaded phases produced
+  /// samples.
   public let latencyIncrease: LatencyIncrease
 
-  /// RPM (Round-trips Per Minute) score
+  /// RPM (Round-trips Per Minute) score, meaningful only when baseline and loaded phases produced
+  /// samples.
   public let rpm: RPMScore?
 
-  /// Overall bufferbloat grade
+  /// Overall bufferbloat grade, meaningful only when a loaded phase produced samples.
   public let grade: BufferbloatGrade
 
   /// Impact on video calling
@@ -330,16 +344,15 @@ public struct LoadGenerationDetails: Sendable, Codable {
 
 // MARK: - Load Generator
 
-/// Generates network load using multiple parallel HTTP streams
-actor LoadGenerator {
+/// Generates network load using multiple parallel HTTP streams.
+struct LoadGenerator: Sendable {
   private let config: BufferbloatConfig
-  private var activeTasks: [Task<Void, Never>] = []
 
   init(config: BufferbloatConfig) {
     self.config = config
   }
 
-  /// Start generating load
+  /// Generates load until the duration expires or the calling task is cancelled.
   func startLoad(duration: TimeInterval, type: LoadType) async {
     let endTime = Date().addingTimeInterval(duration)
 
@@ -354,14 +367,6 @@ actor LoadGenerator {
       async let download: Void = generateDownloadLoad(until: endTime)
       _ = await (upload, download)
     }
-  }
-
-  /// Stop all load generation
-  func stopLoad() {
-    for task in activeTasks {
-      task.cancel()
-    }
-    activeTasks.removeAll()
   }
 
   /// Generate upload load (POST requests with random data)
@@ -411,20 +416,52 @@ actor LoadGenerator {
 
 // MARK: - Bufferbloat Runner
 
-/// Runs the bufferbloat orchestration off the SwiftFTR actor so synchronous log output and
-/// ping loops never monopolize the actor executor.
+/// Injectable effects used by the bufferbloat orchestrator.
+struct BufferbloatDependencies: Sendable {
+  let ping: @Sendable (String, PingConfig) async throws -> PingResult
+  let generateLoad: @Sendable (TimeInterval, LoadType) async -> Void
+
+  static func live(
+    testConfig: BufferbloatConfig,
+    swiftFTRConfig: SwiftFTRConfig
+  ) -> BufferbloatDependencies {
+    BufferbloatDependencies(
+      ping: { target, pingConfig in
+        let executor = PingExecutor(config: swiftFTRConfig)
+        return try await executor.ping(to: target, config: pingConfig)
+      },
+      generateLoad: { duration, type in
+        let generator = LoadGenerator(config: testConfig)
+        await generator.startLoad(duration: duration, type: type)
+      }
+    )
+  }
+}
+
+/// Runs the bufferbloat orchestration.
 struct BufferbloatRunner: Sendable {
   let testConfig: BufferbloatConfig
   let swiftConfig: SwiftFTRConfig
+  let dependencies: BufferbloatDependencies
 
-  /// Execute the test on a detached task to ensure truly concurrent behavior.
-  func runDetached() async throws -> BufferbloatResult {
-    try await Task.detached(priority: .userInitiated) {
-      try await self.run()
-    }.value
+  init(
+    testConfig: BufferbloatConfig,
+    swiftConfig: SwiftFTRConfig,
+    dependencies: BufferbloatDependencies? = nil
+  ) {
+    self.testConfig = testConfig
+    self.swiftConfig = swiftConfig
+    self.dependencies =
+      dependencies
+      ?? .live(
+        testConfig: testConfig,
+        swiftFTRConfig: swiftConfig
+      )
   }
 
   func run() async throws -> BufferbloatResult {
+    try validateRouteConfiguration()
+
     var allPingResults: [BufferbloatPingResult] = []
 
     if testConfig.baselineDuration > 0 {
@@ -443,9 +480,9 @@ struct BufferbloatRunner: Sendable {
       target: testConfig.target,
       duration: testConfig.baselineDuration,
       interval: testConfig.pingInterval,
-      swiftFTRConfig: swiftConfig,
       interface: testConfig.interface,
-      sourceIP: testConfig.sourceIP
+      sourceIP: testConfig.sourceIP,
+      ping: dependencies.ping
     )
     allPingResults.append(contentsOf: baselineResults)
 
@@ -474,10 +511,9 @@ struct BufferbloatRunner: Sendable {
       loadDuration: testConfig.loadDuration,
       loadType: testConfig.loadType,
       interval: testConfig.pingInterval,
-      config: testConfig,
-      swiftFTRConfig: swiftConfig,
       interface: testConfig.interface,
-      sourceIP: testConfig.sourceIP
+      sourceIP: testConfig.sourceIP,
+      dependencies: dependencies
     )
     allPingResults.append(contentsOf: loadedResults)
 
@@ -586,6 +622,20 @@ struct BufferbloatRunner: Sendable {
       loadDetails: loadDetails
     )
   }
+
+  private func validateRouteConfiguration() throws {
+    guard testConfig.loadDuration > 0 else { return }
+
+    let effectiveInterface = testConfig.interface ?? swiftConfig.interface
+    let effectiveSourceIP = testConfig.sourceIP ?? swiftConfig.sourceIP
+    guard effectiveInterface == nil, effectiveSourceIP == nil else {
+      throw TracerouteError.invalidConfiguration(
+        reason: "Loaded bufferbloat tests do not support interface or sourceIP binding because "
+          + "URLSession load traffic cannot be bound to the same route as latency probes. "
+          + "Remove interface/sourceIP or set loadDuration to 0 for a baseline-only measurement."
+      )
+    }
+  }
 }
 
 // MARK: - Free Functions (non-actor-isolated)
@@ -599,9 +649,9 @@ private func measureBaseline(
   target: String,
   duration: TimeInterval,
   interval: TimeInterval,
-  swiftFTRConfig: SwiftFTRConfig,
   interface: String?,
-  sourceIP: String?
+  sourceIP: String?,
+  ping: @Sendable (String, PingConfig) async throws -> PingResult
 ) async throws -> [BufferbloatPingResult] {
   guard duration > 0 else { return [] }
 
@@ -610,7 +660,6 @@ private func measureBaseline(
 
   // Use PingExecutor with count > 1 to do all pings in a single session
   // This creates only ONE socket and ONE receiver Task for all pings
-  let executor = PingExecutor(config: swiftFTRConfig)
   let pingConfig = PingConfig(
     count: count,
     interval: interval,
@@ -619,7 +668,7 @@ private func measureBaseline(
     sourceIP: sourceIP
   )
 
-  let pingResult = try await executor.ping(to: target, config: pingConfig)
+  let pingResult = try await ping(target, pingConfig)
 
   // Convert PingResponse to BufferbloatPingResult
   return pingResult.responses.enumerated().map { (seq, response) in
@@ -642,25 +691,21 @@ private func measureUnderLoad(
   loadDuration: TimeInterval,
   loadType: LoadType,
   interval: TimeInterval,
-  config: BufferbloatConfig,
-  swiftFTRConfig: SwiftFTRConfig,
   interface: String?,
-  sourceIP: String?
+  sourceIP: String?,
+  dependencies: BufferbloatDependencies
 ) async throws -> [BufferbloatPingResult] {
   guard loadDuration > 0 else { return [] }
 
   let count = Int(loadDuration / interval)
   guard count > 0 else { return [] }
 
-  // Start load generation in background
-  let loadGen = LoadGenerator(config: config)
-  let loadTask = Task {
-    await loadGen.startLoad(duration: loadDuration, type: loadType)
-  }
+  // Keep load generation as a structured child. If ping fails or the caller cancels,
+  // scope exit cancels and awaits this child before propagating the error.
+  async let load: Void = dependencies.generateLoad(loadDuration, loadType)
 
   // Use PingExecutor with count > 1 to do all pings in a single session
   // This creates only ONE socket and ONE receiver Task for all pings
-  let executor = PingExecutor(config: swiftFTRConfig)
   let pingConfig = PingConfig(
     count: count,
     interval: interval,
@@ -669,11 +714,11 @@ private func measureUnderLoad(
     sourceIP: sourceIP
   )
 
-  let pingResult = try await executor.ping(to: target, config: pingConfig)
+  let pingResult = try await dependencies.ping(target, pingConfig)
 
-  // Wait for load generation to finish
-  await loadTask.value
-  await loadGen.stopLoad()
+  // On success, do not return until every load request has completed.
+  await load
+  try Task.checkCancellation()
 
   // Convert PingResponse to BufferbloatPingResult with phase classification
   let rampUpCount = max(1, count / 10)  // First 10% is ramp-up

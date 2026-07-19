@@ -366,8 +366,8 @@ struct InterfaceBindingTests {
     )
   }
 
-  @Test("Bufferbloat test with interface binding")
-  func testBufferbloatInterfaceBinding() async throws {
+  @Test("Baseline-only bufferbloat measurement supports interface binding")
+  func testBaselineOnlyBufferbloatInterfaceBinding() async throws {
     guard !shouldSkipNetworkTests else { return }
     let interfaces = await discoverNetworkInterfaces()
     guard let firstInterface = interfaces.first else {
@@ -380,19 +380,20 @@ struct InterfaceBindingTests {
       config: BufferbloatConfig(
         target: "1.1.1.1",
         baselineDuration: 0.6,
-        loadDuration: 1.2,
+        loadDuration: 0,
         pingInterval: 0.2,
         interface: firstInterface
       )
     )
 
-    if result.loaded.sampleCount == 0 {
+    if result.baseline.sampleCount == 0 {
       print(
-        "⏭️  Bufferbloat load phase produced zero samples via \(firstInterface); network unavailable?"
+        "⏭️  Bufferbloat baseline produced zero samples via \(firstInterface); network unavailable?"
       )
       return
     }
-    print("✓ Bufferbloat test via \(firstInterface): Grade \(result.grade.rawValue)")
+    #expect(result.loaded.sampleCount == 0)
+    print("✓ Bufferbloat baseline measured via \(firstInterface)")
   }
 
   // MARK: - Override Precedence Tests
