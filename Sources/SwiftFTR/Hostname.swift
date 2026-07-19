@@ -66,6 +66,30 @@ internal func bindSourceIP(sockfd: Int32, family: Int32, sourceIP: String) -> St
   }
 }
 
+/// Validates that a configured source address can be used with a resolved
+/// destination before creating or binding a socket.
+internal func validateSourceIPFamily(_ sourceIP: String, destinationFamily: Int32) throws {
+  let sourceFamily = detectAddressFamily(sourceIP)
+  guard sourceFamily == AF_INET || sourceFamily == AF_INET6 else {
+    throw TracerouteError.sourceIPBindFailed(
+      sourceIP: sourceIP,
+      errno: EINVAL,
+      details: "Invalid source IP address '\(sourceIP)'. Expected a numeric IPv4 or IPv6 address."
+    )
+  }
+
+  guard sourceFamily == destinationFamily else {
+    let sourceName = sourceFamily == AF_INET6 ? "IPv6" : "IPv4"
+    let destinationName = destinationFamily == AF_INET6 ? "IPv6" : "IPv4"
+    throw TracerouteError.sourceIPBindFailed(
+      sourceIP: sourceIP,
+      errno: EAFNOSUPPORT,
+      details:
+        "Configured source address is \(sourceName), but the destination resolved to \(destinationName). Set preferredFamily to a matching family."
+    )
+  }
+}
+
 /// Family-aware interface bind via `IP_BOUND_IF` (v4) or `IPV6_BOUND_IF` (v6).
 /// Returns nil on success; an error message string on failure. Caller is
 /// responsible for resolving `interfaceName` to `ifIndex` (typically via
