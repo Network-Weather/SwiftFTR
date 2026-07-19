@@ -45,7 +45,33 @@ let config = BufferbloatConfig(
 let result = try await tracer.testBufferbloat(config: config)
 ```
 
-> Important: `BufferbloatConfig.interface` and `sourceIP` bind the baseline and loaded latency pings only. The HTTP upload/download load follows system routing, so these settings do not make the complete test interface-specific.
+## Bound Baseline-Only Measurements
+
+Set `loadDuration` to zero when you need latency measurements bound to an interface or source IP:
+
+```swift
+let tracer = SwiftFTR(config: SwiftFTRConfig(interface: interfaceName))
+let result = try await tracer.testBufferbloat(
+    config: BufferbloatConfig(
+        target: "1.1.1.1",
+        baselineDuration: 5.0,
+        loadDuration: 0
+    )
+)
+
+print("Baseline: \(result.baseline.avgMs) ms")
+```
+
+This mode provides usable `result.baseline` statistics and baseline entries in
+`result.pingResults`. It does not perform a loaded phase, so `result.loaded`,
+`result.latencyIncrease`, `result.rpm`, and `result.grade` are compatibility placeholders and are
+not meaningful. The video-call assessment is derived from the same unavailable loaded metrics and
+must not be interpreted either.
+
+A test with `loadDuration > 0` rejects any effective `interface` or `sourceIP` binding, whether it
+comes from ``BufferbloatConfig`` or the enclosing ``SwiftFTR/SwiftFTR`` configuration. URLSession
+cannot bind the generated HTTP load to that route, and comparing unbound load with bound latency
+would not be a valid bufferbloat measurement.
 
 ## Grading Scale
 

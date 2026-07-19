@@ -169,9 +169,9 @@ traffic follows the system-selected route.
 
 ### Bufferbloat Test
 
-Only bufferbloat's latency probes can be bound; its HTTP load uses URLSession and is not bound to
-the same route. Do not interpret a loaded, bound result as a route-specific bufferbloat comparison.
-Use a zero load duration when you need only a bound baseline latency measurement:
+Interface and source-IP binding are supported only for a baseline-only latency measurement. A
+loaded bufferbloat test rejects effective per-operation or global bindings because its URLSession
+load traffic cannot be bound to the same route.
 
 ```swift
 import SwiftFTR
@@ -188,6 +188,10 @@ let result = try await ftr.testBufferbloat(
 
 print("Baseline latency via \(interfaceName): \(result.baseline.avgMs) ms")
 ```
+
+Only `result.baseline` and baseline entries in `result.pingResults` are usable in this mode.
+`result.loaded`, `result.latencyIncrease`, `result.rpm`, and `result.grade` require a loaded phase
+and are not meaningful for this result.
 
 ## Multi-Interface Monitoring
 
@@ -366,6 +370,32 @@ HTTP/HTTPS probes and bufferbloat load generation use URLSession. URLSession's p
 provide an interface or source-IP binding option, so those requests follow the system-selected
 route. SwiftFTR does not claim that setting a global binding changes URLSession traffic.
 
+## Bufferbloat Limitation
+
+Loaded bufferbloat tests cannot be bound to an interface or source IP. SwiftFTR uses
+`URLSession` to generate HTTP load, and its public API does not support binding a request to a
+specific route. Binding only the latency probes would compare traffic from potentially different
+routes and produce a misleading grade, so ``SwiftFTR/SwiftFTR/testBufferbloat(config:)`` throws
+``SwiftFTR/TracerouteError/invalidConfiguration(reason:)`` before starting network work.
+
+Interface binding remains available for a baseline-only latency measurement. The baseline
+statistics and baseline ping samples are usable, but loaded statistics, latency increase, RPM,
+grade, and the derived video-call assessment are not meaningful without a loaded phase:
+
+```swift
+import SwiftFTR
+
+let ftr = SwiftFTR()
+let config = BufferbloatConfig(
+    target: "1.1.1.1",
+    baselineDuration: 3.0,
+    loadDuration: 0,
+    interface: interfaceName
+)
+let result = try await ftr.testBufferbloat(config: config)
+print("Baseline latency via \(interfaceName): \(result.baseline.avgMs) ms")
+```
+
 ## Implementation Details
 
 SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for interface binding:
@@ -378,6 +408,8 @@ SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for inter
 
 The binding applies to ping, traceroute, TCP, UDP, and DNS sockets. It does not apply to
 URLSession-backed HTTP/HTTPS probes or bufferbloat load requests.
+Loaded bufferbloat tests reject route-specific configurations because binding only their latency
+probes would invalidate the measurement.
 
 ## Platform Support
 
@@ -405,3 +437,4 @@ URLSession-backed HTTP/HTTPS probes or bufferbloat load requests.
 
 - ``SwiftFTR/TracerouteError/interfaceBindFailed(interface:errno:details:)``
 - ``SwiftFTR/TracerouteError/sourceIPBindFailed(sourceIP:errno:details:)``
+- ``SwiftFTR/TracerouteError/invalidConfiguration(reason:)``
