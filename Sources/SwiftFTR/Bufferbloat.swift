@@ -6,7 +6,9 @@ import Foundation
 
 // MARK: - Configuration
 
-/// Configuration for bufferbloat/responsiveness test
+/// Configuration for a bufferbloat/responsiveness test.
+///
+/// Values are validated by ``SwiftFTR/testBufferbloat(config:)`` before the test starts.
 public struct BufferbloatConfig: Sendable {
   /// Target to ping for latency measurement (default: 1.1.1.1)
   public let target: String
@@ -55,7 +57,7 @@ public struct BufferbloatConfig: Sendable {
   ///   config: BufferbloatConfig(
   ///     target: "1.1.1.1",
   ///     loadDuration: 0,
-  ///     interface: "en0"
+  ///     interface: interfaceName
   ///   )
   /// )
   /// ```
@@ -716,6 +718,7 @@ private func measureUnderLoad(
 
   // On success, do not return until every load request has completed.
   await load
+  try Task.checkCancellation()
 
   // Convert PingResponse to BufferbloatPingResult with phase classification
   let rampUpCount = max(1, count / 10)  // First 10% is ramp-up

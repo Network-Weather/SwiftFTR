@@ -77,11 +77,11 @@ would not be a valid bufferbloat measurement.
 
 | Grade | Latency Increase | Video Call Impact |
 |-------|-------------------|-------------------|
-| A     | < 5 ms            | Excellent — no issues expected |
-| B     | 5–30 ms           | Good — occasional minor glitches possible |
-| C     | 30–60 ms          | Fair — noticeable quality degradation |
-| D     | 60–200 ms         | Poor — frequent freezing and audio drops |
-| F     | > 200 ms          | Failing — calls essentially unusable under load |
+| A     | < 25 ms           | Excellent — no issues expected |
+| B     | 25–75 ms          | Good — occasional minor glitches possible |
+| C     | 75–150 ms         | Fair — noticeable quality degradation |
+| D     | 150–300 ms        | Poor — frequent freezing and audio drops |
+| F     | ≥ 300 ms          | Failing — calls essentially unusable under load |
 
 ## Video Call Impact
 

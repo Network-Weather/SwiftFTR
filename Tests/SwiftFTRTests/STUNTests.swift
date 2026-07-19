@@ -103,6 +103,124 @@ struct STUNTests {
     #expect(!desc.contains(". ."))  // No trailing period-space-period
   }
 
+  // MARK: - Response Validation Tests
+
+  @Test("STUN parser accepts a matching binding response")
+  func testValidBindingResponse() throws {
+    let transactionID = Array(UInt8(0)..<UInt8(12))
+    let response = makeIPv4BindingResponse(
+      transactionID: transactionID,
+      address: [203, 0, 113, 7]
+    )
+
+    let result = try parseSTUNBindingResponse(
+      response, transactionID: transactionID, expectedFamily: AF_INET)
+
+    #expect(result.ip == "203.0.113.7")
+    #expect(result.family == AF_INET)
+  }
+
+  @Test("STUN parser decodes a matching IPv6 binding response")
+  func testValidIPv6BindingResponse() throws {
+    let transactionID = Array(UInt8(0)..<UInt8(12))
+    let address: [UInt8] = [
+      0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 1,
+    ]
+    let response = makeIPv6BindingResponse(
+      transactionID: transactionID,
+      address: address
+    )
+
+    let result = try parseSTUNBindingResponse(
+      response, transactionID: transactionID, expectedFamily: AF_INET6)
+
+    #expect(result.ip == "2001:db8::1")
+    #expect(result.family == AF_INET6)
+  }
+
+  @Test("STUN parser rejects a mismatched transaction ID")
+  func testMismatchedTransactionID() {
+    let transactionID = Array(UInt8(0)..<UInt8(12))
+    let response = makeIPv4BindingResponse(
+      transactionID: transactionID,
+      address: [203, 0, 113, 7]
+    )
+    let otherTransactionID = Array(repeating: UInt8(0xFF), count: 12)
+
+    #expect {
+      try parseSTUNBindingResponse(
+        response, transactionID: otherTransactionID, expectedFamily: AF_INET)
+    } throws: { error in
+      guard case STUNError.invalidResponse(let reason) = error else { return false }
+      return reason.contains("transaction ID")
+    }
+  }
+
+  @Test("STUN parser rejects an invalid magic cookie")
+  func testInvalidMagicCookie() {
+    let transactionID = Array(UInt8(0)..<UInt8(12))
+    var response = makeIPv4BindingResponse(
+      transactionID: transactionID,
+      address: [203, 0, 113, 7]
+    )
+    response[4] = 0
+
+    #expect {
+      try parseSTUNBindingResponse(
+        response, transactionID: transactionID, expectedFamily: AF_INET)
+    } throws: { error in
+      guard case STUNError.invalidResponse(let reason) = error else { return false }
+      return reason.contains("cookie")
+    }
+  }
+
+  @Test("STUN parser rejects a mismatched declared length")
+  func testMismatchedMessageLength() {
+    let transactionID = Array(UInt8(0)..<UInt8(12))
+    var response = makeIPv4BindingResponse(
+      transactionID: transactionID,
+      address: [203, 0, 113, 7]
+    )
+    response[3] = 8
+
+    #expect {
+      try parseSTUNBindingResponse(
+        response, transactionID: transactionID, expectedFamily: AF_INET)
+    } throws: { error in
+      guard case STUNError.invalidResponse(let reason) = error else { return false }
+      return reason.contains("length")
+    }
+  }
+
+  @Test("STUN parser rejects an address from the wrong family")
+  func testMismatchedAddressFamily() {
+    let transactionID = Array(UInt8(0)..<UInt8(12))
+    let response = makeIPv4BindingResponse(
+      transactionID: transactionID,
+      address: [203, 0, 113, 7]
+    )
+
+    #expect {
+      try parseSTUNBindingResponse(
+        response, transactionID: transactionID, expectedFamily: AF_INET6)
+    } throws: { error in
+      guard case STUNError.invalidResponse(let reason) = error else { return false }
+      return reason.contains("requested family")
+    }
+  }
+
+  @Test("STUN rejects invalid timeouts before network I/O", arguments: [0.0, -1.0, .infinity])
+  func testInvalidTimeout(timeout: TimeInterval) {
+    #expect {
+      try stunGetPublicIP(
+        family: AF_INET, host: "unused.invalid", port: 3478, timeout: timeout)
+    } throws: { error in
+      guard case STUNError.invalidTimeout = error else { return false }
+      return true
+    }
+  }
+
   // MARK: - Integration with SwiftFTR
 
   @Test("SwiftFTR caches STUN result")
@@ -417,5 +535,52 @@ struct STUNTests {
     if let v6 = ips.v6 {
       #expect(v6.contains(":"), "v6 IP should contain colons")
     }
+  }
+
+  private func makeIPv4BindingResponse(
+    transactionID: [UInt8], address: [UInt8]
+  ) -> [UInt8] {
+    precondition(transactionID.count == 12)
+    precondition(address.count == 4)
+
+    let cookie: [UInt8] = [0x21, 0x12, 0xA4, 0x42]
+    var response: [UInt8] = [
+      0x01, 0x01,  // Binding Success Response
+      0x00, 0x0C,  // One 12-byte XOR-MAPPED-ADDRESS attribute
+    ]
+    response.append(contentsOf: cookie)
+    response.append(contentsOf: transactionID)
+    response.append(contentsOf: [
+      0x00, 0x20,  // XOR-MAPPED-ADDRESS
+      0x00, 0x08,
+      0x00, 0x01,  // Reserved byte + IPv4 family
+      0x00, 0x00,  // XOR port (unused by the parser)
+    ])
+    response.append(contentsOf: zip(address, cookie).map { $0 ^ $1 })
+    return response
+  }
+
+  private func makeIPv6BindingResponse(
+    transactionID: [UInt8], address: [UInt8]
+  ) -> [UInt8] {
+    precondition(transactionID.count == 12)
+    precondition(address.count == 16)
+
+    let cookie: [UInt8] = [0x21, 0x12, 0xA4, 0x42]
+    let mask = cookie + transactionID
+    var response: [UInt8] = [
+      0x01, 0x01,  // Binding Success Response
+      0x00, 0x18,  // One 24-byte XOR-MAPPED-ADDRESS attribute
+    ]
+    response.append(contentsOf: cookie)
+    response.append(contentsOf: transactionID)
+    response.append(contentsOf: [
+      0x00, 0x20,  // XOR-MAPPED-ADDRESS
+      0x00, 0x14,
+      0x00, 0x02,  // Reserved byte + IPv6 family
+      0x00, 0x00,  // XOR port (unused by the parser)
+    ])
+    response.append(contentsOf: zip(address, mask).map { $0 ^ $1 })
+    return response
   }
 }

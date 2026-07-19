@@ -106,6 +106,45 @@ final class SwiftFTRPingParserTests: XCTestCase {
     XCTAssertNil(parsed, "reply with wrong identifier must be filtered")
   }
 
+  func testV4TimeExceededRequiresQuotedICMPEchoRequest() {
+    let identifier: UInt16 = 0xCAFE
+    let sequence: UInt16 = 0x0011
+    var packet = [UInt8](repeating: 0, count: 8 + 20 + 8)
+    packet[0] = 11  // outer Time Exceeded
+    packet[8] = 0x45  // embedded IPv4, IHL 5
+    packet[8 + 9] = 1  // IPPROTO_ICMP
+    let innerICMP = 8 + 20
+    packet[innerICMP] = 8  // Echo Request
+    packet[innerICMP + 4] = UInt8(identifier >> 8)
+    packet[innerICMP + 5] = UInt8(identifier & 0xFF)
+    packet[innerICMP + 6] = UInt8(sequence >> 8)
+    packet[innerICMP + 7] = UInt8(sequence & 0xFF)
+
+    let valid = packet.withUnsafeBytes { raw -> TestParsedPingMessage? in
+      __parsePingMessage(buffer: raw, expectedIdentifier: identifier)
+    }
+    guard case .some(.timeExceeded(let parsedSequence, _, _)) = valid else {
+      XCTFail("valid quoted Echo Request was not correlated")
+      return
+    }
+    XCTAssertEqual(parsedSequence, sequence)
+
+    let corruptions: [(offset: Int, value: UInt8)] = [
+      (8, 0x44),  // IPv4 IHL is shorter than the minimum header.
+      (8 + 9, 17),  // Embedded protocol is UDP, not ICMP.
+      (innerICMP, 0),  // Embedded message is an Echo Reply, not our request.
+      (innerICMP + 1, 1),  // Echo Request code must be zero.
+    ]
+    for corruption in corruptions {
+      var malformed = packet
+      malformed[corruption.offset] = corruption.value
+      let parsed = malformed.withUnsafeBytes { raw -> TestParsedPingMessage? in
+        __parsePingMessage(buffer: raw, expectedIdentifier: identifier)
+      }
+      XCTAssertNil(parsed)
+    }
+  }
+
   // MARK: - ICMPv6 (RFC 4443) parser
 
   /// ICMPv6 Echo Reply: kernel strips the IPv6 header on SOCK_DGRAM IPPROTO_ICMPV6,
@@ -226,5 +265,31 @@ final class SwiftFTRPingParserTests: XCTestCase {
     default:
       XCTFail("expected timeExceeded, got \(parsed)")
     }
+  }
+
+  func testV6TimeExceededRequiresQuotedICMPv6EchoRequest() {
+    let identifier: UInt16 = 0xCAFE
+    var packet = [UInt8](repeating: 0, count: 8 + 40 + 8)
+    packet[0] = 3
+    packet[8] = 0x60
+    packet[8 + 6] = 58  // IPPROTO_ICMPV6
+    let innerICMP = 8 + 40
+    packet[innerICMP] = 128
+    packet[innerICMP + 4] = UInt8(identifier >> 8)
+    packet[innerICMP + 5] = UInt8(identifier & 0xFF)
+
+    var wrongProtocol = packet
+    wrongProtocol[8 + 6] = 17  // IPPROTO_UDP
+    XCTAssertNil(
+      wrongProtocol.withUnsafeBytes { raw in
+        __parseV6PingMessage(buffer: raw, hopLimit: 64, expectedIdentifier: identifier)
+      })
+
+    var wrongType = packet
+    wrongType[innerICMP] = 129  // Echo Reply
+    XCTAssertNil(
+      wrongType.withUnsafeBytes { raw in
+        __parseV6PingMessage(buffer: raw, hopLimit: 64, expectedIdentifier: identifier)
+      })
   }
 }

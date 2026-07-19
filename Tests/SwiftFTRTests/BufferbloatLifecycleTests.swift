@@ -5,26 +5,40 @@ import Testing
 
 @Suite("Bufferbloat Lifecycle Tests")
 struct BufferbloatLifecycleTests {
-  @Test("Successful measurement awaits load completion")
+  @Test("Successful measurement awaits load completion", .timeLimit(.minutes(1)))
   func successfulMeasurementAwaitsLoadCompletion() async throws {
     let load = SuspendingOperationProbe()
+    let pingReadyToReturn = OneShotSignal()
     let dependencies = BufferbloatDependencies(
       ping: { _, _ in
         await load.waitUntilStarted()
-        await load.finish()
+        await pingReadyToReturn.signal()
         return stubPingResult()
       },
       generateLoad: { _, _ in
         await load.run()
       }
     )
+    let runner = makeRunner(dependencies: dependencies)
 
-    _ = try await makeRunner(dependencies: dependencies).run()
+    let task = Task {
+      try await runner.run()
+    }
 
-    let state = await load.state
-    #expect(state.didStart)
-    #expect(state.didFinish)
-    #expect(!state.wasCancelled)
+    await pingReadyToReturn.wait()
+
+    let pendingState = await load.state
+    #expect(pendingState.didStart)
+    #expect(!pendingState.didFinish)
+    #expect(!pendingState.wasCancelled)
+
+    await load.finish()
+    _ = try await task.value
+
+    let finalState = await load.state
+    #expect(finalState.didStart)
+    #expect(finalState.didFinish)
+    #expect(!finalState.wasCancelled)
   }
 
   @Test("Ping failure cancels and awaits load", .timeLimit(.minutes(1)))
@@ -96,6 +110,52 @@ struct BufferbloatLifecycleTests {
     #expect(pingState.wasCancelled)
   }
 
+  @Test(
+    "Caller cancellation after ping completion stops and awaits load",
+    .timeLimit(.minutes(1))
+  )
+  func callerCancellationAfterPingCompletionStopsAndAwaitsLoad() async {
+    let load = SuspendingOperationProbe()
+    let pingReadyToReturn = OneShotSignal()
+    let dependencies = BufferbloatDependencies(
+      ping: { _, _ in
+        await load.waitUntilStarted()
+        await pingReadyToReturn.signal()
+        return stubPingResult()
+      },
+      generateLoad: { _, _ in
+        await load.run()
+      }
+    )
+    let runner = makeRunner(dependencies: dependencies)
+
+    let task = Task {
+      try await runner.run()
+    }
+
+    await pingReadyToReturn.wait()
+
+    let pendingState = await load.state
+    #expect(pendingState.didStart)
+    #expect(!pendingState.didFinish)
+
+    task.cancel()
+
+    do {
+      _ = try await task.value
+      Issue.record("Expected cancellation to be propagated")
+    } catch is CancellationError {
+      // Expected.
+    } catch {
+      Issue.record("Unexpected error: \(error)")
+    }
+
+    let finalState = await load.state
+    #expect(finalState.didStart)
+    #expect(finalState.didFinish)
+    #expect(finalState.wasCancelled)
+  }
+
   private func makeRunner(dependencies: BufferbloatDependencies) -> BufferbloatRunner {
     BufferbloatRunner(
       testConfig: BufferbloatConfig(
@@ -120,6 +180,31 @@ private struct OperationProbeState: Sendable {
   let didStart: Bool
   let didFinish: Bool
   let wasCancelled: Bool
+}
+
+private actor OneShotSignal {
+  private var isSignaled = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  func signal() {
+    guard !isSignaled else { return }
+
+    isSignaled = true
+    let waiters = waiters
+    self.waiters.removeAll()
+
+    for waiter in waiters {
+      waiter.resume()
+    }
+  }
+
+  func wait() async {
+    guard !isSignaled else { return }
+
+    await withCheckedContinuation { continuation in
+      waiters.append(continuation)
+    }
+  }
 }
 
 private actor SuspendingOperationProbe {

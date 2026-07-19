@@ -8,6 +8,7 @@ import Foundation
 /// Uses Swift 6's actor isolation for thread safety.
 public actor TraceHandle {
   private var _isCancelled = false
+  private var cancellationHandler: (@Sendable () -> Void)?
 
   /// Whether this trace has been cancelled.
   public var isCancelled: Bool {
@@ -19,7 +20,33 @@ public actor TraceHandle {
   /// Once cancelled, the trace will stop at the next cancellation check point
   /// and throw `TracerouteError.cancelled`.
   public func cancel() {
+    guard !_isCancelled else { return }
     _isCancelled = true
+    let handler = cancellationHandler
+    cancellationHandler = nil
+    handler?()
+  }
+
+  /// Installs the operation-specific cleanup invoked by `cancel()`.
+  ///
+  /// If cancellation already happened, the handler is invoked immediately so
+  /// setup cannot race ahead with an already-cancelled trace.
+  internal func installCancellationHandler(_ handler: @escaping @Sendable () -> Void) {
+    if _isCancelled {
+      handler()
+    } else {
+      cancellationHandler = handler
+    }
+  }
+
+  /// Removes an operation-specific cleanup handler after the operation ends.
+  internal func clearCancellationHandler() {
+    cancellationHandler = nil
+  }
+
+  /// Whether an in-flight receive operation is currently attached.
+  internal var hasCancellationHandler: Bool {
+    cancellationHandler != nil
   }
 
   init() {}
