@@ -792,14 +792,16 @@ public struct DNSProbeConfig: Sendable {
   ///
   /// Example:
   /// ```swift
-  /// // Test DNS resolution via specific interface
-  /// let result = try await dnsProbe(
-  ///   config: DNSProbeConfig(
-  ///     server: "8.8.8.8",
-  ///     query: "example.com",
-  ///     interface: "en0"
+  /// let snapshot = await NetworkInterfaceDiscovery().discover()
+  /// if let selectedInterface = snapshot.activeInterfaces.first {
+  ///   let result = try await dnsProbe(
+  ///     config: DNSProbeConfig(
+  ///       server: "8.8.8.8",
+  ///       query: "example.com",
+  ///       interface: selectedInterface.name
+  ///     )
   ///   )
-  /// )
+  /// }
   /// ```
   public let interface: String?
 

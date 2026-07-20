@@ -96,7 +96,7 @@ public struct NetworkTopology: Sendable, Codable {
   /// Resolved destination IP
   public let destinationIP: String
 
-  /// Source adapter interface (e.g., "en0")
+  /// Caller-selected BSD source interface, or `nil` when system routing was used.
   public let sourceAdapter: String?
 
   /// Source IP address

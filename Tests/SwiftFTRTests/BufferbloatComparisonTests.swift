@@ -51,7 +51,7 @@ struct RouteBindingCase: Sendable, CustomTestStringConvertible {
   static let cases: [RouteBindingCase] = [
     RouteBindingCase(
       name: "operation interface",
-      testConfig: loadedConfig(interface: "synthetic-interface"),
+      testConfig: loadedConfig(interface: "test-interface"),
       swiftConfig: SwiftFTRConfig()
     ),
     RouteBindingCase(
@@ -62,7 +62,7 @@ struct RouteBindingCase: Sendable, CustomTestStringConvertible {
     RouteBindingCase(
       name: "global interface",
       testConfig: loadedConfig(),
-      swiftConfig: SwiftFTRConfig(interface: "synthetic-interface")
+      swiftConfig: SwiftFTRConfig(interface: "test-interface")
     ),
     RouteBindingCase(
       name: "global source IP",

@@ -293,12 +293,13 @@ let result = try await SwiftFTR().ping(
     )
 )
 
-// Source IP without interface (uses system routing)
+// Source IP without an explicit interface (the system selects the route).
 let result2 = try await SwiftFTR().ping(
     to: "1.1.1.1",
     config: PingConfig(
         count: 5,
-        sourceIP: "192.168.1.100"
+        sourceIP: wifiInterface.ipv4Addresses.first,
+        preferredFamily: .v4
     )
 )
 ```
@@ -320,7 +321,7 @@ let ftr = SwiftFTR()
 do {
     let result = try await ftr.ping(
         to: "1.1.1.1",
-        config: PingConfig(interface: "nonexistent999")
+        config: PingConfig(interface: "test-interface")
     )
 } catch TracerouteError.interfaceBindFailed(let iface, let errno, let details) {
     print("Failed to bind to interface '\(iface)'")

@@ -69,7 +69,8 @@ extension SwiftFTRCommand {
           swift-ftr trace example.com
           swift-ftr trace 1.1.1.1 -m 10 -t 2.0
           swift-ftr trace --json 8.8.8.8
-          swift-ftr trace -i en0 google.com
+          swift-ftr interfaces
+          swift-ftr trace -i <bsd-interface> google.com
         """
     )
 
@@ -82,7 +83,10 @@ extension SwiftFTRCommand {
     @Option(name: .customLong("public-ip"), help: "Override public IP (bypasses STUN)")
     var publicIP: String?
 
-    @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+    @Option(
+      name: [.short, .customLong("interface")],
+      help: "Exact BSD name reported by 'swift-ftr interfaces'"
+    )
     var interface: String?
 
     @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
@@ -348,7 +352,10 @@ extension SwiftFTRCommand {
     @Flag(name: .customLong("no-retry"), help: "Disable automatic retry of unresponsive TTLs")
     var noRetry: Bool = false
 
-    @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+    @Option(
+      name: [.short, .customLong("interface")],
+      help: "Exact BSD name reported by 'swift-ftr interfaces'"
+    )
     var interface: String?
 
     @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
@@ -495,7 +502,8 @@ extension SwiftFTRCommand {
         Examples:
           swift-ftr ping 8.8.8.8
           swift-ftr ping example.com -c 10 -i 0.5
-          swift-ftr ping 1.1.1.1 --interface en0 --json
+          swift-ftr interfaces
+          swift-ftr ping 1.1.1.1 --interface <bsd-interface> --json
         """
     )
 
@@ -517,7 +525,7 @@ extension SwiftFTRCommand {
 
     @Option(
       name: [.customShort("I"), .customLong("interface")],
-      help: "BSD network interface name"
+      help: "Exact BSD name reported by 'swift-ftr interfaces'"
     )
     var interface: String?
 
@@ -647,7 +655,10 @@ extension SwiftFTRCommand {
     @Option(name: [.short, .customLong("timeout")], help: "Timeout in seconds (default: 2.0)")
     var timeout: Double = 2.0
 
-    @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+    @Option(
+      name: [.short, .customLong("interface")],
+      help: "Exact BSD name reported by 'swift-ftr interfaces'"
+    )
     var interface: String?
 
     @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
@@ -877,7 +888,10 @@ extension SwiftFTRCommand {
     @Option(name: [.short, .customLong("timeout")], help: "Timeout in seconds (default: 2.0)")
     var timeout: Double = 2.0
 
-    @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+    @Option(
+      name: [.short, .customLong("interface")],
+      help: "Exact BSD name reported by 'swift-ftr interfaces'"
+    )
     var interface: String?
 
     @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
@@ -1020,7 +1034,10 @@ extension SwiftFTRCommand {
       name: [.short, .customLong("payload-size")], help: "ICMP payload size in bytes (default: 56)")
     var payloadSize: Int = 56
 
-    @Option(name: [.short, .customLong("interface")], help: "Network interface to use (e.g., en0)")
+    @Option(
+      name: [.short, .customLong("interface")],
+      help: "Exact BSD name reported by 'swift-ftr interfaces'"
+    )
     var interface: String?
 
     @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")

@@ -50,13 +50,13 @@ import Testing
           host: "127.0.0.1",
           port: 9,
           timeout: 1,
-          interface: "swiftftr-invalid-interface"
+          interface: "test-interface"
         )
       )
 
       #expect(!result.isReachable)
       #expect(result.responseType == nil)
-      #expect(result.error == "Interface 'swiftftr-invalid-interface' not found")
+      #expect(result.error == "Interface 'test-interface' not found")
     }
 
     @Test("Reports a source address family mismatch in the probe result")

@@ -7,22 +7,22 @@ struct SwiftFTRCommandTests {
   @Test("Ping parses distinct interval and interface short options")
   func pingShortOptions() throws {
     let command = try SwiftFTRCommand.Ping.parse([
-      "example.com", "-i", "0.25", "-I", "synthetic-interface",
+      "example.com", "-i", "0.25", "-I", "test-interface",
     ])
 
     #expect(command.target == "example.com")
     #expect(command.interval == 0.25)
-    #expect(command.interface == "synthetic-interface")
+    #expect(command.interface == "test-interface")
   }
 
   @Test("Ping preserves interval and interface long options")
   func pingLongOptions() throws {
     let command = try SwiftFTRCommand.Ping.parse([
-      "example.com", "--interval", "0.5", "--interface", "alternate-interface",
+      "example.com", "--interval", "0.5", "--interface", "test-interface-a",
     ])
 
     #expect(command.interval == 0.5)
-    #expect(command.interface == "alternate-interface")
+    #expect(command.interface == "test-interface-a")
   }
 
   @Test("Ping help documents both distinct short options")

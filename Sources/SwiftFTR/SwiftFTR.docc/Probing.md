@@ -97,13 +97,15 @@ The TCP, UDP, and DNS probes support binding to a specific network interface or 
 HTTP probe uses URLSession, whose public API does not expose either binding control.
 
 ```swift
-// TCP probe through VPN
-let config = TCPProbeConfig(
-    host: "internal.corp.example.com",
-    port: 443,
-    interface: "utun3"
-)
-let result = try await tcpProbe(config: config)
+let snapshot = await NetworkInterfaceDiscovery().discover()
+if let vpnInterface = snapshot.vpnInterfaces.first {
+    let config = TCPProbeConfig(
+        host: "internal.corp.example.com",
+        port: 443,
+        interface: vpnInterface.name
+    )
+    let result = try await tcpProbe(config: config)
+}
 ```
 
 Use the corresponding `interface` and `sourceIP` properties on ``UDPProbeConfig`` or

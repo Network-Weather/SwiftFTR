@@ -68,13 +68,13 @@ struct STUNTests {
   @Test("STUNError interfaceBindFailed description")
   func testInterfaceBindFailed() {
     let error = STUNError.interfaceBindFailed(
-      interface: "en0",
+      interface: "test-interface",
       errno: 49,
       details: "Interface not found"
     )
     let desc = error.description
 
-    #expect(desc.contains("Failed to bind STUN socket to interface 'en0'"))
+    #expect(desc.contains("Failed to bind STUN socket to interface 'test-interface'"))
     #expect(desc.contains("errno=49"))
     #expect(desc.contains("Interface not found"))
   }

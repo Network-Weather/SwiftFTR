@@ -20,44 +20,9 @@ struct InterfaceBindingTests {
 
   // MARK: - Helper Functions
 
-  /// Check if a network interface exists and is up
-  func interfaceAvailable(_ name: String) -> Bool {
-    #if canImport(Darwin)
-      return if_nametoindex(name) != 0
-    #else
-      return false
-    #endif
-  }
-
   /// Check if network tests should be skipped
   var shouldSkipNetworkTests: Bool {
     ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil
-  }
-
-  /// Check if interface has an active IPv4 address
-  func interfaceHasIPv4(_ name: String) -> Bool {
-    #if canImport(Darwin)
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
-      process.arguments = [name]
-
-      let pipe = Pipe()
-      process.standardOutput = pipe
-
-      try? process.run()
-      process.waitUntilExit()
-
-      guard let data = try? pipe.fileHandleForReading.readToEnd(),
-        let output = String(data: data, encoding: .utf8)
-      else {
-        return false
-      }
-
-      // Check for "inet " line (IPv4 address)
-      return output.contains("inet ") && !output.contains("status: inactive")
-    #else
-      return false
-    #endif
   }
 
   /// Quick check that interface can reach 1.1.1.1
@@ -74,49 +39,18 @@ struct InterfaceBindingTests {
     }
   }
 
-  /// Discover available network interfaces (excluding loopback and virtual, must have IPv4)
+  /// Discover active physical interfaces from system metadata, then keep those with IPv4 reachability.
   func discoverNetworkInterfaces() async -> [String] {
-    #if canImport(Darwin)
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
-      process.arguments = ["-l"]
-
-      let pipe = Pipe()
-      process.standardOutput = pipe
-
-      try? process.run()
-      process.waitUntilExit()
-
-      guard let data = try? pipe.fileHandleForReading.readToEnd(),
-        let output = String(data: data, encoding: .utf8)
-      else {
-        return []
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    var reachable: [String] = []
+    for interface in snapshot.physicalInterfaces
+    where interface.isUp && !interface.ipv4Addresses.isEmpty {
+      if await interfaceIsReachable(interface.name) {
+        reachable.append(interface.name)
       }
-
-      let candidates = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        .split(separator: " ")
-        .map(String.init)
-        .filter { iface in
-          // Exclude loopback, virtual, and bridge interfaces
-          !iface.starts(with: "lo") && !iface.starts(with: "gif") && !iface.starts(with: "stf")
-            && !iface.starts(with: "anpi") && !iface.starts(with: "bridge")
-            && !iface.starts(with: "ap") && !iface.starts(with: "awdl")
-            && !iface.starts(with: "llw") && !iface.starts(with: "utun")
-            && interfaceAvailable(iface)
-            && interfaceHasIPv4(iface)  // Must have active IPv4
-        }
-
-      var reachable: [String] = []
-      for iface in candidates {
-        if await interfaceIsReachable(iface) {
-          reachable.append(iface)
-        }
-        if reachable.count >= 3 { break }
-      }
-      return reachable
-    #else
-      return []
-    #endif
+      if reachable.count >= 3 { break }
+    }
+    return reachable
   }
 
   /// Get two different network interfaces for testing
@@ -265,12 +199,12 @@ struct InterfaceBindingTests {
     do {
       _ = try await ftr.ping(
         to: "1.1.1.1",
-        config: PingConfig(count: 1, timeout: 1.0, interface: "nonexistent999")
+        config: PingConfig(count: 1, timeout: 1.0, interface: "test-interface")
       )
       Issue.record("Should have thrown interfaceBindFailed error")
     } catch let error as TracerouteError {
       if case .interfaceBindFailed(let iface, _, let details) = error {
-        #expect(iface == "nonexistent999")
+        #expect(iface == "test-interface")
         #expect(details?.contains("not found") ?? false, "Error should mention interface not found")
         print("✓ Invalid interface error: \(error)")
       } else {

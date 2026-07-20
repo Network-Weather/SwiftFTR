@@ -34,7 +34,7 @@ final class LocalASNResolverTests: XCTestCase {
     }
   }
 
-  /// IPv6 ASN lookups via swift-ip2asn 0.4.0's dual-stack UltraCompactDatabase.
+  /// IPv6 ASN lookups via swift-ip2asn 0.4.1's dual-stack UltraCompactDatabase.
   /// No network required — uses the bundled DB.
   func testEmbeddedDatabaseIPv6Lookup() async throws {
     let resolver = LocalASNResolver(source: .embedded)

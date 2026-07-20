@@ -34,7 +34,7 @@ How It Works
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
 5) Optional classification (when using `traceClassified`):
    - Detect the client's public IP via STUN with DNS fallback (or use `PTR_PUBLIC_IP`, or disable via `PTR_SKIP_STUN`). `getPublicIPs()` returns both v4 and v6 in parallel for callers that want a dual-stack view.
-   - Batch‑resolve ASNs using Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) or the embedded local database via swift-ip2asn 0.4.0. Apply heuristics for PRIVATE and CGNAT ranges.
+   - Batch‑resolve ASNs using Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) or the embedded local database via swift-ip2asn 0.4.1. Apply heuristics for PRIVATE and CGNAT ranges.
    - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and "hole‑fill" missing stretches between identical segments.
 
 How Fast Is It?
@@ -339,7 +339,7 @@ swift build -c release
 Options:
 - `-m, --max-hops N`: Max TTL/hops to probe (default 40)
 - `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
-- `-i, --interface IFACE`: Use a BSD interface name reported by the operating system
+- `-i, --interface IFACE`: Use an exact BSD name reported by `swift-ftr interfaces`
 - `-s, --source IP`: Bind to specific source IP address
 - `-p, --payload-size N`: ICMP payload size in bytes (default 56)
 - `--json`: Emit JSON with ASN categories and public IP
@@ -387,8 +387,9 @@ Options:
 Configuration and Flags
 -----------------------
 - Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
-- Pass a name returned by `NetworkInterfaceDiscovery` to `SwiftFTRConfig(interface:)` to bind supported socket-backed diagnostics to a caller-selected interface.
-- Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind supported socket-backed diagnostics to a specific source IP.
+- Pass a name and family-matched address returned by `NetworkInterfaceDiscovery` to `SwiftFTRConfig(interface:sourceIP:)` for traceroute, ping, and DNS query-helper defaults.
+- Standalone TCP, UDP, and DNS probes use their operation-level config instead of inheriting those defaults.
+- Bufferbloat honors route binding only for baseline latency (`loadDuration: 0`); loaded tests reject effective binding.
 - HTTP/HTTPS probes use URLSession and do not support either binding option.
 - CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
 

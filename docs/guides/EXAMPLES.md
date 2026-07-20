@@ -103,12 +103,16 @@ if let ethernetInterface = interfaces.physicalInterfaces.first(where: { $0.type 
     let ethernetTracer = SwiftFTR(config: ethernetConfig)
 }
 
-// Bind to specific source IP
-let sourceIPConfig = SwiftFTRConfig(
-    maxHops: 40,
-    sourceIP: "192.168.1.100"  // Use specific local IP
-)
-let sourceTracer = SwiftFTR(config: sourceIPConfig)
+// Bind to a source address reported by the operating system.
+if let selectedInterface = interfaces.activeInterfaces.first,
+   let sourceIP = selectedInterface.ipv4Addresses.first {
+    let sourceIPConfig = SwiftFTRConfig(
+        maxHops: 40,
+        sourceIP: sourceIP,
+        preferredFamily: .v4
+    )
+    let sourceTracer = SwiftFTR(config: sourceIPConfig)
+}
 
 // Combine an interface with one of its reported source addresses.
 if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }),
@@ -530,13 +534,16 @@ if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .
   print("Via WiFi: \(wifiResult.hostname ?? "no PTR")")
 }
 
-// Query via specific source IP
-let cellResult = try await reverseDNS(
-  ip: "10.1.10.1",
-  server: "10.1.10.1",
-  sourceIP: "192.168.1.100"  // Specific source address
-)
-print("Via cellular: \(cellResult.hostname ?? "no PTR")")
+// Query via a source address reported for an active interface.
+if let selectedInterface = interfaces.activeInterfaces.first,
+   let sourceIP = selectedInterface.ipv4Addresses.first {
+  let sourceResult = try await reverseDNS(
+    ip: "10.1.10.1",
+    server: "10.1.10.1",
+    sourceIP: sourceIP
+  )
+  print("Via \(selectedInterface.name): \(sourceResult.hostname ?? "no PTR")")
+}
 
 // Query IPv6 via an interface reported as Ethernet.
 if let ethernetInterface = interfaces.physicalInterfaces.first(where: { $0.type == .ethernet }) {
