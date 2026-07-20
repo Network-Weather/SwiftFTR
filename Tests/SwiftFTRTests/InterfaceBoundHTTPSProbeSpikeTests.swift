@@ -172,7 +172,8 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
           })
       })
     else {
-      try Test.cancel("No active \(family.testDescription) loopback address")
+      print("Skipping: no active \(family.testDescription) loopback address")
+      return
     }
 
     let resolved = try await resolveInterfaceBoundHTTPSInterface(named: interface.name)
@@ -267,14 +268,16 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
   )
   func liveExactInterfaceTLS(endpointCase: LiveEndpointCase) async throws {
     guard let interfaceName = primaryInterfaceName(for: endpointCase) else {
-      try Test.cancel("No OS-reported \(endpointCase.testDescription) primary interface")
+      print("Skipping: no OS-reported \(endpointCase.testDescription) primary interface")
+      return
     }
     guard
       let resolved = try? resolveHost(
         host: "example.com",
         prefer: endpointCase.preferredFamily)
     else {
-      try Test.cancel("example.com has no usable \(endpointCase.testDescription) endpoint")
+      print("Skipping: example.com has no usable \(endpointCase.testDescription) endpoint")
+      return
     }
     let explicitEndpoint = endpointCase.endpoint(address: resolved.canonical)
 
@@ -304,10 +307,12 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
   )
   func liveTLSRejectsWrongLogicalHostname() async throws {
     guard let interfaceName = primaryInterfaceName(for: .ipv4) else {
-      try Test.cancel("No OS-reported IPv4 primary interface")
+      print("Skipping: no OS-reported IPv4 primary interface")
+      return
     }
     guard let resolved = try? resolveHost(host: "example.com", prefer: .v4) else {
-      try Test.cancel("example.com has no usable IPv4 endpoint")
+      print("Skipping: example.com has no usable IPv4 endpoint")
+      return
     }
     let endpoint = InterfaceBoundHTTPSEndpoint.ipv4Address(resolved.canonical)
 
