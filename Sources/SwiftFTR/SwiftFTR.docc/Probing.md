@@ -114,7 +114,8 @@ func probeVPN(interfaceName: String) async throws {
 
 Use the corresponding `interface` and `sourceIP` properties on ``UDPProbeConfig`` or
 ``DNSProbeConfig`` for those protocols. ``HTTPProbeConfig`` intentionally has no such properties;
-HTTP traffic follows URLSession's system-selected route.
+HTTP traffic follows URLSession's system-selected route. TCP and UDP hostname resolution also
+uses system routing; the binding begins at the probe socket.
 
 ## Topics
 

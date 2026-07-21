@@ -772,7 +772,10 @@ public struct DNSQueries: Sendable {
 
 /// Configuration for DNS probe
 public struct DNSProbeConfig: Sendable {
-  /// DNS server to query
+  /// Numeric IPv4 or IPv6 DNS server to query.
+  ///
+  /// This address selects the socket family independently of ``queryType``. For example, an AAAA
+  /// query sent to an IPv4 server still uses an IPv4 UDP transport.
   public let server: String
 
   /// Query name (default: "example.com")

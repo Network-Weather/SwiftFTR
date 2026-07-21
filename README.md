@@ -202,20 +202,8 @@ func compareRoutes(primaryBSDName: String, alternateBSDName: String) async throw
 
     let boundTracer = SwiftFTR(config: SwiftFTRConfig(interface: primaryInterface.name))
 
-    // Use the caller-selected global interface.
-    let primaryPing = try await boundTracer.ping(to: "1.1.1.1")
-
-    // Override with the caller's alternate interface for this operation only.
-    let alternatePing = try await boundTracer.ping(
-        to: "1.1.1.1",
-        config: PingConfig(interface: alternateInterface.name)
-    )
-
-    // Concurrent multi-interface monitoring.
-    async let primary = boundTracer.ping(
-        to: "1.1.1.1",
-        config: PingConfig(interface: primaryInterface.name)
-    )
+    // The first call inherits the global selection; the second overrides it.
+    async let primary = boundTracer.ping(to: "1.1.1.1")
     async let alternate = boundTracer.ping(
         to: "1.1.1.1",
         config: PingConfig(interface: alternateInterface.name)

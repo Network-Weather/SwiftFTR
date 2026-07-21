@@ -1025,10 +1025,10 @@ public actor SwiftFTR {
   /// The interface and source address apply to the STUN attempt. If STUN fails, the DNS-whoami
   /// fallback uses system routing. The optional reverse-DNS lookup also uses system routing.
   /// Returns both the discovered address and its reverse-DNS hostname when available.
-  /// Use this to understand which exit point your traffic uses for a given interface.
   ///
-  /// For multi-path scenarios, create separate `SwiftFTR` instances with different
-  /// interface configurations to discover the public IP for each path.
+  /// The result does not identify whether STUN or the unbound fallback succeeded, so it is not by
+  /// itself proof of a selected interface's exit. For route-specific dual-stack STUN results, use
+  /// ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` instead.
   ///
   /// ## Example
   /// ```swift

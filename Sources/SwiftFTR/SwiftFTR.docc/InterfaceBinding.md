@@ -6,7 +6,7 @@ Control which network interface supported SwiftFTR operations use.
 
 SwiftFTR supports binding selected socket-backed operations to specific network interfaces, giving you routing control in multi-interface scenarios like:
 
-- Simultaneous WiFi and Ethernet connections
+- Simultaneous Wi-Fi and Ethernet connections
 - VPN tunnel selection
 - Multi-homed servers
 - Network testing and troubleshooting
@@ -78,8 +78,7 @@ Set a default interface for supported operations launched through a ``SwiftFTR/S
 import SwiftFTR
 
 let config = SwiftFTRConfig(
-    interface: selectedRoute.interface.name,
-    sourceIP: selectedRoute.sourceIP
+    interface: selectedRoute.interface.name
 )
 let ftr = SwiftFTR(config: config)
 
@@ -98,16 +97,16 @@ import SwiftFTR
 let ftr = SwiftFTR(config: SwiftFTRConfig(interface: selectedRoute.interface.name))
 
 // Use the global interface selection.
-let wifiPing = try await ftr.ping(to: "1.1.1.1")
+let primaryPing = try await ftr.ping(to: "1.1.1.1")
 
 // Override with the caller's alternate selection for this operation only.
-let ethPing = try await ftr.ping(
+let alternatePing = try await ftr.ping(
     to: "1.1.1.1",
     config: PingConfig(interface: alternateRoute.interface.name)
 )
 
 // Back to the global interface selection.
-let wifiPing2 = try await ftr.ping(to: "8.8.8.8")
+let primaryPing2 = try await ftr.ping(to: "8.8.8.8")
 ```
 
 ## Resolution Order
@@ -415,8 +414,6 @@ Common error scenarios:
 HTTP/HTTPS probes and bufferbloat load generation use URLSession. URLSession's public API does not
 provide an interface or source-IP binding option, so those requests follow the system-selected
 route. SwiftFTR does not claim that setting a global binding changes URLSession traffic.
-The bufferbloat behavior is covered once in “Bufferbloat Test” above: loaded tests reject an
-effective binding, while baseline-only measurements may bind their ping socket.
 
 ## Implementation Details
 
@@ -431,8 +428,6 @@ SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for inter
 The binding applies only to the ping, traceroute, TCP, UDP, DNS, and STUN sockets identified in the
 support matrix. It does not apply to prerequisite hostname resolution, system rDNS, Team Cymru
 queries, DNS-whoami fallback, URLSession-backed HTTP/HTTPS probes, or bufferbloat load requests.
-Loaded bufferbloat tests reject route-specific configurations because binding only their latency
-probes would invalidate the measurement.
 
 ## Platform Support
 

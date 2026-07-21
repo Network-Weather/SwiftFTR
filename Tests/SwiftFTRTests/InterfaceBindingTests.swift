@@ -199,7 +199,11 @@ struct InterfaceBindingTests {
   @Test("Invalid interface throws descriptive error")
   func testInvalidInterfaceThrowsError() async {
     let ftr = SwiftFTR()
-    let invalidInterface = String(repeating: "x", count: Int(IFNAMSIZ) + 1)
+    #if canImport(Darwin)
+      let invalidInterface = String(repeating: "x", count: Int(IFNAMSIZ) + 1)
+    #else
+      let invalidInterface = String(repeating: "x", count: 1_024)
+    #endif
 
     do {
       _ = try await ftr.ping(
