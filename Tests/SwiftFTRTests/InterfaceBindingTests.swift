@@ -11,7 +11,7 @@ import Testing
 ///
 /// These tests verify that:
 /// 1. Operation-level interface config overrides global config
-/// 2. Different interfaces produce different public IPs (multi-interface systems)
+/// 2. Multi-interface classified traces can populate public-IP metadata
 /// 3. Concurrent operations with different interfaces work correctly
 /// 4. Invalid interfaces produce descriptive errors
 ///
@@ -134,8 +134,8 @@ struct InterfaceBindingTests {
 
   // MARK: - Multi-Interface Tests
 
-  @Test("Different interfaces have different public IPs")
-  func testDifferentInterfacesHaveDifferentPublicIPs() async throws {
+  @Test("Classified traces discover public-IP metadata for two interfaces")
+  func testClassifiedTracesDiscoverPublicIPMetadataForTwoInterfaces() async throws {
     guard !shouldSkipNetworkTests else {
       print("⏭️  Skipping multi-interface test: SKIP_NETWORK_TESTS=1")
       return
@@ -225,30 +225,30 @@ struct InterfaceBindingTests {
   }
 
   @Test("Invalid source IP throws descriptive error")
-  func testInvalidSourceIPThrowsError() async {
-    let interfaces = await discoverNetworkInterfaces()
-    guard let firstInterface = interfaces.first else {
-      print("⏭️  Skipping: No suitable network interfaces found")
-      return
-    }
-
+  func testInvalidSourceIPThrowsError() async throws {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    let loopback = try #require(
+      snapshot.interfaces.first { $0.type == .loopback && $0.isUp }
+    )
+    let target = try #require(loopback.ipv4Addresses.first)
+    let invalidSourceIP = "192.0.2.999"
     let ftr = SwiftFTR()
 
     do {
       _ = try await ftr.ping(
-        to: "1.1.1.1",
+        to: target,
         config: PingConfig(
           count: 1,
           timeout: 1.0,
-          interface: firstInterface,
-          sourceIP: "192.0.2.1"  // TEST-NET-1 - unlikely to be assigned
+          interface: loopback.name,
+          sourceIP: invalidSourceIP,
+          preferredFamily: .v4
         )
       )
-      // May succeed if IP happens to be assigned, so don't fail the test
-      print("Note: Source IP 192.0.2.1 binding succeeded (IP may be assigned)")
+      Issue.record("Should have thrown sourceIPBindFailed error")
     } catch let error as TracerouteError {
       if case .sourceIPBindFailed(let ip, _, _) = error {
-        #expect(ip == "192.0.2.1")
+        #expect(ip == invalidSourceIP)
         print("✓ Invalid source IP error: \(error)")
       } else {
         Issue.record("Wrong error type: \(error)")
