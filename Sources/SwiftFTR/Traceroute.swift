@@ -127,7 +127,11 @@ public struct SwiftFTRConfig: Sendable {
   public let maxWaitMs: Int
   /// Size in bytes of the Echo payload (default: 56)
   public let payloadSize: Int
-  /// Override the public IP address (bypasses STUN discovery if set)
+  /// Public-address override for classified trace and multipath enrichment.
+  ///
+  /// When set, these enrichment paths bypass public-IP discovery. The standalone
+  /// ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` function and
+  /// ``SwiftFTR/discoverPublicIPWithHostname()`` do not use this value.
   public let publicIP: String?
   /// Enable verbose logging for debugging
   public let enableLogging: Bool
@@ -205,7 +209,8 @@ public struct SwiftFTRConfig: Sendable {
   ///   - maxHops: Maximum TTL/hops to probe (default: 40)
   ///   - maxWaitMs: Maximum wait time per probe in milliseconds (default: 1000ms)
   ///   - payloadSize: Size in bytes of the Echo payload (default: 56)
-  ///   - publicIP: Override the public IP address (bypasses STUN discovery if set)
+  ///   - publicIP: Public-address override for classified trace and multipath enrichment. It does
+  ///     not affect the standalone public-IP discovery APIs.
   ///   - enableLogging: Enable verbose logging for debugging
   ///   - noReverseDNS: Disable reverse DNS lookups (default: false)
   ///   - rdnsCacheTTL: TTL for rDNS cache entries in seconds (default: 86400 = 1 day)
@@ -247,7 +252,7 @@ public struct SwiftFTRConfig: Sendable {
 /// Top-level entry point for performing fast, parallel traceroutes.
 ///
 /// SwiftFTR is an actor providing thread-safe traceroute operations with
-/// built-in caching for rDNS lookups and STUN public IP discovery.
+/// built-in caching for rDNS lookups and public-address enrichment of classified traces.
 @available(macOS 13.0, *)
 public actor SwiftFTR {
   internal nonisolated let config: SwiftFTRConfig
@@ -751,8 +756,9 @@ public actor SwiftFTR {
 
   /// Perform a traceroute and enrich results with ASN-based categorization.
   ///
-  /// This variant computes the client's public IP (via STUN by default unless overridden in config),
-  /// resolves origin ASNs for relevant IP addresses using the provided resolver, and labels
+  /// This variant obtains the client's public address from configuration, the actor cache, or fresh
+  /// IPv4 discovery (STUN followed by DNS fallback). It resolves origin ASNs for relevant IP
+  /// addresses using the provided resolver and labels
   /// each hop as LOCAL, ISP, TRANSIT, or DESTINATION. Missing stretches between
   /// identical segments are interpolated for readability.
   ///
@@ -1100,7 +1106,7 @@ public actor SwiftFTR {
 
   /// Invalidate just the public IP cache.
   ///
-  /// Forces re-discovery via STUN on the next trace.
+  /// Forces fresh discovery during the next classified trace or multipath enrichment that needs it.
   public func invalidatePublicIP() {
     cacheGeneration &+= 1
     cachedPublicIP = nil

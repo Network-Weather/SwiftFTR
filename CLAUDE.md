@@ -12,8 +12,8 @@ swift build -c debug
 # Build release (optimized)
 swift build -c release
 
-# Run all tests (with STUN disabled for isolation)
-PTR_SKIP_STUN=1 swift test -c debug
+# Run all tests without live-network integration tests
+SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug
 
 # Run specific test
 swift test --filter ComprehensiveIntegrationTests/testClassifiedTrace
@@ -28,7 +28,7 @@ swift build -c release --product swift-ftr
 swift format lint -r Sources Tests
 
 # Auto-format code
-swift format -i -r Sources Tests
+swift format format --in-place -r Sources Tests
 ```
 
 ### Documentation
@@ -76,7 +76,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 **Caching Infrastructure**
 - `RDNSCache` (`RDNSCache.swift`): Reverse DNS with 86400s TTL
-- `STUNCache` (in `STUN.swift`): Public IP via STUN + DNS fallback, invalidated on network change
+- `SwiftFTR.cachedPublicIP`: Public-address enrichment for classified trace/multipath, invalidated on network change
 - `_ASNMemoryCache` (in `ASN.swift`): LRU-style IP-to-ASN cache
 
 ### Key Design Patterns
@@ -91,8 +91,8 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 | Variable | Effect |
 |---|---|
-| `PTR_SKIP_STUN=1` | Skip STUN public IP discovery (used in tests for isolation) |
-| `PTR_PUBLIC_IP=x.y.z.w` | Override public IP (bypasses STUN) |
+| `PTR_SKIP_STUN=1` | Skip legacy STUN integration tests; the library runtime ignores it |
+| `SKIP_NETWORK_TESTS=1` | Skip non-STUN live-network tests; combine with `PTR_SKIP_STUN=1` for an offline run |
 | `SWIFTFTR_VERBOSE_HTTP_TIMING=1` | Verbose HTTP probe timing logs |
 | `SWIFTFTR_DEBUG_MULTIPATH` | Debug output for multipath discovery |
 
@@ -104,7 +104,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 ## Testing Notes
 
-- **Offline by default**: Use `PTR_SKIP_STUN=1` for deterministic/offline test runs
+- **Offline runs**: Use `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1` for deterministic test runs
 - **`NetworkTestGate`**: Actor-based concurrency limiter in tests that perform real network I/O
 - **STUN tests**: Conditionally enabled — skipped when `PTR_SKIP_STUN` is set
 - **ICMP on CI**: Network traces do NOT work on GitHub cloud runners; integration tests require self-hosted runners or local execution

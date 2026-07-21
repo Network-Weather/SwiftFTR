@@ -40,7 +40,7 @@ public actor SwiftFTR {
     // Handle network changes (cancels traces, clears caches)
     public func networkChanged() async
     
-    // Get cached public IP if available
+    // Get the configured or cached classification-enrichment public IP if available
     public var publicIP: String? { get }
     
     // Clear all caches
@@ -59,7 +59,7 @@ public struct SwiftFTRConfig: Sendable {
     public let maxHops: Int           // Maximum TTL to probe (default: 40)
     public let maxWaitMs: Int          // Timeout in milliseconds (default: 1000)
     public let payloadSize: Int        // ICMP payload size in bytes (default: 56)
-    public let publicIP: String?       // Override public IP (default: nil, auto-detect)
+    public let publicIP: String?       // Classified trace/multipath enrichment override
     public let enableLogging: Bool     // Enable debug logging (default: false)
     public let interface: String?      // Network interface to bind to (default: nil)
     public let sourceIP: String?       // Source IP to bind to (default: nil)
@@ -578,7 +578,7 @@ let config = SwiftFTRConfig(
     maxHops: 20,           // Limit to 20 hops
     maxWaitMs: 2000,       // 2 second timeout
     payloadSize: 64,       // 64 byte payload
-    publicIP: nil,         // Auto-detect public IP
+    publicIP: nil,         // Auto-detect for classified trace/multipath enrichment
     enableLogging: true,   // Enable debug logs
     noReverseDNS: false,   // Enable rDNS lookups
     rdnsCacheTTL: 3600,    // 1 hour cache
@@ -586,7 +586,7 @@ let config = SwiftFTRConfig(
 )
 
 let tracer = SwiftFTR(config: config)
-let result = try await tracer.trace(to: "1.1.1.1")
+let result = try await tracer.traceClassified(to: "1.1.1.1")
 ```
 
 ### Example 3: Classified Traceroute with ASN
@@ -622,9 +622,9 @@ await tracer.networkChanged()
 
 // This will:
 // 1. Cancel all active traces
-// 2. Clear public IP cache
+// 2. Clear the classified-enrichment public IP cache
 // 3. Clear rDNS cache
-// 4. Force fresh lookups on next trace
+// 4. Force fresh lookups during the next applicable operation
 ```
 
 ### Example 5: Concurrent Traces
@@ -744,7 +744,7 @@ do {
 ```swift
 let tracer = SwiftFTR()
 
-// Check cached public IP
+// Check the configured or cached enrichment public IP
 if let publicIP = await tracer.publicIP {
     print("Cached public IP: \(publicIP)")
 }
@@ -807,7 +807,7 @@ public func stunGetPublicIPv4(
 ### Caching Behavior
 - **ASN lookups**: Cached indefinitely in memory
 - **rDNS lookups**: Cached with TTL (default 86400 seconds)
-- **Public IP**: Cached until network change
+- **Public IP enrichment**: Classified trace/multipath discovery is cached until network change
 - **Cache invalidation**: Via networkChanged() or clearCaches()
 
 ## Thread Safety and Concurrency
@@ -1040,11 +1040,9 @@ swift build -c release
     --public-ip 1.2.3.4
 ```
 
-## Environment Variables (CLI Only)
+## Public-IP CLI Option
 
-- `PTR_PUBLIC_IP`: Override public IP detection
-- `PTR_SKIP_STUN`: Skip STUN discovery (set to 1)
-- `PTR_VERBOSE`: Enable verbose output
+- `--public-ip IP`: Override discovery for classified-trace enrichment.
 
 ## Testing
 
@@ -1069,17 +1067,17 @@ func testNetworkChange() async throws {
     let tracer = SwiftFTR()
     
     // First trace
-    _ = try await tracer.trace(to: "google.com")
+    _ = try await tracer.traceClassified(to: "google.com")
     let publicIP1 = await tracer.publicIP
     
     // Simulate network change
     await tracer.networkChanged()
     
     // Second trace
-    _ = try await tracer.trace(to: "google.com")
+    _ = try await tracer.traceClassified(to: "google.com")
     let publicIP2 = await tracer.publicIP
     
-    // Public IP should be re-discovered
+    // Classified enrichment should re-discover and cache a public IP
     XCTAssertNotNil(publicIP2)
 }
 ```

@@ -29,4 +29,5 @@ for hop in classified.hops {
 ## Notes
 
 - Classification performs best-effort ASN lookups with short timeouts; results may be incomplete.
-- Set ``SwiftFTR/SwiftFTRConfig/publicIP`` to use a known public address and bypass STUN discovery.
+- Set ``SwiftFTR/SwiftFTRConfig/publicIP`` to use a known public address and bypass discovery for
+  classified-trace enrichment.

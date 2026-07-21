@@ -53,7 +53,7 @@ let config = SwiftFTRConfig(
     maxHops: 20,           // Maximum TTL to probe (default: 40)
     maxWaitMs: 2000,       // Max wait time in milliseconds (default: 1000)
     payloadSize: 32,       // ICMP payload size in bytes (default: 56)
-    publicIP: "1.2.3.4",   // Override public IP (skips STUN)
+    publicIP: "1.2.3.4",   // Override classified trace/multipath enrichment discovery
     enableLogging: true    // Enable debug logging (default: false)
 )
 
@@ -388,7 +388,7 @@ let gatewayPTR = try await tracer.dns.reverseIPv4(
   ip: "10.1.10.1",
   server: "10.1.10.1"  // Query the gateway itself
 )
-if let record = gatewayPTR.records.first, case .ptr(let hostname) = record.data {
+if let record = gatewayPTR.records.first, case .hostname(let hostname) = record.data {
   print("Gateway hostname: \(hostname)")
 }
 
@@ -778,6 +778,9 @@ for (host, stats) in results {
 ```
 
 ## Multipath Discovery (v0.5.0+)
+
+Multipath discovery currently supports IPv4 destinations and source addresses only. A hostname
+must resolve to IPv4 for these examples.
 
 ### Basic Multipath Discovery
 ```swift

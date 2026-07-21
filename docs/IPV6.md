@@ -88,8 +88,8 @@ Dual-stack `tcpProbe(...)` and `udpProbe(...)`: same entry points work for both 
 
 | Variable | Effect |
 |---|---|
-| `PTR_SKIP_STUN=1` | Skip STUN public-IP discovery (used in tests for isolation) |
-| `SKIP_NETWORK_TESTS=1` | Skip all tests that touch the network (any family) |
+| `PTR_SKIP_STUN=1` | Skip legacy STUN integration tests; the library runtime ignores it |
+| `SKIP_NETWORK_TESTS=1` | Skip non-STUN live-network tests; combine with `PTR_SKIP_STUN=1` for an offline run |
 | `SKIP_IPV6_TESTS=1` | Force-skip v6 integration tests (e.g. to test the skip path locally) |
 | `FORCE_IPV6_TESTS=1` | Force-run v6 integration tests without probing (use only if your environment is guaranteed) |
 

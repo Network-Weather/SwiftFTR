@@ -19,7 +19,7 @@ public struct STUNPublicIP: Sendable {
 }
 
 /// Public IPs discovered across both v4 and v6 in a single sweep. Either field
-/// may be nil if that family's STUN/DNS path didn't succeed. NWX-style downstream
+/// may be nil if that family's STUN sweep didn't succeed. NWX-style downstream
 /// consumers can render both alongside each other (e.g. a status row showing
 /// "v4: 203.0.113.5 / v6: 2001:db8::1").
 public struct PublicIPs: Sendable {
@@ -612,9 +612,8 @@ func getPublicIPv4(
 /// "this network is v6-only" cases.
 ///
 /// Each family-specific sweep walks the same STUN server list (`stunServers`)
-/// using `stunGetPublicIPWithFallback`. The DNS whoami fallback used by the
-/// older `getPublicIPv4` is NOT run here for v6 because Akamai's whoami service
-/// returns only v4. v6 discovery is STUN-only.
+/// using `stunGetPublicIPWithFallback`. Neither sweep invokes the DNS-whoami fallback used by
+/// `getPublicIPv4`; both families are STUN-only in this API.
 ///
 /// - Parameters:
 ///   - stunTimeout: Per-server timeout (default 0.8s).

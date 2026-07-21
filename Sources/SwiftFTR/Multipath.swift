@@ -102,7 +102,7 @@ public struct NetworkTopology: Sendable, Codable {
   /// Source IP address
   public let sourceIP: String?
 
-  /// Public IP (from STUN)
+  /// Public address used for classification, whether configured, cached, or discovered.
   public let publicIP: String?
 
   /// All discovered paths (may contain duplicates if fingerprints match)
