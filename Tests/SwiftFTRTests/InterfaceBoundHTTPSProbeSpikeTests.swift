@@ -39,9 +39,22 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
     }
   }
 
-  @Test("Rejects control and non-ASCII bytes in the configurable User-Agent")
+  @Test("Serializes the stable default User-Agent")
+  func serializesDefaultUserAgent() throws {
+    let plan = try makeInterfaceBoundHTTPSRequestPlan(
+      configuration: InterfaceBoundHTTPSProbeSpikeConfiguration(
+        logicalHostname: "probe.example",
+        interfaceName: "caller-selected-interface"))
+    let request = String(decoding: plan.requestBytes, as: UTF8.self)
+
+    #expect(
+      request.contains(
+        "User-Agent: \(InterfaceBoundHTTPSProbeSpikeConfiguration.defaultUserAgent)\r\n"))
+  }
+
+  @Test("Rejects empty, control, and non-ASCII configurable User-Agent values")
   func rejectsUnsafeUserAgentBytes() {
-    for userAgent in ["Probe\u{1}", "Probe\tAgent", "Pröbe"] {
+    for userAgent in ["", "Probe\u{1}", "Probe\tAgent", "Pröbe"] {
       #expect {
         try makeInterfaceBoundHTTPSRequestPlan(
           configuration: InterfaceBoundHTTPSProbeSpikeConfiguration(
