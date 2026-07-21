@@ -13,11 +13,12 @@ What happened? What did you expect?
 - SwiftFTR version (commit or tag):
 
 ## Repro Steps
-Commands/code to reproduce (prefer offline repro with `PTR_SKIP_STUN=1`).
+Commands/code to reproduce. `PTR_SKIP_STUN` and `SKIP_NETWORK_TESTS` only select tests; they do not
+change library or CLI runtime behavior.
 
 ```bash
-# example
-PTR_SKIP_STUN=1 .build/release/swift-ftr -w 1.0 1.1.1.1
+# minimal local example
+.build/release/swift-ftr -w 1.0 127.0.0.1
 ```
 
 ## Logs / Output
@@ -25,4 +26,3 @@ Paste relevant output. Redact any sensitive info.
 
 ## Additional context
 Anything else helpful (screenshots, traces, etc.).
-

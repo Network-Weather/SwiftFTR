@@ -91,8 +91,8 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 | Variable | Effect |
 |---|---|
-| `PTR_SKIP_STUN=1` | Skip legacy STUN integration tests; the library runtime ignores it |
-| `SKIP_NETWORK_TESTS=1` | Skip non-STUN live-network tests; combine with `PTR_SKIP_STUN=1` for an offline run |
+| `PTR_SKIP_STUN=1` | Skip the public-IP integration-test subset using this legacy gate; no runtime effect |
+| `SKIP_NETWORK_TESTS=1` | Skip the remaining live-network tests; set both variables for an offline run |
 | `SWIFTFTR_VERBOSE_HTTP_TIMING=1` | Verbose HTTP probe timing logs |
 | `SWIFTFTR_DEBUG_MULTIPATH` | Debug output for multipath discovery |
 
@@ -106,7 +106,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 - **Offline runs**: Use `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1` for deterministic test runs
 - **`NetworkTestGate`**: Actor-based concurrency limiter in tests that perform real network I/O
-- **STUN tests**: Conditionally enabled — skipped when `PTR_SKIP_STUN` is set
+- **Public-IP tests**: The legacy suite is split across both test gates; set both for an offline run
 - **ICMP on CI**: Network traces do NOT work on GitHub cloud runners; integration tests require self-hosted runners or local execution
 - Tests should not assume specific hop counts, ASN assignments, or that TRANSIT segments exist
 

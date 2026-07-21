@@ -783,14 +783,22 @@ public func resolveIPv4(host: String, enableLogging: Bool = false) throws -> soc
 ```swift
 public struct STUNPublicIP: Sendable {
     public let ip: String
+    public let family: Int32
 }
 
-// Discover public IP via STUN
-public func stunGetPublicIPv4(
-    timeout: TimeInterval = 1.0,
-    server: String = "stun.cloudflare.com",
-    port: UInt16 = 3478
-) throws -> STUNPublicIP
+public struct PublicIPs: Sendable {
+    public let v4: String?
+    public let v6: String?
+    public var any: String? { get }
+}
+
+// Discover both families in parallel via STUN; failed families are nil.
+public func getPublicIPs(
+    stunTimeout: TimeInterval = 0.8,
+    interface: String? = nil,
+    sourceIP: String? = nil,
+    enableLogging: Bool = false
+) async -> PublicIPs
 ```
 
 ## Performance Characteristics
@@ -807,8 +815,9 @@ public func stunGetPublicIPv4(
 ### Caching Behavior
 - **ASN lookups**: Cached indefinitely in memory
 - **rDNS lookups**: Cached with TTL (default 86400 seconds)
-- **Public IP enrichment**: Classified trace/multipath discovery is cached until network change
-- **Cache invalidation**: Via networkChanged() or clearCaches()
+- **Public IP enrichment**: Classified-trace discovery populates the actor cache; multipath reuses
+  an existing actor-cached value but does not write worker discoveries back to that cache
+- **Cache invalidation**: Via `networkChanged()`, `clearCaches()`, or `invalidatePublicIP()`
 
 ## Thread Safety and Concurrency
 
