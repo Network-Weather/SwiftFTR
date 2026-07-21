@@ -35,7 +35,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
   Then pushes will be blocked if formatting fails.
 - To auto‑format in place (optional):
   ```bash
-  swift format -i -r Sources Tests
+  swift format format --in-place -r Sources Tests
   ```
 
 ## Documentation
@@ -53,7 +53,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 
 ## Testing
 - Unit tests should not depend on network access. Use fakes/mocks.
-- For code paths that perform DNS/WHOIS/STUN, prefer injectable resolvers via configuration. Use `SwiftFTRConfig(publicIP: ...)` to bypass STUN in tests.
+- For code paths that perform DNS/WHOIS/STUN, prefer injectable resolvers. Use `SwiftFTRConfig(publicIP: ...)` to bypass discovery in classified-trace or multipath tests.
 - Add tests next to the code they exercise under `Tests/SwiftFTRTests`.
 
 ## Commit Style
@@ -69,7 +69,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 - Note any user‑visible changes: new flags, breaking API changes, or behavior shifts.
 - Ensure:
   - `swift format lint -r Sources Tests` passes
-  - `PTR_SKIP_STUN=1 swift test` passes
+  - `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test` passes offline
   - Public symbols have reasonable documentation
 
 ## Releases (maintainers)

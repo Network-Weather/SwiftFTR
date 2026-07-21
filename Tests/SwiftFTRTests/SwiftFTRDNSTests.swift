@@ -227,8 +227,8 @@ final class SwiftFTRDNSTests: XCTestCase {
     XCTAssertEqual(__detectAddressFamily("fe80::1"), AF_INET6)
 
     // IPv6 link-local with scope ID
-    XCTAssertEqual(__detectAddressFamily("fe80::1%en0"), AF_INET6)
-    XCTAssertEqual(__detectAddressFamily("fe80::28d5:b1ff:fe4d:3564%en0"), AF_INET6)
+    XCTAssertEqual(__detectAddressFamily("fe80::1%test-interface"), AF_INET6)
+    XCTAssertEqual(__detectAddressFamily("fe80::28d5:b1ff:fe4d:3564%test-interface"), AF_INET6)
 
     // Invalid
     XCTAssertEqual(__detectAddressFamily("not-an-ip"), -1)

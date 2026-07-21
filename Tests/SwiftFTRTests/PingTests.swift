@@ -344,26 +344,13 @@ struct PingIntegrationTests {
     #expect(r3.statistics.received > 0)
   }
 
-  @Test(
-    "Ping respects per-operation interface binding (v0.7.0)",
-    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
+  @Test("Ping respects per-operation interface binding (v0.7.0)")
   func testPingWithInterface() async throws {
-    // Try to get a valid interface
-    let interfaces = ["en0", "en1", "en2"]
-    var validInterface: String?
-
-    for iface in interfaces {
-      let ifIndex = if_nametoindex(iface)
-      if ifIndex != 0 {
-        validInterface = iface
-        break
-      }
-    }
-
-    guard let interface = validInterface else {
-      // Skip test if no valid interface found
-      return
-    }
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    let loopback = try #require(
+      snapshot.interfaces.first { $0.type == .loopback && $0.isUp }
+    )
+    let target = try #require(loopback.ipv4Addresses.first)
 
     // Test per-operation binding (v0.7.0 feature)
     // Create tracer WITHOUT global interface
@@ -374,12 +361,14 @@ struct PingIntegrationTests {
       count: 2,
       interval: 0.5,
       timeout: 2.0,
-      interface: interface  // Operation-level interface override
+      interface: loopback.name,
+      preferredFamily: .v4
     )
 
-    // Should not throw with valid interface
-    let result = try await tracer.ping(to: "1.1.1.1", config: pingConfig)
+    let result = try await tracer.ping(to: target, config: pingConfig)
     #expect(result.responses.count == 2)
+    #expect(result.statistics.sent == 2)
+    #expect(result.statistics.received > 0)
   }
 
   @Test("Ping with invalid hostname fails")

@@ -127,7 +127,11 @@ public struct SwiftFTRConfig: Sendable {
   public let maxWaitMs: Int
   /// Size in bytes of the Echo payload (default: 56)
   public let payloadSize: Int
-  /// Override the public IP address (bypasses STUN discovery if set)
+  /// Public-address override for classified trace and multipath enrichment.
+  ///
+  /// When set, these enrichment paths bypass public-IP discovery. The standalone
+  /// ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` function and
+  /// ``SwiftFTR/discoverPublicIPWithHostname()`` do not use this value.
   public let publicIP: String?
   /// Enable verbose logging for debugging
   public let enableLogging: Bool
@@ -151,10 +155,23 @@ public struct SwiftFTRConfig: Sendable {
   ///
   /// Example:
   /// ```swift
-  /// let config = SwiftFTRConfig(
-  ///   interface: "en0",
-  ///   sourceIP: "192.168.1.100"  // Must be assigned to en0
-  /// )
+  /// func makeConfiguration(interfaceName: String, sourceIP: String) async -> SwiftFTRConfig? {
+  ///   let snapshot = await NetworkInterfaceDiscovery().discover()
+  ///   guard let selectedInterface = snapshot.interface(named: interfaceName),
+  ///     selectedInterface.isUp,
+  ///     selectedInterface.ipv4Addresses.contains(sourceIP)
+  ///       || selectedInterface.ipv6Addresses.contains(sourceIP)
+  ///   else { return nil }
+  ///
+  ///   let preferredFamily: PreferredFamily =
+  ///     selectedInterface.ipv4Addresses.contains(sourceIP) ? .v4 : .v6
+  ///   let config = SwiftFTRConfig(
+  ///     interface: selectedInterface.name,
+  ///     sourceIP: sourceIP,
+  ///     preferredFamily: preferredFamily
+  ///   )
+  ///   return config
+  /// }
   /// ```
   public let sourceIP: String?
 
@@ -192,13 +209,15 @@ public struct SwiftFTRConfig: Sendable {
   ///   - maxHops: Maximum TTL/hops to probe (default: 40)
   ///   - maxWaitMs: Maximum wait time per probe in milliseconds (default: 1000ms)
   ///   - payloadSize: Size in bytes of the Echo payload (default: 56)
-  ///   - publicIP: Override the public IP address (bypasses STUN discovery if set)
+  ///   - publicIP: Public-address override for classified trace and multipath enrichment. It does
+  ///     not affect the standalone public-IP discovery APIs.
   ///   - enableLogging: Enable verbose logging for debugging
   ///   - noReverseDNS: Disable reverse DNS lookups (default: false)
   ///   - rdnsCacheTTL: TTL for rDNS cache entries in seconds (default: 86400 = 1 day)
   ///   - rdnsCacheSize: Maximum rDNS cache size (default: 1000 entries)
-  ///   - interface: Network interface to use for sending probes (e.g. "en0"). If nil, uses system default.
-  ///   - sourceIP: Source IP address to bind to (e.g. "192.168.1.100"). Must be assigned to the interface. If nil, uses system default.
+  ///   - interface: BSD interface name returned by ``NetworkInterfaceDiscovery``. If nil, uses system routing.
+  ///   - sourceIP: Source address reported on the selected interface. It must match the
+  ///     destination family. If nil, the system chooses an address.
   ///   - asnResolverStrategy: Strategy for ASN lookups during classification (default: .dns)
   ///   - preferredFamily: IP family preference for resolution (default: .auto)
   public init(
@@ -233,7 +252,7 @@ public struct SwiftFTRConfig: Sendable {
 /// Top-level entry point for performing fast, parallel traceroutes.
 ///
 /// SwiftFTR is an actor providing thread-safe traceroute operations with
-/// built-in caching for rDNS lookups and STUN public IP discovery.
+/// built-in caching for rDNS lookups and public-address enrichment of classified traces.
 @available(macOS 13.0, *)
 public actor SwiftFTR {
   internal nonisolated let config: SwiftFTRConfig
@@ -737,8 +756,9 @@ public actor SwiftFTR {
 
   /// Perform a traceroute and enrich results with ASN-based categorization.
   ///
-  /// This variant computes the client's public IP (via STUN by default unless overridden in config),
-  /// resolves origin ASNs for relevant IP addresses using the provided resolver, and labels
+  /// This variant obtains the client's public address from configuration, the actor cache, or fresh
+  /// IPv4 discovery (STUN followed by DNS fallback). It resolves origin ASNs for relevant IP
+  /// addresses using the provided resolver and labels
   /// each hop as LOCAL, ISP, TRANSIT, or DESTINATION. Missing stretches between
   /// identical segments are interpolated for readability.
   ///
@@ -1006,13 +1026,15 @@ public actor SwiftFTR {
     await NetworkInterfaceDiscovery().discover()
   }
 
-  /// Discover public IP via STUN through the configured (or default) interface.
+  /// Discover public IPv4 via STUN through the configured (or default) interface.
   ///
-  /// Returns both the public IP and its reverse DNS hostname if available.
-  /// Use this to understand which exit point your traffic uses for a given interface.
+  /// The interface and source address apply to the STUN attempt. If STUN fails, the DNS-whoami
+  /// fallback uses system routing. The optional reverse-DNS lookup also uses system routing.
+  /// Returns both the discovered address and its reverse-DNS hostname when available.
   ///
-  /// For multi-path scenarios, create separate `SwiftFTR` instances with different
-  /// interface configurations to discover the public IP for each path.
+  /// The result does not identify whether STUN or the unbound fallback succeeded, so it is not by
+  /// itself proof of a selected interface's exit. For route-specific dual-stack STUN results, use
+  /// ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` instead.
   ///
   /// ## Example
   /// ```swift
@@ -1021,10 +1043,16 @@ public actor SwiftFTR {
   /// let (ip, hostname) = try await tracer.discoverPublicIPWithHostname()
   /// print("Exit: \(ip) (\(hostname ?? "no rDNS"))")
   ///
-  /// // Discover public IP through VPN
-  /// let vpnTracer = SwiftFTR(config: SwiftFTRConfig(interface: "utun3"))
-  /// let (vpnIP, vpnHost) = try await vpnTracer.discoverPublicIPWithHostname()
-  /// print("VPN exit: \(vpnIP) (\(vpnHost ?? "no rDNS"))")
+  /// func discoverVPNExit(vpnBSDName: String) async throws {
+  ///   let snapshot = await NetworkInterfaceDiscovery().discover()
+  ///   guard let vpnInterface = snapshot.interface(named: vpnBSDName),
+  ///     vpnInterface.isUp, vpnInterface.type.isVPN
+  ///   else { return }
+  ///
+  ///   let vpnTracer = SwiftFTR(config: SwiftFTRConfig(interface: vpnInterface.name))
+  ///   let (vpnIP, vpnHost) = try await vpnTracer.discoverPublicIPWithHostname()
+  ///   print("VPN exit: \(vpnIP) (\(vpnHost ?? "no rDNS"))")
+  /// }
   /// ```
   public func discoverPublicIPWithHostname() async throws -> (ip: String, hostname: String?) {
     let ip = try await discoverPublicIP()
@@ -1078,7 +1106,7 @@ public actor SwiftFTR {
 
   /// Invalidate just the public IP cache.
   ///
-  /// Forces re-discovery via STUN on the next trace.
+  /// Forces fresh discovery during the next classified trace or multipath enrichment that needs it.
   public func invalidatePublicIP() {
     cacheGeneration &+= 1
     cachedPublicIP = nil

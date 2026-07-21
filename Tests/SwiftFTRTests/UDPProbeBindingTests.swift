@@ -45,18 +45,19 @@ import Testing
 
     @Test("Reports an unknown interface in the probe result")
     func invalidInterfaceReturnsClearError() async throws {
+      let invalidInterface = String(repeating: "x", count: Int(IFNAMSIZ) + 1)
       let result = try await udpProbe(
         config: UDPProbeConfig(
           host: "127.0.0.1",
           port: 9,
           timeout: 1,
-          interface: "swiftftr-invalid-interface"
+          interface: invalidInterface
         )
       )
 
       #expect(!result.isReachable)
       #expect(result.responseType == nil)
-      #expect(result.error == "Interface 'swiftftr-invalid-interface' not found")
+      #expect(result.error == "Interface '\(invalidInterface)' not found")
     }
 
     @Test("Reports a source address family mismatch in the probe result")

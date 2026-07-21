@@ -5,7 +5,7 @@ import Foundation
 #endif
 
 /// Returns `AF_INET` for IPv4, `AF_INET6` for IPv6, or `-1` if the string is not a valid IP.
-/// Strips scope ID (e.g. `%en0`) from IPv6 link-local addresses before parsing.
+/// Strips a scope ID (for example, `%interface-name`) from an IPv6 link-local address before parsing.
 @inline(__always)
 func detectAddressFamily(_ ip: String) -> Int32 {
   var addr4 = in_addr()
@@ -16,7 +16,7 @@ func detectAddressFamily(_ ip: String) -> Int32 {
   return -1
 }
 
-/// Parse an IPv6 server string like `fe80::1%en0` into (bareIP, scopeID).
+/// Parse an IPv6 server string like `fe80::1%interface-name` into (bareIP, scopeID).
 /// `scopeID` is the numeric interface index (from the `%zone` suffix), or 0 if absent.
 func parseIPv6Scoped(_ server: String) -> (ip: String, scopeID: UInt32) {
   let parts = server.split(separator: "%", maxSplits: 1)
@@ -42,7 +42,7 @@ func ipString(_ sin: sockaddr_in) -> String {
 }
 
 /// Canonical IPv6 string form via `inet_ntop`. Appends `%<ifname>` zone suffix when
-/// `scopeID != 0` so link-local addresses round-trip as `fe80::1%en0` rather than
+/// `scopeID != 0` so link-local addresses round-trip as `fe80::1%interface-name` rather than
 /// losing their zone (which would collide on string keys across interfaces).
 ///
 /// Downstream contract (NWX): every address SwiftFTR emits goes through this

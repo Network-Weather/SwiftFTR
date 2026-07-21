@@ -358,7 +358,7 @@ struct PingExecutor: Sendable {
             sourceIP: sourceIPStr, errno: errno, details: "bind() failed")
         }
       case AF_INET6:
-        // Honor link-local scope suffix (fe80::xxxx%en0) via parseIPv6Scoped.
+        // Honor link-local scope suffix (fe80::xxxx%interface-name) via parseIPv6Scoped.
         let (bare, scopeID) = parseIPv6Scoped(sourceIPStr)
         var addr = sockaddr_in6()
         addr.sin6_family = sa_family_t(AF_INET6)

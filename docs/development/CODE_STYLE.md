@@ -6,7 +6,7 @@ SwiftFTR uses `swift-format` for automated code formatting. Run before committin
 
 ```bash
 swift format lint -r Sources Tests
-swift format -i -r Sources Tests  # Auto-fix
+swift format format --in-place -r Sources Tests  # Auto-fix
 ```
 
 ## Naming Convention Exceptions

@@ -18,9 +18,9 @@ All of these are NWX downstream contracts. Changing any of them in a stage past 
 - **Single dest-string entry point.** `tracer.ping(to: "1.1.1.1")` and `tracer.ping(to: "2606:4700:4700::1111")` both go through the same `ping(to:config:)` method. The library detects the family from the resolved address and dispatches. No `pingV4`/`pingV6` API split.
 - **`PreferredFamily` opt-in.** Optional `preferredFamily: .v4 | .v6 | .auto` (default `.auto`) on `PingConfig` (and later `SwiftFTRConfig`). `.auto` uses the literal's family for IP literals and the first `getaddrinfo(AF_UNSPEC)` answer for hostnames.
 - **Canonical-form contract.** Every address SwiftFTR emits (`PingResult.resolvedIP`, `TraceHop.ipAddress`, `ParsedICMP.sourceAddress`) is the `inet_ntop` canonical form. Round-tripping `String → resolve → String` is stable for any input. NWX uses these strings as dictionary keys; inconsistency would silently break lookups.
-- **Link-local scope IDs preserved.** When a hop or reply source is link-local (`fe80::/10`), the emitted string includes the zone suffix (`fe80::xxxx%en0`) via `if_indextoname(sin6_scope_id)`. Never strip. Multiple link-local hops on different interfaces must not collide on string keys.
+- **Link-local scope IDs preserved.** When a hop or reply source is link-local (`fe80::/10`), the emitted string includes the operating system's zone suffix (`fe80::xxxx%interface-name`) via `if_indextoname(sin6_scope_id)`. Never strip. Multiple link-local hops on different interfaces must not collide on string keys.
 - **Hop limit in the same `ttl` field.** `PingResponse.ttl: Int?` carries the IPv4 TTL for v4 replies and the IPv6 hop limit for v6 replies. Same field, same units (1–255). No new `hopLimit` field added.
-- **Interface binding works identically.** `SwiftFTRConfig(interface: "en0")` binds v6 sockets via `IPV6_BOUND_IF` and produces source-address-selected output on that interface, mirroring the v4 `IP_BOUND_IF` path.
+- **Interface binding works identically.** Passing a name returned by `NetworkInterfaceDiscovery` to `SwiftFTRConfig(interface:)` binds v6 sockets via `IPV6_BOUND_IF` and produces source-address-selected output on that interface, mirroring the v4 `IP_BOUND_IF` path.
 - **Concurrent-ping safety.** Each `ping()` call allocates its own ephemeral socket — no shared identifier/sequence space, safe to call concurrently from a shared `SwiftFTR` instance.
 - **Unprivileged sockets only.** `SOCK_DGRAM IPPROTO_ICMPV6` (no setuid, no entitlements) — same model as the existing v4 `SOCK_DGRAM IPPROTO_ICMP` path. Documented if a stage ever needs a raw socket.
 - **Family-agnostic errors.** Single `TracerouteError` covers both families; cases like `.resolutionFailed`, `.bindFailed`, `.sendFailed` apply equally to both. Family captured in error context, not in the error type.
@@ -88,8 +88,8 @@ Dual-stack `tcpProbe(...)` and `udpProbe(...)`: same entry points work for both 
 
 | Variable | Effect |
 |---|---|
-| `PTR_SKIP_STUN=1` | Skip STUN public-IP discovery (used in tests for isolation) |
-| `SKIP_NETWORK_TESTS=1` | Skip all tests that touch the network (any family) |
+| `PTR_SKIP_STUN=1` | Skip the public-IP integration-test subset using this legacy gate; no runtime effect |
+| `SKIP_NETWORK_TESTS=1` | Skip the remaining live-network tests; set both variables for an offline run |
 | `SKIP_IPV6_TESTS=1` | Force-skip v6 integration tests (e.g. to test the skip path locally) |
 | `FORCE_IPV6_TESTS=1` | Force-run v6 integration tests without probing (use only if your environment is guaranteed) |
 
@@ -121,7 +121,7 @@ NWX-validated, used in SwiftFTR's tests and the spike:
 For local-loop and link-local testing:
 
 - `::1` — loopback. **Caveat**: Darwin returns the Echo *Request* unchanged (type 128) on loopback rather than synthesizing an Echo Reply (type 129). Integration tests prefer a non-loopback target.
-- `fe80::1%en0` — link-local on a specific interface, for `interface:` binding tests.
+- A link-local address with the zone returned by system metadata — for example, `fe80::1%interface-name` — for `interface:` binding tests. Do not infer the zone from a BSD name's numeric suffix.
 
 ## References
 
