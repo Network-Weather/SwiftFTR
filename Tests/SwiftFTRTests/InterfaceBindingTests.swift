@@ -3,6 +3,10 @@ import Testing
 
 @testable import SwiftFTR
 
+#if canImport(Darwin)
+  import Darwin
+#endif
+
 /// Tests for per-operation interface and source IP binding
 ///
 /// These tests verify that:
@@ -195,16 +199,17 @@ struct InterfaceBindingTests {
   @Test("Invalid interface throws descriptive error")
   func testInvalidInterfaceThrowsError() async {
     let ftr = SwiftFTR()
+    let invalidInterface = String(repeating: "x", count: Int(IFNAMSIZ) + 1)
 
     do {
       _ = try await ftr.ping(
         to: "1.1.1.1",
-        config: PingConfig(count: 1, timeout: 1.0, interface: "test-interface")
+        config: PingConfig(count: 1, timeout: 1.0, interface: invalidInterface)
       )
       Issue.record("Should have thrown interfaceBindFailed error")
     } catch let error as TracerouteError {
       if case .interfaceBindFailed(let iface, _, let details) = error {
-        #expect(iface == "test-interface")
+        #expect(iface == invalidInterface)
         #expect(details?.contains("not found") ?? false, "Error should mention interface not found")
         print("✓ Invalid interface error: \(error)")
       } else {

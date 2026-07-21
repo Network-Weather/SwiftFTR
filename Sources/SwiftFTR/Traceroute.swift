@@ -151,15 +151,22 @@ public struct SwiftFTRConfig: Sendable {
   ///
   /// Example:
   /// ```swift
-  /// let snapshot = await NetworkInterfaceDiscovery().discover()
-  /// if let selectedInterface = snapshot.activeInterfaces.first,
-  ///   let sourceIP = selectedInterface.ipv4Addresses.first
-  /// {
+  /// func makeConfiguration(interfaceName: String, sourceIP: String) async -> SwiftFTRConfig? {
+  ///   let snapshot = await NetworkInterfaceDiscovery().discover()
+  ///   guard let selectedInterface = snapshot.interface(named: interfaceName),
+  ///     selectedInterface.isUp,
+  ///     selectedInterface.ipv4Addresses.contains(sourceIP)
+  ///       || selectedInterface.ipv6Addresses.contains(sourceIP)
+  ///   else { return nil }
+  ///
+  ///   let preferredFamily: PreferredFamily =
+  ///     selectedInterface.ipv4Addresses.contains(sourceIP) ? .v4 : .v6
   ///   let config = SwiftFTRConfig(
   ///     interface: selectedInterface.name,
   ///     sourceIP: sourceIP,
-  ///     preferredFamily: .v4
+  ///     preferredFamily: preferredFamily
   ///   )
+  ///   return config
   /// }
   /// ```
   public let sourceIP: String?
@@ -1013,9 +1020,11 @@ public actor SwiftFTR {
     await NetworkInterfaceDiscovery().discover()
   }
 
-  /// Discover public IP via STUN through the configured (or default) interface.
+  /// Discover public IPv4 via STUN through the configured (or default) interface.
   ///
-  /// Returns both the public IP and its reverse DNS hostname if available.
+  /// The interface and source address apply to the STUN attempt. If STUN fails, the DNS-whoami
+  /// fallback uses system routing. The optional reverse-DNS lookup also uses system routing.
+  /// Returns both the discovered address and its reverse-DNS hostname when available.
   /// Use this to understand which exit point your traffic uses for a given interface.
   ///
   /// For multi-path scenarios, create separate `SwiftFTR` instances with different
@@ -1028,8 +1037,12 @@ public actor SwiftFTR {
   /// let (ip, hostname) = try await tracer.discoverPublicIPWithHostname()
   /// print("Exit: \(ip) (\(hostname ?? "no rDNS"))")
   ///
-  /// let snapshot = await NetworkInterfaceDiscovery().discover()
-  /// if let vpnInterface = snapshot.vpnInterfaces.first {
+  /// func discoverVPNExit(vpnBSDName: String) async throws {
+  ///   let snapshot = await NetworkInterfaceDiscovery().discover()
+  ///   guard let vpnInterface = snapshot.interface(named: vpnBSDName),
+  ///     vpnInterface.isUp, vpnInterface.type.isVPN
+  ///   else { return }
+  ///
   ///   let vpnTracer = SwiftFTR(config: SwiftFTRConfig(interface: vpnInterface.name))
   ///   let (vpnIP, vpnHost) = try await vpnTracer.discoverPublicIPWithHostname()
   ///   print("VPN exit: \(vpnIP) (\(vpnHost ?? "no rDNS"))")

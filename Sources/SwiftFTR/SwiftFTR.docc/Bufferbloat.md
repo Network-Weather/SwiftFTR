@@ -50,8 +50,12 @@ let result = try await tracer.testBufferbloat(config: config)
 Set `loadDuration` to zero when you need latency measurements bound to an interface or source IP:
 
 ```swift
-let snapshot = await NetworkInterfaceDiscovery().discover()
-if let selectedInterface = snapshot.activeInterfaces.first {
+func measureBoundBaseline(interfaceName: String) async throws {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    guard let selectedInterface = snapshot.interface(named: interfaceName),
+          selectedInterface.isUp
+    else { return }
+
     let tracer = SwiftFTR(config: SwiftFTRConfig(interface: selectedInterface.name))
     let result = try await tracer.testBufferbloat(
         config: BufferbloatConfig(

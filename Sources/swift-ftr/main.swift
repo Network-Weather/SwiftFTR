@@ -70,7 +70,7 @@ extension SwiftFTRCommand {
           swift-ftr trace 1.1.1.1 -m 10 -t 2.0
           swift-ftr trace --json 8.8.8.8
           swift-ftr interfaces
-          swift-ftr trace -i <bsd-interface> google.com
+          swift-ftr trace -i BSD_NAME google.com
         """
     )
 
@@ -503,7 +503,7 @@ extension SwiftFTRCommand {
           swift-ftr ping 8.8.8.8
           swift-ftr ping example.com -c 10 -i 0.5
           swift-ftr interfaces
-          swift-ftr ping 1.1.1.1 --interface <bsd-interface> --json
+          swift-ftr ping 1.1.1.1 --interface BSD_NAME --json
         """
     )
 
@@ -996,10 +996,11 @@ extension SwiftFTRCommand {
   struct Multipath: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
       commandName: "multipath",
-      abstract: "Discover ECMP paths using Dublin Traceroute",
+      abstract: "Discover IPv4 ECMP paths using Dublin Traceroute",
       discussion: """
         Systematically varies flow identifiers to discover multiple paths to a destination,
         using Paris Traceroute consistency within each flow.
+        Multipath discovery currently supports IPv4 destinations and source addresses only.
 
         Examples:
           swift-ftr multipath example.com
@@ -1040,7 +1041,7 @@ extension SwiftFTRCommand {
     )
     var interface: String?
 
-    @Option(name: [.short, .customLong("source")], help: "Source IP address to bind to")
+    @Option(name: [.short, .customLong("source")], help: "IPv4 source address to bind to")
     var sourceIP: String?
 
     @Option(name: .customLong("public-ip"), help: "Override public IP (bypasses STUN)")
@@ -1055,7 +1056,7 @@ extension SwiftFTRCommand {
     @Flag(name: .customLong("verbose"), help: "Enable verbose logging")
     var verbose: Bool = false
 
-    @Argument(help: "Destination hostname or IPv4/IPv6 address")
+    @Argument(help: "Destination hostname or IPv4 address (IPv4 only)")
     var target: String
 
     func run() async throws {

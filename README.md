@@ -34,7 +34,7 @@ How It Works
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
 5) Optional classification (when using `traceClassified`):
    - Detect the client's public IP via STUN with DNS fallback (or use `PTR_PUBLIC_IP`, or disable via `PTR_SKIP_STUN`). `getPublicIPs()` returns both v4 and v6 in parallel for callers that want a dual-stack view.
-   - Batch‑resolve ASNs using Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) or the embedded local database via swift-ip2asn 0.4.1. Apply heuristics for PRIVATE and CGNAT ranges.
+   - Batch‑resolve ASNs using Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) or the embedded local database via swift-ip2asn. Apply heuristics for PRIVATE and CGNAT ranges.
    - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and "hole‑fill" missing stretches between identical segments.
 
 How Fast Is It?
@@ -125,18 +125,13 @@ Use It as a Library
 ```swift
 import SwiftFTR
 
-// Discover names at runtime; BSD names do not imply WiFi or Ethernet.
-let interfaceSnapshot = await NetworkInterfaceDiscovery().discover()
-let selectedInterface = interfaceSnapshot.physicalInterfaces.first { $0.type == .wifi }
-
 // Configure defaults for supported socket-backed diagnostics
 let config = SwiftFTRConfig(
     maxHops: 40,        // Max TTL to probe
     maxWaitMs: 1000,    // Timeout in milliseconds
     payloadSize: 56,    // ICMP payload size
     publicIP: nil,      // Auto-detect via STUN (with DNS fallback)
-    enableLogging: false, // Set true for debugging
-    interface: selectedInterface?.name // Optional: caller-selected interface
+    enableLogging: false // Set true for debugging
 )
 
 let tracer = SwiftFTR(config: config)
@@ -195,34 +190,39 @@ for hop in topology.uniqueHops() {
     print("Discovered hop at TTL \(hop.ttl): \(hop.ip ?? "*")")
 }
 
-// Per-Operation Interface Binding
-// Override global interface for specific operations
-let interfaces = await NetworkInterfaceDiscovery().discover()
-if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }),
-   let ethernetInterface = interfaces.physicalInterfaces.first(where: { $0.type == .ethernet }) {
-    let boundTracer = SwiftFTR(config: SwiftFTRConfig(interface: wifiInterface.name))
+// Per-operation interface binding with names selected by your UI or caller.
+func compareRoutes(primaryBSDName: String, alternateBSDName: String) async throws {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    guard let primaryInterface = snapshot.interfaces.first(where: { $0.name == primaryBSDName }),
+          let alternateInterface = snapshot.interfaces.first(where: { $0.name == alternateBSDName }),
+          primaryInterface.isUp, alternateInterface.isUp
+    else {
+        return
+    }
+
+    let boundTracer = SwiftFTR(config: SwiftFTRConfig(interface: primaryInterface.name))
 
     // Use the caller-selected global interface.
-    let wifiPing = try await boundTracer.ping(to: "1.1.1.1")
+    let primaryPing = try await boundTracer.ping(to: "1.1.1.1")
 
-    // Override to use Ethernet for this operation only.
-    let ethPing = try await boundTracer.ping(
+    // Override with the caller's alternate interface for this operation only.
+    let alternatePing = try await boundTracer.ping(
         to: "1.1.1.1",
-        config: PingConfig(interface: ethernetInterface.name)
+        config: PingConfig(interface: alternateInterface.name)
     )
 
     // Concurrent multi-interface monitoring.
-    async let wifi = boundTracer.ping(
+    async let primary = boundTracer.ping(
         to: "1.1.1.1",
-        config: PingConfig(interface: wifiInterface.name)
+        config: PingConfig(interface: primaryInterface.name)
     )
-    async let ethernet = boundTracer.ping(
+    async let alternate = boundTracer.ping(
         to: "1.1.1.1",
-        config: PingConfig(interface: ethernetInterface.name)
+        config: PingConfig(interface: alternateInterface.name)
     )
-    let (wifiResult, ethResult) = try await (wifi, ethernet)
-    print("WiFi loss: \(Int(wifiResult.statistics.packetLoss * 100))%")
-    print("Ethernet loss: \(Int(ethResult.statistics.packetLoss * 100))%")
+    let (primaryResult, alternateResult) = try await (primary, alternate)
+    print("Primary loss: \(Int(primaryResult.statistics.packetLoss * 100))%")
+    print("Alternate loss: \(Int(alternateResult.statistics.packetLoss * 100))%")
 }
 
 // DNS API with rich metadata
@@ -387,10 +387,13 @@ Options:
 Configuration and Flags
 -----------------------
 - Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
-- Pass a name and family-matched address returned by `NetworkInterfaceDiscovery` to `SwiftFTRConfig(interface:sourceIP:)` for traceroute, ping, and DNS query-helper defaults.
-- Standalone TCP, UDP, and DNS probes use their operation-level config instead of inheriting those defaults.
+- Validate an exact caller-selected name and family-matched address against `NetworkInterfaceDiscovery`; never infer a physical adapter's role from its BSD-name suffix.
+- Traceroute, streaming/classified trace, and IPv4-only multipath use the global `SwiftFTRConfig` binding. Ping supports IPv4 and IPv6; each non-`nil` operation-level binding independently overrides its global counterpart.
+- Actor DNS query helpers inherit globals unless the call overrides them. The numeric DNS server—not A versus AAAA record type—selects the IPv4 or IPv6 transport. Standalone TCP, UDP, and DNS probes use operation config only.
+- `getPublicIPs()` accepts operation-level bindings for parallel IPv4/IPv6 STUN. `discoverPublicIPWithHostname()` applies globals to its IPv4 STUN attempt, but its DNS-whoami fallback and rDNS lookup use system routing.
 - Bufferbloat honors route binding only for baseline latency (`loadDuration: 0`); loaded tests reject effective binding.
 - HTTP/HTTPS probes use URLSession and do not support either binding option.
+- Socket binding controls the documented probe sockets only. Hostname resolution, system rDNS, DNS-whoami fallback, and Team Cymru ASN lookups are not bound by these settings.
 - CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
 
 Design Details

@@ -11,40 +11,60 @@ SwiftFTR supports binding selected socket-backed operations to specific network 
 - Multi-homed servers
 - Network testing and troubleshooting
 
-Support varies by API. Traceroute uses the global ``SwiftFTRConfig`` setting, ping supports global
-and per-operation settings, and TCP, UDP, and DNS probes expose operation-level settings. HTTP
-probes follow system routing because URLSession does not expose interface binding.
+Binding applies to the sockets created by the supported operation. It does not bind hostname
+resolution, system reverse DNS, Team Cymru ASN queries, or URLSession traffic.
+
+| API | Binding source | Address families | Important scope |
+| --- | --- | --- | --- |
+| Trace, streaming trace, classified trace | Global ``SwiftFTRConfig`` only | IPv4 and IPv6 | Probe sockets only; hostname resolution, rDNS, and Cymru queries use system routing. |
+| Multipath discovery | Global ``SwiftFTRConfig`` only | IPv4 only | IPv6 destinations and source addresses are rejected. |
+| Ping | ``PingConfig`` values independently override global values; each `nil` value inherits its global counterpart | IPv4 and IPv6 | Probe socket only. |
+| Actor DNS query helpers (`tracer.dns`) | Call-level values independently override global values | IPv4 and IPv6 DNS transports | The numeric DNS server selects the transport family; record type does not. An AAAA query therefore uses IPv4 by default because the default server is `8.8.8.8`. |
+| Standalone DNS, TCP, and UDP probes | Operation config only | IPv4 and IPv6 | Hostname resolution for TCP/UDP remains system-routed. |
+| ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` | Function arguments only | Parallel IPv4 and IPv6 STUN | A source address is applied only to its matching family. |
+| ``SwiftFTR/discoverPublicIPWithHostname()`` | Global config for IPv4 STUN | IPv4 | DNS-whoami fallback and the optional rDNS lookup are system-routed. |
+| Bufferbloat | Operation values override globals | IPv4 and IPv6 baseline ping | Binding is accepted only when `loadDuration == 0`; loaded tests reject any effective binding. |
+| HTTP/HTTPS probe | None | URLSession-selected | Interface and source-address binding are unavailable. |
 
 ## Selecting Interface Names
 
-Discover interfaces at runtime and select by the operating system's reported type. BSD names are identifiers only; their numeric suffix does not identify WiFi or Ethernet hardware.
+Discover interfaces at runtime, present the operating system's metadata to the caller, and pass
+back the exact BSD name the caller selected. BSD names are identifiers only; their numeric suffix
+does not identify Wi-Fi or Ethernet hardware. Select a source address explicitly too—do not use
+the first address when the interface has several.
 
 ```swift
 import SwiftFTR
 
-let interfaceSnapshot = await NetworkInterfaceDiscovery().discover()
-
 enum InterfaceSelectionError: Error {
-    case unavailable(InterfaceType)
+    case unavailable(String)
+    case addressNotAssigned(String)
 }
 
-func requireInterface(
-    _ type: InterfaceType,
+struct SelectedRoute {
+    let interface: NetworkInterface
+    let sourceIP: String?
+}
+
+func validateRouteSelection(
+    interfaceName: String,
+    sourceIP: String?,
     from snapshot: NetworkInterfaceSnapshot
-) throws -> NetworkInterface {
-    guard let interface = snapshot.physicalInterfaces.first(where: { $0.type == type }) else {
-        throw InterfaceSelectionError.unavailable(type)
+) throws -> SelectedRoute {
+    guard let interface = snapshot.interface(named: interfaceName), interface.isUp else {
+        throw InterfaceSelectionError.unavailable(interfaceName)
     }
-    return interface
+    let assignedAddresses = interface.ipv4Addresses + interface.ipv6Addresses
+    if let sourceIP, !assignedAddresses.contains(sourceIP) {
+        throw InterfaceSelectionError.addressNotAssigned(sourceIP)
+    }
+    return SelectedRoute(interface: interface, sourceIP: sourceIP)
 }
-
-let wifiInterface = try requireInterface(.wifi, from: interfaceSnapshot)
-let ethernetInterface = try requireInterface(.ethernet, from: interfaceSnapshot)
 ```
 
-The examples below use these discovered values. Ping and the DNS query helpers inherit global
-interface and source-IP settings when an operation does not override them. Standalone TCP, UDP,
-and DNS probes use only their operation config; a `nil` binding lets the system select the route.
+Call this validator with the exact interface name and optional source address selected by your UI.
+The examples below call two validated results `selectedRoute` and `alternateRoute`. A `nil`
+binding lets the system select the route.
 
 ## Binding Levels
 
@@ -58,8 +78,8 @@ Set a default interface for supported operations launched through a ``SwiftFTR/S
 import SwiftFTR
 
 let config = SwiftFTRConfig(
-    interface: wifiInterface.name,
-    sourceIP: wifiInterface.ipv4Addresses.first
+    interface: selectedRoute.interface.name,
+    sourceIP: selectedRoute.sourceIP
 )
 let ftr = SwiftFTR(config: config)
 
@@ -75,15 +95,15 @@ Override the global interface for specific operations:
 ```swift
 import SwiftFTR
 
-let ftr = SwiftFTR(config: SwiftFTRConfig(interface: wifiInterface.name))
+let ftr = SwiftFTR(config: SwiftFTRConfig(interface: selectedRoute.interface.name))
 
 // Use the global interface selection.
 let wifiPing = try await ftr.ping(to: "1.1.1.1")
 
-// Override to use Ethernet for this operation only
+// Override with the caller's alternate selection for this operation only.
 let ethPing = try await ftr.ping(
     to: "1.1.1.1",
-    config: PingConfig(interface: ethernetInterface.name)
+    config: PingConfig(interface: alternateRoute.interface.name)
 )
 
 // Back to the global interface selection.
@@ -100,10 +120,10 @@ For APIs that expose both global and operation settings, SwiftFTR resolves inter
 import SwiftFTR
 
 // Example 1: Operation override wins
-let ftr1 = SwiftFTR(config: SwiftFTRConfig(interface: wifiInterface.name))
+let ftr1 = SwiftFTR(config: SwiftFTRConfig(interface: selectedRoute.interface.name))
 let result1 = try await ftr1.ping(
     to: "1.1.1.1",
-    config: PingConfig(interface: ethernetInterface.name)
+    config: PingConfig(interface: alternateRoute.interface.name)
 )
 
 // Example 2: Global config used when no operation override
@@ -116,14 +136,7 @@ let result3 = try await ftr2.ping(to: "1.1.1.1")  // Uses system routing
 
 ## Supported Operations
 
-Binding support is not uniform across every transport:
-
-- Traceroute and streaming traceroute use ``SwiftFTR/SwiftFTRConfig/interface`` and ``SwiftFTR/SwiftFTRConfig/sourceIP``.
-- Ping uses the global settings and supports overrides through ``SwiftFTR/PingConfig``.
-- The DNS query helpers use global settings and support call-level overrides. The standalone DNS probe uses ``SwiftFTR/DNSProbeConfig``.
-- The standalone TCP and UDP probes use ``SwiftFTR/TCPProbeConfig`` and ``SwiftFTR/UDPProbeConfig``.
-- Bufferbloat applies its binding settings only to latency pings; its HTTP load traffic follows system routing.
-- HTTP probes don't expose binding settings.
+The matrix above is authoritative. The examples below show the operation-level forms.
 
 ### Ping
 
@@ -135,7 +148,7 @@ let result = try await ftr.ping(
     to: "1.1.1.1",
     config: PingConfig(
         count: 5,
-        interface: ethernetInterface.name
+        interface: alternateRoute.interface.name
     )
 )
 
@@ -152,7 +165,7 @@ let result = try await tcpProbe(
         host: "example.com",
         port: 443,
         timeout: 2.0,
-        interface: wifiInterface.name
+        interface: selectedRoute.interface.name
     )
 )
 
@@ -169,13 +182,12 @@ let result = try await udpProbe(
         host: "1.1.1.1",
         port: 53,
         timeout: 2.0,
-        interface: wifiInterface.name,
-        sourceIP: wifiInterface.ipv4Addresses.first,
+        interface: selectedRoute.interface.name,
         preferredFamily: .v4
     )
 )
 
-print("UDP probe via \(wifiInterface.name): \(result.isReachable ? "reachable" : "unreachable")")
+print("UDP probe via \(selectedRoute.interface.name): \(result.isReachable ? "reachable" : "unreachable")")
 ```
 
 When `sourceIP` is set, its address family must match the resolved destination family. Use
@@ -191,12 +203,32 @@ let result = try await dnsProbe(
         server: "1.1.1.1",
         query: "example.com",
         timeout: 2.0,
-        interface: ethernetInterface.name
+        interface: selectedRoute.interface.name
     )
 )
 
 print("DNS probe via selected interface: \(result.isReachable ? "reachable" : "unreachable")")
 ```
+
+The DNS server must be a numeric address. Its family selects the UDP transport independently of
+the record type: an AAAA query sent to `8.8.8.8` travels over IPv4, while the same query sent to an
+IPv6 DNS server travels over IPv6.
+
+### Public IP Discovery
+
+Use the standalone dual-stack API when the caller needs operation-level route selection:
+
+```swift
+let publicIPs = await getPublicIPs(
+    interface: selectedRoute.interface.name,
+    sourceIP: selectedRoute.sourceIP
+)
+print(publicIPs.v4 as Any, publicIPs.v6 as Any)
+```
+
+``SwiftFTR/discoverPublicIPWithHostname()`` instead inherits the actor's global binding and first
+tries bound IPv4 STUN. If STUN fails, its DNS-whoami fallback drops that binding; the optional
+reverse-DNS lookup is also system-routed.
 
 ### HTTP Probe
 
@@ -218,11 +250,11 @@ let result = try await ftr.testBufferbloat(
         target: "1.1.1.1",
         baselineDuration: 3.0,
         loadDuration: 0,
-        interface: wifiInterface.name
+        interface: selectedRoute.interface.name
     )
 )
 
-print("Baseline latency via \(wifiInterface.name): \(result.baseline.avgMs) ms")
+print("Baseline latency via \(selectedRoute.interface.name): \(result.baseline.avgMs) ms")
 ```
 
 Only `result.baseline` and baseline entries in `result.pingResults` are usable in this mode.
@@ -238,26 +270,26 @@ import SwiftFTR
 
 let ftr = SwiftFTR()
 
-// Concurrent monitoring via WiFi and Ethernet
-async let wifiResult = ftr.ping(
+// Concurrent monitoring via two exact caller-selected routes.
+async let primaryResult = ftr.ping(
     to: "1.1.1.1",
-    config: PingConfig(count: 10, interval: 0.5, interface: wifiInterface.name)
+    config: PingConfig(count: 10, interval: 0.5, interface: selectedRoute.interface.name)
 )
-async let ethResult = ftr.ping(
+async let alternateResult = ftr.ping(
     to: "1.1.1.1",
-    config: PingConfig(count: 10, interval: 0.5, interface: ethernetInterface.name)
+    config: PingConfig(count: 10, interval: 0.5, interface: alternateRoute.interface.name)
 )
 
-let (wifi, ethernet) = try await (wifiResult, ethResult)
+let (primary, alternate) = try await (primaryResult, alternateResult)
 
 // Compare results
-print("WiFi:     \(wifi.statistics.avgRTT.map { String(format: "%.1fms", $0 * 1000) } ?? "N/A")")
-print("Ethernet: \(ethernet.statistics.avgRTT.map { String(format: "%.1fms", $0 * 1000) } ?? "N/A")")
+print("Primary:   \(primary.statistics.avgRTT.map { String(format: "%.1fms", $0 * 1000) } ?? "N/A")")
+print("Alternate: \(alternate.statistics.avgRTT.map { String(format: "%.1fms", $0 * 1000) } ?? "N/A")")
 
-if let wifiRTT = wifi.statistics.avgRTT,
-   let ethRTT = ethernet.statistics.avgRTT {
-    let faster = wifiRTT < ethRTT ? "WiFi" : "Ethernet"
-    print("\(faster) is faster by \(abs(wifiRTT - ethRTT) * 1000)ms")
+if let primaryRTT = primary.statistics.avgRTT,
+   let alternateRTT = alternate.statistics.avgRTT {
+    let faster = primaryRTT < alternateRTT ? "primary" : "alternate"
+    print("The \(faster) route is faster by \(abs(primaryRTT - alternateRTT) * 1000)ms")
 }
 ```
 
@@ -283,25 +315,34 @@ Bind to a specific source IP address on an interface (useful for multi-IP interf
 ```swift
 import SwiftFTR
 
-// Bind to an address reported for the selected interface.
-let result = try await SwiftFTR().ping(
-    to: "1.1.1.1",
-    config: PingConfig(
-        count: 5,
-        interface: wifiInterface.name,
-        sourceIP: wifiInterface.ipv4Addresses.first
-    )
-)
+func pingFromSelectedIPv4(_ route: SelectedRoute) async throws {
+    guard let sourceIP = route.sourceIP,
+          route.interface.ipv4Addresses.contains(sourceIP)
+    else {
+        throw InterfaceSelectionError.addressNotAssigned(route.sourceIP ?? "")
+    }
 
-// Source IP without an explicit interface (the system selects the route).
-let result2 = try await SwiftFTR().ping(
-    to: "1.1.1.1",
-    config: PingConfig(
-        count: 5,
-        sourceIP: wifiInterface.ipv4Addresses.first,
-        preferredFamily: .v4
+    // Bind to the exact interface and address selected by the caller.
+    let result = try await SwiftFTR().ping(
+        to: "1.1.1.1",
+        config: PingConfig(
+            count: 5,
+            interface: route.interface.name,
+            sourceIP: sourceIP,
+            preferredFamily: .v4
+        )
     )
-)
+
+    // Source IP without an explicit interface (the system selects the route).
+    let result2 = try await SwiftFTR().ping(
+        to: "1.1.1.1",
+        config: PingConfig(
+            count: 5,
+            sourceIP: sourceIP,
+            preferredFamily: .v4
+        )
+    )
+}
 ```
 
 **Requirements**:
@@ -317,11 +358,13 @@ Handle interface and source IP binding errors:
 import SwiftFTR
 
 let ftr = SwiftFTR()
+// Longer than Darwin's interface-name limit, so this cannot accidentally name real hardware.
+let impossibleInterfaceName = String(repeating: "x", count: 64)
 
 do {
     let result = try await ftr.ping(
         to: "1.1.1.1",
-        config: PingConfig(interface: "test-interface")
+        config: PingConfig(interface: impossibleInterfaceName)
     )
 } catch TracerouteError.interfaceBindFailed(let iface, let errno, let details) {
     print("Failed to bind to interface '\(iface)'")
@@ -341,7 +384,7 @@ do {
     let result = try await ftr.ping(
         to: "1.1.1.1",
         config: PingConfig(
-            interface: wifiInterface.name,
+            interface: selectedRoute.interface.name,
             sourceIP: "192.0.2.1"  // Documentation-only address, normally unassigned
         )
     )
@@ -372,32 +415,8 @@ Common error scenarios:
 HTTP/HTTPS probes and bufferbloat load generation use URLSession. URLSession's public API does not
 provide an interface or source-IP binding option, so those requests follow the system-selected
 route. SwiftFTR does not claim that setting a global binding changes URLSession traffic.
-
-## Bufferbloat Limitation
-
-Loaded bufferbloat tests cannot be bound to an interface or source IP. SwiftFTR uses
-`URLSession` to generate HTTP load, and its public API does not support binding a request to a
-specific route. Binding only the latency probes would compare traffic from potentially different
-routes and produce a misleading grade, so ``SwiftFTR/SwiftFTR/testBufferbloat(config:)`` throws
-``SwiftFTR/TracerouteError/invalidConfiguration(reason:)`` before starting network work.
-
-Interface binding remains available for a baseline-only latency measurement. The baseline
-statistics and baseline ping samples are usable, but loaded statistics, latency increase, RPM,
-grade, and the derived video-call assessment are not meaningful without a loaded phase:
-
-```swift
-import SwiftFTR
-
-let ftr = SwiftFTR()
-let config = BufferbloatConfig(
-    target: "1.1.1.1",
-    baselineDuration: 3.0,
-    loadDuration: 0,
-    interface: wifiInterface.name
-)
-let result = try await ftr.testBufferbloat(config: config)
-print("Baseline latency via \(wifiInterface.name): \(result.baseline.avgMs) ms")
-```
+The bufferbloat behavior is covered once in “Bufferbloat Test” above: loaded tests reject an
+effective binding, while baseline-only measurements may bind their ping socket.
 
 ## Implementation Details
 
@@ -409,14 +428,15 @@ SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for inter
 - Applied to ICMP, DNS, TCP, and UDP sockets by the APIs listed above
 - Requires valid interface name and index
 
-The binding applies to ping, traceroute, TCP, UDP, and DNS sockets. It does not apply to
-URLSession-backed HTTP/HTTPS probes or bufferbloat load requests.
+The binding applies only to the ping, traceroute, TCP, UDP, DNS, and STUN sockets identified in the
+support matrix. It does not apply to prerequisite hostname resolution, system rDNS, Team Cymru
+queries, DNS-whoami fallback, URLSession-backed HTTP/HTTPS probes, or bufferbloat load requests.
 Loaded bufferbloat tests reject route-specific configurations because binding only their latency
 probes would invalidate the measurement.
 
 ## Platform Support
 
-- **macOS**: Supported socket operations use `IP_BOUND_IF` / `IPV6_BOUND_IF`
+- **macOS 13 and later**: Supported socket operations use Darwin's `IP_BOUND_IF` / `IPV6_BOUND_IF`
 - **Linux**: Not yet supported (would require `SO_BINDTODEVICE`)
 
 ## Topics

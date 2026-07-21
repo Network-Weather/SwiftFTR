@@ -85,48 +85,37 @@ let prodTracer = SwiftFTR(config: prodConfig)
 
 ### Network Interface Selection (v0.4.0+)
 ```swift
-let interfaces = await NetworkInterfaceDiscovery().discover()
+func traceUsingCallerSelection(
+    destination: String,
+    interfaceName: String,
+    sourceIP: String?
+) async throws {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    guard let selectedInterface = snapshot.interface(named: interfaceName),
+          selectedInterface.isUp
+    else { return }
 
-if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }) {
-    let wifiConfig = SwiftFTRConfig(
-        maxHops: 40,
-        interface: wifiInterface.name
-    )
-    let wifiTracer = SwiftFTR(config: wifiConfig)
-}
+    let addresses = selectedInterface.ipv4Addresses + selectedInterface.ipv6Addresses
+    if let sourceIP, !addresses.contains(sourceIP) { return }
 
-if let ethernetInterface = interfaces.physicalInterfaces.first(where: { $0.type == .ethernet }) {
-    let ethernetConfig = SwiftFTRConfig(
-        maxHops: 40,
-        interface: ethernetInterface.name
-    )
-    let ethernetTracer = SwiftFTR(config: ethernetConfig)
-}
+    let family: PreferredFamily
+    if let sourceIP {
+        family = selectedInterface.ipv4Addresses.contains(sourceIP) ? .v4 : .v6
+    } else {
+        family = .auto
+    }
 
-// Bind to a source address reported by the operating system.
-if let selectedInterface = interfaces.activeInterfaces.first,
-   let sourceIP = selectedInterface.ipv4Addresses.first {
-    let sourceIPConfig = SwiftFTRConfig(
-        maxHops: 40,
-        sourceIP: sourceIP,
-        preferredFamily: .v4
-    )
-    let sourceTracer = SwiftFTR(config: sourceIPConfig)
-}
-
-// Combine an interface with one of its reported source addresses.
-if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }),
-   let sourceIP = wifiInterface.ipv4Addresses.first {
     let preciseConfig = SwiftFTRConfig(
         maxHops: 40,
-        interface: wifiInterface.name,
-        sourceIP: sourceIP
+        interface: selectedInterface.name,
+        sourceIP: sourceIP,
+        preferredFamily: family
     )
     let preciseTracer = SwiftFTR(config: preciseConfig)
 
     // Handle interface binding errors.
     do {
-        let result = try await preciseTracer.trace(to: "example.com")
+        let result = try await preciseTracer.trace(to: destination)
         print("Trace completed via \(preciseConfig.interface ?? "default")")
     } catch TracerouteError.interfaceBindFailed(let iface, let errno, let details) {
         print("Failed to bind to interface \(iface): \(details ?? "")")
@@ -403,14 +392,19 @@ if let record = gatewayPTR.records.first, case .ptr(let hostname) = record.data 
   print("Gateway hostname: \(hostname)")
 }
 
-// Query via an interface and one of its reported source addresses.
-let interfaces = await NetworkInterfaceDiscovery().discover()
-if let selectedInterface = interfaces.physicalInterfaces.first,
-   let sourceIP = selectedInterface.ipv4Addresses.first {
+// Query over IPv4 using an exact interface and address selected by the caller.
+func queryA(interfaceName: String, sourceIPv4: String) async throws {
+  let snapshot = await NetworkInterfaceDiscovery().discover()
+  guard let selectedInterface = snapshot.interface(named: interfaceName),
+        selectedInterface.isUp,
+        selectedInterface.ipv4Addresses.contains(sourceIPv4)
+  else { return }
+
   let result = try await tracer.dns.a(
     hostname: "example.com",
+    server: "8.8.8.8",
     interface: selectedInterface.name,
-    sourceIP: sourceIP
+    sourceIP: sourceIPv4
   )
 }
 ```
@@ -523,36 +517,34 @@ All DNS query functions support network interface and source IP binding.
 ```swift
 import SwiftFTR
 
-let interfaces = await NetworkInterfaceDiscovery().discover()
+func queryUsingCallerSelection(
+  interfaceName: String,
+  sourceIPv4: String,
+  sourceIPv6: String
+) async throws {
+  let snapshot = await NetworkInterfaceDiscovery().discover()
+  guard let selectedInterface = snapshot.interface(named: interfaceName),
+        selectedInterface.isUp,
+        selectedInterface.ipv4Addresses.contains(sourceIPv4),
+        selectedInterface.ipv6Addresses.contains(sourceIPv6)
+  else { return }
 
-if let wifiInterface = interfaces.physicalInterfaces.first(where: { $0.type == .wifi }) {
-  let wifiResult = try await reverseDNS(
+  let interfaceResult = try await reverseDNS(
     ip: "10.1.10.1",
     server: "10.1.10.1",
-    interface: wifiInterface.name
+    interface: selectedInterface.name,
+    sourceIP: sourceIPv4
   )
-  print("Via WiFi: \(wifiResult.hostname ?? "no PTR")")
-}
+  print("Via \(selectedInterface.name): \(interfaceResult.hostname ?? "no PTR")")
 
-// Query via a source address reported for an active interface.
-if let selectedInterface = interfaces.activeInterfaces.first,
-   let sourceIP = selectedInterface.ipv4Addresses.first {
-  let sourceResult = try await reverseDNS(
-    ip: "10.1.10.1",
-    server: "10.1.10.1",
-    sourceIP: sourceIP
-  )
-  print("Via \(selectedInterface.name): \(sourceResult.hostname ?? "no PTR")")
-}
-
-// Query IPv6 via an interface reported as Ethernet.
-if let ethernetInterface = interfaces.physicalInterfaces.first(where: { $0.type == .ethernet }) {
-  let ethResult = try await queryAAAA(
+  // The numeric DNS server selects an IPv6 transport; AAAA is the record type.
+  let ipv6Result = try await queryAAAA(
     hostname: "google.com",
     server: "2001:4860:4860::8888",  // Google's IPv6 DNS
-    interface: ethernetInterface.name
+    interface: selectedInterface.name,
+    sourceIP: sourceIPv6
   )
-  print("Via ethernet: \(ethResult.addresses)")
+  print("AAAA over IPv6: \(ipv6Result.addresses)")
 }
 ```
 

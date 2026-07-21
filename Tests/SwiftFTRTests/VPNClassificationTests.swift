@@ -11,14 +11,14 @@ struct VPNClassificationTests {
   @Test("VPNContext auto-detects VPN from interface name")
   func testVPNContextAutoDetect() {
     // VPN interfaces should create VPN context
-    let utunContext = VPNContext.forInterface("utun-test")
+    let utunContext = VPNContext.forInterface("utun3")
     #expect(utunContext.isVPNTrace == true)
-    #expect(utunContext.traceInterface == "utun-test")
+    #expect(utunContext.traceInterface == "utun3")
 
-    let ipsecContext = VPNContext.forInterface("ipsec-test")
+    let ipsecContext = VPNContext.forInterface("ipsec0")
     #expect(ipsecContext.isVPNTrace == true)
 
-    let pppContext = VPNContext.forInterface("ppp-test")
+    let pppContext = VPNContext.forInterface("ppp0")
     #expect(pppContext.isVPNTrace == true)
 
     // Non-VPN interfaces should not create VPN context
@@ -42,7 +42,7 @@ struct VPNClassificationTests {
   /// if it is, because CI runners can be configured without them.
   @Test("VPNContext.forInterface populates vpnLocalIPs from getifaddrs")
   func testVPNContextPopulatesLocalIPs() {
-    let firstContext = VPNContext.forInterface("utun-test-a")
+    let firstContext = VPNContext.forInterface("utun0")
     // Every entry should look like a valid IPv4 or IPv6 string.
     for ip in firstContext.vpnLocalIPs {
       let isV4 = detectAddressFamily(ip) == AF_INET
@@ -55,7 +55,7 @@ struct VPNClassificationTests {
     // the population walks every VPN interface on the host, not just the
     // named one. Sanity check that calling twice with different VPN-shaped
     // names yields the same set.
-    let secondContext = VPNContext.forInterface("utun-test-b")
+    let secondContext = VPNContext.forInterface("utun1")
     #expect(firstContext.vpnLocalIPs == secondContext.vpnLocalIPs)
     // And a non-VPN interface produces no context at all (empty set is fine).
     let nonVPNContext = VPNContext.forInterface("test-interface")
