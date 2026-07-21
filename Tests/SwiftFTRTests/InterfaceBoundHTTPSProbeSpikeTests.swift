@@ -280,8 +280,9 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
     arguments: LiveEndpointCase.allCases
   )
   func liveExactInterfaceTLS(endpointCase: LiveEndpointCase) async throws {
-    guard let interfaceName = primaryInterfaceName(for: endpointCase) else {
-      print("Skipping: no OS-reported \(endpointCase.testDescription) primary interface")
+    guard let interfaceName = liveInterfaceName(for: endpointCase) else {
+      print(
+        "Skipping: no caller-selected or OS-reported \(endpointCase.testDescription) interface")
       return
     }
     guard
@@ -319,8 +320,8 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
     .timeLimit(.minutes(1))
   )
   func liveTLSRejectsWrongLogicalHostname() async throws {
-    guard let interfaceName = primaryInterfaceName(for: .ipv4) else {
-      print("Skipping: no OS-reported IPv4 primary interface")
+    guard let interfaceName = liveInterfaceName(for: .ipv4) else {
+      print("Skipping: no caller-selected or OS-reported IPv4 interface")
       return
     }
     guard let resolved = try? resolveHost(host: "example.com", prefer: .v4) else {
@@ -379,7 +380,15 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
       checkCancellation: { try Task.checkCancellation() })
   }
 
-  private func primaryInterfaceName(for endpointCase: LiveEndpointCase) -> String? {
+  /// `SWIFTFTR_HTTPS_SPIKE_INTERFACE` lets a live rehearsal use the exact interface selected by
+  /// its operator. With no override, the smoke test uses the OS-reported primary for each family.
+  private func liveInterfaceName(for endpointCase: LiveEndpointCase) -> String? {
+    if let callerSelection = ProcessInfo.processInfo.environment[
+      "SWIFTFTR_HTTPS_SPIKE_INTERFACE"],
+      !callerSelection.isEmpty
+    {
+      return callerSelection
+    }
     guard
       let value = SCDynamicStoreCopyValue(nil, endpointCase.dynamicStoreKey as CFString),
       let dictionary = value as? [String: Any]
