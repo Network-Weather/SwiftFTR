@@ -44,6 +44,77 @@ final class SwiftFTRCacheTests: XCTestCase {
     }
   }
 
+  private enum ControlledResolverError: Error {
+    case requestedFailure
+  }
+
+  private struct ImmediateFailureResolver: ASNResolver {
+    func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+      throw ControlledResolverError.requestedFailure
+    }
+  }
+
+  /// Resolver whose calls remain suspended until a test explicitly completes them.
+  private actor ControlledResolver: ASNResolver {
+    private var batches: [[String]] = []
+    private var pendingCalls: [Int: CheckedContinuation<[String: ASNInfo], Error>] = [:]
+
+    func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+      let callIndex = batches.count
+      batches.append(ipv4Addrs.sorted())
+      return try await withCheckedThrowingContinuation { continuation in
+        pendingCalls[callIndex] = continuation
+      }
+    }
+
+    func callCount() -> Int { batches.count }
+
+    func recordedBatches() -> [[String]] { batches }
+
+    func succeed(callAt index: Int) {
+      guard let continuation = pendingCalls.removeValue(forKey: index) else { return }
+      var result: [String: ASNInfo] = [:]
+      for address in batches[index] {
+        let suffix = Int(address.split(separator: ".").last ?? "0") ?? 0
+        result[address] = ASNInfo(asn: 65_000 + suffix, name: "Controlled")
+      }
+      continuation.resume(returning: result)
+    }
+
+    func succeedAll() {
+      for index in pendingCalls.keys.sorted() {
+        succeed(callAt: index)
+      }
+    }
+
+    func failAll() {
+      for index in pendingCalls.keys.sorted() {
+        pendingCalls.removeValue(forKey: index)?.resume(
+          throwing: ControlledResolverError.requestedFailure
+        )
+      }
+    }
+  }
+
+  private func waitForCallCount(
+    _ expectedCount: Int,
+    from resolver: ControlledResolver
+  ) async -> Bool {
+    for _ in 0..<2_000 {
+      if await resolver.callCount() >= expectedCount { return true }
+      try? await Task.sleep(for: .milliseconds(1))
+    }
+    return await resolver.callCount() >= expectedCount
+  }
+
+  private func waitForJoinCount(_ expectedCount: Int) async -> Bool {
+    for _ in 0..<2_000 {
+      if await _ASNMemoryCache.shared.inFlightJoinCount >= expectedCount { return true }
+      try? await Task.sleep(for: .milliseconds(1))
+    }
+    return await _ASNMemoryCache.shared.inFlightJoinCount >= expectedCount
+  }
+
   func testCachingResolverHitsCache() async throws {
     let base = CountingResolver()
     let caching = CachingASNResolver(base: base)
@@ -196,6 +267,269 @@ final class SwiftFTRCacheTests: XCTestCase {
 
   // MARK: - Concurrent Access Tests
 
+  func testCachingResolverCoalescesIdenticalConcurrentMisses() async throws {
+    let base = ControlledResolver()
+    let caching = CachingASNResolver(base: base)
+    let addresses = ["203.0.113.10", "203.0.113.11"]
+
+    let first = Task {
+      try await caching.resolve(ipv4Addrs: addresses, timeout: 1.0)
+    }
+    let firstStarted = await waitForCallCount(1, from: base)
+    XCTAssertTrue(firstStarted)
+
+    let second = Task {
+      try await caching.resolve(ipv4Addrs: addresses, timeout: 1.0)
+    }
+    let secondJoined = await waitForJoinCount(1)
+    let callsWhileSuspended = await base.callCount()
+
+    await base.succeedAll()
+    let firstResult = try await first.value
+    let secondResult = try await second.value
+
+    XCTAssertTrue(secondJoined)
+    XCTAssertEqual(callsWhileSuspended, 1, "Identical misses should share one upstream call")
+    XCTAssertEqual(firstResult, secondResult)
+    XCTAssertEqual(Set(secondResult.keys), Set(addresses))
+  }
+
+  func testCachingResolverCoalescesOverlappingBatches() async throws {
+    let base = ControlledResolver()
+    let caching = CachingASNResolver(base: base)
+
+    let first = Task {
+      try await caching.resolve(
+        ipv4Addrs: ["203.0.113.1", "203.0.113.2"],
+        timeout: 1.0
+      )
+    }
+    let firstStarted = await waitForCallCount(1, from: base)
+    XCTAssertTrue(firstStarted)
+
+    let second = Task {
+      try await caching.resolve(
+        ipv4Addrs: ["203.0.113.2", "203.0.113.3"],
+        timeout: 1.0
+      )
+    }
+    let secondStarted = await waitForCallCount(2, from: base)
+    XCTAssertTrue(secondStarted)
+    let batches = await base.recordedBatches()
+
+    await base.succeedAll()
+    let firstResult = try await first.value
+    let secondResult = try await second.value
+
+    XCTAssertEqual(batches, [["203.0.113.1", "203.0.113.2"], ["203.0.113.3"]])
+    XCTAssertEqual(Set(firstResult.keys), ["203.0.113.1", "203.0.113.2"])
+    XCTAssertEqual(Set(secondResult.keys), ["203.0.113.2", "203.0.113.3"])
+  }
+
+  func testNestedCachingResolversUseIndependentFlights() async throws {
+    let base = ControlledResolver()
+    let inner = CachingASNResolver(base: base)
+    let outer = CachingASNResolver(base: inner)
+    let address = "203.0.113.4"
+
+    let lookup = Task {
+      try await outer.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let baseStarted = await waitForCallCount(1, from: base)
+    XCTAssertTrue(baseStarted, "Nested caching decorators must not await their own outer flight")
+    await base.succeedAll()
+
+    let result = try await lookup.value
+    let callCount = await base.callCount()
+    XCTAssertEqual(callCount, 1)
+    XCTAssertNotNil(result[address])
+  }
+
+  func testDifferentCachingResolversDoNotShareFlights() async throws {
+    let firstBase = ControlledResolver()
+    let secondBase = ControlledResolver()
+    let firstCache = CachingASNResolver(base: firstBase)
+    let secondCache = CachingASNResolver(base: secondBase)
+    let address = "203.0.113.5"
+
+    let first = Task {
+      try await firstCache.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let firstStarted = await waitForCallCount(1, from: firstBase)
+    XCTAssertTrue(firstStarted)
+    let second = Task {
+      try await secondCache.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let secondStarted = await waitForCallCount(1, from: secondBase)
+    XCTAssertTrue(
+      secondStarted, "Each caching decorator must use its own base for an in-flight miss")
+
+    await firstBase.succeedAll()
+    await secondBase.succeedAll()
+    _ = try await first.value
+    _ = try await second.value
+  }
+
+  func testDifferentTimeoutsDoNotShareFlights() async throws {
+    let base = ControlledResolver()
+    let caching = CachingASNResolver(base: base)
+    let address = "203.0.113.6"
+
+    let short = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 0.1)
+    }
+    let firstStarted = await waitForCallCount(1, from: base)
+    XCTAssertTrue(firstStarted)
+    let long = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let secondStarted = await waitForCallCount(2, from: base)
+    XCTAssertTrue(secondStarted, "A short-timeout caller must not join a longer flight")
+
+    await base.succeedAll()
+    _ = try await short.value
+    _ = try await long.value
+    let callCount = await base.callCount()
+    XCTAssertEqual(callCount, 2)
+  }
+
+  func testRejectedNaNTimeoutReleasesFlightReservation() async {
+    let caching = CachingASNResolver(base: ImmediateFailureResolver())
+
+    do {
+      _ = try await caching.resolve(ipv4Addrs: ["203.0.113.7"], timeout: .nan)
+      XCTFail("The base resolver should reject the lookup")
+    } catch ControlledResolverError.requestedFailure {
+      // Expected.
+    } catch {
+      XCTFail("Unexpected error: \(error)")
+    }
+
+    let reservationCount = await _ASNMemoryCache.shared.inFlightReservationCount
+    XCTAssertEqual(reservationCount, 0, "A rejected timeout must not leak its flight key")
+  }
+
+  func testCachingResolverReleasesFailedFlightsForRetry() async throws {
+    let base = ControlledResolver()
+    let caching = CachingASNResolver(base: base)
+    let address = "203.0.113.20"
+
+    let first = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let firstStarted = await waitForCallCount(1, from: base)
+    XCTAssertTrue(firstStarted)
+    let joined = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let secondJoined = await waitForJoinCount(1)
+    let callsWhileSuspended = await base.callCount()
+
+    await base.failAll()
+    for task in [first, joined] {
+      do {
+        _ = try await task.value
+        XCTFail("The failed shared load should throw")
+      } catch ControlledResolverError.requestedFailure {
+        // Expected.
+      } catch {
+        XCTFail("Unexpected error: \(error)")
+      }
+    }
+
+    let retry = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let retryStarted = await waitForCallCount(2, from: base)
+    XCTAssertTrue(retryStarted)
+    await base.succeedAll()
+    let retryResult = try await retry.value
+    let batches = await base.recordedBatches()
+
+    XCTAssertTrue(secondJoined)
+    XCTAssertEqual(callsWhileSuspended, 1)
+    XCTAssertEqual(batches, [[address], [address]])
+    XCTAssertNotNil(retryResult[address])
+  }
+
+  func testCancelingCallerDoesNotCancelSharedFlight() async throws {
+    let base = ControlledResolver()
+    let caching = CachingASNResolver(base: base)
+    let address = "203.0.113.40"
+
+    let owner = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let ownerStarted = await waitForCallCount(1, from: base)
+    XCTAssertTrue(ownerStarted)
+    let joined = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let secondJoined = await waitForJoinCount(1)
+
+    let cancellationObserved = expectation(description: "Canceled caller stops waiting")
+    let canceledResult = Task {
+      defer { cancellationObserved.fulfill() }
+      do {
+        _ = try await joined.value
+        return false
+      } catch is CancellationError {
+        return true
+      } catch {
+        return false
+      }
+    }
+    joined.cancel()
+    await fulfillment(of: [cancellationObserved], timeout: 1.0)
+    await base.succeedAll()
+    let ownerResult = try await owner.value
+    let canceledPromptly = await canceledResult.value
+
+    XCTAssertTrue(secondJoined)
+    XCTAssertTrue(canceledPromptly)
+    let callCount = await base.callCount()
+    XCTAssertEqual(callCount, 1)
+    XCTAssertNotNil(ownerResult[address])
+  }
+
+  func testClearingCacheCancelsFlightsAndPreventsStalePopulation() async throws {
+    let base = ControlledResolver()
+    let caching = CachingASNResolver(base: base)
+    let address = "203.0.113.50"
+
+    let first = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let firstStarted = await waitForCallCount(1, from: base)
+    XCTAssertTrue(firstStarted)
+
+    await _ASNMemoryCache.shared.clear()
+    await base.succeedAll()
+    do {
+      _ = try await first.value
+      XCTFail("Clearing the cache should cancel its shared flights")
+    } catch is CancellationError {
+      // Expected.
+    } catch {
+      XCTFail("Unexpected error: \(error)")
+    }
+
+    let cacheCount = await _ASNMemoryCache.shared.count
+    XCTAssertEqual(cacheCount, 0)
+
+    let retry = Task {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+    }
+    let retryStarted = await waitForCallCount(2, from: base)
+    XCTAssertTrue(retryStarted)
+    await base.succeedAll()
+    let retryResult = try await retry.value
+    let batches = await base.recordedBatches()
+
+    XCTAssertEqual(batches, [[address], [address]])
+    XCTAssertNotNil(retryResult[address])
+  }
+
   /// Verify concurrent cache access doesn't corrupt data.
   func testCacheConcurrentAccessCorrectness() async throws {
     actor SequenceResolver: ASNResolver {
@@ -328,7 +662,8 @@ final class SwiftFTRCacheTests: XCTestCase {
     // Should complete quickly (cache is fast)
     XCTAssertLessThan(elapsed, 2.0, "Stress test should complete in <2s (took \(elapsed)s)")
 
-    // Should have far fewer calls than 100 (caching worked)
-    XCTAssertLessThan(calls, 100, "Cache should deduplicate (got \(calls) calls)")
+    // The requests cover 34 unique addresses. Each upstream call must reserve at least one new
+    // address, so overlapping misses can never produce more calls than unique keys.
+    XCTAssertLessThanOrEqual(calls, 34, "Cache should coalesce overlapping misses (got \(calls))")
   }
 }

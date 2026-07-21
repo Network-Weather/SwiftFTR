@@ -69,7 +69,7 @@ public struct MultipathConfig: Sendable {
 }
 
 /// Multipath probing currently varies IPv4 ICMP identifiers. Reject an
-/// incompatible family before launching detached workers so every flow uses
+/// incompatible family before launching flow workers so every flow uses
 /// the same address family as its configured source.
 internal func validateMultipathAddressFamily(_ config: SwiftFTRConfig) throws {
   if case .v6 = config.preferredFamily {
@@ -250,7 +250,16 @@ public struct DiscoveredPath: Sendable, Codable {
   }
 }
 
-// MARK: - Multipath Discovery Actor
+// MARK: - Multipath Discovery
+
+protocol MultipathFlowRunning: Sendable {
+  func runMultipathFlow(
+    target: String,
+    flowID: FlowIdentifier,
+    maxHops: Int,
+    timeoutMs: Int
+  ) async throws -> (FlowIdentifier, ClassifiedTrace)
+}
 
 /// Dublin Traceroute implementation for ECMP path enumeration
 ///
@@ -280,13 +289,13 @@ public struct DiscoveredPath: Sendable, Codable {
 ///
 /// For monitoring ICMP reachability (ping), ICMP-based discovery is more accurate.
 /// For monitoring TCP/UDP application traffic, UDP-based discovery would be preferred.
-struct MultipathDiscovery: Sendable {
-  private let workerSpawner: SwiftFTR.MultipathWorkerSpawner
+struct MultipathDiscovery<Worker: MultipathFlowRunning>: Sendable {
+  private let worker: Worker
   private let config: SwiftFTRConfig
   private let debugTracing: Bool
 
-  init(workerSpawner: SwiftFTR.MultipathWorkerSpawner, config: SwiftFTRConfig) {
-    self.workerSpawner = workerSpawner
+  init(worker: Worker, config: SwiftFTRConfig) {
+    self.worker = worker
     self.config = config
     self.debugTracing =
       ProcessInfo.processInfo.environment["SWIFTFTR_DEBUG_MULTIPATH"] != nil
@@ -296,6 +305,8 @@ struct MultipathDiscovery: Sendable {
   func discoverPaths(to target: String, multipathConfig: MultipathConfig) async throws
     -> NetworkTopology
   {
+    try Task.checkCancellation()
+
     let startTime = monotonicTime()
     let parentStart = startTime
 
@@ -307,9 +318,11 @@ struct MultipathDiscovery: Sendable {
     // Process flows in batches to enable early termination while maintaining parallelism
     let batchSize = 5  // Balance parallelism vs early stopping responsiveness
     var variation = 0
-    let spawner = workerSpawner
+    let flowWorker = worker
 
     while variation < multipathConfig.flowVariations {
+      try Task.checkCancellation()
+
       let batchEnd = min(variation + batchSize, multipathConfig.flowVariations)
       var batchResults: [(FlowIdentifier, ClassifiedTrace)] = []
 
@@ -321,14 +334,15 @@ struct MultipathDiscovery: Sendable {
           let flowID = FlowIdentifier.generate(variation: v)
 
           group.addTask {
+            try Task.checkCancellation()
             let launch = self.debugTracing ? self.monotonicTime() : 0.0
-            let task = spawner.scheduleMultipathFlowTask(
+            let result = try await flowWorker.runMultipathFlow(
               target: target,
               flowID: flowID,
               maxHops: multipathConfig.maxHops,
               timeoutMs: multipathConfig.timeoutMs
             )
-            let result = try await task.value
+            try Task.checkCancellation()
             if self.debugTracing {
               let done = self.monotonicTime()
               let offset = launch - parentStart
@@ -341,11 +355,20 @@ struct MultipathDiscovery: Sendable {
           }
         }
 
-        // Collect batch results
-        for try await result in group {
-          batchResults.append(result)
+        do {
+          // Collect every child before leaving the group. If either the caller or a
+          // flow fails, cancelAll() promptly reaches the remaining structured workers;
+          // the task-group scope then joins them before propagating the error.
+          for try await result in group {
+            batchResults.append(result)
+          }
+        } catch {
+          group.cancelAll()
+          throw error
         }
       }
+
+      try Task.checkCancellation()
 
       // Process batch results
       for (flowID, trace) in batchResults {
@@ -401,6 +424,8 @@ struct MultipathDiscovery: Sendable {
         break
       }
     }
+
+    try Task.checkCancellation()
 
     let duration = monotonicTime() - startTime
 
@@ -495,14 +520,15 @@ extension SwiftFTR {
   /// Discover multiple paths to target using Dublin Traceroute
   ///
   /// Systematically varies flow identifiers to enumerate ECMP paths.
-  /// Uses sequential flow variation (one flow at a time) with parallel
-  /// TTL probing within each flow (maintaining Paris consistency).
+  /// Runs flow variations in parallel batches while maintaining Paris
+  /// consistency within each flow.
   ///
   /// - Parameters:
   ///   - target: Hostname or IP to trace
   ///   - config: Multipath discovery configuration
   /// - Returns: Network topology with all discovered paths
-  /// - Throws: `TracerouteError` on failure
+  /// - Throws: `CancellationError` when the calling task is cancelled, or
+  ///   `TracerouteError` when discovery cannot complete.
   ///
   /// - Important: This implementation uses **ICMP Echo Request** packets with varying
   ///   ICMP ID fields. Many ECMP routers do not hash ICMP fields, so this may find
@@ -534,33 +560,32 @@ extension SwiftFTR {
     try swiftConfig.validateForOperation()
     try config.validateForOperation()
 
-    let spawner = MultipathWorkerSpawner(
+    let worker = MultipathWorkerSpawner(
       baseConfig: swiftConfig,
       rdnsCache: self.rdnsCache,
       asnResolver: self.asnResolver,
       cachedPublicIP: self.cachedPublicIP
     )
-    let discovery = MultipathDiscovery(workerSpawner: spawner, config: swiftConfig)
+    let discovery = MultipathDiscovery(worker: worker, config: swiftConfig)
 
-    // Run the multipath orchestration detached so scheduling cannot re-enter SwiftFTR.
-    return try await Task.detached(priority: .userInitiated) {
-      try await discovery.discoverPaths(to: target, multipathConfig: config)
-    }.value
+    return try await discovery.discoverPaths(to: target, multipathConfig: config)
   }
 
-  /// Provides detached worker tasks that reuse caches but never hop back to the main actor.
-  struct MultipathWorkerSpawner: Sendable {
+  /// Runs flow workers that reuse caches without escaping the caller's task group.
+  struct MultipathWorkerSpawner: MultipathFlowRunning {
     let baseConfig: SwiftFTRConfig
     let rdnsCache: RDNSCache
     let asnResolver: ASNResolver
     let cachedPublicIP: String?
 
-    func scheduleMultipathFlowTask(
+    func runMultipathFlow(
       target: String,
       flowID: FlowIdentifier,
       maxHops: Int,
       timeoutMs: Int
-    ) -> Task<(FlowIdentifier, ClassifiedTrace), Error> {
+    ) async throws -> (FlowIdentifier, ClassifiedTrace) {
+      try Task.checkCancellation()
+
       let workerConfig = SwiftFTRConfig(
         maxHops: maxHops,
         maxWaitMs: timeoutMs,
@@ -577,19 +602,18 @@ extension SwiftFTR {
       let rdns = rdnsCache
       let resolver = asnResolver
 
-      return Task.detached(priority: .userInitiated) {
-        let worker = SwiftFTR(
-          config: workerConfig,
-          rdnsCache: rdns,
-          asnResolver: resolver,
-          cachedPublicIP: cachedIP
-        )
-        let trace = try await worker.performClassifiedTraceWithFlowID(
-          to: target,
-          flowIdentifier: flowID.icmpID
-        )
-        return (flowID, trace)
-      }
+      let worker = SwiftFTR(
+        config: workerConfig,
+        rdnsCache: rdns,
+        asnResolver: resolver,
+        cachedPublicIP: cachedIP
+      )
+      let trace = try await worker.performClassifiedTraceWithFlowID(
+        to: target,
+        flowIdentifier: flowID.icmpID
+      )
+      try Task.checkCancellation()
+      return (flowID, trace)
     }
   }
 
