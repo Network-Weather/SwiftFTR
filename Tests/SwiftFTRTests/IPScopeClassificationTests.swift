@@ -10,7 +10,7 @@ struct IPScopeClassificationTests {
     let cases: [(String, IPAddressScope)] = [
       ("fc00::1", .privateNetwork),
       ("fdff:ffff::1", .privateNetwork),
-      ("fe80::1%test-interface-a", .linkLocal),
+      ("fe80::1%utun7", .linkLocal),
       ("febf:ffff::1", .linkLocal),
       ("::1", .loopback),
       ("::", .unspecified),
@@ -38,15 +38,11 @@ struct IPScopeClassificationTests {
       #expect(ipAddressScope(of: address) == expectedScope)
     }
     #expect(ipAddressesAreEqual("::ffff:192.168.1.10", "192.168.1.10"))
-    #expect(
-      ipAddressesAreEqual(
-        "fe80::1%test-interface-a", "fe80:0:0:0:0:0:0:1%test-interface-a"))
-    #expect(ipAddressesAreEqual("fe80::1%test-interface-a", "fe80::1%test-interface-b") == false)
+    #expect(ipAddressesAreEqual("fe80::1%utun3", "fe80:0:0:0:0:0:0:1%utun3"))
+    #expect(ipAddressesAreEqual("fe80::1%utun3", "fe80::1%test0") == false)
     #expect(ipAddressesAreEqual("ff02::1%7", "ff02:0:0:0:0:0:0:1%7"))
-    #expect(ipAddressesAreEqual("ff02::1%test-interface-a", "ff02::1") == false)
-    #expect(
-      ipAddressesAreEqual(
-        "2001:4860::1%test-interface-a", "2001:4860::1%test-interface-b") == false)
+    #expect(ipAddressesAreEqual("ff02::1%utun3", "ff02::1") == false)
+    #expect(ipAddressesAreEqual("2001:4860::1%utun3", "2001:4860::1%test0") == false)
   }
 
   @Test("Non-global IPv6 hops stay local and out of ASN resolution")
@@ -54,7 +50,7 @@ struct IPScopeClassificationTests {
     let destination = "2606:4700:4700:0:0:0:0:1111"
     let hopAddresses = [
       "fc00::1",
-      "fe80::1%test-interface-a",
+      "fe80::1%utun7",
       "::1",
       "::",
       "ff02::1",
@@ -150,7 +146,7 @@ struct IPScopeClassificationTests {
           reachedDestination: true),
       ])
     let context = VPNContext(
-      traceInterface: "test-interface",
+      traceInterface: "synthetic-interface",
       isVPNTrace: false,
       vpnLocalIPs: ["2001:4860::8844"])
 
