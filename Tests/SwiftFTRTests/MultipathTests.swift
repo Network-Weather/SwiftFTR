@@ -148,7 +148,7 @@ struct NetworkTopologyTests {
     let topology = NetworkTopology(
       destination: "example.com",
       destinationIP: "93.184.216.34",
-      sourceAdapter: "en0",
+      sourceAdapter: "test-interface",
       sourceIP: "192.168.1.100",
       publicIP: "1.2.3.4",
       paths: [path1, path2],
@@ -201,7 +201,7 @@ struct NetworkTopologyTests {
     let topology = NetworkTopology(
       destination: "example.com",
       destinationIP: "93.184.216.34",
-      sourceAdapter: "en0",
+      sourceAdapter: "test-interface",
       sourceIP: "192.168.1.100",
       publicIP: "1.2.3.4",
       paths: [path1, path2],
@@ -233,7 +233,7 @@ struct NetworkTopologyTests {
     let topology = NetworkTopology(
       destination: "example.com",
       destinationIP: "93.184.216.34",
-      sourceAdapter: "en0",
+      sourceAdapter: "test-interface",
       sourceIP: "192.168.1.100",
       publicIP: "1.2.3.4",
       paths: [path],
@@ -298,7 +298,7 @@ struct NetworkTopologyTests {
     let topology = NetworkTopology(
       destination: "example.com",
       destinationIP: "93.184.216.34",
-      sourceAdapter: "en0",
+      sourceAdapter: "test-interface",
       sourceIP: "192.168.1.100",
       publicIP: "1.2.3.4",
       paths: [path1, path2],
@@ -345,7 +345,7 @@ struct NetworkTopologyTests {
     let topology = NetworkTopology(
       destination: "example.com",
       destinationIP: "93.184.216.34",
-      sourceAdapter: "en0",
+      sourceAdapter: "test-interface",
       sourceIP: "192.168.1.100",
       publicIP: "1.2.3.4",
       paths: [path1, path2],
@@ -392,7 +392,7 @@ struct NetworkTopologyTests {
     let topology = NetworkTopology(
       destination: "example.com",
       destinationIP: "93.184.216.34",
-      sourceAdapter: "en0",
+      sourceAdapter: "test-interface",
       sourceIP: "192.168.1.100",
       publicIP: "1.2.3.4",
       paths: [path1, path2],
@@ -440,7 +440,7 @@ struct NetworkTopologyTests {
     let topology = NetworkTopology(
       destination: "example.com",
       destinationIP: "93.184.216.34",
-      sourceAdapter: "en0",
+      sourceAdapter: "test-interface",
       sourceIP: "192.168.1.100",
       publicIP: "1.2.3.4",
       paths: [path1, path2],
@@ -474,7 +474,7 @@ struct NetworkTopologyTests {
     let topology = NetworkTopology(
       destination: "example.com",
       destinationIP: "93.184.216.34",
-      sourceAdapter: "en0",
+      sourceAdapter: "test-interface",
       sourceIP: "192.168.1.100",
       publicIP: "1.2.3.4",
       paths: [path],

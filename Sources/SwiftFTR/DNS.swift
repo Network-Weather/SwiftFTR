@@ -772,7 +772,10 @@ public struct DNSQueries: Sendable {
 
 /// Configuration for DNS probe
 public struct DNSProbeConfig: Sendable {
-  /// DNS server to query
+  /// Numeric IPv4 or IPv6 DNS server to query.
+  ///
+  /// This address selects the socket family independently of ``queryType``. For example, an AAAA
+  /// query sent to an IPv4 server still uses an IPv4 UDP transport.
   public let server: String
 
   /// Query name (default: "example.com")
@@ -792,14 +795,20 @@ public struct DNSProbeConfig: Sendable {
   ///
   /// Example:
   /// ```swift
-  /// // Test DNS resolution via specific interface
-  /// let result = try await dnsProbe(
-  ///   config: DNSProbeConfig(
-  ///     server: "8.8.8.8",
-  ///     query: "example.com",
-  ///     interface: "en0"
+  /// func probeDNS(interfaceName: String) async throws {
+  ///   let snapshot = await NetworkInterfaceDiscovery().discover()
+  ///   guard let selectedInterface = snapshot.interface(named: interfaceName),
+  ///     selectedInterface.isUp
+  ///   else { return }
+  ///
+  ///   let result = try await dnsProbe(
+  ///     config: DNSProbeConfig(
+  ///       server: "8.8.8.8",
+  ///       query: "example.com",
+  ///       interface: selectedInterface.name
+  ///     )
   ///   )
-  /// )
+  /// }
   /// ```
   public let interface: String?
 

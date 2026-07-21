@@ -52,14 +52,22 @@ public struct BufferbloatConfig: Sendable {
   ///
   /// Example:
   /// ```swift
-  /// // Measure baseline latency via a specific interface without generating load.
-  /// let result = try await ftr.testBufferbloat(
-  ///   config: BufferbloatConfig(
-  ///     target: "1.1.1.1",
-  ///     loadDuration: 0,
-  ///     interface: interfaceName
+  /// func measureBaseline(interfaceName: String) async throws {
+  ///   let snapshot = await NetworkInterfaceDiscovery().discover()
+  ///   guard let selectedInterface = snapshot.interface(named: interfaceName),
+  ///     selectedInterface.isUp
+  ///   else { return }
+  ///
+  ///   // The exact BSD name comes from the caller's selection.
+  ///   let ftr = SwiftFTR()
+  ///   let result = try await ftr.testBufferbloat(
+  ///     config: BufferbloatConfig(
+  ///       target: "1.1.1.1",
+  ///       loadDuration: 0,
+  ///       interface: selectedInterface.name
+  ///     )
   ///   )
-  /// )
+  /// }
   /// ```
   public let interface: String?
 

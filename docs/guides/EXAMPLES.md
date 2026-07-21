@@ -53,7 +53,7 @@ let config = SwiftFTRConfig(
     maxHops: 20,           // Maximum TTL to probe (default: 40)
     maxWaitMs: 2000,       // Max wait time in milliseconds (default: 1000)
     payloadSize: 32,       // ICMP payload size in bytes (default: 56)
-    publicIP: "1.2.3.4",   // Override public IP (skips STUN)
+    publicIP: "1.2.3.4",   // Override classified trace/multipath enrichment discovery
     enableLogging: true    // Enable debug logging (default: false)
 )
 
@@ -85,43 +85,43 @@ let prodTracer = SwiftFTR(config: prodConfig)
 
 ### Network Interface Selection (v0.4.0+)
 ```swift
-// Use specific network interface
-let wifiConfig = SwiftFTRConfig(
-    maxHops: 40,
-    interface: "en0"  // WiFi interface on macOS
-)
-let wifiTracer = SwiftFTR(config: wifiConfig)
+func traceUsingCallerSelection(
+    destination: String,
+    interfaceName: String,
+    sourceIP: String?
+) async throws {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    guard let selectedInterface = snapshot.interface(named: interfaceName),
+          selectedInterface.isUp
+    else { return }
 
-// Use ethernet interface
-let ethernetConfig = SwiftFTRConfig(
-    maxHops: 40,
-    interface: "en1"  // Ethernet interface
-)
-let ethernetTracer = SwiftFTR(config: ethernetConfig)
+    let addresses = selectedInterface.ipv4Addresses + selectedInterface.ipv6Addresses
+    if let sourceIP, !addresses.contains(sourceIP) { return }
 
-// Bind to specific source IP
-let sourceIPConfig = SwiftFTRConfig(
-    maxHops: 40,
-    sourceIP: "192.168.1.100"  // Use specific local IP
-)
-let sourceTracer = SwiftFTR(config: sourceIPConfig)
+    let family: PreferredFamily
+    if let sourceIP {
+        family = selectedInterface.ipv4Addresses.contains(sourceIP) ? .v4 : .v6
+    } else {
+        family = .auto
+    }
 
-// Combine interface and source IP for precise control
-let preciseConfig = SwiftFTRConfig(
-    maxHops: 40,
-    interface: "en0",
-    sourceIP: "192.168.1.100"  // Must be an IP on en0
-)
-let preciseTracer = SwiftFTR(config: preciseConfig)
+    let preciseConfig = SwiftFTRConfig(
+        maxHops: 40,
+        interface: selectedInterface.name,
+        sourceIP: sourceIP,
+        preferredFamily: family
+    )
+    let preciseTracer = SwiftFTR(config: preciseConfig)
 
-// Handle interface binding errors
-do {
-    let result = try await preciseTracer.trace(to: "example.com")
-    print("Trace completed via \(preciseConfig.interface ?? "default")")
-} catch TracerouteError.interfaceBindFailed(let iface, let errno, let details) {
-    print("Failed to bind to interface \(iface): \(details ?? "")")
-} catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
-    print("Failed to bind to source IP \(ip): \(details ?? "")")
+    // Handle interface binding errors.
+    do {
+        let result = try await preciseTracer.trace(to: destination)
+        print("Trace completed via \(preciseConfig.interface ?? "default")")
+    } catch TracerouteError.interfaceBindFailed(let iface, let errno, let details) {
+        print("Failed to bind to interface \(iface): \(details ?? "")")
+    } catch TracerouteError.sourceIPBindFailed(let ip, let errno, let details) {
+        print("Failed to bind to source IP \(ip): \(details ?? "")")
+    }
 }
 ```
 
@@ -388,16 +388,25 @@ let gatewayPTR = try await tracer.dns.reverseIPv4(
   ip: "10.1.10.1",
   server: "10.1.10.1"  // Query the gateway itself
 )
-if let record = gatewayPTR.records.first, case .ptr(let hostname) = record.data {
+if let record = gatewayPTR.records.first, case .hostname(let hostname) = record.data {
   print("Gateway hostname: \(hostname)")
 }
 
-// Query via specific interface
-let result = try await tracer.dns.a(
-  hostname: "example.com",
-  interface: "en0",
-  sourceIP: "192.168.1.100"
-)
+// Query over IPv4 using an exact interface and address selected by the caller.
+func queryA(interfaceName: String, sourceIPv4: String) async throws {
+  let snapshot = await NetworkInterfaceDiscovery().discover()
+  guard let selectedInterface = snapshot.interface(named: interfaceName),
+        selectedInterface.isUp,
+        selectedInterface.ipv4Addresses.contains(sourceIPv4)
+  else { return }
+
+  let result = try await tracer.dns.a(
+    hostname: "example.com",
+    server: "8.8.8.8",
+    interface: selectedInterface.name,
+    sourceIP: sourceIPv4
+  )
+}
 ```
 
 ### Reverse DNS Lookup (PTR Records)
@@ -508,29 +517,35 @@ All DNS query functions support network interface and source IP binding.
 ```swift
 import SwiftFTR
 
-// Query via specific network interface (e.g., WiFi)
-let wifiResult = try await reverseDNS(
-  ip: "10.1.10.1",
-  server: "10.1.10.1",
-  interface: "en0"  // WiFi interface
-)
-print("Via WiFi: \(wifiResult.hostname ?? "no PTR")")
+func queryUsingCallerSelection(
+  interfaceName: String,
+  sourceIPv4: String,
+  sourceIPv6: String
+) async throws {
+  let snapshot = await NetworkInterfaceDiscovery().discover()
+  guard let selectedInterface = snapshot.interface(named: interfaceName),
+        selectedInterface.isUp,
+        selectedInterface.ipv4Addresses.contains(sourceIPv4),
+        selectedInterface.ipv6Addresses.contains(sourceIPv6)
+  else { return }
 
-// Query via specific source IP
-let cellResult = try await reverseDNS(
-  ip: "10.1.10.1",
-  server: "10.1.10.1",
-  sourceIP: "192.168.1.100"  // Specific source address
-)
-print("Via cellular: \(cellResult.hostname ?? "no PTR")")
+  let interfaceResult = try await reverseDNS(
+    ip: "10.1.10.1",
+    server: "10.1.10.1",
+    interface: selectedInterface.name,
+    sourceIP: sourceIPv4
+  )
+  print("Via \(selectedInterface.name): \(interfaceResult.hostname ?? "no PTR")")
 
-// Query IPv6 via specific interface
-let ethResult = try await queryAAAA(
-  hostname: "google.com",
-  server: "2001:4860:4860::8888",  // Google's IPv6 DNS
-  interface: "en1"  // Ethernet interface
-)
-print("Via ethernet: \(ethResult.addresses)")
+  // The numeric DNS server selects an IPv6 transport; AAAA is the record type.
+  let ipv6Result = try await queryAAAA(
+    hostname: "google.com",
+    server: "2001:4860:4860::8888",  // Google's IPv6 DNS
+    interface: selectedInterface.name,
+    sourceIP: sourceIPv6
+  )
+  print("AAAA over IPv6: \(ipv6Result.addresses)")
+}
 ```
 
 ### Network Device Identification Pattern
@@ -763,6 +778,9 @@ for (host, stats) in results {
 ```
 
 ## Multipath Discovery (v0.5.0+)
+
+Multipath discovery currently supports IPv4 destinations and source addresses only. A hostname
+must resolve to IPv4 for these examples.
 
 ### Basic Multipath Discovery
 ```swift

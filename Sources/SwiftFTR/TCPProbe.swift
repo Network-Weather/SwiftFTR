@@ -26,8 +26,12 @@ public struct TCPProbeConfig: Sendable {
   ///
   /// Example:
   /// ```swift
-  /// let snapshot = await NetworkInterfaceDiscovery().discover()
-  /// if let selectedInterface = snapshot.activeInterfaces.first {
+  /// func probeTCP(interfaceName: String) async throws {
+  ///   let snapshot = await NetworkInterfaceDiscovery().discover()
+  ///   guard let selectedInterface = snapshot.interface(named: interfaceName),
+  ///     selectedInterface.isUp
+  ///   else { return }
+  ///
   ///   let result = try await tcpProbe(
   ///     config: TCPProbeConfig(
   ///       host: "example.com",

@@ -50,16 +50,23 @@ let result = try await tracer.testBufferbloat(config: config)
 Set `loadDuration` to zero when you need latency measurements bound to an interface or source IP:
 
 ```swift
-let tracer = SwiftFTR(config: SwiftFTRConfig(interface: interfaceName))
-let result = try await tracer.testBufferbloat(
-    config: BufferbloatConfig(
-        target: "1.1.1.1",
-        baselineDuration: 5.0,
-        loadDuration: 0
-    )
-)
+func measureBoundBaseline(interfaceName: String) async throws {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    guard let selectedInterface = snapshot.interface(named: interfaceName),
+          selectedInterface.isUp
+    else { return }
 
-print("Baseline: \(result.baseline.avgMs) ms")
+    let tracer = SwiftFTR(config: SwiftFTRConfig(interface: selectedInterface.name))
+    let result = try await tracer.testBufferbloat(
+        config: BufferbloatConfig(
+            target: "1.1.1.1",
+            baselineDuration: 5.0,
+            loadDuration: 0
+        )
+    )
+
+    print("Baseline via \(selectedInterface.name): \(result.baseline.avgMs) ms")
+}
 ```
 
 This mode provides usable `result.baseline` statistics and baseline entries in

@@ -16,7 +16,7 @@ Why SwiftFTR?
 - No sudo: Uses `SOCK_DGRAM` with `IPPROTO_ICMP` / `IPPROTO_ICMPV6` on macOS, so you can run traceroute‑style measurements from apps, tests, and CI without elevated privileges.
 - Parallel by design: Sends one ICMP Echo per TTL up to your max hop in a tight loop, then listens for all responses concurrently.
 - Simple async API: A single `trace(...)` call returns structured hops; `traceClassified(...)` adds ASN‑based labeling. The same entry point accepts IPv4 or IPv6 targets — family is detected automatically.
-- Dual-stack: ping, traceroute, TCP/UDP probes, and STUN-based public-IP discovery all work over IPv4 and IPv6 through the same APIs. v4 literals transparently work on v6-only NAT64 networks via system synthesis.
+- Dual-stack: ping, traceroute, TCP/UDP probes, and `getPublicIPs()` support IPv4 and IPv6. v4 literals transparently work on v6-only NAT64 networks via system synthesis.
 - Production‑friendly: Monotonic RTT timing, buffer reuse, and an in‑memory ASN cache minimize noise and allocations.
 
 How It Works
@@ -33,8 +33,8 @@ How It Works
    - Compute RTT with a monotonic clock and place the hop at `ttl - 1`.
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
 5) Optional classification (when using `traceClassified`):
-   - Detect the client's public IP via STUN with DNS fallback (or use `PTR_PUBLIC_IP`, or disable via `PTR_SKIP_STUN`). `getPublicIPs()` returns both v4 and v6 in parallel for callers that want a dual-stack view.
-   - Batch‑resolve ASNs using Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) or the embedded local database via swift-ip2asn 0.4.0. Apply heuristics for PRIVATE and CGNAT ranges.
+   - Enrich classified traces with a configured value or cached IPv4 discovery (STUN, then DNS fallback). The separate `getPublicIPs()` call returns uncached STUN results for v4 and v6 in parallel.
+   - Batch‑resolve ASNs using Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) or the embedded local database via swift-ip2asn. Apply heuristics for PRIVATE and CGNAT ranges.
    - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and "hole‑fill" missing stretches between identical segments.
 
 How Fast Is It?
@@ -89,7 +89,7 @@ Key Features
 - `PreferredFamily { .v4, .v6, .auto }` lets callers force a family; default `.auto` lets the OS decide
 - v4 literals on v6-only NAT64 networks transparently use the gateway's synthesized v6 mapping (RFC 6147)
 - All emitted addresses are in `inet_ntop` canonical form; link-local addresses keep their `%zone` suffix
-- `interface: "en0"` binds v6 sockets via `IPV6_BOUND_IF`
+- A caller-selected BSD interface name binds v6 sockets via `IPV6_BOUND_IF`
 
 **Network Probing**
 - **Ping**: ICMP/ICMPv6 echo with statistics (min/avg/max RTT, jitter, packet loss)
@@ -107,13 +107,12 @@ Key Features
 - Traceroute and ping honor global interface/source-address settings; ping also supports a per-operation override
 - TCP, UDP, and DNS probes expose operation-level binding; HTTP/HTTPS probes follow system routing
 - Supported socket-backed diagnostics accept family-matched IPv4 or IPv6 source addresses (link-local `%zone` honored)
-- Bufferbloat binding applies to its latency pings only; generated HTTP load follows system routing
+- Bufferbloat accepts binding only for baseline-only latency (`loadDuration: 0`); loaded tests reject any effective binding before network work
 
 **Public IP Discovery**
-- STUN over both v4 and v6 with multi-server fallback (Google, Cloudflare)
-- `getPublicIPs()` runs both families in parallel and returns whichever succeeded
-- DNS-based fallback via Akamai whoami (v4 only — works behind captive portals)
-- Results cached until network change
+- `getPublicIPs()` is an uncached, STUN-only call that runs IPv4 and IPv6 in parallel and returns whichever families succeeded
+- `discoverPublicIPWithHostname()` performs fresh IPv4 discovery on each call: STUN first, then an unbound Akamai DNS-whoami fallback, plus optional system-routed rDNS
+- Classified trace honors `SwiftFTRConfig.publicIP`; otherwise its `SwiftFTR` actor caches discovered IPv4 until invalidation. Multipath also honors the override and reuses an actor-cached value when available
 
 **Architecture**
 - Actor-based design for thread safety
@@ -130,10 +129,8 @@ let config = SwiftFTRConfig(
     maxHops: 40,        // Max TTL to probe
     maxWaitMs: 1000,    // Timeout in milliseconds
     payloadSize: 56,    // ICMP payload size
-    publicIP: nil,      // Auto-detect via STUN (with DNS fallback)
-    enableLogging: false, // Set true for debugging
-    interface: "en0",   // Optional: specific network interface
-    sourceIP: "192.168.1.100" // Optional: specific source IP
+    publicIP: nil,      // Auto-detect for classified trace/multipath enrichment
+    enableLogging: false // Set true for debugging
 )
 
 let tracer = SwiftFTR(config: config)
@@ -192,25 +189,28 @@ for hop in topology.uniqueHops() {
     print("Discovered hop at TTL \(hop.ttl): \(hop.ip ?? "*")")
 }
 
-// Per-Operation Interface Binding
-// Override global interface for specific operations
-let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))  // Global: WiFi
+// Per-operation interface binding with names selected by your UI or caller.
+func compareRoutes(primaryBSDName: String, alternateBSDName: String) async throws {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    guard let primaryInterface = snapshot.interfaces.first(where: { $0.name == primaryBSDName }),
+          let alternateInterface = snapshot.interfaces.first(where: { $0.name == alternateBSDName }),
+          primaryInterface.isUp, alternateInterface.isUp
+    else {
+        return
+    }
 
-// Use global interface (en0)
-let wifiPing = try await tracer.ping(to: "1.1.1.1")
+    let boundTracer = SwiftFTR(config: SwiftFTRConfig(interface: primaryInterface.name))
 
-// Override to use Ethernet for this operation only
-let ethPing = try await tracer.ping(
-    to: "1.1.1.1",
-    config: PingConfig(interface: "en14")
-)
-
-// Concurrent multi-interface monitoring
-async let wifi = tracer.ping(to: "1.1.1.1", config: PingConfig(interface: "en0"))
-async let ethernet = tracer.ping(to: "1.1.1.1", config: PingConfig(interface: "en14"))
-let (wifiResult, ethResult) = try await (wifi, ethernet)
-print("WiFi loss: \(Int(wifiResult.statistics.packetLoss * 100))%")
-print("Ethernet loss: \(Int(ethResult.statistics.packetLoss * 100))%")
+    // The first call inherits the global selection; the second overrides it.
+    async let primary = boundTracer.ping(to: "1.1.1.1")
+    async let alternate = boundTracer.ping(
+        to: "1.1.1.1",
+        config: PingConfig(interface: alternateInterface.name)
+    )
+    let (primaryResult, alternateResult) = try await (primary, alternate)
+    print("Primary loss: \(Int(primaryResult.statistics.packetLoss * 100))%")
+    print("Alternate loss: \(Int(alternateResult.statistics.packetLoss * 100))%")
+}
 
 // DNS API with rich metadata
 // IPv4 address lookup
@@ -303,7 +303,7 @@ for try await hop in tracer.traceStream(to: "example.com", config: streamConfig)
 Notes for Embedding
 -------------------
 - **Thread Safety**: The `SwiftFTR` actor protects shared state, while operations designed for parallel use keep independent per-operation state. Its async API can be called from any actor or task.
-- **Public IP**: Configure via `SwiftFTRConfig(publicIP: "x.y.z.w")` to bypass STUN discovery.
+- **Public IP enrichment**: `SwiftFTRConfig(publicIP:)` overrides discovery for classified trace and multipath enrichment; it does not change `getPublicIPs()` or `discoverPublicIPWithHostname()`.
 - **ASN Lookups**: `traceClassified` uses DNS‑based Team Cymru with caching. Inject custom `ASNResolver` for offline lookups.
 - **Timeout Behavior**: `maxWaitMs` bounds the ICMP receive phase of `trace`. Resolution and optional STUN, rDNS, or ASN enrichment have their own I/O and timeout behavior.
 - **Error Handling**: Detailed `TracerouteError` with context about failures (permissions, network, platform).
@@ -326,7 +326,7 @@ swift build -c release
 Options:
 - `-m, --max-hops N`: Max TTL/hops to probe (default 40)
 - `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
-- `-i, --interface IFACE`: Use specific network interface (e.g., en0)
+- `-i, --interface IFACE`: Use an exact BSD name reported by `swift-ftr interfaces`
 - `-s, --source IP`: Bind to specific source IP address
 - `-p, --payload-size N`: ICMP payload size in bytes (default 56)
 - `--json`: Emit JSON with ASN categories and public IP
@@ -373,10 +373,14 @@ Options:
 
 Configuration and Flags
 -----------------------
-- Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
-- Use `SwiftFTRConfig(interface: interfaceName)` to bind supported socket-backed diagnostics to a caller-selected network interface.
-- Use `SwiftFTRConfig(sourceIP: "192.168.1.100")` to bind supported socket-backed diagnostics to a specific source IP.
+- Use `SwiftFTRConfig(publicIP: ...)` to bypass discovery for classified trace and multipath enrichment only; the standalone public-IP APIs ignore this value.
+- Validate an exact caller-selected name and family-matched address against `NetworkInterfaceDiscovery`; never infer a physical adapter's role from its BSD-name suffix.
+- Traceroute, streaming/classified trace, and IPv4-only multipath use the global `SwiftFTRConfig` binding. Ping supports IPv4 and IPv6; each non-`nil` operation-level binding independently overrides its global counterpart.
+- Actor DNS query helpers inherit globals unless the call overrides them. The numeric DNS server—not A versus AAAA record type—selects the IPv4 or IPv6 transport. Standalone DNS query functions and DNS/TCP/UDP probes use only their function arguments or operation config.
+- `getPublicIPs()` accepts operation-level bindings for parallel IPv4/IPv6 STUN. `discoverPublicIPWithHostname()` applies globals to its IPv4 STUN attempt, but its DNS-whoami fallback and rDNS lookup use system routing.
+- Bufferbloat honors route binding only for baseline latency (`loadDuration: 0`); loaded tests reject effective binding.
 - HTTP/HTTPS probes use URLSession and do not support either binding option.
+- Socket binding controls the documented probe sockets only. Hostname resolution, system rDNS, DNS-whoami fallback, and Team Cymru ASN lookups are not bound by these settings.
 - CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
 
 Design Details

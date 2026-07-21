@@ -3,11 +3,15 @@ import Testing
 
 @testable import SwiftFTR
 
+#if canImport(Darwin)
+  import Darwin
+#endif
+
 /// Tests for per-operation interface and source IP binding
 ///
 /// These tests verify that:
 /// 1. Operation-level interface config overrides global config
-/// 2. Different interfaces produce different public IPs (multi-interface systems)
+/// 2. Multi-interface classified traces can populate public-IP metadata
 /// 3. Concurrent operations with different interfaces work correctly
 /// 4. Invalid interfaces produce descriptive errors
 ///
@@ -20,44 +24,9 @@ struct InterfaceBindingTests {
 
   // MARK: - Helper Functions
 
-  /// Check if a network interface exists and is up
-  func interfaceAvailable(_ name: String) -> Bool {
-    #if canImport(Darwin)
-      return if_nametoindex(name) != 0
-    #else
-      return false
-    #endif
-  }
-
   /// Check if network tests should be skipped
   var shouldSkipNetworkTests: Bool {
     ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil
-  }
-
-  /// Check if interface has an active IPv4 address
-  func interfaceHasIPv4(_ name: String) -> Bool {
-    #if canImport(Darwin)
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
-      process.arguments = [name]
-
-      let pipe = Pipe()
-      process.standardOutput = pipe
-
-      try? process.run()
-      process.waitUntilExit()
-
-      guard let data = try? pipe.fileHandleForReading.readToEnd(),
-        let output = String(data: data, encoding: .utf8)
-      else {
-        return false
-      }
-
-      // Check for "inet " line (IPv4 address)
-      return output.contains("inet ") && !output.contains("status: inactive")
-    #else
-      return false
-    #endif
   }
 
   /// Quick check that interface can reach 1.1.1.1
@@ -74,49 +43,18 @@ struct InterfaceBindingTests {
     }
   }
 
-  /// Discover available network interfaces (excluding loopback and virtual, must have IPv4)
+  /// Discover active physical interfaces from system metadata, then keep those with IPv4 reachability.
   func discoverNetworkInterfaces() async -> [String] {
-    #if canImport(Darwin)
-      let process = Process()
-      process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
-      process.arguments = ["-l"]
-
-      let pipe = Pipe()
-      process.standardOutput = pipe
-
-      try? process.run()
-      process.waitUntilExit()
-
-      guard let data = try? pipe.fileHandleForReading.readToEnd(),
-        let output = String(data: data, encoding: .utf8)
-      else {
-        return []
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    var reachable: [String] = []
+    for interface in snapshot.physicalInterfaces
+    where interface.isUp && !interface.ipv4Addresses.isEmpty {
+      if await interfaceIsReachable(interface.name) {
+        reachable.append(interface.name)
       }
-
-      let candidates = output.trimmingCharacters(in: .whitespacesAndNewlines)
-        .split(separator: " ")
-        .map(String.init)
-        .filter { iface in
-          // Exclude loopback, virtual, and bridge interfaces
-          !iface.starts(with: "lo") && !iface.starts(with: "gif") && !iface.starts(with: "stf")
-            && !iface.starts(with: "anpi") && !iface.starts(with: "bridge")
-            && !iface.starts(with: "ap") && !iface.starts(with: "awdl")
-            && !iface.starts(with: "llw") && !iface.starts(with: "utun")
-            && interfaceAvailable(iface)
-            && interfaceHasIPv4(iface)  // Must have active IPv4
-        }
-
-      var reachable: [String] = []
-      for iface in candidates {
-        if await interfaceIsReachable(iface) {
-          reachable.append(iface)
-        }
-        if reachable.count >= 3 { break }
-      }
-      return reachable
-    #else
-      return []
-    #endif
+      if reachable.count >= 3 { break }
+    }
+    return reachable
   }
 
   /// Get two different network interfaces for testing
@@ -196,8 +134,8 @@ struct InterfaceBindingTests {
 
   // MARK: - Multi-Interface Tests
 
-  @Test("Different interfaces have different public IPs")
-  func testDifferentInterfacesHaveDifferentPublicIPs() async throws {
+  @Test("Classified traces discover public-IP metadata for two interfaces")
+  func testClassifiedTracesDiscoverPublicIPMetadataForTwoInterfaces() async throws {
     guard !shouldSkipNetworkTests else {
       print("⏭️  Skipping multi-interface test: SKIP_NETWORK_TESTS=1")
       return
@@ -261,16 +199,21 @@ struct InterfaceBindingTests {
   @Test("Invalid interface throws descriptive error")
   func testInvalidInterfaceThrowsError() async {
     let ftr = SwiftFTR()
+    #if canImport(Darwin)
+      let invalidInterface = String(repeating: "x", count: Int(IFNAMSIZ) + 1)
+    #else
+      let invalidInterface = String(repeating: "x", count: 1_024)
+    #endif
 
     do {
       _ = try await ftr.ping(
         to: "1.1.1.1",
-        config: PingConfig(count: 1, timeout: 1.0, interface: "nonexistent999")
+        config: PingConfig(count: 1, timeout: 1.0, interface: invalidInterface)
       )
       Issue.record("Should have thrown interfaceBindFailed error")
     } catch let error as TracerouteError {
       if case .interfaceBindFailed(let iface, _, let details) = error {
-        #expect(iface == "nonexistent999")
+        #expect(iface == invalidInterface)
         #expect(details?.contains("not found") ?? false, "Error should mention interface not found")
         print("✓ Invalid interface error: \(error)")
       } else {
@@ -282,30 +225,30 @@ struct InterfaceBindingTests {
   }
 
   @Test("Invalid source IP throws descriptive error")
-  func testInvalidSourceIPThrowsError() async {
-    let interfaces = await discoverNetworkInterfaces()
-    guard let firstInterface = interfaces.first else {
-      print("⏭️  Skipping: No suitable network interfaces found")
-      return
-    }
-
+  func testInvalidSourceIPThrowsError() async throws {
+    let snapshot = await NetworkInterfaceDiscovery().discover()
+    let loopback = try #require(
+      snapshot.interfaces.first { $0.type == .loopback && $0.isUp }
+    )
+    let target = try #require(loopback.ipv4Addresses.first)
+    let invalidSourceIP = "192.0.2.999"
     let ftr = SwiftFTR()
 
     do {
       _ = try await ftr.ping(
-        to: "1.1.1.1",
+        to: target,
         config: PingConfig(
           count: 1,
           timeout: 1.0,
-          interface: firstInterface,
-          sourceIP: "192.0.2.1"  // TEST-NET-1 - unlikely to be assigned
+          interface: loopback.name,
+          sourceIP: invalidSourceIP,
+          preferredFamily: .v4
         )
       )
-      // May succeed if IP happens to be assigned, so don't fail the test
-      print("Note: Source IP 192.0.2.1 binding succeeded (IP may be assigned)")
+      Issue.record("Should have thrown sourceIPBindFailed error")
     } catch let error as TracerouteError {
       if case .sourceIPBindFailed(let ip, _, _) = error {
-        #expect(ip == "192.0.2.1")
+        #expect(ip == invalidSourceIP)
         print("✓ Invalid source IP error: \(error)")
       } else {
         Issue.record("Wrong error type: \(error)")

@@ -1,4 +1,4 @@
-// swift-ip2asn 0.4.0 v6 lookup spike.
+// swift-ip2asn v6 lookup spike.
 //
 // Validates that `UltraCompactDatabase.lookup(_ ipString:)` correctly dispatches
 // v6 strings to `lookupV6(hi:lo:)` against the bundled `ip2asn-v2.ultra` dataset
@@ -13,7 +13,7 @@ import SwiftIP2ASN
 @main
 struct IP2ASNv6Probe {
   static func main() async {
-    print("Loading embedded ip2asn database (0.4.0, dual-stack ULT2 format)…")
+    print("Loading embedded ip2asn database (dual-stack ULT2 format)…")
     let db: UltraCompactDatabase
     do {
       db = try EmbeddedDatabase.loadUltraCompact()

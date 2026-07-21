@@ -15,8 +15,8 @@ This repository uses GitHub Actions for CI/CD automation. The workflows are desi
 - **macos**: Build debug + release, run tests with network isolation, and compile the external-consumer fixture
 
 **Environment Variables:**
-- `PTR_SKIP_STUN=1` - Skip STUN tests in CI
-- `SKIP_NETWORK_TESTS=1` - Skip tests requiring real network access
+- `PTR_SKIP_STUN=1` - Skip the public-IP integration-test subset using the legacy gate
+- `SKIP_NETWORK_TESTS=1` - Skip the remaining live-network tests; CI sets both variables
 
 ### 2. Release (`release.yml`)
 **Triggers:**
