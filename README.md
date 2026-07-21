@@ -377,7 +377,7 @@ Configuration and Flags
 - Prefer `SwiftFTRConfig(publicIP: ...)` to bypass STUN discovery when desired.
 - Validate an exact caller-selected name and family-matched address against `NetworkInterfaceDiscovery`; never infer a physical adapter's role from its BSD-name suffix.
 - Traceroute, streaming/classified trace, and IPv4-only multipath use the global `SwiftFTRConfig` binding. Ping supports IPv4 and IPv6; each non-`nil` operation-level binding independently overrides its global counterpart.
-- Actor DNS query helpers inherit globals unless the call overrides them. The numeric DNS server—not A versus AAAA record type—selects the IPv4 or IPv6 transport. Standalone TCP, UDP, and DNS probes use operation config only.
+- Actor DNS query helpers inherit globals unless the call overrides them. The numeric DNS server—not A versus AAAA record type—selects the IPv4 or IPv6 transport. Standalone DNS query functions and DNS/TCP/UDP probes use only their function arguments or operation config.
 - `getPublicIPs()` accepts operation-level bindings for parallel IPv4/IPv6 STUN. `discoverPublicIPWithHostname()` applies globals to its IPv4 STUN attempt, but its DNS-whoami fallback and rDNS lookup use system routing.
 - Bufferbloat honors route binding only for baseline latency (`loadDuration: 0`); loaded tests reject effective binding.
 - HTTP/HTTPS probes use URLSession and do not support either binding option.

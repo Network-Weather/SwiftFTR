@@ -20,7 +20,7 @@ resolution, system reverse DNS, Team Cymru ASN queries, or URLSession traffic.
 | Multipath discovery | Global ``SwiftFTRConfig`` only | IPv4 only | IPv6 destinations and source addresses are rejected. |
 | Ping | ``PingConfig`` values independently override global values; each `nil` value inherits its global counterpart | IPv4 and IPv6 | Probe socket only. |
 | Actor DNS query helpers (`tracer.dns`) | Call-level values independently override global values | IPv4 and IPv6 DNS transports | The numeric DNS server selects the transport family; record type does not. An AAAA query therefore uses IPv4 by default because the default server is `8.8.8.8`. |
-| Standalone DNS, TCP, and UDP probes | Operation config only | IPv4 and IPv6 | Hostname resolution for TCP/UDP remains system-routed. |
+| Standalone DNS query functions and DNS/TCP/UDP probes | Function arguments or operation config only | IPv4 and IPv6 | They do not inherit ``SwiftFTRConfig``; hostname resolution for TCP/UDP remains system-routed. |
 | ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` | Function arguments only | Parallel IPv4 and IPv6 STUN | A source address is applied only to its matching family. |
 | ``SwiftFTR/discoverPublicIPWithHostname()`` | Global config for IPv4 STUN | IPv4 | DNS-whoami fallback and the optional rDNS lookup are system-routed. |
 | Bufferbloat | Operation values override globals | IPv4 and IPv6 baseline ping | Binding is accepted only when `loadDuration == 0`; loaded tests reject any effective binding. |
