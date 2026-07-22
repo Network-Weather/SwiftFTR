@@ -368,7 +368,7 @@ more than 20% worse than its control for two consecutive daily windows.
 
 Every implementation PR must pass:
 
-- `swift format lint -r Sources Tests` with zero diagnostics—not merely a zero exit status—and
+- `swift format lint --strict -r Sources Tests` with zero diagnostics, and
   `git diff --check`;
 - debug and release builds;
 - the full offline suite and focused deterministic HTTP suite;

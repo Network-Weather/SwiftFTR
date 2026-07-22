@@ -33,7 +33,7 @@ public struct StreamingHop: Sendable, Equatable {
   /// Time-To-Live that elicited this response (1-based).
   public let ttl: Int
 
-  /// Responder IPv4 address. `nil` for timeout placeholders.
+  /// Responder IPv4 or IPv6 address. `nil` for timeout placeholders.
   public let ipAddress: String?
 
   /// Round-trip time in seconds for this hop. `nil` for timeout placeholders.

@@ -12,11 +12,11 @@ jobs:
     runs-on: macos-15
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Swift version
         run: swift --version
       - name: Formatting (lint)
-        run: swift format lint -r Sources Tests
+        run: swift format lint --strict -r Sources Tests
 
   macos:
     name: macOS (Build & Test)
@@ -24,7 +24,7 @@ jobs:
     needs: format
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Swift version
         run: swift --version
       - name: Build (debug)
@@ -38,3 +38,5 @@ jobs:
         run: swift build -c release
       - name: Build external-package integration
         run: swift build --package-path IntegrationPackage
+      - name: Build external API compatibility consumer
+        run: swift build --package-path TestLibraryUsage

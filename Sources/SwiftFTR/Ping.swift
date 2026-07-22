@@ -35,7 +35,7 @@ public enum PreferredFamily: Sendable, Codable {
 
 /// Configuration for ping operations.
 ///
-/// Values are validated by ``SwiftFTR/ping(to:config:)`` before socket creation.
+/// Numeric values are validated by ``SwiftFTR/ping(to:config:)`` before socket creation.
 public struct PingConfig: Sendable {
   /// Number of pings to send (default: 5)
   public let count: Int

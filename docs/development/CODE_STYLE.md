@@ -5,7 +5,7 @@
 SwiftFTR uses `swift-format` for automated code formatting. Run before committing:
 
 ```bash
-swift format lint -r Sources Tests
+swift format lint --strict -r Sources Tests
 swift format format --in-place -r Sources Tests  # Auto-fix
 ```
 
@@ -64,24 +64,15 @@ public func __parseICMPMessage(_ data: [UInt8]) -> ParsedICMP?
 
 **Reason:** Double-underscore prefix (`__`) signals these are internal/private implementation details exposed only for testing via `@_spi(Testing)`. This naming convention is common in low-level systems programming and clearly indicates "do not use directly."
 
-## Pre-Existing Technical Debt
+## Format Diagnostics
 
-Some warnings exist in code written before v0.5.0 and are not part of this release:
-
-- `Sources/ptrtests/main.swift:123` - Line length
-- `Sources/swift-ftr/main.swift` - JSON field names (see above)
-
-## Format Warnings We Fix
-
-New code in v0.5.0 follows all swift-format recommendations:
-- ✅ Line length limits
-- ✅ Proper line breaks between declarations
-- ✅ camelCase for all Swift-only code
-- ✅ Trailing newlines
+The current tree passes strict formatting. Intentional naming exceptions use narrow, local
+`swift-format-ignore` directives so new diagnostics still fail CI.
 
 ## CI Enforcement
 
-GitHub Actions runs `swift format lint` on every push. PRs must pass formatting checks to merge.
+GitHub Actions runs `swift format lint --strict` on every push. PRs must pass formatting checks to
+merge.
 
 ## Summary
 

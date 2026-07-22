@@ -47,6 +47,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       Or run trace directly (default behavior):
         swift-ftr example.com
       """,
+    version: swiftFTRVersion,
     subcommands: [
       Trace.self, Stream.self, Ping.self, Probe.self, Multipath.self, Bufferbloat.self,
       Interfaces.self,

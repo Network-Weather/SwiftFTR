@@ -9,7 +9,7 @@ import Foundation
 
 /// Configuration for TCP probing.
 ///
-/// Values are validated by ``tcpProbe(config:)`` before resolution or socket creation.
+/// Numeric values are validated by ``tcpProbe(config:)`` before resolution or socket creation.
 public struct TCPProbeConfig: Sendable {
   /// Target host (hostname or IP)
   public let host: String

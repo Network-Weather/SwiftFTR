@@ -147,7 +147,7 @@ internal func resolveHost(host: String, prefer: PreferredFamily) throws -> Resol
     sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     _ = inet_pton(AF_INET, host, &sin.sin_addr)
     var storage = sockaddr_storage()
-    withUnsafePointer(to: &sin) { src in
+    _ = withUnsafePointer(to: &sin) { src in
       withUnsafeMutablePointer(to: &storage) { dst in
         memcpy(dst, src, MemoryLayout<sockaddr_in>.size)
       }
@@ -164,7 +164,7 @@ internal func resolveHost(host: String, prefer: PreferredFamily) throws -> Resol
     sin6.sin6_scope_id = scopeID
     _ = inet_pton(AF_INET6, bare, &sin6.sin6_addr)
     var storage = sockaddr_storage()
-    withUnsafePointer(to: &sin6) { src in
+    _ = withUnsafePointer(to: &sin6) { src in
       withUnsafeMutablePointer(to: &storage) { dst in
         memcpy(dst, src, MemoryLayout<sockaddr_in6>.size)
       }
@@ -213,7 +213,7 @@ internal func resolveHost(host: String, prefer: PreferredFamily) throws -> Resol
     if fam == AF_INET, let addr = ai.pointee.ai_addr {
       let sin = addr.withMemoryRebound(to: sockaddr_in.self, capacity: 1) { $0.pointee }
       var storage = sockaddr_storage()
-      withUnsafeMutablePointer(to: &storage) { dst in
+      _ = withUnsafeMutablePointer(to: &storage) { dst in
         memcpy(dst, addr, MemoryLayout<sockaddr_in>.size)
       }
       return ResolvedHost(
@@ -223,7 +223,7 @@ internal func resolveHost(host: String, prefer: PreferredFamily) throws -> Resol
     if fam == AF_INET6, let addr = ai.pointee.ai_addr {
       let sin6 = addr.withMemoryRebound(to: sockaddr_in6.self, capacity: 1) { $0.pointee }
       var storage = sockaddr_storage()
-      withUnsafeMutablePointer(to: &storage) { dst in
+      _ = withUnsafeMutablePointer(to: &storage) { dst in
         memcpy(dst, addr, MemoryLayout<sockaddr_in6>.size)
       }
       return ResolvedHost(
