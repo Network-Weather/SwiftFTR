@@ -1,5 +1,6 @@
 import XCTest
 
+// swift-format-ignore: OrderedImports
 @_spi(Testing) @testable import SwiftFTR
 
 final class SwiftFTRCacheTests: XCTestCase {
