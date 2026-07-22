@@ -171,7 +171,7 @@ public struct TraceClassifier: Sendable {
   /// Classify a TraceResult into segments using ASN lookups and heuristics.
   /// - Parameters:
   ///   - trace: Plain traceroute output to classify.
-  ///   - destinationIP: Destination IPv4 address (numeric string) for ASN matching.
+  ///   - destinationIP: Destination IPv4 or IPv6 address (numeric string) for ASN matching.
   ///   - resolver: ASN resolver to use (DNS- or WHOIS-based).
   ///   - timeout: Per-lookup timeout in seconds.
   ///   - publicIP: Override public IP (bypasses STUN if provided).

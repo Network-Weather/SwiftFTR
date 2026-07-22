@@ -9,7 +9,6 @@ if ! command -v swift >/dev/null 2>&1; then
 fi
 
 # Lint all Swift sources; fail push on violations
-swift format lint -r Sources Tests
+swift format lint --strict -r Sources Tests
 
 echo "[pre-push] Formatting OK."
-

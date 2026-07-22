@@ -1,4 +1,4 @@
 /// The current SwiftFTR library version.
 ///
 /// Update this constant when cutting a new release.
-public let swiftFTRVersion = "0.13.0"
+public let swiftFTRVersion = "0.14.0"

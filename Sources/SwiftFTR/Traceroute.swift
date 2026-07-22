@@ -8,7 +8,7 @@ import Foundation
 public struct TraceHop: Sendable {
   /// Time-To-Live probed for this hop (1-based).
   public let ttl: Int
-  /// Responder IPv4 address as a string. `nil` if timed out.
+  /// Responder IPv4 or IPv6 address as a string. `nil` if timed out.
   public let ipAddress: String?
   /// Round-trip time in seconds for this hop, or `nil` if no reply.
   public let rtt: TimeInterval?
@@ -50,13 +50,36 @@ public struct TraceResult: Sendable {
   public let hops: [TraceHop]
   /// Total wall-clock duration (seconds) measured for the trace.
   public let duration: TimeInterval
+
+  /// Creates a trace result without a separately supplied resolved address.
+  ///
+  /// This initializer preserves the callable initializer shape published in SwiftFTR 0.13.
+  /// Manually constructed results use `nil` for ``resolvedIP``.
+  public init(
+    destination: String,
+    maxHops: Int,
+    reached: Bool,
+    hops: [TraceHop],
+    duration: TimeInterval = 0
+  ) {
+    self.init(
+      destination: destination,
+      maxHops: maxHops,
+      reached: reached,
+      hops: hops,
+      duration: duration,
+      resolvedIP: nil
+    )
+  }
+
+  /// Creates a trace result with the numeric address used for probing.
   public init(
     destination: String,
     maxHops: Int,
     reached: Bool,
     hops: [TraceHop],
     duration: TimeInterval = 0,
-    resolvedIP: String? = nil
+    resolvedIP: String?
   ) {
     self.destination = destination
     self.resolvedIP = resolvedIP
@@ -346,7 +369,7 @@ public actor SwiftFTR {
   /// This method supports cancellation via network changes and includes optional
   /// reverse DNS lookups based on configuration.
   /// - Parameters:
-  ///   - host: Destination hostname or IPv4 address.
+  ///   - host: Destination hostname or IPv4/IPv6 address.
   /// - Returns: A `TraceResult` with ordered hops and whether the destination responded.
   /// - Throws: `TracerouteError` if resolution, socket operations fail, or trace is cancelled
   public func trace(
@@ -389,7 +412,7 @@ public actor SwiftFTR {
   /// ```
   ///
   /// - Parameters:
-  ///   - host: Destination hostname or IPv4 address.
+  ///   - host: Destination hostname or IPv4/IPv6 address.
   ///   - streamConfig: Configuration for streaming behavior (timeouts, retry, etc.)
   /// - Returns: An `AsyncThrowingStream<StreamingHop, Error>` yielding hops as they arrive.
   public nonisolated func traceStream(
@@ -770,7 +793,7 @@ public actor SwiftFTR {
   /// You can also provide an explicit `VPNContext` for more control.
   ///
   /// - Parameters:
-  ///   - host: Destination hostname or IPv4 address.
+  ///   - host: Destination hostname or IPv4/IPv6 address.
   ///   - vpnContext: Context for VPN-aware classification (optional, auto-detected from interface).
   ///   - resolver: ASN resolver implementation (default: uses internal cached resolver).
   /// - Returns: A ClassifiedTrace containing segment labels and (when available) ASN info.

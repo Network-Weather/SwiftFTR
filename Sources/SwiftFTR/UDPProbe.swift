@@ -9,7 +9,8 @@ import Foundation
 
 /// Configuration for UDP probing.
 ///
-/// Values are validated by ``udpProbe(config:)`` before resolution or socket creation.
+/// Numeric and payload-size values are validated by ``udpProbe(config:)`` before resolution or
+/// socket creation.
 public struct UDPProbeConfig: Sendable {
   /// Target host (hostname or IP)
   public let host: String
@@ -43,7 +44,31 @@ public struct UDPProbeConfig: Sendable {
   ///   - port: The destination UDP port.
   ///   - timeout: The maximum time to wait for a response, in seconds.
   ///   - payload: The datagram payload. An empty value sends a zero-byte datagram.
-  ///   - interface: The network interface to use, or `nil` to use system routing.
+  ///   - preferredFamily: The address family to prefer during resolution.
+  public init(
+    host: String,
+    port: Int,
+    timeout: TimeInterval = 2.0,
+    payload: Data = Data(),
+    preferredFamily: PreferredFamily = .auto
+  ) {
+    self.host = host
+    self.port = port
+    self.timeout = timeout
+    self.payload = payload
+    self.interface = nil
+    self.sourceIP = nil
+    self.preferredFamily = preferredFamily
+  }
+
+  /// Creates a UDP probe configuration bound to an interface and optional source address.
+  ///
+  /// - Parameters:
+  ///   - host: The destination hostname or IP address.
+  ///   - port: The destination UDP port.
+  ///   - timeout: The maximum time to wait for a response, in seconds.
+  ///   - payload: The datagram payload. An empty value sends a zero-byte datagram.
+  ///   - interface: The network interface to use, or `nil` for system interface selection.
   ///   - sourceIP: The source address to use, or `nil` to let the system choose.
   ///   - preferredFamily: The address family to prefer during resolution.
   public init(
@@ -51,7 +76,7 @@ public struct UDPProbeConfig: Sendable {
     port: Int,
     timeout: TimeInterval = 2.0,
     payload: Data = Data(),
-    interface: String? = nil,
+    interface: String?,
     sourceIP: String? = nil,
     preferredFamily: PreferredFamily = .auto
   ) {
@@ -62,6 +87,34 @@ public struct UDPProbeConfig: Sendable {
     self.interface = interface
     self.sourceIP = sourceIP
     self.preferredFamily = preferredFamily
+  }
+
+  /// Creates a UDP probe configuration with optional source-address binding.
+  ///
+  /// - Parameters:
+  ///   - host: The destination hostname or IP address.
+  ///   - port: The destination UDP port.
+  ///   - timeout: The maximum time to wait for a response, in seconds.
+  ///   - payload: The datagram payload. An empty value sends a zero-byte datagram.
+  ///   - sourceIP: The source address to use, or `nil` to let the system choose.
+  ///   - preferredFamily: The address family to prefer during resolution.
+  public init(
+    host: String,
+    port: Int,
+    timeout: TimeInterval = 2.0,
+    payload: Data = Data(),
+    sourceIP: String?,
+    preferredFamily: PreferredFamily = .auto
+  ) {
+    self.init(
+      host: host,
+      port: port,
+      timeout: timeout,
+      payload: payload,
+      interface: nil,
+      sourceIP: sourceIP,
+      preferredFamily: preferredFamily
+    )
   }
 }
 
@@ -122,7 +175,35 @@ public struct UDPProbeResult: Sendable, Codable {
 ///   - port: The destination UDP port.
 ///   - timeout: The maximum time to wait for a response, in seconds.
 ///   - payload: The datagram payload. An empty value sends a zero-byte datagram.
-///   - interface: The network interface to use, or `nil` to use system routing.
+/// - Returns: The probe result, including reachability, timing, and any operation error.
+/// - Throws: `CancellationError` if the calling task is canceled, or
+///   ``TracerouteError/invalidConfiguration(reason:)`` for invalid numeric settings.
+#if compiler(>=6.2)
+  @concurrent
+#endif
+public func udpProbe(
+  host: String,
+  port: Int,
+  timeout: TimeInterval = 2.0,
+  payload: Data = Data()
+) async throws -> UDPProbeResult {
+  let config = UDPProbeConfig(
+    host: host,
+    port: port,
+    timeout: timeout,
+    payload: payload
+  )
+  return try await udpProbe(config: config)
+}
+
+/// Sends a UDP probe bound to an interface and optional source address.
+///
+/// - Parameters:
+///   - host: The destination hostname or IP address.
+///   - port: The destination UDP port.
+///   - timeout: The maximum time to wait for a response, in seconds.
+///   - payload: The datagram payload. An empty value sends a zero-byte datagram.
+///   - interface: The network interface to use, or `nil` for system interface selection.
 ///   - sourceIP: The source address to use, or `nil` to let the system choose.
 /// - Returns: The probe result, including reachability, timing, and any operation error.
 /// - Throws: `CancellationError` if the calling task is canceled, or
@@ -135,7 +216,7 @@ public func udpProbe(
   port: Int,
   timeout: TimeInterval = 2.0,
   payload: Data = Data(),
-  interface: String? = nil,
+  interface: String?,
   sourceIP: String? = nil
 ) async throws -> UDPProbeResult {
   let config = UDPProbeConfig(
@@ -144,6 +225,37 @@ public func udpProbe(
     timeout: timeout,
     payload: payload,
     interface: interface,
+    sourceIP: sourceIP
+  )
+  return try await udpProbe(config: config)
+}
+
+/// Sends a UDP probe with optional source-address binding.
+///
+/// - Parameters:
+///   - host: The destination hostname or IP address.
+///   - port: The destination UDP port.
+///   - timeout: The maximum time to wait for a response, in seconds.
+///   - payload: The datagram payload. An empty value sends a zero-byte datagram.
+///   - sourceIP: The source address to use, or `nil` to let the system choose.
+/// - Returns: The probe result, including reachability, timing, and any operation error.
+/// - Throws: `CancellationError` if the calling task is canceled, or
+///   ``TracerouteError/invalidConfiguration(reason:)`` for invalid numeric settings.
+#if compiler(>=6.2)
+  @concurrent
+#endif
+public func udpProbe(
+  host: String,
+  port: Int,
+  timeout: TimeInterval = 2.0,
+  payload: Data = Data(),
+  sourceIP: String?
+) async throws -> UDPProbeResult {
+  let config = UDPProbeConfig(
+    host: host,
+    port: port,
+    timeout: timeout,
+    payload: payload,
     sourceIP: sourceIP
   )
   return try await udpProbe(config: config)

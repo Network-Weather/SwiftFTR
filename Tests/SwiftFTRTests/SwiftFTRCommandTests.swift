@@ -1,9 +1,15 @@
+import SwiftFTR
 import Testing
 
 @testable import swift_ftr
 
 @Suite("swift-ftr command parsing")
 struct SwiftFTRCommandTests {
+  @Test("Root command reports the library version")
+  func rootVersion() {
+    #expect(SwiftFTRCommand.configuration.version == swiftFTRVersion)
+  }
+
   @Test("Ping parses distinct interval and interface short options")
   func pingShortOptions() throws {
     let command = try SwiftFTRCommand.Ping.parse([

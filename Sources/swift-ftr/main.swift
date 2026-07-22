@@ -47,6 +47,7 @@ struct SwiftFTRCommand: AsyncParsableCommand {
       Or run trace directly (default behavior):
         swift-ftr example.com
       """,
+    version: swiftFTRVersion,
     subcommands: [
       Trace.self, Stream.self, Ping.self, Probe.self, Multipath.self, Bufferbloat.self,
       Interfaces.self,
@@ -689,6 +690,13 @@ extension SwiftFTRCommand {
           printJSON(result)
         } else {
           printPretty(result)
+        }
+
+        // A completed probe can still report an unreachable target or a binding error. Preserve
+        // the structured output while making the process status useful to scripts and release
+        // smoke tests.
+        if !result.isReachable {
+          Foundation.exit(1)
         }
       } catch {
         fputs("Error: \(error)\n", stderr)

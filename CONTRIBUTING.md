@@ -20,7 +20,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 2. Make changes with focused commits and clear messages (see Commit Style).
 3. Ensure formatting and tests pass locally:
    ```bash
-   swift format lint -r Sources Tests
+   swift format lint --strict -r Sources Tests
    swift test -c debug
    ```
 4. Open a Pull Request. The CI will run format, build, tests, docs.
@@ -44,7 +44,8 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
   ```bash
   swift package --allow-writing-to-directory docc \
     generate-documentation --target SwiftFTR \
-    --output-path docc --transform-for-static-hosting
+    --output-path docc --transform-for-static-hosting \
+    --warnings-as-errors
   open docc/index.html
   ```
 - Docs auto‑publish to GitHub Pages on pushes to `main`: https://swiftftr.networkweather.com/
@@ -68,7 +69,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 - Describe the problem and solution. Include screenshots or sample output where helpful.
 - Note any user‑visible changes: new flags, breaking API changes, or behavior shifts.
 - Ensure:
-  - `swift format lint -r Sources Tests` passes
+  - `swift format lint --strict -r Sources Tests` passes
   - `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test` passes offline
   - Public symbols have reasonable documentation
 
@@ -76,33 +77,36 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 
 ### Release Checklist
 Before creating a new release, ensure:
-1. [ ] Update version in `Package.swift` (if applicable)
-2. [ ] Update `CHANGELOG.md` with release notes
-3. [ ] Update `docs/development/ROADMAP.md` to reflect current version
-4. [ ] Update any version references in documentation
-5. [ ] Run tests: `swift test`
-6. [ ] Build release binary: `swift build -c release`
-7. [ ] Test CLI binary: `.build/release/swift-ftr --version`
+1. [ ] Update `Sources/SwiftFTR/Version.swift`; `Package.swift` has no package-version field
+2. [ ] Consolidate `CHANGELOG.md` into dated, adopter-facing release notes
+3. [ ] Update the SwiftPM version and migration links in `README.md`
+4. [ ] Update `ROADMAP.md` only when the release actually completes or reprioritizes work
+5. [ ] Run the offline test suite: `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test`
+6. [ ] Run debug/release builds, external-consumer builds, DocC, and the API compatibility check
+7. [ ] Run the release's documented live IPv4/IPv6 matrix on the final mainline commit
+8. [ ] Test the CLI version in both pretty and JSON output
 
 ### Creating a Release
-1. Commit all changes and push to `main`
-2. Create and push a version tag:
+1. Merge the release-preparation PR and wait for main CI and documentation deployment
+2. Create an annotated tag on the release-preparation merge commit and push it:
    ```bash
-   git tag v0.X.Y
+   git tag -a v0.X.Y <merge-commit> -m "v0.X.Y"
    git push origin v0.X.Y
    ```
 3. The automated release workflow will:
    - Build the release binary with attestation
    - Generate SBOM (Software Bill of Materials)
    - Create GitHub Release with auto-generated notes
-   - **Automatically update DocC documentation on GitHub Pages**
-4. Verify the release:
+4. Replace the generated GitHub notes with the curated `CHANGELOG.md` section, then verify:
    - Check GitHub Releases page for binaries and checksums
+   - Verify the build attestation and that the checksum matches the binary
    - Verify DocC updated at https://swiftftr.networkweather.com/
+   - Build a throwaway consumer using the published remote tag
 
 ### Manual Release (if needed)
-- Actions → "Release (manual)" → Run workflow with `ref = vX.Y.Z`
-- This will trigger the same process as tag-based releases
+- Actions → "Release (attested + SBOM)" → Run workflow with `tag = vX.Y.Z`
+- The annotated tag must already exist and its CLI version must match; documentation deploys from
+  `main`
 
 ### Post-Release
 - Announce the release if it contains significant features

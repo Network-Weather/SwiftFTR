@@ -25,7 +25,7 @@ swift build -c release --product swift-ftr
 ### Code Quality
 ```bash
 # Check formatting (required before push)
-swift format lint -r Sources Tests
+swift format lint --strict -r Sources Tests
 
 # Auto-format code
 swift format format --in-place -r Sources Tests
@@ -33,9 +33,10 @@ swift format format --in-place -r Sources Tests
 
 ### Documentation
 ```bash
-swift package --allow-writing-to-directory docs \
+swift package --allow-writing-to-directory docc \
   generate-documentation --target SwiftFTR \
-  --output-path docs --transform-for-static-hosting --hosting-base-path SwiftFTR
+  --output-path docc --transform-for-static-hosting \
+  --warnings-as-errors
 ```
 
 ## Architecture Overview

@@ -3,6 +3,157 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+0.14.0 — 2026-07-22
+-------------------
+
+This release hardens SwiftFTR's network protocols and async lifecycle, preserves the exact endpoint
+used by traceroute, adds IPv4/IPv6 UDP route binding, and removes numbered BSD-name guesses for
+physical Wi-Fi/Ethernet roles. See
+[Migrating to SwiftFTR 0.14](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo014.md) for adopter-focused
+examples and a checklist.
+
+### Public API and compatibility
+
+- `TraceResult.resolvedIP` reports the exact numeric address used for probing. Classified trace and
+  multipath enrichment reuse that address instead of resolving the hostname a second time.
+  [#29](https://github.com/Network-Weather/SwiftFTR/pull/29)
+- `UDPProbeConfig` and `udpProbe(...)` accept an exact `interface` and family-matched `sourceIP`.
+  Empty `Data` now sends a true zero-byte datagram rather than one NUL byte.
+  [#34](https://github.com/Network-Weather/SwiftFTR/pull/34)
+- `DNSError` adds `invalidTimeout` and `setsockoptFailed`. Exhaustive downstream switches must add
+  both known cases. An ordinary `default` handles grouped errors; `@unknown default` does not stand
+  in for currently known cases.
+  [#43](https://github.com/Network-Weather/SwiftFTR/pull/43)
+- Compatibility overloads retain the callable 0.13 initializer/function shapes for `TraceResult`,
+  `UDPProbeConfig`, and `udpProbe`. The API compatibility diagnostic against v0.13.0 therefore
+  reports only the two intentional `DNSError` additions.
+
+### Behavior changes
+
+- Invalid numeric, range, duration, and payload-size values for trace, streaming trace, ping,
+  TCP/UDP, bufferbloat, and multipath operations are validated before network work. Nonthrowing
+  configuration initializers retain values instead of trapping; throwing operation paths report
+  `TracerouteError.invalidConfiguration`. Host resolution and route binding retain their existing
+  API-specific error channels.
+  [#32](https://github.com/Network-Weather/SwiftFTR/pull/32)
+  [#33](https://github.com/Network-Weather/SwiftFTR/pull/33)
+- `httpProbe` completes when response headers arrive and cancels the body transfer. `rtt` therefore
+  measures through header receipt rather than full-body download. URLSession's `networkRTT` and
+  `tcpHandshakeRTT` remain best-effort and may be `nil`. Only absolute HTTP/HTTPS URLs with a host
+  and finite positive timeouts are accepted.
+  [#37](https://github.com/Network-Weather/SwiftFTR/pull/37)
+- `swift-ftr probe tcp` exits with a failure status when its structured result reports an
+  unreachable target or route-binding error. Successful probes, including reachable closed ports,
+  continue to exit successfully.
+- Loaded bufferbloat tests reject effective interface or source-address binding because URLSession
+  load traffic cannot be guaranteed to follow the bound ping route. Bound baseline-only runs remain
+  available with `loadDuration: 0`.
+  [#38](https://github.com/Network-Weather/SwiftFTR/pull/38)
+- Multipath remains IPv4-only and rejects forced IPv6 or IPv6 source configurations before
+  launching workers. Empty decoded topologies no longer trap during divergence analysis.
+  [#29](https://github.com/Network-Weather/SwiftFTR/pull/29)
+  [#40](https://github.com/Network-Weather/SwiftFTR/pull/40)
+- `reverseDNS` returns `nil` when no PTR hostname exists instead of returning the numeric address.
+  [#35](https://github.com/Network-Weather/SwiftFTR/pull/35)
+- Classification handles IPv6 unique-local, link-local, loopback, unspecified and multicast
+  scopes, IPv4-mapped IPv6, CGNAT, and VPN-local addresses consistently. Non-global addresses are
+  not sent to ASN resolvers, and exact destination identity takes precedence over ASN heuristics.
+  [#36](https://github.com/Network-Weather/SwiftFTR/pull/36)
+- Physical interface type comes from macOS SystemConfiguration metadata. Unknown names are `.other`;
+  callers must discover interfaces dynamically and must not infer Wi-Fi or Ethernet from a BSD-name
+  prefix or numeric suffix.
+  [#48](https://github.com/Network-Weather/SwiftFTR/pull/48)
+
+### Cancellation, concurrency, and caching
+
+- Ending a streaming trace or reacting to `networkChanged()` cancels its active socket, timers,
+  producer, and retry work.
+  [#27](https://github.com/Network-Weather/SwiftFTR/pull/27)
+- Ping lifecycle cleanup is serialized; setup failures close sockets, sender tasks are joined, and
+  cancellation is idempotent.
+  [#30](https://github.com/Network-Weather/SwiftFTR/pull/30)
+- TCP and UDP probes propagate task cancellation promptly instead of remaining alive until timeout.
+  [#34](https://github.com/Network-Weather/SwiftFTR/pull/34)
+  [#42](https://github.com/Network-Weather/SwiftFTR/pull/42)
+- Bufferbloat and multipath work remains in the caller's structured task tree. Sibling work is
+  canceled and joined on failure or cancellation.
+  [#38](https://github.com/Network-Weather/SwiftFTR/pull/38)
+  [#39](https://github.com/Network-Weather/SwiftFTR/pull/39)
+- Selected legacy DNS, STUN/public-IP enrichment, ASN, and cached-rDNS blocking calls run on a
+  Dispatch-backed queue capped at eight operations instead of Swift's cooperative executor. Once
+  submitted, cancellation waits for a synchronous operation to finish; configured socket timeouts
+  bound the calls that have them.
+  [#41](https://github.com/Network-Weather/SwiftFTR/pull/41)
+- Public-IP and rDNS cache generations prevent work started on an old network from repopulating
+  cleared caches. Concurrent ASN misses are coalesced by resolver identity, address, and timeout.
+  [#31](https://github.com/Network-Weather/SwiftFTR/pull/31)
+  [#51](https://github.com/Network-Weather/SwiftFTR/pull/51)
+
+### Protocol and parser hardening
+
+- STUN sockets connect to the selected server, and responses must match the Binding Success type,
+  declared length, magic cookie, transaction ID, and requested address family.
+  [#25](https://github.com/Network-Weather/SwiftFTR/pull/25)
+- DNS UDP responses must come from the selected resolver and match the transaction ID, response bit,
+  opcode, truncation state, and response code. TXT queries use the same validated path. Truncated
+  UDP replies are rejected; DNS-over-TCP fallback is not yet implemented.
+  [#28](https://github.com/Network-Weather/SwiftFTR/pull/28)
+- DNS validates timeouts and QNAME/PTR inputs before socket conversion. Compressed names and
+  name-bearing RDATA are bounded to their records and reject invalid pointers, cycles, overlong
+  expansion, and cross-record borrowing.
+  [#43](https://github.com/Network-Weather/SwiftFTR/pull/43)
+  [#45](https://github.com/Network-Weather/SwiftFTR/pull/45)
+- ICMP error correlation validates the quoted IP protocol, header shape, Echo Request type/code,
+  and IPv6 Next Header before matching identifiers and sequences.
+  [#44](https://github.com/Network-Weather/SwiftFTR/pull/44)
+
+### CLI changes
+
+- `swift-ftr --version` reports the same release version embedded in trace JSON output.
+- `swift-ftr ping` uses `-i` for interval and `-I` for interface; long options are unchanged.
+  [#46](https://github.com/Network-Weather/SwiftFTR/pull/46)
+- Trace JSON honors `--no-rdns` and avoids all reverse lookups when it is present.
+  [#47](https://github.com/Network-Weather/SwiftFTR/pull/47)
+- `swift-ftr interfaces` shows active interfaces by default; `--include-inactive` includes down
+  interfaces.
+  [#49](https://github.com/Network-Weather/SwiftFTR/pull/49)
+
+### Routing contracts
+
+- Interface names represent the caller's exact OS-discovered selection. Binding applies only to an
+  API's documented probe sockets. Hostname resolution, system rDNS, DNS-whoami fallback, Team Cymru
+  ASN queries, and URLSession HTTP traffic remain system-routed.
+- `getPublicIPs()` is uncached, dual-stack, and STUN-only. `SwiftFTRConfig.publicIP` applies to
+  classified trace and multipath enrichment, not standalone public-IP calls.
+- Public HTTP/HTTPS probes do not expose production interface or source-address binding.
+
+[#50](https://github.com/Network-Weather/SwiftFTR/pull/50)
+
+### Dependencies
+
+- The SwiftIP2ASN floor is now 0.4.1, adding self-healing disk cache behavior, cache-poisoning
+  prevention, robust missing-file refresh, and the July 2026 dual-stack database.
+
+### Development and release tooling
+
+- CI separates deterministic offline checks from opt-in live-network tests and validates
+  documentation commands.
+  [#26](https://github.com/Network-Weather/SwiftFTR/pull/26)
+- UDP loopback tests have bounded waits and deterministic cancellation cleanup; production behavior
+  is unchanged.
+  [#52](https://github.com/Network-Weather/SwiftFTR/pull/52)
+- Address-copy helpers explicitly discard `memcpy` return values so Swift 6.3 builds remain
+  warning-free.
+- The security policy lists the 0.14.x release line as supported.
+- The release workflow uses current Node 24 action generations, requires an existing annotated
+  version tag with a matching CLI version, and emits one explicitly named CycloneDX SBOM instead of
+  allowing the SBOM action to upload a duplicate asset.
+- An internal `NWConnection` HTTPS spike validates exact-interface IPv4/IPv6 TLS, SNI, default
+  trust, Host, User-Agent, bounded headers, and cancellation. It is dormant, not wired into
+  `httpProbe`, and is not production API. The production roadmap retains URLSession for
+  unconstrained probes and forbids silent route fallback.
+  [#53](https://github.com/Network-Weather/SwiftFTR/pull/53)
+
 0.13.0 — 2026-05-28
 -------------------
 

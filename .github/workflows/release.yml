@@ -5,15 +5,10 @@ on:
     tags: [ "v*" ]
   workflow_dispatch:
     inputs:
-      ref:
-        description: 'Tag or ref to release (e.g., v0.7.0)'
-        required: false
+      tag:
+        description: 'Existing annotated stable release tag (e.g., v0.14.0)'
+        required: true
         type: string
-      rebuild_docs:
-        description: 'Rebuild documentation after release'
-        required: false
-        type: boolean
-        default: false
 
 permissions:
   contents: write       # create GitHub Releases
@@ -26,30 +21,70 @@ jobs:
     name: macOS Release (SwiftPM)
     runs-on: macos-15
     steps:
-      - name: Determine release ref
-        id: release_ref
+      - name: Determine release tag
+        id: release_tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          PUSHED_TAG: ${{ github.ref_name }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            if [ -n "${{ inputs.ref }}" ]; then
-              echo "ref=${{ inputs.ref }}" >> $GITHUB_OUTPUT
-            else
-              echo "ref=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-            fi
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            release_tag="$INPUT_TAG"
           else
-            echo "ref=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            release_tag="$PUSHED_TAG"
           fi
 
+          if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release ref must be a stable semantic-version tag: $release_tag" >&2
+            exit 1
+          fi
+
+          printf 'tag=%s\n' "$release_tag" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          ref: ${{ steps.release_ref.outputs.ref }}
+          ref: ${{ steps.release_tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify release tag
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
+        run: |
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "Release tag does not exist: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [ "$(git cat-file -t "$RELEASE_TAG")" != "tag" ]; then
+            echo "Release tag must be annotated: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          checkout_commit="$(git rev-parse HEAD)"
+          if [ "$tag_commit" != "$checkout_commit" ]; then
+            echo "Checked-out commit does not match $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "Release tag must point to a commit on main: $RELEASE_TAG" >&2
+            exit 1
+          fi
 
       - name: Swift version
         run: swift --version
 
       - name: Build (release)
+        env:
+          RELEASE_TAG: ${{ steps.release_tag.outputs.tag }}
         run: |
           swift build -c release
+          expected_version="${RELEASE_TAG#v}"
+          actual_version="$(.build/release/swift-ftr --version)"
+          if [ "$actual_version" != "$expected_version" ]; then
+            echo "CLI version $actual_version does not match tag $RELEASE_TAG" >&2
+            exit 1
+          fi
           cp .build/release/swift-ftr swift-ftr-macos-arm64
           shasum -a 256 swift-ftr-macos-arm64 > swift-ftr-macos-arm64.sha256
 
@@ -59,18 +94,20 @@ jobs:
           path: .
           format: cyclonedx-json
           output-file: sbom.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: swift-ftr-${{ steps.release_ref.outputs.ref }}-macos-arm64
+          name: swift-ftr-${{ steps.release_tag.outputs.tag }}-macos-arm64
           path: |
             swift-ftr-macos-arm64
             swift-ftr-macos-arm64.sha256
             sbom.cdx.json
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@v1
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             swift-ftr-macos-arm64
@@ -78,9 +115,9 @@ jobs:
             sbom.cdx.json
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.release_ref.outputs.ref }}
+          tag_name: ${{ steps.release_tag.outputs.tag }}
           files: |
             swift-ftr-macos-arm64
             swift-ftr-macos-arm64.sha256
@@ -88,13 +125,3 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  rebuild-docs:
-    name: Rebuild Documentation
-    needs: macos-release
-    if: github.event_name == 'workflow_dispatch' && inputs.rebuild_docs == true
-    uses: ./.github/workflows/docs.yml
-    permissions:
-      contents: read
-      pages: write
-      id-token: write

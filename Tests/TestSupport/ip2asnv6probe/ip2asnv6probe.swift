@@ -52,7 +52,7 @@ struct IP2ASNv6Probe {
       let isV6 = addr.contains(":")
       let resultStr: String
       switch result {
-      case .some(let (asn, name)):
+      case .some((let asn, let name)):
         resultStr = "AS\(asn) (\(name ?? "<no name>"))"
         if isV6 { v6Hits += 1 } else { v4Hits += 1 }
       case .none:

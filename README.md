@@ -59,12 +59,19 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.13.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.14.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
   ]
   ```
+
+Upgrading from 0.13
+-------------------
+Read [Migrating to SwiftFTR 0.14](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo014.md) before
+updating. Existing direct call sites remain source-compatible, but exhaustive `DNSError` switches,
+HTTP timing assumptions, route-bound bufferbloat tests, and interface classification may require
+small changes.
 
 Swift 6.1 Compliance
 --------------------
@@ -418,7 +425,8 @@ Generate and view the docs:
   ```bash
   swift package --allow-writing-to-directory docc \
     generate-documentation --target SwiftFTR \
-    --output-path docc --transform-for-static-hosting --hosting-base-path SwiftFTR
+    --output-path docc --transform-for-static-hosting \
+    --warnings-as-errors
   open docc/index.html
   ```
 
@@ -426,7 +434,7 @@ Formatting & Hooks
 ------------------
 - Lint formatting locally before pushing:
   ```bash
-  swift format lint -r Sources Tests
+  swift format lint --strict -r Sources Tests
   ```
 - Optional: install repo hooks so pushes fail on formatting issues:
   ```bash
@@ -440,7 +448,7 @@ MIT — see LICENSE.
 Versioning & Releases
 ---------------------
 - Semantic Versioning. See CHANGELOG.md for release notes.
-- To consume via SwiftPM, use the `0.1.0` tag or later.
+- To consume via SwiftPM, use the `0.14.0` tag or a later compatible release.
 
 Contributing
 ------------
