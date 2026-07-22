@@ -3,7 +3,7 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-0.14.0 — Unreleased
+0.14.0 — 2026-07-22
 -------------------
 
 This release hardens SwiftFTR's network protocols and async lifecycle, preserves the exact endpoint
