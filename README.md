@@ -88,14 +88,14 @@ Key Features
 - Streaming API with real-time hop updates via `AsyncThrowingStream`
 - ASN-based hop classification: LOCAL, ISP, TRANSIT, VPN, DESTINATION
 - v6 hops get full ASN annotations via Team Cymru `origin6.asn.cymru.com` or the embedded swift-ip2asn database
-- VPN-aware classification for tunnel and exit node detection
+- VPN-aware classification of tunnel-local and exit-side path segments
 - Automatic rDNS lookups with 24-hour caching
 
 **Dual-stack IPv4 / IPv6**
 - Ping, traceroute, TCP probes, and UDP probes accept v4 literals, v6 literals, and hostnames through the same entry points
 - `PreferredFamily { .v4, .v6, .auto }` lets callers force a family; default `.auto` lets the OS decide
 - v4 literals on v6-only NAT64 networks transparently use the gateway's synthesized v6 mapping (RFC 6147)
-- All emitted addresses are in `inet_ntop` canonical form; link-local addresses keep their `%zone` suffix
+- IPv6 formatting uses `inet_ntop`; link-local paths retain a `%zone` suffix when macOS supplies a scope ID
 - A caller-selected BSD interface name binds v6 sockets via `IPV6_BOUND_IF`
 
 **Network Probing**
@@ -155,7 +155,7 @@ let v6Result = try await tracer.trace(to: "2606:4700:4700::1111")
 // Or force a family explicitly:
 let v6Config = SwiftFTRConfig(preferredFamily: .v6)
 let alwaysV6 = SwiftFTR(config: v6Config)
-let google = try await alwaysV6.trace(to: "google.com")  // prefers AAAA if available
+let googleTrace = try await alwaysV6.trace(to: "google.com")  // prefers AAAA if available
 
 // Dual-stack public-IP discovery:
 let publicIPs = await getPublicIPs()
@@ -327,12 +327,12 @@ swift build -c release
 
 ### Traceroute (default command)
 ```bash
-.build/release/swift-ftr trace example.com -m 40 -w 1.0
+.build/release/swift-ftr trace example.com -m 40 -t 1.0
 ```
 
 Options:
 - `-m, --max-hops N`: Max TTL/hops to probe (default 40)
-- `-w, --timeout SEC`: Overall wait after sending probes (default 1.0)
+- `-t, --timeout SEC`: Overall wait after sending probes (default 1.0)
 - `-i, --interface IFACE`: Use an exact BSD name reported by `swift-ftr interfaces`
 - `-s, --source IP`: Bind to specific source IP address
 - `-p, --payload-size N`: ICMP payload size in bytes (default 56)
