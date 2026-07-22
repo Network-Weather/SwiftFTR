@@ -42,6 +42,9 @@ examples and a checklist.
   `tcpHandshakeRTT` remain best-effort and may be `nil`. Only absolute HTTP/HTTPS URLs with a host
   and finite positive timeouts are accepted.
   [#37](https://github.com/Network-Weather/SwiftFTR/pull/37)
+- `swift-ftr probe tcp` exits with a failure status when its structured result reports an
+  unreachable target or route-binding error. Successful probes, including reachable closed ports,
+  continue to exit successfully.
 - Loaded bufferbloat tests reject effective interface or source-address binding because URLSession
   load traffic cannot be guaranteed to follow the bound ping route. Bound baseline-only runs remain
   available with `loadDuration: 0`.

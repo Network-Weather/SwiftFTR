@@ -249,6 +249,9 @@ and VPN paths.
   value in its `version` field.
 - `swift-ftr ping` uses `-i` for interval and `-I` for interface. Long options are unchanged.
 - Trace JSON now honors `--no-rdns`.
+- `swift-ftr probe tcp` now exits nonzero after printing a structured unreachable or binding-error
+  result. Reachable open and closed ports still exit zero. Update automation that previously read
+  JSON while assuming every completed TCP probe returned a successful process status.
 - `swift-ftr interfaces` shows active interfaces by default; add `--include-inactive` to include
   down interfaces.
 
@@ -264,4 +267,5 @@ and VPN paths.
 - Discover and validate exact interfaces dynamically; do not infer physical roles from BSD names.
 - Handle cancellation according to each API's contract; legacy HTTP reports a `"Cancelled"`
   result while TCP/UDP probes throw `CancellationError`.
+- Let TCP-probe automation accept nonzero status when the accompanying result is unreachable.
 - Refresh SwiftPM resolution so SwiftIP2ASN 0.4.1 is selected.

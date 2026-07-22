@@ -691,6 +691,13 @@ extension SwiftFTRCommand {
         } else {
           printPretty(result)
         }
+
+        // A completed probe can still report an unreachable target or a binding error. Preserve
+        // the structured output while making the process status useful to scripts and release
+        // smoke tests.
+        if !result.isReachable {
+          Foundation.exit(1)
+        }
       } catch {
         fputs("Error: \(error)\n", stderr)
         Foundation.exit(1)
