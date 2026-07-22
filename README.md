@@ -68,10 +68,10 @@ Install (SwiftPM)
 
 Upgrading from 0.13
 -------------------
-Read [Migrating to SwiftFTR 0.14](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo014.md) before
-updating. Existing direct call sites remain source-compatible, but exhaustive `DNSError` switches,
-HTTP timing assumptions, route-bound bufferbloat tests, and interface classification may require
-small changes.
+Read the published [Migrating to SwiftFTR 0.14](https://swiftftr.networkweather.com/documentation/swiftftr/migratingto014/)
+guide and the [0.14 changelog](CHANGELOG.md#0140--2026-07-22) before updating. Existing direct call
+sites remain source-compatible, but exhaustive `DNSError` switches, HTTP timing assumptions,
+route-bound bufferbloat tests, and interface classification may require small changes.
 
 Swift 6.1 Compliance
 --------------------
@@ -91,7 +91,7 @@ Key Features
 - VPN-aware classification for tunnel and exit node detection
 - Automatic rDNS lookups with 24-hour caching
 
-**Dual-stack IPv4 / IPv6 (v0.13.0)**
+**Dual-stack IPv4 / IPv6**
 - Ping, traceroute, TCP probes, and UDP probes accept v4 literals, v6 literals, and hostnames through the same entry points
 - `PreferredFamily { .v4, .v6, .auto }` lets callers force a family; default `.auto` lets the OS decide
 - v4 literals on v6-only NAT64 networks transparently use the gateway's synthesized v6 mapping (RFC 6147)
@@ -157,7 +157,7 @@ let v6Config = SwiftFTRConfig(preferredFamily: .v6)
 let alwaysV6 = SwiftFTR(config: v6Config)
 let google = try await alwaysV6.trace(to: "google.com")  // prefers AAAA if available
 
-// Dual-stack public-IP discovery (v0.13.0):
+// Dual-stack public-IP discovery:
 let publicIPs = await getPublicIPs()
 print("v4: \(publicIPs.v4 ?? "n/a"), v6: \(publicIPs.v6 ?? "n/a")")
 
@@ -165,7 +165,7 @@ print("v4: \(publicIPs.v4 ?? "n/a"), v6: \(publicIPs.v6 ?? "n/a")")
 let classified = try await tracer.traceClassified(to: "www.example.com")
 for hop in classified.hops {
     print(hop.ttl, hop.ip ?? "*", hop.category.rawValue, hop.asn ?? 0, hop.asName ?? "")
-    // New: hostname from reverse DNS
+    // Optional hostname from reverse DNS
     if let hostname = hop.hostname {
         print("  Hostname: \(hostname)")
     }

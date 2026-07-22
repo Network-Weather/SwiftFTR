@@ -11,6 +11,11 @@ Massively parallel, async/await traceroute for macOS using ICMP datagram sockets
 - Optional classification into segments (LOCAL, ISP, TRANSIT, DESTINATION) using ASN lookups and heuristics.
 - STUN-based public IP discovery and configurable classified-trace enrichment.
 
+SwiftFTR 0.14 hardens protocol validation, cancellation, caching, and route binding while
+preserving ordinary 0.13 call sites. Before upgrading, review <doc:MigratingTo014> for the two new
+``DNSError`` cases and behavior changes to HTTP timing, reverse DNS, bufferbloat binding, and
+interface classification.
+
 ## Usage
 
 ### Basic tracing
@@ -37,7 +42,7 @@ for hop in classified.hops {
 }
 ```
 
-### DNS queries (v0.8.0+)
+### DNS queries
 
 ```swift
 import SwiftFTR
