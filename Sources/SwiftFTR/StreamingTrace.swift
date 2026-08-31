@@ -43,16 +43,35 @@ public struct StreamingHop: Sendable, Equatable {
   /// `true` for Echo Reply (destination reached), `false` for Time Exceeded.
   public let reachedDestination: Bool
 
+  /// What actually happened at this hop. See ``HopOutcome``.
+  public let outcome: HopOutcome
+
+  /// Creates a streaming hop, inferring ``outcome`` from the other fields.
+  ///
+  /// Retains the callable shape published before ``HopOutcome`` existed.
   public init(
     ttl: Int,
     ipAddress: String?,
     rtt: TimeInterval?,
     reachedDestination: Bool
   ) {
+    self.init(
+      ttl: ttl, ipAddress: ipAddress, rtt: rtt, reachedDestination: reachedDestination,
+      outcome: ipAddress == nil ? .timedOut : .replied)
+  }
+
+  public init(
+    ttl: Int,
+    ipAddress: String?,
+    rtt: TimeInterval?,
+    reachedDestination: Bool,
+    outcome: HopOutcome
+  ) {
     self.ttl = ttl
     self.ipAddress = ipAddress
     self.rtt = rtt
     self.reachedDestination = reachedDestination
+    self.outcome = outcome
   }
 }
 

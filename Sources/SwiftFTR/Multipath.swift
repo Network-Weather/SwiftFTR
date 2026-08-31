@@ -747,7 +747,8 @@ extension SwiftFTR {
         asn: hop.asn,
         asName: hop.asName,
         category: hop.category,
-        hostname: hostname
+        hostname: hostname,
+        outcome: hop.outcome
       )
     }
 

@@ -16,7 +16,20 @@ public struct TraceHop: Sendable {
   public let reachedDestination: Bool
   /// Hostname from reverse DNS lookup. `nil` if lookup disabled, failed, or timed out.
   public let hostname: String?
+  /// What actually happened at this hop.
+  ///
+  /// Authoritative where the other fields are derived. In particular it separates a router that
+  /// forwarded the probe onward from one that refused to route it — both of which report an
+  /// address and a round-trip time — and separates a probe that was never sent from one that drew
+  /// no answer, which otherwise look identical.
+  public let outcome: HopOutcome
 
+  /// Creates a hop, inferring ``outcome`` from the other fields.
+  ///
+  /// Retains the callable shape published before ``HopOutcome`` existed. A hop built this way
+  /// reports ``HopOutcome/replied`` when it has an address and ``HopOutcome/timedOut`` when it does
+  /// not; it never reports ``HopOutcome/unreachable`` or ``HopOutcome/notSent``, which cannot be
+  /// recovered from these fields. Prefer the initializer that takes an explicit outcome.
   public init(
     ttl: Int,
     ipAddress: String?,
@@ -24,11 +37,29 @@ public struct TraceHop: Sendable {
     reachedDestination: Bool,
     hostname: String? = nil
   ) {
+    self.init(
+      ttl: ttl,
+      ipAddress: ipAddress,
+      rtt: rtt,
+      reachedDestination: reachedDestination,
+      hostname: hostname,
+      outcome: ipAddress == nil ? .timedOut : .replied)
+  }
+
+  public init(
+    ttl: Int,
+    ipAddress: String?,
+    rtt: TimeInterval?,
+    reachedDestination: Bool,
+    hostname: String? = nil,
+    outcome: HopOutcome
+  ) {
     self.ttl = ttl
     self.ipAddress = ipAddress
     self.rtt = rtt
     self.reachedDestination = reachedDestination
     self.hostname = hostname
+    self.outcome = outcome
   }
 
 }
@@ -933,7 +964,8 @@ public actor SwiftFTR {
         category: hop.category,
         hostname: hop.ip.flatMap {
           hostnameMap[$0] ?? tr.hops.first { $0.ipAddress == hop.ip }?.hostname
-        }
+        },
+        outcome: hop.outcome
       )
     }
 
@@ -1528,14 +1560,15 @@ private final class TraceReceiveOperation: @unchecked Sendable {
           }
         }
 
-      case .destinationUnreachable(let originalID, let originalSeq):
+      case .destinationUnreachable(let originalID, let originalSeq, let code):
         guard originalID == nil || originalID == identifier else { continue }
         if let seq = originalSeq, let info = outstanding.removeValue(forKey: seq) {
           let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
           let rtt = monotonicNow() - info.sentAt
           if hops[hopIndex] == nil {
             hops[hopIndex] = TraceHop(
-              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
+              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false,
+              outcome: .unreachable(code: code))
           }
         }
 
@@ -1759,10 +1792,12 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
           if !emitIntermediateHop(seq: seq, parsed: parsed) { return }
         }
 
-      case .destinationUnreachable(let originalID, let originalSeq):
+      case .destinationUnreachable(let originalID, let originalSeq, let code):
         guard originalID == nil || originalID == identifier else { continue }
         if let seq = originalSeq {
-          if !emitIntermediateHop(seq: seq, parsed: parsed) { return }
+          if !emitIntermediateHop(seq: seq, parsed: parsed, outcome: .unreachable(code: code)) {
+            return
+          }
         }
 
       case .other:
@@ -1786,7 +1821,9 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     }
   }
 
-  private func emitIntermediateHop(seq: UInt16, parsed: ParsedICMP) -> Bool {
+  private func emitIntermediateHop(
+    seq: UInt16, parsed: ParsedICMP, outcome: HopOutcome = .replied
+  ) -> Bool {
     guard let info = outstanding[seq] else { return true }
     if let destTTL = reachedTTL, info.ttl > destTTL { return true }
     if receivedTTLs.contains(info.ttl) { return true }
@@ -1796,7 +1833,8 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     guard
       yieldHop(
         StreamingHop(
-          ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false))
+          ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false,
+          outcome: outcome))
     else {
       cancel()
       return false
