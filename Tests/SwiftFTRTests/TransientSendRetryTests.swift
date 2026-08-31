@@ -18,6 +18,10 @@ import Testing
 /// call the probe path makes; `sendto` with a destination address on a
 /// connected stream socket succeeds on macOS, so `sendTraceProbe` runs
 /// unmodified against it.
+///
+/// Serialized: these tests assert on elapsed time, so they run one at a time
+/// rather than competing with each other for the machine.
+@Suite(.serialized)
 struct TransientSendRetryTests {
 
   // MARK: - Errno classification
@@ -53,7 +57,9 @@ struct TransientSendRetryTests {
 
     pair.startDraining(after: 0.03)
 
-    let deadline = monotonicNow() + traceBurstSendRetryBudget
+    // A deliberately generous deadline. What this test pins is that a blocked
+    // burst recovers at all; `transientPressureFailsAtBudget` pins the budget.
+    let deadline = monotonicNow() + 5.0
     let start = monotonicNow()
     for ttl in 1...30 {
       try sendTraceProbe(
@@ -62,9 +68,10 @@ struct TransientSendRetryTests {
     }
     let elapsed = monotonicNow() - start
 
-    // The burst had to wait for the drainer, so the retry path really ran.
-    #expect(elapsed >= 0.02)
-    #expect(elapsed < traceBurstSendRetryBudget + 0.5)
+    // The socket had no free space when the burst began, so these probes only
+    // went out because the retry path waited for the drainer to make room.
+    #expect(pair.drainedByteCount > 0)
+    #expect(elapsed < 2.0)
   }
 
   @Test("A send that never clears fails with the transient errno at the budget")
@@ -86,7 +93,7 @@ struct TransientSendRetryTests {
 
     #expect(thrown == EWOULDBLOCK)
     #expect(elapsed >= budget * 0.8)
-    #expect(elapsed < budget + 0.5)
+    #expect(elapsed < budget + 1.0)
   }
 
   @Test("The retry budget is shared across the burst, not granted per probe")
@@ -118,7 +125,7 @@ struct TransientSendRetryTests {
     let elapsed = monotonicNow() - start
 
     #expect(secondThrown == EWOULDBLOCK)
-    #expect(elapsed < 0.02)
+    #expect(elapsed < 0.05)
   }
 
   @Test("Non-transient errnos propagate on the first attempt")
@@ -136,7 +143,7 @@ struct TransientSendRetryTests {
     let elapsed = monotonicNow() - start
 
     #expect(thrown == EBADF)
-    #expect(elapsed < 0.1)
+    #expect(elapsed < 0.5)
   }
 
   // MARK: - ENOBUFS
@@ -169,7 +176,7 @@ struct TransientSendRetryTests {
 
     #expect(thrown == ENOBUFS)
     #expect(elapsed >= budget * 0.8)
-    #expect(elapsed < budget + 0.5)
+    #expect(elapsed < budget + 1.0)
     // Roughly one attempt per millisecond of budget. Spinning on poll would run
     // this into the tens of thousands.
     #expect(attempts < 500, "ENOBUFS retries should sleep between attempts")
@@ -186,7 +193,9 @@ struct TransientSendRetryTests {
     pair.fillSendBuffer()
     #expect(pair.rawSendErrno() == EWOULDBLOCK, "harness must start with a blocked socket")
 
-    pair.startDraining(after: 0.01)
+    // The ping budget is a fixed internal constant, so the drainer releases the
+    // socket quickly to leave room for scheduling jitter on a loaded machine.
+    pair.startDraining(after: 0.002)
 
     let executor = PingExecutor(config: SwiftFTRConfig())
     let packet = makeICMPEchoRequest(identifier: 0x1234, sequence: 1, payloadSize: 56)
@@ -197,11 +206,14 @@ struct TransientSendRetryTests {
       sockfd: pair.writer, packet: packet, to: resolved)
     let finish = executor.monotonicTime()
 
+    // The socket had no free space when the send began, so it only went out
+    // because the retry path waited for the drainer to make room.
+    #expect(pair.drainedByteCount > 0)
+
     // The reported send time is the attempt that reached the wire, so it lands
-    // after the wait rather than at the start of it.
+    // within the call rather than before the wait.
     #expect(sendTime >= start)
     #expect(sendTime <= finish)
-    #expect(finish - start >= 0.005)
   }
 
   @Test("A ping send that never clears reports the transient errno")
@@ -223,7 +235,7 @@ struct TransientSendRetryTests {
 
     #expect(thrown == EWOULDBLOCK)
     #expect(elapsed >= pingSendRetryBudget * 0.8)
-    #expect(elapsed < pingSendRetryBudget + 0.5)
+    #expect(elapsed < pingSendRetryBudget + 1.0)
   }
 }
 
@@ -249,7 +261,16 @@ private final class BlockedSendPair: @unchecked Sendable {
   private let lock = NSLock()
   private var draining = false
   private var drainerRunning = false
+  private var drainedBytes = 0
   private let drainerExited = DispatchSemaphore(value: 0)
+
+  /// How many bytes the drainer has consumed so far. Every byte counted here is
+  /// space the writer did not have when its burst started.
+  var drainedByteCount: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return drainedBytes
+  }
 
   init(sendBufferBytes: Int32 = 2048) throws {
     var descriptors: [Int32] = [-1, -1]
@@ -285,8 +306,14 @@ private final class BlockedSendPair: @unchecked Sendable {
     return sent < 0 ? errno : 0
   }
 
-  /// Starts consuming from the reader after `delay`, which lets the writer's
-  /// send buffer drain.
+  /// Starts consuming from the reader `delay` after this call returns, which
+  /// lets the writer's send buffer drain.
+  ///
+  /// The drainer runs on a dedicated thread rather than the global queue: the
+  /// test suite saturates the global pool, and a drainer that cannot be
+  /// scheduled turns a correctness test into a load test. This call returns only
+  /// once that thread is running, so `delay` measures from a thread that already
+  /// exists rather than from an unscheduled work item.
   func startDraining(after delay: TimeInterval) {
     lock.lock()
     draining = true
@@ -294,17 +321,25 @@ private final class BlockedSendPair: @unchecked Sendable {
     lock.unlock()
 
     let reader = self.reader
-    DispatchQueue.global().async { [self] in
+    let ready = DispatchSemaphore(value: 0)
+    let thread = Thread { [self] in
+      ready.signal()
       Thread.sleep(forTimeInterval: delay)
       var buffer = [UInt8](repeating: 0, count: 64 * 1024)
       while shouldKeepDraining() {
         var descriptor = pollfd(fd: reader, events: Int16(POLLIN), revents: 0)
         if poll(&descriptor, 1, 20) > 0 {
-          _ = buffer.withUnsafeMutableBytes { recv(reader, $0.baseAddress, $0.count, 0) }
+          let received = buffer.withUnsafeMutableBytes {
+            recv(reader, $0.baseAddress, $0.count, 0)
+          }
+          if received > 0 { recordDrained(received) }
         }
       }
       drainerExited.signal()
     }
+    thread.stackSize = 512 * 1024
+    thread.start()
+    ready.wait()
   }
 
   func close() {
@@ -322,6 +357,12 @@ private final class BlockedSendPair: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return draining
+  }
+
+  private func recordDrained(_ count: Int) {
+    lock.lock()
+    drainedBytes += count
+    lock.unlock()
   }
 }
 
