@@ -33,6 +33,21 @@ Unreleased
 - `TraceClassifier.classify(...)` takes a `publicIPDiscoveryTimeout` parameter, defaulted, for
   callers that reach discovery without a config in hand.
 
+### Bug fixes
+
+- Traceroute no longer aborts when the kernel reports momentary send-buffer pressure. Probe sockets
+  are non-blocking and a trace pushes every hop's probe out in one burst, so a single `sendto`
+  returning `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS` used to fail the whole traceroute with
+  `TracerouteError.sendFailed`. Those three errnos are now retried — waiting on `poll(POLLOUT)` for
+  socket-buffer pressure, and on a 1 ms sleep for `ENOBUFS`, which reports the interface queue and
+  leaves the socket reporting itself writable. The retry budget is 250 ms shared across the whole
+  burst, not per probe, so the 1 s receive window is not at risk. Every other errno still fails on
+  the first attempt with no added latency, so callers that key offline and permission diagnostics off
+  `EHOSTUNREACH`, `ENETDOWN`, `ENETUNREACH` and `EACCES` see them just as promptly as before. When
+  the budget runs out the same `sendFailed(errno:)` is thrown as before.
+- Ping applies the same retry, with a 50 ms per-send budget, so transient pressure no longer silently
+  drops a packet from the sample.
+
 0.14.0 — 2026-07-22
 -------------------
 

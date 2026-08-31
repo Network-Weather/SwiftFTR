@@ -133,7 +133,10 @@ private struct PingOperationFixture {
       resolved: resolved,
       config: config,
       identifier: 0x1234,
-      sendPacket: { _, _, _ in sends.recordSend() },
+      sendPacket: { _, _, _ in
+        sends.recordSend()
+        return monotonicNow()
+      },
       monotonicTime: { monotonicNow() },
       closeSocket: { closes.closeAndRecord($0) }
     )
