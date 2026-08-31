@@ -3,6 +3,36 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Behavior changes
+
+- `traceClassified()` now completes, or throws, within a budget derived from its own configuration,
+  and honors task cancellation during enrichment as it already did during the probe phase.
+  Previously the enrichment phase could run far past any caller watchdog while ignoring
+  cancellation: `getaddrinfo` (for each STUN hostname, walked serially) and `getnameinfo` (per hop)
+  have no timeout of their own and stall 30 seconds against an unresponsive resolver, and the
+  shared blocking-I/O executor did not honor cancellation. A cancelled classified trace now returns
+  in about 0.1s where it previously returned only when an executor slot freed.
+- Reverse DNS degrades instead of stalling. Hops whose lookup exceeds its budget report numerically,
+  and two consecutive stalled lookups suppress further attempts until the cache is cleared — which
+  callers already do on a network change. Reverse-DNS lookups run concurrently, so the budget bounds
+  the phase as a whole rather than being paid per hop.
+- Public-IP discovery degrades instead of stalling. Classification proceeds without a public address
+  when discovery exceeds its budget.
+
+### New public API
+
+- `SwiftFTRConfig.rdnsLookupTimeout` and `SwiftFTRConfig.publicIPDiscoveryTimeout` set the
+  enrichment budgets. Both are optional and fall back to the defaults when absent or invalid,
+  matching the existing `rdnsCacheTTL` / `rdnsCacheSize` pattern. Raise them on links whose
+  legitimate resolver latency is high.
+- `SwiftFTRConfig.defaultRDNSLookupTimeout` (5s) and `SwiftFTRConfig.defaultPublicIPDiscoveryTimeout`
+  (6s) expose those defaults.
+- `TraceClassifier.classify(...)` takes a `publicIPDiscoveryTimeout` parameter, defaulted, for
+  callers that reach discovery without a config in hand.
+
 0.14.0 — 2026-07-22
 -------------------
 
