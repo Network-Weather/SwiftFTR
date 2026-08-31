@@ -4,6 +4,140 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 
 ## Priority Queue
 
+### Retry transient send errors instead of aborting the trace
+**Goal**: A momentarily full send buffer must not destroy an entire traceroute.
+
+- **Problem**: The trace socket is non-blocking, and all `maxHops` probes are sent in one
+  unpaced burst. `sendTraceProbe` throws `TracerouteError.sendFailed(errno:)` on any
+  negative `sendto` return, so a single `EAGAIN` — the kernel saying "buffer full, try
+  again in a moment" — aborts the whole measurement. This is the most common traceroute
+  failure in NWX production telemetry (~80 events/week across at least 4 clients).
+- **Approach**: Classify `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS` as transient and retry them
+  against a budget shared across the whole burst, not per-probe — with `maxHops: 40` and
+  `maxWaitMs: 1000` as defaults, a per-probe budget would blow the receive deadline.
+  Wait for writability with `poll(POLLOUT)`; `ENOBUFS` reflects the interface queue rather
+  than the socket buffer, so it needs a short sleep instead, as `poll` reports the socket
+  writable immediately.
+- **Every other errno keeps failing fast.** NWX maps `EHOSTUNREACH`, `ENETDOWN`, and
+  `ENETUNREACH` to offline states it acts on, and must keep receiving them promptly.
+- **On budget exhaustion, throw as today.** Degrading to a skipped probe is the better
+  end state but is not safe to ship until a caller can distinguish "we never sent" from
+  "the router ignored us" — see the hop outcome model below, which unblocks it.
+- **Also**: audit the ping send path. It does not abort, but it silently drops the probe
+  on any send error, so transient pressure quietly shrinks the sample rather than
+  reporting anything.
+- **Acceptance**: a test that forces the condition deterministically (shrink `SO_SNDBUF`
+  via `setsockopt`, then send a burst) fails before the change and passes after.
+
+### Per-hop outcome model
+**Goal**: Let a caller tell apart the four things that can actually happen at a hop.
+
+- **Problem**: `TraceHop` encodes outcome implicitly through `nil` fields, and it collapses
+  distinctions the library already parses. `.timeExceeded` and `.destinationUnreachable`
+  currently construct identical hops — an address, an RTT, `reachedDestination: false` —
+  so "this router forwarded me" and "this router refused" are indistinguishable
+  downstream. The ICMP code is parsed and then discarded: `ParsedICMP.Kind` carries a code
+  only on `.other`. The ping parser keeps it, so the trace path is the outlier.
+- **Approach**: add a `HopOutcome` enum covering the four real outcomes — probe never sent
+  (with errno), sent and nothing returned, an ICMP error returned (with code and timing),
+  and a normal reply (Time Exceeded from an intermediate hop, or Echo Reply at the
+  destination). Thread the ICMP code through the v4 and v6 trace parsers.
+- **Additive, not a migration.** The enum becomes authoritative; `ipAddress`, `rtt`, and
+  `reachedDestination` stay and are documented as derived. Purer designs move the timing
+  onto the enum's associated values so illegal states are unrepresentable, but that breaks
+  the primary downstream consumer for little gain.
+- **Reach**: `TraceHop`, the classified and streaming hop types, and the CLI's snake_case
+  JSON output, which carries a stated backward-compatibility obligation.
+- **Deliberately out of scope**: a fifth outcome for replies arriving after the deadline,
+  which currently collapse into the timeout case. Only meaningful for the streaming API;
+  add it if a consumer asks.
+- **Unblocks**: skipping a probe whose send budget is exhausted, rather than failing the
+  trace, because `.notSent` makes the skip legible instead of a phantom unresponsive hop.
+
+### Bounded, cancellable enrichment
+**Goal**: `traceClassified()` completes, or throws, within a bound derived from its own
+configuration — and honors cancellation while doing it.
+
+- **Problem**: 5 distinct clients tripped NWX's 60-second watchdog (~10 occurrences).
+  The probe path is not at fault: every exit path of both receive operations resumes its
+  continuation exactly once, and cancellation during the probe phase terminates in ~0.105s
+  with no leaked socket. The exposure is the enrichment phase — STUN, per-hop rDNS, and
+  ASN lookups all run as blocking operations on one process-global 8-slot
+  `BlockingIOExecutor`, which has three compounding properties:
+  1. **Cancellation is not honored.** Queued operations are not removed when a task is
+     cancelled, and a running syscall is never interrupted. A `traceClassified` cancelled
+     at 0.1s was measured returning at 5.49s — exactly when an executor slot freed. That
+     is the field signature: the watchdog fires, the task stays suspended.
+  2. **No SwiftFTR deadline on `getaddrinfo` (3 STUN hostnames) or `getnameinfo`
+     (per hop).** Only the STUN and DNS *sockets* set `SO_RCVTIMEO`.
+  3. **Priority inversion.** rDNS enqueues at background priority while probe, ASN, and
+     STUN work enqueues higher; `OperationQueue` serves strictly by priority. A background
+     operation submitted first was measured running only after 24 later, higher-priority
+     operations (2.19s against a ~0.7s FIFO prediction). A host app issuing continuous
+     probe traffic defers an in-flight trace's rDNS phase without bound.
+- **Why it lands on real users**: NWX clears `cachedPublicIP` and its rDNS caches on every
+  network change, so the first trace after a transition — exactly when a resolver is most
+  likely degraded — always runs full STUN discovery plus a cold rDNS wave.
+- **Approach**:
+  - Give every blocking primitive its own deadline. rDNS can stop calling `getnameinfo`
+    altogether and use the in-package `DNSClient` PTR path, which already sets a socket
+    timeout. Resolve STUN hostnames the same bounded way, or ship literal addresses with
+    a hostname fallback.
+  - Make `runDetachedBlockingIO` cancellation-aware for at least not-yet-started
+    operations, and check `Task.isCancelled` between enrichment steps so a cancelled trace
+    stops enqueueing further work.
+  - Revisit executor sizing and the rDNS/probe priority inversion so one slow category
+    cannot absorb the queue.
+- **Acceptance**: `traceClassified` returns or throws within a configuration-derived bound
+  under network blackhole, blackhole during STUN, mid-trace interface loss, and executor
+  saturation; a cancelled trace terminates promptly in the enrichment phase as it already
+  does in the probe phase.
+- **Measured magnitude**: a single `getaddrinfo`/`getnameinfo` stalls **30.0s** when DNS
+  packets are dropped silently — a give-up time, not a latency, and specific to silent
+  loss rather than to degraded networks generally. It is the relevant case here: captive
+  portals, flaky Wi-Fi, and network transitions all produce silent loss.
+  STUN discovery serially resolves 3 hostnames, so it alone costs 90s and exceeds NWX's
+  watchdog before any rDNS runs; a 40-hop rDNS phase through the 8-slot executor costs
+  another 150s. `getnameinfo` returns *success* with the numeric form after stalling, so
+  nothing in this path reports an error a caller could key on.
+- **Cheapest open discriminator, NWX-side**: `log.*` telemetry carries no `app_version`,
+  so it is not yet possible to tell whether the reporting clients predate the NWX 1.3.0
+  fix for its own cooperative-thread-pinning SSDP loop. Adding that field settles whether
+  any residual host-app contribution remains.
+
+### STUN server list provides no actual redundancy
+**Goal**: Make public-IP discovery fail over to a genuinely different endpoint.
+
+- **Problem**: `stunServers` lists multiple Google hostnames, and discovery walks them serially,
+  paying a `getaddrinfo` for each. Measured 2026-08-30: `stun.l.google.com` and
+  `stun1.l.google.com` both resolve to `74.125.250.129` — the same address. The list costs 3x the
+  DNS work of one server while providing no IP-level failover, and against an unresponsive
+  resolver each of those lookups stalls 30s.
+- **Approach**: pick endpoints operated by different providers so failover means something, and
+  resolve them concurrently rather than serially. Two servers on distinct networks beat three
+  hostnames pointing at one address.
+- **Note**: verify the duplication still holds before acting — Google's records carry a ~150s TTL
+  and are geo-steered, so a different vantage point may resolve them differently.
+
+### Literal-IP STUN endpoints
+**Goal**: Remove DNS from public-IP discovery entirely, rather than bounding its cost.
+
+- **Rationale**: discovery exists to find our public address; it does not need a name lookup to do
+  it. A literal address makes a dead resolver cost nothing here instead of costing the configured
+  budget.
+- **Constraint — the address must be anycast, not geo-DNS-steered.** Google's STUN records carry a
+  ~150s TTL and resolve to a nearby edge, so pinning one sampled in any single location both bets
+  against the operator's stated intent and sends every other region to a distant address.
+  `stun.cloudflare.com` has the opposite profile: a ~24h TTL on `162.159.207.0` (v4) and
+  `2606:4700:49::` (v6), both anycast, both verified answering STUN binding requests on
+  2026-08-30.
+- **Trade-off, and why this needs a decision rather than an implementation**: measured from
+  Redwood City, the Cloudflare anycast v4 answered in 103ms against Google's 14ms. Pinning trades
+  everyday latency for failure-mode robustness, and adds a default third-party dependency. Worth
+  measuring from more than one vantage point first.
+- **Shape if adopted**: literal addresses as the fast path, hostnames as fallback, and a comment
+  on the pin stating the condition under which it should be revisited.
+
 ### IPv6 hardening
 Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner. Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).
 

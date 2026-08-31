@@ -14,3 +14,6 @@ docc/
 *_PLAN.md
 *_SUMMARY.md
 compare_bufferbloat.swift
+
+# Claude Code local state and agent worktrees
+.claude/
