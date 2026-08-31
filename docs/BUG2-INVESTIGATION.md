@@ -66,19 +66,20 @@ doc comment):
 
 ### 1d. Worst-case arithmetic (network "up but broken", e.g. DNS unresponsive)
 
-Let G = one `getaddrinfo`/`getnameinfo` stall time with an unresponsive system
-resolver. **G is not measured.** Part 2d measured only the healthy-network
-baseline (sub-millisecond); establishing G needs the sudo pf test in Part 4.
-The arithmetic below is therefore parameterized on G, and asserts no value for
-it. It shows the shape of the exposure, not a number.
+G = one `getaddrinfo`/`getnameinfo` stall against an unresponsive system
+resolver = **30.0s, measured** (Part 2d). The enrichment phase crosses NWX's
+60s watchdog once G exceeds roughly 8s on the STUN path alone, so this clears
+that bar by nearly 4x:
 
-- Step 1: 3 STUN hostnames × G (serial, one blocking op) → 3G.
-- Step 4: ceil(hops/8) waves × G if getnameinfo stalls: 40 hops → 5G.
-- Step 6 (only when step 1 failed): 3 more × G.
+- Step 1: 3 STUN hostnames × G (serial, one blocking op) → **90s**, over the
+  watchdog on this step alone, before a single rDNS lookup runs.
+- Step 4: ceil(hops/8) waves × G if getnameinfo stalls: 40 hops → 5G = **150s**.
+- Step 6 (only when step 1 failed): 3 more × G → a further 90s.
 
-So the enrichment phase crosses NWX's 60s watchdog once G exceeds roughly 8
-seconds on the STUN path alone. Whether a dead resolver actually stalls that
-long on macOS is the open question.
+Note that `getnameinfo` **succeeds** after its 30s stall, returning the numeric
+form rather than an error. A degraded-resolver rDNS phase therefore costs its
+full 150s and then reports nothing wrong; there is no error anywhere in this
+path for a caller to key on.
 
 None of it cancellable. The NWX watchdog fires at 60s, cancels the group; the
 traceClassified task remains suspended inside `runDetachedBlockingIO` — which is
@@ -130,10 +131,22 @@ trace whose config-derived budget is ~1–2s. Scale sleeper duration to realisti
 degraded-resolver stalls and the 60s watchdog fires with the task still
 suspended and immune to cancellation. This is the field signature.
 
-### 2d. Resolver primitive baselines — healthy network
-getaddrinfo(stun hostnames): 0.5–1.1ms each; getnameinfo(8.8.8.8): 0.5ms.
-The degraded-resolver stall magnitude (the G in 1d) is **not yet measured** —
-needs a pf rule blocking port 53 (sudo; see Part 3).
+### 2d. Resolver primitive baselines — MEASURED
+Method: point Wi-Fi DNS at 203.0.113.1 (TEST-NET-3, never answers), flush
+mDNSResponder, time `getaddrinfo`/`getnameinfo` via their libc entry points,
+restore DHCP DNS. Ran on macOS 25.6 with the default system resolver; no pf
+rules and no firewall state involved.
+
+| primitive | healthy | dead resolver |
+|---|---|---|
+| `getaddrinfo` (3 STUN hostnames) | 0.020–0.037s each, 0.077s total | **30.010 / 30.001 / 30.003s**, 90.014s total |
+| `getnameinfo` (8.8.8.8, 1.1.1.1) | 0.002–0.007s | **30.002 / 30.001s** |
+
+**G = 30.0s**, consistent within 10ms across all five calls — this is macOS's
+total resolver budget, not a per-query timeout, so it should hold fleet-wide
+rather than being a property of this machine. `getaddrinfo` raises after the
+stall; `getnameinfo` returns success with the numeric form, so the rDNS path
+stalls silently.
 
 ### 2e. Cooperative-pool saturation — NOT reproduced
 10 busy-spin `.userInitiated` tasks (= activeProcessorCount) spinning 4s while
@@ -162,9 +175,11 @@ from the host app defers an in-flight trace's rDNS phase without bound.
    (c) rDNS ops are additionally starved by priority (2f), and
    (d) cancellation is explicitly not honored while queued or running (2c).
    NWX's post-network-change cache clearing guarantees the worst-case path runs
-   exactly when the resolver is most likely broken. 60s is reachable without
-   any SwiftFTR bug in the probe path, and telemetry cannot distinguish "hung
-   forever" from "returned after >60s" because NWX abandons the await.
+   exactly when the resolver is most likely broken. With G measured at 30s
+   (2d), STUN discovery alone costs 90s and the rDNS phase 150s, so 60s is not
+   merely reachable — it is exceeded by the enrichment phase without any
+   SwiftFTR bug in the probe path. Telemetry cannot distinguish "hung forever"
+   from "returned after >60s" because NWX abandons the await.
 2. **NOT SUPPORTED — Hypothesis 1 (dropped continuation):** every exit path of
    both receive operations resumes exactly once (audit table 1a); dynamic
    cancel/blackhole tests terminate promptly with no leaked fd or continuation.
@@ -176,15 +191,15 @@ from the host app defers an in-flight trace's rDNS phase without bound.
 
 ## Part 4: Follow-ups requiring approval (sudo)
 
+Item 1 is **done** — see 2d for the result and the method actually used. Prefer
+`networksetup -setdnsservers` over pf for anything in this class: replacing the
+pf ruleset with `pfctl -f -` flushes rules the system and any active VPN added
+at startup, and restoring `/etc/pf.conf` does not bring third-party anchors
+back. The DNS-redirect approach touches one network service, needs no firewall
+state, and reverses cleanly.
+
 Not run — ask before executing:
 
-1. Degraded-resolver magnitude (fills in G from 1d):
-   `sudo pfctl -E && echo "block drop out quick proto udp from any to any port 53
-   block drop out quick proto tcp from any to any port 53" | sudo pfctl -f -`
-   then time `getaddrinfo("stun.l.google.com")` / `getnameinfo("8.8.8.8")` and a
-   full `traceClassified(to: "1.1.1.1")` with cold caches; restore with
-   `sudo pfctl -f /etc/pf.conf` (and `sudo pfctl -d` if pf was disabled before).
-   NOTE: this blackholes DNS for the whole machine while active.
 2. Full blackhole mid-trace / during STUN: same pattern with
    `block drop out quick proto icmp from any to any` and
    `block drop out quick proto udp from any to any port {3478, 19302}`.

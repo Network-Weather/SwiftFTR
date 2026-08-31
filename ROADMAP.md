@@ -92,10 +92,12 @@ configuration — and honors cancellation while doing it.
   under network blackhole, blackhole during STUN, mid-trace interface loss, and executor
   saturation; a cancelled trace terminates promptly in the enrichment phase as it already
   does in the probe phase.
-- **Open measurement**: the stall magnitude of a single `getaddrinfo`/`getnameinfo`
-  against a dead resolver is still unmeasured; it needs a pf rule blocking port 53 and
-  therefore sudo. Worst-case arithmetic in
-  [`docs/BUG2-INVESTIGATION.md`](docs/BUG2-INVESTIGATION.md) is parameterized on it.
+- **Measured magnitude**: a single `getaddrinfo`/`getnameinfo` against a dead resolver
+  stalls **30.0s** — macOS's total resolver budget, consistent within 10ms across calls.
+  STUN discovery serially resolves 3 hostnames, so it alone costs 90s and exceeds NWX's
+  watchdog before any rDNS runs; a 40-hop rDNS phase through the 8-slot executor costs
+  another 150s. `getnameinfo` returns *success* with the numeric form after stalling, so
+  nothing in this path reports an error a caller could key on.
 - **Cheapest open discriminator, NWX-side**: `log.*` telemetry carries no `app_version`,
   so it is not yet possible to tell whether the reporting clients predate the NWX 1.3.0
   fix for its own cooperative-thread-pinning SSDP loop. Adding that field settles whether
