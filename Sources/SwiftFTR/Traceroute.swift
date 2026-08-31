@@ -264,10 +264,16 @@ public struct SwiftFTRConfig: Sendable {
   /// Defaults to `.dns` (Team Cymru DNS) for backward compatibility.
   ///
   /// Options:
-  /// - `.dns`: DNS-based lookups (default, always current, requires network)
-  /// - `.embedded`: Local database from SwiftIP2ASN (~10μs lookups, +6MB memory)
+  /// - `.hybrid(source, fallbackTimeout:)`: **Default.** Local database first, DNS only for
+  ///   addresses it does not cover. Costs ~6MB of memory for the embedded database and removes
+  ///   the network from the common path, which matters because a caller that discards caches on
+  ///   a network change re-pays the cold path every time — and a cold DNS lookup against an
+  ///   unresponsive resolver stalls for 30 seconds.
+  /// - `.dns`: DNS-based lookups via Team Cymru. No memory cost, but every uncached address is a
+  ///   network round trip, and enrichment is only as reliable as the resolver.
+  /// - `.embedded`: Local database only (~10μs lookups, +6MB memory). No network at any point;
+  ///   an address the database does not cover simply has no ASN.
   /// - `.remote(bundledPath:url:)`: Remote database with optional offline fallback
-  /// - `.hybrid(source, fallbackTimeout:)`: Local first, DNS fallback for missing
   ///
   /// Example:
   /// ```swift
@@ -304,7 +310,8 @@ public struct SwiftFTRConfig: Sendable {
   ///   - interface: BSD interface name returned by ``NetworkInterfaceDiscovery``. If nil, uses system routing.
   ///   - sourceIP: Source address reported on the selected interface. It must match the
   ///     destination family. If nil, the system chooses an address.
-  ///   - asnResolverStrategy: Strategy for ASN lookups during classification (default: .dns)
+  ///   - asnResolverStrategy: Strategy for ASN lookups during classification
+  ///     (default: `.hybrid(.embedded)`)
   ///   - preferredFamily: IP family preference for resolution (default: .auto)
   public init(
     maxHops: Int = 40,
@@ -319,7 +326,7 @@ public struct SwiftFTRConfig: Sendable {
     publicIPDiscoveryTimeout: TimeInterval? = nil,
     interface: String? = nil,
     sourceIP: String? = nil,
-    asnResolverStrategy: ASNResolverStrategy = .dns,
+    asnResolverStrategy: ASNResolverStrategy = .hybrid(.embedded),
     preferredFamily: PreferredFamily = .auto
   ) {
     self.maxHops = maxHops
