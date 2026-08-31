@@ -59,7 +59,7 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.15.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.16.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
@@ -450,7 +450,7 @@ MIT — see LICENSE.
 Versioning & Releases
 ---------------------
 - Semantic Versioning. See CHANGELOG.md for release notes.
-- To consume via SwiftPM, use the `0.15.0` tag or a later compatible release.
+- To consume via SwiftPM, use the `0.16.0` tag or a later compatible release.
 
 Contributing
 ------------

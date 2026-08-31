@@ -28,7 +28,7 @@ public struct TraceHop: Sendable {
   ///
   /// Retains the callable shape published before ``HopOutcome`` existed. A hop built this way
   /// reports ``HopOutcome/replied`` when it has an address and ``HopOutcome/timedOut`` when it does
-  /// not; it never reports ``HopOutcome/unreachable`` or ``HopOutcome/notSent``, which cannot be
+  /// not; it never reports ``HopOutcome/unreachable(code:)`` or ``HopOutcome/notSent(errno:)``, which cannot be
   /// recovered from these fields. Prefer the initializer that takes an explicit outcome.
   public init(
     ttl: Int,
