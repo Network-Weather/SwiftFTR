@@ -67,6 +67,24 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 ### IPv6 hardening
 Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner. Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).
 
+### Swift 6.4 adoption pass
+**Goal**: Take the 6.4 concurrency ergonomics where they simplify teardown, and stay warning-clean.
+
+- **Gated on Swift 6.4 GM** (in beta with Xcode 27 as of 2026-08; announced at WWDC June 2026).
+- **SE-0520 warning triage**: compile under 6.4 and address new warnings on discarded throwing
+  Tasks (grep on 2026-08-31 found most Task creations assigned or inside task groups, so
+  expected fallout is small). Consider typed-throws `Task` where it clarifies error contracts.
+- **SE-0493 async `defer` + SE-0504 `withTaskCancellationShield`**: candidates for socket
+  close/drain paths where cancellation must not skip cleanup (`TraceHandle` cancellation,
+  blocking-IO teardown). Adopt only where they replace existing multi-exit-path cleanup
+  boilerplate, not wholesale.
+- **SE-0518 `~Sendable`**: consider explicit sendability annotations on public types to lock
+  the "all public types are Sendable" contract into the source rather than inference.
+- **SE-0509 SBOM**: add `swift package generate-sbom` to the release checklist.
+- **Constraint**: raising `swift-tools-version` above 6.0 raises the minimum toolchain for
+  every consumer (NWX is primary). Any adoption that forces a bump is a deliberate,
+  consumer-visible decision, not a side effect.
+
 ### Enterprise Proxy & VPN Telemetry
 **Goal**: Measure performance in locked-down corporate environments where direct internet access is blocked.
 - **Proxy Tunneling**: Support HTTP CONNECT and SOCKS5 tunneling to reach external targets.
