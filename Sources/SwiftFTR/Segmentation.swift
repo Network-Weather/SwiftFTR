@@ -20,7 +20,15 @@ public struct ClassifiedHop: Sendable, Codable {
   public let category: HopCategory
   /// Hostname from reverse DNS lookup
   public let hostname: String?
+  /// What actually happened at this hop. See ``HopOutcome``.
+  ///
+  /// Carries through from the underlying ``TraceHop``, so a hop refused by a router is
+  /// distinguishable from one that forwarded the probe on, and both from one never sent.
+  public let outcome: HopOutcome
 
+  /// Creates a classified hop, inferring ``outcome`` from the other fields.
+  ///
+  /// Retains the callable shape published before ``HopOutcome`` existed.
   public init(
     ttl: Int,
     ip: String?,
@@ -30,6 +38,21 @@ public struct ClassifiedHop: Sendable, Codable {
     category: HopCategory,
     hostname: String? = nil
   ) {
+    self.init(
+      ttl: ttl, ip: ip, rtt: rtt, asn: asn, asName: asName, category: category,
+      hostname: hostname, outcome: ip == nil ? .timedOut : .replied)
+  }
+
+  public init(
+    ttl: Int,
+    ip: String?,
+    rtt: TimeInterval?,
+    asn: Int?,
+    asName: String?,
+    category: HopCategory,
+    hostname: String? = nil,
+    outcome: HopOutcome
+  ) {
     self.ttl = ttl
     self.ip = ip
     self.rtt = rtt
@@ -37,6 +60,7 @@ public struct ClassifiedHop: Sendable, Codable {
     self.asName = asName
     self.category = category
     self.hostname = hostname
+    self.outcome = outcome
   }
 }
 
@@ -338,7 +362,8 @@ public struct TraceClassifier: Sendable {
           asn: asn,
           asName: name,
           category: cat,
-          hostname: hop.hostname
+          hostname: hop.hostname,
+          outcome: hop.outcome
         )
       )
     }
@@ -380,7 +405,8 @@ public struct TraceClassifier: Sendable {
                   asn: fillASN,
                   asName: fillName,
                   category: cat,
-                  hostname: hop.hostname
+                  hostname: hop.hostname,
+                  outcome: hop.outcome
                 )
               }
             }

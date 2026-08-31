@@ -3,6 +3,32 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### New public API
+
+- `HopOutcome` on `TraceHop`, `ClassifiedHop` and `StreamingHop` says what actually happened at a
+  hop: the probe was never sent (with its `errno`), it was sent and nothing came back, a router
+  reported it undeliverable (with the ICMP code), or it drew a normal reply. Previously a hop
+  encoded this implicitly through which fields were `nil`, which could not express the first case
+  at all and collapsed the middle two — a router that forwarded the probe on and a router that
+  refused to route it produced identical hops.
+- `ICMPUnreachableReason` names the IPv4 Destination Unreachable codes, with a `displayName` and an
+  `isAdministrative` flag so a firewall dropping traffic deliberately reads differently from a
+  network that could not deliver it. `HopOutcome.unreachableReason` parses the code.
+- The hop types keep `ipAddress`/`ip`, `rtt` and `reachedDestination`, and keep their previous
+  initializers, which infer an outcome. Existing call sites compile and behave unchanged.
+
+### Behavior changes
+
+- A probe that transient send pressure kept off the wire no longer fails the whole trace. That TTL
+  is reported as `.notSent(errno:)` and the trace continues, so a caller loses one hop of a topology
+  instead of the topology. A burst where *no* probe reached the wire still throws, and every
+  non-transient errno still aborts immediately as before.
+- `swift-ftr --json` gains `outcome` on each hop, plus `unreachable_reason` where one applies. Both
+  are additive; existing keys keep their names and meanings.
+
 0.15.0 — 2026-08-31
 -------------------
 

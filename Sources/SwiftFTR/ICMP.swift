@@ -95,7 +95,7 @@ struct ParsedICMP {
   enum Kind {
     case echoReply(id: UInt16, seq: UInt16)
     case timeExceeded(originalID: UInt16?, originalSeq: UInt16?)
-    case destinationUnreachable(originalID: UInt16?, originalSeq: UInt16?)
+    case destinationUnreachable(originalID: UInt16?, originalSeq: UInt16?, code: UInt8)
     case other(type: UInt8, code: UInt8)
   }
   let kind: Kind
@@ -160,7 +160,7 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
       return ParsedICMP(
         kind: (type == ICMPv4Type.timeExceeded.rawValue)
           ? .timeExceeded(originalID: nil, originalSeq: nil)
-          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+          : .destinationUnreachable(originalID: nil, originalSeq: nil, code: code),
         sourceAddress: addrStr)
     }
     let ipFirst = bytes[embedStart]
@@ -170,7 +170,7 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
         return ParsedICMP(
           kind: (type == ICMPv4Type.timeExceeded.rawValue)
             ? .timeExceeded(originalID: nil, originalSeq: nil)
-            : .destinationUnreachable(originalID: nil, originalSeq: nil),
+            : .destinationUnreachable(originalID: nil, originalSeq: nil, code: code),
           sourceAddress: addrStr)
       }
       let innerICMP = embedStart + ihl
@@ -184,7 +184,7 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
               kind: .timeExceeded(originalID: id, originalSeq: seq), sourceAddress: addrStr)
           } else {
             return ParsedICMP(
-              kind: .destinationUnreachable(originalID: id, originalSeq: seq),
+              kind: .destinationUnreachable(originalID: id, originalSeq: seq, code: code),
               sourceAddress: addrStr)
           }
         }
@@ -193,7 +193,7 @@ func parseICMPv4Message(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr
     return ParsedICMP(
       kind: (type == ICMPv4Type.timeExceeded.rawValue)
         ? .timeExceeded(originalID: nil, originalSeq: nil)
-        : .destinationUnreachable(originalID: nil, originalSeq: nil),
+        : .destinationUnreachable(originalID: nil, originalSeq: nil, code: code),
       sourceAddress: addrStr)
   default:
     return ParsedICMP(kind: .other(type: type, code: code), sourceAddress: addrStr)
@@ -291,7 +291,7 @@ func parseICMPv6Message(
       return ParsedICMP(
         kind: (type == ICMPv6Type.timeExceeded.rawValue)
           ? .timeExceeded(originalID: nil, originalSeq: nil)
-          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+          : .destinationUnreachable(originalID: nil, originalSeq: nil, code: code),
         sourceAddress: addrStr)
     }
     let ipFirst = bytes[embedStart]
@@ -300,14 +300,14 @@ func parseICMPv6Message(
       return ParsedICMP(
         kind: (type == ICMPv6Type.timeExceeded.rawValue)
           ? .timeExceeded(originalID: nil, originalSeq: nil)
-          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+          : .destinationUnreachable(originalID: nil, originalSeq: nil, code: code),
         sourceAddress: addrStr)
     }
     guard bytes[embedStart + 6] == UInt8(IPPROTO_ICMPV6) else {
       return ParsedICMP(
         kind: (type == ICMPv6Type.timeExceeded.rawValue)
           ? .timeExceeded(originalID: nil, originalSeq: nil)
-          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+          : .destinationUnreachable(originalID: nil, originalSeq: nil, code: code),
         sourceAddress: addrStr)
     }
     // Next Header at embedStart+6 should be IPPROTO_ICMPV6 (58) for the embedded
@@ -318,7 +318,7 @@ func parseICMPv6Message(
       return ParsedICMP(
         kind: (type == ICMPv6Type.timeExceeded.rawValue)
           ? .timeExceeded(originalID: nil, originalSeq: nil)
-          : .destinationUnreachable(originalID: nil, originalSeq: nil),
+          : .destinationUnreachable(originalID: nil, originalSeq: nil, code: code),
         sourceAddress: addrStr)
     }
     let innerType = bytes[innerICMP]
@@ -330,13 +330,14 @@ func parseICMPv6Message(
           kind: .timeExceeded(originalID: id, originalSeq: seq), sourceAddress: addrStr)
       } else {
         return ParsedICMP(
-          kind: .destinationUnreachable(originalID: id, originalSeq: seq), sourceAddress: addrStr)
+          kind: .destinationUnreachable(originalID: id, originalSeq: seq, code: code),
+          sourceAddress: addrStr)
       }
     }
     return ParsedICMP(
       kind: (type == ICMPv6Type.timeExceeded.rawValue)
         ? .timeExceeded(originalID: nil, originalSeq: nil)
-        : .destinationUnreachable(originalID: nil, originalSeq: nil),
+        : .destinationUnreachable(originalID: nil, originalSeq: nil, code: code),
       sourceAddress: addrStr)
 
   default:
@@ -368,7 +369,7 @@ public struct TestParsedICMP: Sendable {
   public enum Kind: Sendable {
     case echoReply(id: UInt16, seq: UInt16)
     case timeExceeded(id: UInt16?, seq: UInt16?)
-    case destinationUnreachable(id: UInt16?, seq: UInt16?)
+    case destinationUnreachable(id: UInt16?, seq: UInt16?, code: UInt8)
     case other(type: UInt8, code: UInt8)
   }
   public let kind: Kind
@@ -402,9 +403,9 @@ private func _toTestParsedICMP(_ p: ParsedICMP) -> TestParsedICMP {
     return TestParsedICMP(kind: .echoReply(id: id, seq: seq), source: p.sourceAddress)
   case .timeExceeded(let oid, let oseq):
     return TestParsedICMP(kind: .timeExceeded(id: oid, seq: oseq), source: p.sourceAddress)
-  case .destinationUnreachable(let oid, let oseq):
+  case .destinationUnreachable(let oid, let oseq, let code):
     return TestParsedICMP(
-      kind: .destinationUnreachable(id: oid, seq: oseq), source: p.sourceAddress)
+      kind: .destinationUnreachable(id: oid, seq: oseq, code: code), source: p.sourceAddress)
   case .other(let t, let c):
     return TestParsedICMP(kind: .other(type: t, code: c), source: p.sourceAddress)
   }

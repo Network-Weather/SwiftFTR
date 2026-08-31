@@ -170,6 +170,21 @@ extension SwiftFTRCommand {
         let hostname: String?
         let asn_info: HopASN?
         let rtt_ms: Double?
+        // Additive. Existing keys keep their names and meanings; consumers that ignore this see
+        // exactly the output they saw before.
+        let outcome: String
+        let unreachable_reason: String?
+      }
+      /// Renders a hop outcome as a stable snake_case token.
+      ///
+      /// These strings are output contract: rename one and you break a consumer parsing it.
+      func outcomeString(_ outcome: HopOutcome) -> String {
+        switch outcome {
+        case .notSent: return "not_sent"
+        case .timedOut: return "timed_out"
+        case .unreachable: return "unreachable"
+        case .replied: return "replied"
+        }
       }
       // swift-format-ignore: AlwaysUseLowerCamelCase
       struct Root: Codable {
@@ -217,11 +232,14 @@ extension SwiftFTRCommand {
           hops.append(
             HopObj(
               ttl: h.ttl, segment: seg, address: ip, hostname: rdns, asn_info: asninfo,
-              rtt_ms: h.rtt.map { oneDecimal($0 * 1000) }))
+              rtt_ms: h.rtt.map { oneDecimal($0 * 1000) },
+              outcome: outcomeString(h.outcome),
+              unreachable_reason: h.outcome.unreachableReason?.displayName))
         } else {
           hops.append(
             HopObj(
-              ttl: h.ttl, segment: nil, address: nil, hostname: nil, asn_info: nil, rtt_ms: nil)
+              ttl: h.ttl, segment: nil, address: nil, hostname: nil, asn_info: nil, rtt_ms: nil,
+              outcome: outcomeString(h.outcome), unreachable_reason: nil)
           )
         }
       }

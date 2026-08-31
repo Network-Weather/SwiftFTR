@@ -16,7 +16,20 @@ public struct TraceHop: Sendable {
   public let reachedDestination: Bool
   /// Hostname from reverse DNS lookup. `nil` if lookup disabled, failed, or timed out.
   public let hostname: String?
+  /// What actually happened at this hop.
+  ///
+  /// Authoritative where the other fields are derived. In particular it separates a router that
+  /// forwarded the probe onward from one that refused to route it — both of which report an
+  /// address and a round-trip time — and separates a probe that was never sent from one that drew
+  /// no answer, which otherwise look identical.
+  public let outcome: HopOutcome
 
+  /// Creates a hop, inferring ``outcome`` from the other fields.
+  ///
+  /// Retains the callable shape published before ``HopOutcome`` existed. A hop built this way
+  /// reports ``HopOutcome/replied`` when it has an address and ``HopOutcome/timedOut`` when it does
+  /// not; it never reports ``HopOutcome/unreachable`` or ``HopOutcome/notSent``, which cannot be
+  /// recovered from these fields. Prefer the initializer that takes an explicit outcome.
   public init(
     ttl: Int,
     ipAddress: String?,
@@ -24,11 +37,29 @@ public struct TraceHop: Sendable {
     reachedDestination: Bool,
     hostname: String? = nil
   ) {
+    self.init(
+      ttl: ttl,
+      ipAddress: ipAddress,
+      rtt: rtt,
+      reachedDestination: reachedDestination,
+      hostname: hostname,
+      outcome: ipAddress == nil ? .timedOut : .replied)
+  }
+
+  public init(
+    ttl: Int,
+    ipAddress: String?,
+    rtt: TimeInterval?,
+    reachedDestination: Bool,
+    hostname: String? = nil,
+    outcome: HopOutcome
+  ) {
     self.ttl = ttl
     self.ipAddress = ipAddress
     self.rtt = rtt
     self.reachedDestination = reachedDestination
     self.hostname = hostname
+    self.outcome = outcome
   }
 
 }
@@ -571,21 +602,29 @@ public actor SwiftFTR {
       print("[SwiftFTR] Streaming trace: sending \(maxHops) probes...")
     }
     let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
-    for ttl in 1...maxHops {
-      try setTraceHopLimit(sockfd: fd, family: resolved.family, ttl: ttl)
-      let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
-      let sentAt = monotonicNow()
-      try sendTraceProbe(
-        sockfd: fd, resolved: resolved, identifier: identifier,
-        sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
-      outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
-    }
+    let unsentTTLs = try sendTraceBurst(
+      sockfd: fd, resolved: resolved, identifier: identifier, maxHops: maxHops,
+      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, outstanding: &outstanding)
 
     // Collect responses via DispatchSourceRead with retry support.
     if config.enableLogging {
       print(
         "[SwiftFTR] Streaming trace: timeout \(streamConfig.probeTimeout)s, retry after \(streamConfig.retryAfter.map { "\($0)s" } ?? "disabled")"
       )
+    }
+
+    // Probes that never left the host are known now, not at the deadline, so report them
+    // immediately. A consumer that sees only the hops that answered cannot tell a router that
+    // ignored us from a probe we never sent.
+    for ttl in unsentTTLs.keys.sorted() {
+      guard let code = unsentTTLs[ttl] else { continue }
+      if !yield(
+        StreamingHop(
+          ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false,
+          outcome: .notSent(errno: code)))
+      {
+        return
+      }
     }
 
     let streamOperation = StreamingTraceReceiveOperation(
@@ -718,15 +757,9 @@ public actor SwiftFTR {
       print("[SwiftFTR] Sending \(maxHops) probes...")
     }
     let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
-    for ttl in 1...maxHops {
-      try setTraceHopLimit(sockfd: fd, family: resolved.family, ttl: ttl)
-      let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
-      let sentAt = monotonicNow()
-      try sendTraceProbe(
-        sockfd: fd, resolved: resolved, identifier: identifier,
-        sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
-      outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
-    }
+    let unsentTTLs = try sendTraceBurst(
+      sockfd: fd, resolved: resolved, identifier: identifier, maxHops: maxHops,
+      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, outstanding: &outstanding)
 
     // Collect responses via DispatchSourceRead (kqueue-backed on macOS).
     // All probes are already in-flight; we wait for responses until the deadline
@@ -773,12 +806,16 @@ public actor SwiftFTR {
     var hops = receiveResult.hops
     let reachedTTL = receiveResult.reachedTTL
 
-    // Finalize hops: mark unresolved up to reachedTTL (or max) as timeouts
+    // Finalize hops up to reachedTTL (or max). A TTL whose probe never left the host is reported
+    // as such rather than as a timeout: both render without an address, but only one of them means
+    // the network stayed silent.
     let cutoff = reachedTTL ?? maxHops
     for ttl in 1...cutoff {
       let idx = ttl - 1
       if hops[idx] == nil {
-        hops[idx] = TraceHop(ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false)
+        hops[idx] = TraceHop(
+          ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false,
+          outcome: unsentTTLs[ttl].map { .notSent(errno: $0) } ?? .timedOut)
       }
     }
 
@@ -800,7 +837,8 @@ public actor SwiftFTR {
           ipAddress: hop.ipAddress,
           rtt: hop.rtt,
           reachedDestination: hop.reachedDestination,
-          hostname: hop.ipAddress.flatMap { hostnames[$0] }
+          hostname: hop.ipAddress.flatMap { hostnames[$0] },
+          outcome: hop.outcome
         )
       }
     }
@@ -933,7 +971,8 @@ public actor SwiftFTR {
         category: hop.category,
         hostname: hop.ip.flatMap {
           hostnameMap[$0] ?? tr.hops.first { $0.ipAddress == hop.ip }?.hostname
-        }
+        },
+        outcome: hop.outcome
       )
     }
 
@@ -1276,6 +1315,48 @@ internal func bindTraceSourceIP(
   }
 }
 
+/// Sends one probe per TTL, tolerating probes that transient send pressure kept off the wire.
+///
+/// A probe whose send fails with a transient errno past the shared retry budget is recorded rather
+/// than aborting the burst: the caller renders that TTL as ``HopOutcome/notSent(errno:)``, which a
+/// consumer can tell apart from a router that simply did not answer. Losing one hop of a topology
+/// beats losing the topology.
+///
+/// Any other errno still throws immediately — callers map `EHOSTUNREACH`, `ENETDOWN`,
+/// `ENETUNREACH` and `EACCES` to states they act on, and delaying those delays the diagnosis.
+/// A burst where *no* probe reached the wire also throws: a result full of holes would claim we
+/// measured something when we measured nothing.
+///
+/// - Returns: TTLs that never left the host, mapped to the errno that stopped them.
+internal func sendTraceBurst(
+  sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, maxHops: Int, payloadSize: Int,
+  retryDeadline: TimeInterval, outstanding: inout [UInt16: TraceSendInfo]
+) throws -> [Int: Int32] {
+  var unsent: [Int: Int32] = [:]
+  var lastTransientError: Error?
+
+  for ttl in 1...maxHops {
+    try setTraceHopLimit(sockfd: sockfd, family: resolved.family, ttl: ttl)
+    let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
+    let sentAt = monotonicNow()
+    do {
+      try sendTraceProbe(
+        sockfd: sockfd, resolved: resolved, identifier: identifier,
+        sequence: seq, payloadSize: payloadSize, retryDeadline: retryDeadline)
+      outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
+    } catch let error as TracerouteError {
+      guard case .sendFailed(let code) = error, isTransientSendErrno(code) else { throw error }
+      unsent[ttl] = code
+      lastTransientError = error
+    }
+  }
+
+  if outstanding.isEmpty, let lastTransientError {
+    throw lastTransientError
+  }
+  return unsent
+}
+
 /// Family-aware ICMP send: v4 uses `makeICMPEchoRequest`, v6 uses
 /// `makeICMPv6EchoRequest`. Caller resolves destination via `resolveHost`.
 ///
@@ -1380,7 +1461,7 @@ private struct TraceReceiveResult {
 }
 
 /// Shared send info for probe tracking.
-private struct TraceSendInfo {
+internal struct TraceSendInfo {
   let ttl: Int
   let sentAt: TimeInterval
 }
@@ -1528,14 +1609,15 @@ private final class TraceReceiveOperation: @unchecked Sendable {
           }
         }
 
-      case .destinationUnreachable(let originalID, let originalSeq):
+      case .destinationUnreachable(let originalID, let originalSeq, let code):
         guard originalID == nil || originalID == identifier else { continue }
         if let seq = originalSeq, let info = outstanding.removeValue(forKey: seq) {
           let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
           let rtt = monotonicNow() - info.sentAt
           if hops[hopIndex] == nil {
             hops[hopIndex] = TraceHop(
-              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
+              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false,
+              outcome: .unreachable(code: code))
           }
         }
 
@@ -1759,10 +1841,12 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
           if !emitIntermediateHop(seq: seq, parsed: parsed) { return }
         }
 
-      case .destinationUnreachable(let originalID, let originalSeq):
+      case .destinationUnreachable(let originalID, let originalSeq, let code):
         guard originalID == nil || originalID == identifier else { continue }
         if let seq = originalSeq {
-          if !emitIntermediateHop(seq: seq, parsed: parsed) { return }
+          if !emitIntermediateHop(seq: seq, parsed: parsed, outcome: .unreachable(code: code)) {
+            return
+          }
         }
 
       case .other:
@@ -1786,7 +1870,9 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     }
   }
 
-  private func emitIntermediateHop(seq: UInt16, parsed: ParsedICMP) -> Bool {
+  private func emitIntermediateHop(
+    seq: UInt16, parsed: ParsedICMP, outcome: HopOutcome = .replied
+  ) -> Bool {
     guard let info = outstanding[seq] else { return true }
     if let destTTL = reachedTTL, info.ttl > destTTL { return true }
     if receivedTTLs.contains(info.ttl) { return true }
@@ -1796,7 +1882,8 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     guard
       yieldHop(
         StreamingHop(
-          ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false))
+          ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false,
+          outcome: outcome))
     else {
       cancel()
       return false
