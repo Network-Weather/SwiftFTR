@@ -374,13 +374,6 @@ extension TaskPriority {
   }
 }
 
-/// How long public-IP discovery (STUN, with DNS fallback) may run before its caller gives up.
-///
-/// The per-socket timeouts inside `getPublicIPv4` do not cover resolving each STUN hostname, and
-/// the server list is walked serially, so the enclosing call needs a bound of its own. Sized to
-/// admit a slow-but-working discovery while staying well below any plausible caller watchdog.
-let publicIPDiscoveryDeadline: TimeInterval = 6.0
-
 /// Raised when a blocking operation outlives the deadline its caller supplied.
 ///
 /// The caller is resumed; the underlying syscall keeps running on its executor worker until it

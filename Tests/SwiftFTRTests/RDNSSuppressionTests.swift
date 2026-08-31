@@ -147,3 +147,35 @@ private final class Mutex<T>: @unchecked Sendable {
     }
   }
 }
+
+/// Validation and plumbing of the caller-settable enrichment budgets.
+@Suite("Enrichment timeout configuration")
+struct EnrichmentTimeoutConfigTests {
+
+  @Test("Callers can raise the budgets for slow-but-working networks")
+  func callerSuppliedTimeoutsAreHonored() {
+    let config = SwiftFTRConfig(rdnsLookupTimeout: 12.0, publicIPDiscoveryTimeout: 20.0)
+    #expect(config.rdnsLookupTimeoutForConstruction == 12.0)
+    #expect(config.publicIPDiscoveryTimeoutForOperation == 20.0)
+  }
+
+  @Test("Omitted budgets fall back to the documented defaults")
+  func defaultsApplyWhenUnset() {
+    let config = SwiftFTRConfig()
+    #expect(config.rdnsLookupTimeoutForConstruction == SwiftFTRConfig.defaultRDNSLookupTimeout)
+    #expect(
+      config.publicIPDiscoveryTimeoutForOperation
+        == SwiftFTRConfig.defaultPublicIPDiscoveryTimeout)
+  }
+
+  @Test("Nonsensical budgets fall back rather than disabling enrichment")
+  func invalidTimeoutsFallBack() {
+    for bad in [0.0, -1.0, TimeInterval.nan, TimeInterval.infinity] {
+      let config = SwiftFTRConfig(rdnsLookupTimeout: bad, publicIPDiscoveryTimeout: bad)
+      #expect(config.rdnsLookupTimeoutForConstruction == SwiftFTRConfig.defaultRDNSLookupTimeout)
+      #expect(
+        config.publicIPDiscoveryTimeoutForOperation
+          == SwiftFTRConfig.defaultPublicIPDiscoveryTimeout)
+    }
+  }
+}

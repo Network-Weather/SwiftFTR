@@ -73,6 +73,28 @@ extension SwiftFTRConfig {
     guard let rdnsCacheSize, rdnsCacheSize >= 0 else { return 1_000 }
     return rdnsCacheSize
   }
+
+  /// A safe reverse-DNS lookup budget, falling back to the default for absent or invalid input.
+  ///
+  /// Zero is rejected rather than honored: a zero budget would suppress every hostname, which
+  /// ``SwiftFTRConfig/noReverseDNS`` already expresses directly and more legibly.
+  var rdnsLookupTimeoutForConstruction: TimeInterval {
+    guard
+      let rdnsLookupTimeout, rdnsLookupTimeout.isFinite, rdnsLookupTimeout > 0,
+      rdnsLookupTimeout <= ConfigurationLimits.maximumTimeout
+    else { return SwiftFTRConfig.defaultRDNSLookupTimeout }
+    return rdnsLookupTimeout
+  }
+
+  /// A safe public-IP discovery budget, falling back to the default for absent or invalid input.
+  var publicIPDiscoveryTimeoutForOperation: TimeInterval {
+    guard
+      let publicIPDiscoveryTimeout, publicIPDiscoveryTimeout.isFinite,
+      publicIPDiscoveryTimeout > 0,
+      publicIPDiscoveryTimeout <= ConfigurationLimits.maximumTimeout
+    else { return SwiftFTRConfig.defaultPublicIPDiscoveryTimeout }
+    return publicIPDiscoveryTimeout
+  }
 }
 
 extension StreamingTraceConfig {

@@ -18,7 +18,13 @@ actor RDNSCache {
   /// `getnameinfo` consults the system resolver and holds its worker for 30 seconds when DNS
   /// queries go unanswered, against a healthy-network cost of a few milliseconds. Hostnames are
   /// cosmetic enrichment, so a trace degrades to numeric addresses rather than waiting.
-  static let lookupDeadline: TimeInterval = 2.0
+  ///
+  /// Sized generously because ``batchLookup(_:)`` issues lookups concurrently: this bounds the
+  /// reverse-DNS phase as a whole rather than being paid once per hop. Links with legitimately
+  /// slow resolvers should not lose hostnames, so the budget favors them over shaving a failure
+  /// case that the circuit breaker already handles after two stalls.
+  /// Callers override it with `SwiftFTRConfig.rdnsLookupTimeout`.
+  static let lookupDeadline: TimeInterval = SwiftFTRConfig.defaultRDNSLookupTimeout
 
   /// Consecutive stalled lookups after which the cache stops attempting reverse DNS.
   ///
