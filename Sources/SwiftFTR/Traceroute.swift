@@ -570,13 +570,14 @@ public actor SwiftFTR {
     if config.enableLogging {
       print("[SwiftFTR] Streaming trace: sending \(maxHops) probes...")
     }
+    let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
     for ttl in 1...maxHops {
       try setTraceHopLimit(sockfd: fd, family: resolved.family, ttl: ttl)
       let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
       let sentAt = monotonicNow()
       try sendTraceProbe(
         sockfd: fd, resolved: resolved, identifier: identifier,
-        sequence: seq, payloadSize: payloadSize)
+        sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
       outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
     }
 
@@ -716,13 +717,14 @@ public actor SwiftFTR {
     if config.enableLogging {
       print("[SwiftFTR] Sending \(maxHops) probes...")
     }
+    let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
     for ttl in 1...maxHops {
       try setTraceHopLimit(sockfd: fd, family: resolved.family, ttl: ttl)
       let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
       let sentAt = monotonicNow()
       try sendTraceProbe(
         sockfd: fd, resolved: resolved, identifier: identifier,
-        sequence: seq, payloadSize: payloadSize)
+        sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
       outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
     }
 
@@ -1276,9 +1278,15 @@ internal func bindTraceSourceIP(
 
 /// Family-aware ICMP send: v4 uses `makeICMPEchoRequest`, v6 uses
 /// `makeICMPv6EchoRequest`. Caller resolves destination via `resolveHost`.
+///
+/// The trace socket is non-blocking, so `sendto` reports transient buffer
+/// pressure rather than waiting. `retryDeadline` is the monotonic timestamp past
+/// which such a send gives up; callers compute one deadline per burst and pass
+/// the same value to every probe in it, so the whole burst shares a single
+/// bounded budget. Non-transient errnos propagate on the first attempt.
 internal func sendTraceProbe(
   sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, sequence: UInt16,
-  payloadSize: Int
+  payloadSize: Int, retryDeadline: TimeInterval
 ) throws {
   let packet: [UInt8]
   if resolved.family == AF_INET6 {
@@ -1289,14 +1297,15 @@ internal func sendTraceProbe(
       identifier: identifier, sequence: sequence, payloadSize: payloadSize)
   }
   var addr = resolved.address
-  let sent = packet.withUnsafeBytes { raw in
-    withUnsafePointer(to: &addr) { ap -> ssize_t in
-      ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
+  _ = try sendRetryingTransientPressure(sockfd: sockfd, deadline: retryDeadline) {
+    packet.withUnsafeBytes { raw in
+      withUnsafePointer(to: &addr) { ap -> ssize_t in
+        ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+          sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
+        }
       }
     }
   }
-  if sent < 0 { throw TracerouteError.sendFailed(errno: errno) }
 }
 
 /// Family-aware receive that yields a parsed ICMP/ICMPv6 message and the
@@ -1816,6 +1825,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       )
     }
 
+    let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
     for ttl in missingTTLs {
       do {
         try setTraceHopLimit(sockfd: sockfd, family: family, ttl: ttl)
@@ -1827,7 +1837,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       do {
         try sendTraceProbe(
           sockfd: sockfd, resolved: resolved, identifier: identifier,
-          sequence: seq, payloadSize: payloadSize)
+          sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
         outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
       } catch {
         // Best-effort retry — silently skip if send fails (will time out instead).
