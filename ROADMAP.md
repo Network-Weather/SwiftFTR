@@ -4,33 +4,6 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 
 ## Priority Queue
 
-### Per-hop outcome model
-**Goal**: Let a caller tell apart the four things that can actually happen at a hop.
-
-- **Problem**: `TraceHop` encodes outcome implicitly through `nil` fields, and it collapses
-  distinctions the library already parses. `.timeExceeded` and `.destinationUnreachable`
-  currently construct identical hops — an address, an RTT, `reachedDestination: false` —
-  so "this router forwarded me" and "this router refused" are indistinguishable
-  downstream. The ICMP code is parsed and then discarded: `ParsedICMP.Kind` carries a code
-  only on `.other`. The ping parser keeps it, so the trace path is the outlier.
-- **Approach**: add a `HopOutcome` enum covering the four real outcomes — probe never sent
-  (with errno), sent and nothing returned, an ICMP error returned (with code and timing),
-  and a normal reply (Time Exceeded from an intermediate hop, or Echo Reply at the
-  destination). Thread the ICMP code through the v4 and v6 trace parsers.
-- **Additive, not a migration.** The enum becomes authoritative; `ipAddress`, `rtt`, and
-  `reachedDestination` stay and are documented as derived. Purer designs move the timing
-  onto the enum's associated values so illegal states are unrepresentable, but that breaks
-  the primary downstream consumer for little gain.
-- **Reach**: `TraceHop`, the classified and streaming hop types, and the CLI's snake_case
-  JSON output, which carries a stated backward-compatibility obligation.
-- **Deliberately out of scope**: a fifth outcome for replies arriving after the deadline,
-  which currently collapse into the timeout case. Only meaningful for the streaming API;
-  add it if a consumer asks.
-- **Unblocks a pending behavior change**: transient send-pressure retry currently throws when its
-  shared burst budget is exhausted, losing the whole trace. Skipping just that probe would be
-  better, but is only honest once `.notSent(errno:)` exists — until then a skipped probe is
-  indistinguishable from an unresponsive router, and the caller cannot tell that we never sent.
-
 ### STUN server list provides no actual redundancy
 **Goal**: Make public-IP discovery fail over to a genuinely different endpoint.
 
