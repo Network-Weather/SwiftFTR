@@ -144,7 +144,7 @@ struct BlockingIOBridgeTests {
     #expect(probe.maximumActiveCount <= width)
   }
 
-  @Test("Cancellation waits for a started blocking operation")
+  @Test("Cancelling a started blocking operation resumes the caller exactly once")
   func cancellationDoesNotAbandonContinuation() async throws {
     let executor = BlockingIOExecutor(
       maximumConcurrentOperations: 1,
@@ -165,10 +165,14 @@ struct BlockingIOBridgeTests {
     operation.cancel()
     #expect(operation.isCancelled)
 
-    probe.release(count: 1)
-    let value = try await operation.value
+    // The caller is released rather than waiting for a syscall whose result it can no longer use.
+    await #expect(throws: CancellationError.self) { try await operation.value }
 
-    #expect(value == 7)
+    // The syscall itself still runs to completion on its worker. Its result is discarded rather
+    // than resumed a second time; a double resume would trap the checked continuation and fail the
+    // run outright.
+    probe.release(count: 1)
+    try await Task.sleep(nanoseconds: 200_000_000)
     #expect(probe.invocationCount == 1)
   }
 

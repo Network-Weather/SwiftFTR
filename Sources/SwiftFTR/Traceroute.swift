@@ -144,6 +144,20 @@ public enum TracerouteError: Error, CustomStringConvertible {
 /// Values are retained by the initializer and validated when a throwing operation starts.
 /// Invalid values fail with ``TracerouteError/invalidConfiguration(reason:)``.
 public struct SwiftFTRConfig: Sendable {
+  /// Default budget for public-IP discovery (STUN, with DNS fallback), in seconds.
+  ///
+  /// The per-socket timeouts inside discovery do not cover resolving each STUN hostname, and the
+  /// server list is walked serially, so the enclosing call needs a bound of its own. Sized to admit
+  /// a slow-but-working discovery while staying well below any plausible caller watchdog.
+  public static let defaultPublicIPDiscoveryTimeout: TimeInterval = 6.0
+
+  /// Default budget for a single reverse-DNS lookup, in seconds.
+  ///
+  /// Lookups run concurrently, so this bounds the reverse-DNS phase as a whole rather than being
+  /// paid once per hop — which is why it can afford to be generous toward slow-but-working
+  /// resolvers.
+  public static let defaultRDNSLookupTimeout: TimeInterval = 5.0
+
   /// Maximum TTL/hops to probe (default: 40)
   public let maxHops: Int
   /// Maximum wait time per probe in milliseconds (default: 1000ms)
@@ -164,6 +178,21 @@ public struct SwiftFTRConfig: Sendable {
   public let rdnsCacheTTL: TimeInterval?
   /// Maximum rDNS cache size (default: 1000 entries)
   public let rdnsCacheSize: Int?
+  /// How long a single reverse-DNS lookup may take before the trace gives up on it.
+  ///
+  /// Reverse DNS runs through `getnameinfo`, which consults the system resolver and has no timeout
+  /// parameter of its own; an unanswered query holds it for 30 seconds. Hops whose lookup exceeds
+  /// this budget report numerically instead. Lookups run concurrently, so this bounds the whole
+  /// reverse-DNS phase rather than costing this much per hop.
+  ///
+  /// Raise it on links whose legitimate resolver latency is high. `nil` uses the default of 5s.
+  public let rdnsLookupTimeout: TimeInterval?
+  /// How long public-IP discovery (STUN, with DNS fallback) may take before the trace gives up.
+  ///
+  /// This bounds the whole discovery, including resolving each STUN hostname — which the
+  /// per-socket timeouts inside discovery do not cover. Classification proceeds without a public
+  /// address when it elapses. `nil` uses the default of 6s.
+  public let publicIPDiscoveryTimeout: TimeInterval?
   /// Default BSD interface name for operations that support binding.
   /// If nil, those operations use system routing.
   public let interface: String?
@@ -238,6 +267,9 @@ public struct SwiftFTRConfig: Sendable {
   ///   - noReverseDNS: Disable reverse DNS lookups (default: false)
   ///   - rdnsCacheTTL: TTL for rDNS cache entries in seconds (default: 86400 = 1 day)
   ///   - rdnsCacheSize: Maximum rDNS cache size (default: 1000 entries)
+  ///   - rdnsLookupTimeout: Per-lookup reverse-DNS budget in seconds (default: 5). Bounds the
+  ///     reverse-DNS phase as a whole, since lookups run concurrently.
+  ///   - publicIPDiscoveryTimeout: Budget for public-IP discovery in seconds (default: 6)
   ///   - interface: BSD interface name returned by ``NetworkInterfaceDiscovery``. If nil, uses system routing.
   ///   - sourceIP: Source address reported on the selected interface. It must match the
   ///     destination family. If nil, the system chooses an address.
@@ -252,6 +284,8 @@ public struct SwiftFTRConfig: Sendable {
     noReverseDNS: Bool = false,
     rdnsCacheTTL: TimeInterval? = nil,
     rdnsCacheSize: Int? = nil,
+    rdnsLookupTimeout: TimeInterval? = nil,
+    publicIPDiscoveryTimeout: TimeInterval? = nil,
     interface: String? = nil,
     sourceIP: String? = nil,
     asnResolverStrategy: ASNResolverStrategy = .dns,
@@ -265,6 +299,8 @@ public struct SwiftFTRConfig: Sendable {
     self.noReverseDNS = noReverseDNS
     self.rdnsCacheTTL = rdnsCacheTTL
     self.rdnsCacheSize = rdnsCacheSize
+    self.rdnsLookupTimeout = rdnsLookupTimeout
+    self.publicIPDiscoveryTimeout = publicIPDiscoveryTimeout
     self.interface = interface
     self.sourceIP = sourceIP
     self.asnResolverStrategy = asnResolverStrategy
@@ -311,7 +347,8 @@ public actor SwiftFTR {
     self.config = config
     self.rdnsCache = RDNSCache(
       ttl: config.cacheTTLForConstruction,
-      maxSize: config.cacheSizeForConstruction
+      maxSize: config.cacheSizeForConstruction,
+      lookupDeadline: config.rdnsLookupTimeoutForConstruction
     )
     self.asnResolver = Self.createResolver(for: config.asnResolverStrategy)
   }
@@ -816,9 +853,16 @@ public actor SwiftFTR {
       }
     }
 
+    // Each enrichment step submits blocking work to a shared, bounded executor. Checking
+    // cancellation between steps keeps a cancelled trace from queueing work whose result nobody
+    // will read, and returns the caller promptly rather than at the end of the pipeline.
+    try Task.checkCancellation()
+
     let effectivePublicIP = await effectivePublicIPForClassification {
       try? await self.discoverPublicIP()
     }
+
+    try Task.checkCancellation()
 
     // Perform base trace (includes rDNS if enabled)
     let tr = try await trace(to: host)
@@ -832,6 +876,8 @@ public actor SwiftFTR {
     var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
     allIPs.insert(destIP)
     if let pip = effectivePublicIP { allIPs.insert(pip) }
+
+    try Task.checkCancellation()
 
     // Get hostnames (either from trace or via rDNS)
     var hostnameMap: [String: String] = [:]
@@ -870,7 +916,8 @@ public actor SwiftFTR {
       interface: config.interface,
       sourceIP: config.sourceIP,
       vpnContext: effectiveVPNContext,
-      enableLogging: config.enableLogging
+      enableLogging: config.enableLogging,
+      publicIPDiscoveryTimeout: config.publicIPDiscoveryTimeoutForOperation
     )
 
     // Enhance classified result with hostnames
@@ -992,7 +1039,10 @@ public actor SwiftFTR {
     let interface = config.interface
     let sourceIP = config.sourceIP
     let enableLogging = config.enableLogging
-    return try await runDetachedBlockingIO {
+    // `stunTimeout` and `dnsTimeout` bound the socket waits, not the `getaddrinfo` that resolves
+    // each STUN hostname first. That call holds its worker for 30 seconds against an unresponsive
+    // resolver, and the server list is walked serially, so discovery needs a bound of its own.
+    return try await runDetachedBlockingIO(deadline: config.publicIPDiscoveryTimeoutForOperation) {
       try getPublicIPv4(
         stunTimeout: 2.0,
         dnsTimeout: 3.0,
