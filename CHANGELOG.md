@@ -3,50 +3,77 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-Unreleased
-----------
+0.15.0 — 2026-08-31
+-------------------
 
-### Behavior changes
+This release makes traceroute survive two conditions that previously destroyed a measurement:
+momentary send-buffer pressure, and a system resolver that stops answering. Both were found in
+downstream production telemetry rather than in testing.
 
-- `traceClassified()` now completes, or throws, within a budget derived from its own configuration,
-  and honors task cancellation during enrichment as it already did during the probe phase.
-  Previously the enrichment phase could run far past any caller watchdog while ignoring
-  cancellation: `getaddrinfo` (for each STUN hostname, walked serially) and `getnameinfo` (per hop)
-  have no timeout of their own and stall 30 seconds against an unresponsive resolver, and the
-  shared blocking-I/O executor did not honor cancellation. A cancelled classified trace now returns
-  in about 0.1s where it previously returned only when an executor slot freed.
-- Reverse DNS degrades instead of stalling. Hops whose lookup exceeds its budget report numerically,
-  and two consecutive stalled lookups suppress further attempts until the cache is cleared — which
-  callers already do on a network change. Reverse-DNS lookups run concurrently, so the budget bounds
-  the phase as a whole rather than being paid per hop.
-- Public-IP discovery degrades instead of stalling. Classification proceeds without a public address
-  when discovery exceeds its budget.
+### Traces no longer fail on transient send pressure
+
+Probe sockets are non-blocking and a trace pushes every hop's probe out in one burst, so a single
+`sendto` returning `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS` — the kernel saying "no room right now" — used
+to fail the entire traceroute with `TracerouteError.sendFailed`. This was the most common traceroute
+failure observed in the field.
+
+Those three errnos are now retried: `poll(POLLOUT)` for socket-buffer pressure, and a 1 ms sleep for
+`ENOBUFS`, which reports the interface output queue and leaves the socket reporting itself writable.
+The budget is 250 ms shared across the whole burst rather than per probe, so the default 1 s receive
+window is not at risk. Ping applies the same retry with a 50 ms per-send budget, so transient
+pressure no longer silently drops a packet from the sample.
+
+**Every other errno still fails on the first attempt with no added latency.** Callers that map
+`EHOSTUNREACH`, `ENETDOWN`, `ENETUNREACH` and `EACCES` to offline or permission states see them
+exactly as promptly as before. When the retry budget is exhausted, the same `sendFailed(errno:)` is
+thrown as in 0.14.
+
+### `traceClassified()` is now bounded and cancellable
+
+`traceClassified()` completes, or throws, within a budget derived from its own configuration, and
+honors task cancellation during enrichment as it already did during the probe phase. A cancelled
+classified trace now returns in about 0.1s, where it previously returned only when a slot on the
+shared blocking-I/O executor happened to free.
+
+The enrichment phase could previously run far past any caller watchdog while ignoring cancellation.
+`getaddrinfo` (once per STUN hostname, walked serially) and `getnameinfo` (once per hop) have no
+timeout of their own and stall 30 seconds against a resolver that drops queries silently, so
+public-IP discovery alone could consume 90 seconds before a single hostname lookup began.
+
+### Reverse DNS now degrades rather than stalling — read this if you rely on hostnames
+
+**This is the one change that can take something away.** Reverse DNS gives up after
+`rdnsLookupTimeout` (default 5s), and two consecutive stalled lookups suppress further attempts
+until the cache is cleared, which callers already do on a network change. Hops whose lookup does not
+finish in time report numerically.
+
+Previously a slow-but-working resolver would eventually return a hostname — after up to 30 seconds.
+**On genuinely slow links, hostnames that used to appear may now be absent.** If you see fewer
+hostnames after upgrading, raise `SwiftFTRConfig.rdnsLookupTimeout`; the budget bounds the
+reverse-DNS phase as a whole rather than being paid per hop, because lookups run concurrently, so
+raising it costs one wall-clock wait and not one per hop.
+
+Public-IP discovery degrades the same way: classification proceeds without a public address when
+discovery exceeds its budget.
 
 ### New public API
 
 - `SwiftFTRConfig.rdnsLookupTimeout` and `SwiftFTRConfig.publicIPDiscoveryTimeout` set the
   enrichment budgets. Both are optional and fall back to the defaults when absent or invalid,
-  matching the existing `rdnsCacheTTL` / `rdnsCacheSize` pattern. Raise them on links whose
-  legitimate resolver latency is high.
+  matching the existing `rdnsCacheTTL` / `rdnsCacheSize` pattern.
 - `SwiftFTRConfig.defaultRDNSLookupTimeout` (5s) and `SwiftFTRConfig.defaultPublicIPDiscoveryTimeout`
-  (6s) expose those defaults.
-- `TraceClassifier.classify(...)` takes a `publicIPDiscoveryTimeout` parameter, defaulted, for
-  callers that reach discovery without a config in hand.
+  (6s) expose those defaults, so callers can adjust relative to them.
+- `TraceClassifier.classify(...)` gains a defaulted `publicIPDiscoveryTimeout` parameter for callers
+  that reach discovery without a config in hand.
 
-### Bug fixes
+All additions are additive and defaulted; existing call sites compile unchanged.
 
-- Traceroute no longer aborts when the kernel reports momentary send-buffer pressure. Probe sockets
-  are non-blocking and a trace pushes every hop's probe out in one burst, so a single `sendto`
-  returning `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS` used to fail the whole traceroute with
-  `TracerouteError.sendFailed`. Those three errnos are now retried — waiting on `poll(POLLOUT)` for
-  socket-buffer pressure, and on a 1 ms sleep for `ENOBUFS`, which reports the interface queue and
-  leaves the socket reporting itself writable. The retry budget is 250 ms shared across the whole
-  burst, not per probe, so the 1 s receive window is not at risk. Every other errno still fails on
-  the first attempt with no added latency, so callers that key offline and permission diagnostics off
-  `EHOSTUNREACH`, `ENETDOWN`, `ENETUNREACH` and `EACCES` see them just as promptly as before. When
-  the budget runs out the same `sendFailed(errno:)` is thrown as before.
-- Ping applies the same retry, with a 50 ms per-send budget, so transient pressure no longer silently
-  drops a packet from the sample.
+### Known limitation
+
+A blocking syscall that has already started still occupies its executor slot until it returns — up
+to 30 seconds for a stalled resolver. The calling trace is released; the slot is not. Removing this
+requires not calling `getnameinfo` at all, which depends on discovering the effective system
+resolver. Tracked in [ROADMAP.md](ROADMAP.md).
 
 0.14.0 — 2026-07-22
 -------------------
