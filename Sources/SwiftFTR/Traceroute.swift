@@ -816,9 +816,16 @@ public actor SwiftFTR {
       }
     }
 
+    // Each enrichment step submits blocking work to a shared, bounded executor. Checking
+    // cancellation between steps keeps a cancelled trace from queueing work whose result nobody
+    // will read, and returns the caller promptly rather than at the end of the pipeline.
+    try Task.checkCancellation()
+
     let effectivePublicIP = await effectivePublicIPForClassification {
       try? await self.discoverPublicIP()
     }
+
+    try Task.checkCancellation()
 
     // Perform base trace (includes rDNS if enabled)
     let tr = try await trace(to: host)
@@ -832,6 +839,8 @@ public actor SwiftFTR {
     var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
     allIPs.insert(destIP)
     if let pip = effectivePublicIP { allIPs.insert(pip) }
+
+    try Task.checkCancellation()
 
     // Get hostnames (either from trace or via rDNS)
     var hostnameMap: [String: String] = [:]
@@ -992,7 +1001,10 @@ public actor SwiftFTR {
     let interface = config.interface
     let sourceIP = config.sourceIP
     let enableLogging = config.enableLogging
-    return try await runDetachedBlockingIO {
+    // `stunTimeout` and `dnsTimeout` bound the socket waits, not the `getaddrinfo` that resolves
+    // each STUN hostname first. That call holds its worker for 30 seconds against an unresponsive
+    // resolver, and the server list is walked serially, so discovery needs a bound of its own.
+    return try await runDetachedBlockingIO(deadline: publicIPDiscoveryDeadline) {
       try getPublicIPv4(
         stunTimeout: 2.0,
         dnsTimeout: 3.0,

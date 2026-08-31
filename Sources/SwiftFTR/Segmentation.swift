@@ -202,11 +202,19 @@ public struct TraceClassifier: Sendable {
       // Try to discover public IP (STUN with DNS fallback) if not provided.
       // Must run off the cooperative pool to avoid deadlocking callers that
       // are already actor-isolated (e.g. SwiftFTR.traceClassified).
-      if let pub = try? await runDetachedBlockingIO({
-        try getPublicIPv4(
-          stunTimeout: 0.8, dnsTimeout: 2.0,
-          interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
-      }) {
+      //
+      // The deadline covers resolving the STUN hostnames, which the per-socket timeouts below do
+      // not: `getaddrinfo` holds its worker for 30 seconds against an unresponsive resolver, and
+      // the server list is walked serially. Classification degrades without a public IP, so a
+      // timeout here costs enrichment detail rather than the trace.
+      if let pub = try? await runDetachedBlockingIO(
+        deadline: publicIPDiscoveryDeadline,
+        {
+          try getPublicIPv4(
+            stunTimeout: 0.8, dnsTimeout: 2.0,
+            interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+        })
+      {
         resolvedPublicIP = pub.ip
         allIPs.insert(pub.ip)
       }

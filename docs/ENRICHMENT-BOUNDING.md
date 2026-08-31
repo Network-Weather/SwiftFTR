@@ -60,10 +60,16 @@ After N consecutive rDNS timeouts, skip the remaining lookups for that batch.
 Turns a worst-case 5-wave, 150s rDNS phase into a single timeout. Reverse DNS is
 cosmetic enrichment; degrading it to numeric addresses is the correct trade.
 
-### 5. Priority
+### 5. Priority — not changed, and why
 
-Raise rDNS above `.background`, or give it a reserved share of the queue, so it
-cannot be starved indefinitely by concurrent probe traffic.
+The plan was to raise rDNS above `.background` so probe traffic could not starve
+it. The caller-side deadline makes that unnecessary: a trace now stops waiting
+after the deadline regardless of queue position, so priority inversion can no
+longer extend a trace. Raising rDNS priority would displace probe and ASN work
+to buy nothing, so `.background` stands.
+
+Starvation still costs a *suppressed hostname* rather than a delayed trace,
+which is the correct trade for cosmetic enrichment.
 
 ## Residual exposure, deliberately not fixed here
 
