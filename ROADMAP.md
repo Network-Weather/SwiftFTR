@@ -4,31 +4,6 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 
 ## Priority Queue
 
-### Retry transient send errors instead of aborting the trace
-**Goal**: A momentarily full send buffer must not destroy an entire traceroute.
-
-- **Problem**: The trace socket is non-blocking, and all `maxHops` probes are sent in one
-  unpaced burst. `sendTraceProbe` throws `TracerouteError.sendFailed(errno:)` on any
-  negative `sendto` return, so a single `EAGAIN` — the kernel saying "buffer full, try
-  again in a moment" — aborts the whole measurement. This is the most common traceroute
-  failure in NWX production telemetry (~80 events/week across at least 4 clients).
-- **Approach**: Classify `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS` as transient and retry them
-  against a budget shared across the whole burst, not per-probe — with `maxHops: 40` and
-  `maxWaitMs: 1000` as defaults, a per-probe budget would blow the receive deadline.
-  Wait for writability with `poll(POLLOUT)`; `ENOBUFS` reflects the interface queue rather
-  than the socket buffer, so it needs a short sleep instead, as `poll` reports the socket
-  writable immediately.
-- **Every other errno keeps failing fast.** NWX maps `EHOSTUNREACH`, `ENETDOWN`, and
-  `ENETUNREACH` to offline states it acts on, and must keep receiving them promptly.
-- **On budget exhaustion, throw as today.** Degrading to a skipped probe is the better
-  end state but is not safe to ship until a caller can distinguish "we never sent" from
-  "the router ignored us" — see the hop outcome model below, which unblocks it.
-- **Also**: audit the ping send path. It does not abort, but it silently drops the probe
-  on any send error, so transient pressure quietly shrinks the sample rather than
-  reporting anything.
-- **Acceptance**: a test that forces the condition deterministically (shrink `SO_SNDBUF`
-  via `setsockopt`, then send a burst) fails before the change and passes after.
-
 ### Per-hop outcome model
 **Goal**: Let a caller tell apart the four things that can actually happen at a hop.
 
@@ -51,59 +26,10 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 - **Deliberately out of scope**: a fifth outcome for replies arriving after the deadline,
   which currently collapse into the timeout case. Only meaningful for the streaming API;
   add it if a consumer asks.
-- **Unblocks**: skipping a probe whose send budget is exhausted, rather than failing the
-  trace, because `.notSent` makes the skip legible instead of a phantom unresponsive hop.
-
-### Bounded, cancellable enrichment
-**Goal**: `traceClassified()` completes, or throws, within a bound derived from its own
-configuration — and honors cancellation while doing it.
-
-- **Problem**: 5 distinct clients tripped NWX's 60-second watchdog (~10 occurrences).
-  The probe path is not at fault: every exit path of both receive operations resumes its
-  continuation exactly once, and cancellation during the probe phase terminates in ~0.105s
-  with no leaked socket. The exposure is the enrichment phase — STUN, per-hop rDNS, and
-  ASN lookups all run as blocking operations on one process-global 8-slot
-  `BlockingIOExecutor`, which has three compounding properties:
-  1. **Cancellation is not honored.** Queued operations are not removed when a task is
-     cancelled, and a running syscall is never interrupted. A `traceClassified` cancelled
-     at 0.1s was measured returning at 5.49s — exactly when an executor slot freed. That
-     is the field signature: the watchdog fires, the task stays suspended.
-  2. **No SwiftFTR deadline on `getaddrinfo` (3 STUN hostnames) or `getnameinfo`
-     (per hop).** Only the STUN and DNS *sockets* set `SO_RCVTIMEO`.
-  3. **Priority inversion.** rDNS enqueues at background priority while probe, ASN, and
-     STUN work enqueues higher; `OperationQueue` serves strictly by priority. A background
-     operation submitted first was measured running only after 24 later, higher-priority
-     operations (2.19s against a ~0.7s FIFO prediction). A host app issuing continuous
-     probe traffic defers an in-flight trace's rDNS phase without bound.
-- **Why it lands on real users**: NWX clears `cachedPublicIP` and its rDNS caches on every
-  network change, so the first trace after a transition — exactly when a resolver is most
-  likely degraded — always runs full STUN discovery plus a cold rDNS wave.
-- **Approach**:
-  - Give every blocking primitive its own deadline. rDNS can stop calling `getnameinfo`
-    altogether and use the in-package `DNSClient` PTR path, which already sets a socket
-    timeout. Resolve STUN hostnames the same bounded way, or ship literal addresses with
-    a hostname fallback.
-  - Make `runDetachedBlockingIO` cancellation-aware for at least not-yet-started
-    operations, and check `Task.isCancelled` between enrichment steps so a cancelled trace
-    stops enqueueing further work.
-  - Revisit executor sizing and the rDNS/probe priority inversion so one slow category
-    cannot absorb the queue.
-- **Acceptance**: `traceClassified` returns or throws within a configuration-derived bound
-  under network blackhole, blackhole during STUN, mid-trace interface loss, and executor
-  saturation; a cancelled trace terminates promptly in the enrichment phase as it already
-  does in the probe phase.
-- **Measured magnitude**: a single `getaddrinfo`/`getnameinfo` stalls **30.0s** when DNS
-  packets are dropped silently — a give-up time, not a latency, and specific to silent
-  loss rather than to degraded networks generally. It is the relevant case here: captive
-  portals, flaky Wi-Fi, and network transitions all produce silent loss.
-  STUN discovery serially resolves 3 hostnames, so it alone costs 90s and exceeds NWX's
-  watchdog before any rDNS runs; a 40-hop rDNS phase through the 8-slot executor costs
-  another 150s. `getnameinfo` returns *success* with the numeric form after stalling, so
-  nothing in this path reports an error a caller could key on.
-- **Cheapest open discriminator, NWX-side**: `log.*` telemetry carries no `app_version`,
-  so it is not yet possible to tell whether the reporting clients predate the NWX 1.3.0
-  fix for its own cooperative-thread-pinning SSDP loop. Adding that field settles whether
-  any residual host-app contribution remains.
+- **Unblocks a pending behavior change**: transient send-pressure retry currently throws when its
+  shared burst budget is exhausted, losing the whole trace. Skipping just that probe would be
+  better, but is only honest once `.notSent(errno:)` exists — until then a skipped probe is
+  indistinguishable from an unresponsive router, and the caller cannot tell that we never sent.
 
 ### STUN server list provides no actual redundancy
 **Goal**: Make public-IP discovery fail over to a genuinely different endpoint.
