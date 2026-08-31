@@ -105,6 +105,39 @@ configuration — and honors cancellation while doing it.
   fix for its own cooperative-thread-pinning SSDP loop. Adding that field settles whether
   any residual host-app contribution remains.
 
+### STUN server list provides no actual redundancy
+**Goal**: Make public-IP discovery fail over to a genuinely different endpoint.
+
+- **Problem**: `stunServers` lists multiple Google hostnames, and discovery walks them serially,
+  paying a `getaddrinfo` for each. Measured 2026-08-30: `stun.l.google.com` and
+  `stun1.l.google.com` both resolve to `74.125.250.129` — the same address. The list costs 3x the
+  DNS work of one server while providing no IP-level failover, and against an unresponsive
+  resolver each of those lookups stalls 30s.
+- **Approach**: pick endpoints operated by different providers so failover means something, and
+  resolve them concurrently rather than serially. Two servers on distinct networks beat three
+  hostnames pointing at one address.
+- **Note**: verify the duplication still holds before acting — Google's records carry a ~150s TTL
+  and are geo-steered, so a different vantage point may resolve them differently.
+
+### Literal-IP STUN endpoints
+**Goal**: Remove DNS from public-IP discovery entirely, rather than bounding its cost.
+
+- **Rationale**: discovery exists to find our public address; it does not need a name lookup to do
+  it. A literal address makes a dead resolver cost nothing here instead of costing the configured
+  budget.
+- **Constraint — the address must be anycast, not geo-DNS-steered.** Google's STUN records carry a
+  ~150s TTL and resolve to a nearby edge, so pinning one sampled in any single location both bets
+  against the operator's stated intent and sends every other region to a distant address.
+  `stun.cloudflare.com` has the opposite profile: a ~24h TTL on `162.159.207.0` (v4) and
+  `2606:4700:49::` (v6), both anycast, both verified answering STUN binding requests on
+  2026-08-30.
+- **Trade-off, and why this needs a decision rather than an implementation**: measured from
+  Redwood City, the Cloudflare anycast v4 answered in 103ms against Google's 14ms. Pinning trades
+  everyday latency for failure-mode robustness, and adds a default third-party dependency. Worth
+  measuring from more than one vantage point first.
+- **Shape if adopted**: literal addresses as the fast path, hostnames as fallback, and a comment
+  on the pin stating the condition under which it should be revisited.
+
 ### IPv6 hardening
 Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner. Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).
 
