@@ -142,11 +142,30 @@ rules and no firewall state involved.
 | `getaddrinfo` (3 STUN hostnames) | 0.020–0.037s each, 0.077s total | **30.010 / 30.001 / 30.003s**, 90.014s total |
 | `getnameinfo` (8.8.8.8, 1.1.1.1) | 0.002–0.007s | **30.002 / 30.001s** |
 
-**G = 30.0s**, consistent within 10ms across all five calls — this is macOS's
-total resolver budget, not a per-query timeout, so it should hold fleet-wide
-rather than being a property of this machine. `getaddrinfo` raises after the
-stall; `getnameinfo` returns success with the numeric form, so the rDNS path
-stalls silently.
+**G = 30.0s**, consistent within 10ms across all five calls. `getaddrinfo`
+raises after the stall; `getnameinfo` returns success with the numeric form, so
+the rDNS path stalls silently.
+
+Two qualifications on that number:
+
+**It is a give-up time, not a latency.** Healthy resolution on the same link is
+20–37ms. G is what an undeadlined call costs when the resolver never answers.
+
+**It requires silence specifically.** The test blackholed packets — no reply and
+no ICMP unreachable. A resolver that actively refuses, returns SERVFAIL, or sits
+behind a downed interface fails fast instead, so G is the worst case under
+silent packet loss toward the resolver, not a universal "degraded network"
+constant. That failure mode is the relevant one here: captive portals, flaky
+Wi-Fi, and network transitions all produce it, and NWX's post-network-change
+path runs precisely in that window.
+
+The tight ±10ms spread across calls suggests a hard cap rather than a summed
+retry schedule, and `RES_MAXRETRANS` in `resolv.h` is exactly 30 — documented in
+`man 5 resolver` as the maximum total timeout allowed for a query. That is a
+candidate, **not a confirmed mechanism**: macOS resolves through mDNSResponder
+rather than classic `res_send`. Confirming it would mean setting an explicit
+`timeout:` resolver option and re-measuring. The fix does not depend on the
+answer — the defect is that SwiftFTR bounds this call not at all.
 
 ### 2e. Cooperative-pool saturation — NOT reproduced
 10 busy-spin `.userInitiated` tasks (= activeProcessorCount) spinning 4s while

@@ -92,8 +92,10 @@ configuration — and honors cancellation while doing it.
   under network blackhole, blackhole during STUN, mid-trace interface loss, and executor
   saturation; a cancelled trace terminates promptly in the enrichment phase as it already
   does in the probe phase.
-- **Measured magnitude**: a single `getaddrinfo`/`getnameinfo` against a dead resolver
-  stalls **30.0s** — macOS's total resolver budget, consistent within 10ms across calls.
+- **Measured magnitude**: a single `getaddrinfo`/`getnameinfo` stalls **30.0s** when DNS
+  packets are dropped silently — a give-up time, not a latency, and specific to silent
+  loss rather than to degraded networks generally. It is the relevant case here: captive
+  portals, flaky Wi-Fi, and network transitions all produce silent loss.
   STUN discovery serially resolves 3 hostnames, so it alone costs 90s and exceeds NWX's
   watchdog before any rDNS runs; a 40-hop rDNS phase through the 8-slot executor costs
   another 150s. `getnameinfo` returns *success* with the numeric form after stalling, so
