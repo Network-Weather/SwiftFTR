@@ -4,6 +4,22 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 
 ## Priority Queue
 
+### Cache and network-transition lifecycle
+**Goal**: Give consumers independent control over trace
+cancellation, public-IP freshness, network-scoped rDNS, and per-trace hop
+budgets without replacing the `SwiftFTR` actor.
+
+- **Problem**: `networkChanged()` currently cancels traces and clears every
+  cache as one operation. Consumers can need to preserve TTL-valid global rDNS across
+  local roaming, revalidate public IP based on gateway/WAN evidence, and vary
+  the hop budget by path confidence. Recreating the actor to approximate this
+  policy risks orphaned work and turns cached observations into immutable
+  config overrides.
+- **Approach**: Add separate cancellation, public-IP, and network-scoped rDNS
+  invalidation APIs, plus an operation-scoped trace-options override. Keep
+  `networkChanged()` as the conservative compatibility composition.
+- **Design and acceptance**: [Cache and network-transition lifecycle](docs/development/CACHE-AND-TRANSITION-LIFECYCLE.md).
+
 ### Per-hop outcome model
 **Goal**: Let a caller tell apart the four things that can actually happen at a hop.
 
