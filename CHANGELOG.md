@@ -3,31 +3,55 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-Unreleased
-----------
+0.16.0 — 2026-08-31
+-------------------
 
-### New public API
+A hop can now tell you what actually happened to it, rather than leaving you to infer it from
+which fields came back empty. That closes a gap 0.15.0 opened: transient send-pressure retry
+could still lose a whole trace when its budget ran out, and now it loses one hop instead.
 
-- `HopOutcome` on `TraceHop`, `ClassifiedHop` and `StreamingHop` says what actually happened at a
-  hop: the probe was never sent (with its `errno`), it was sent and nothing came back, a router
-  reported it undeliverable (with the ICMP code), or it drew a normal reply. Previously a hop
-  encoded this implicitly through which fields were `nil`, which could not express the first case
-  at all and collapsed the middle two — a router that forwarded the probe on and a router that
-  refused to route it produced identical hops.
-- `ICMPUnreachableReason` names the IPv4 Destination Unreachable codes, with a `displayName` and an
-  `isAdministrative` flag so a firewall dropping traffic deliberately reads differently from a
-  network that could not deliver it. `HopOutcome.unreachableReason` parses the code.
-- The hop types keep `ipAddress`/`ip`, `rtt` and `reachedDestination`, and keep their previous
-  initializers, which infer an outcome. Existing call sites compile and behave unchanged.
+### Hops report an outcome
 
-### Behavior changes
+`HopOutcome` on `TraceHop`, `ClassifiedHop` and `StreamingHop` names the four things that can
+happen at a hop: the probe never left the host (with its `errno`), it was sent and nothing came
+back, a router reported it undeliverable (with the ICMP code), or it drew a normal reply.
 
-- A probe that transient send pressure kept off the wire no longer fails the whole trace. That TTL
-  is reported as `.notSent(errno:)` and the trace continues, so a caller loses one hop of a topology
-  instead of the topology. A burst where *no* probe reached the wire still throws, and every
-  non-transient errno still aborts immediately as before.
-- `swift-ftr --json` gains `outcome` on each hop, plus `unreachable_reason` where one applies. Both
-  are additive; existing keys keep their names and meanings.
+Two distinctions were previously unrecoverable:
+
+- **A router that forwarded your probe and a router that refused to route it produced identical
+  hops** — same address, same round-trip time, same `reachedDestination: false`. The ICMP code
+  explaining the refusal was parsed and then discarded.
+- **A probe we never sent looked exactly like a probe the network ignored.** Both render as
+  `* * *`.
+
+`ICMPUnreachableReason` names the IPv4 Destination Unreachable codes, with a `displayName` and an
+`isAdministrative` flag, so a firewall dropping traffic deliberately reads differently from a
+network that could not deliver it. `HopOutcome.unreachableReason` parses the code.
+
+### A probe that never left no longer fails the trace
+
+When transient send pressure keeps a probe off the wire past the retry budget, that TTL is now
+reported as `.notSent(errno:)` and the trace continues. You lose one hop of a topology instead of
+the topology.
+
+Two guards keep this from hiding real failures. A burst where **no** probe reached the wire still
+throws, because a result full of holes would claim we measured something when we measured nothing.
+Every **non-transient** errno still aborts on the first attempt, so `EHOSTUNREACH`, `ENETDOWN`,
+`ENETUNREACH` and `EACCES` arrive exactly as promptly as before.
+
+The streaming API emits unsent hops immediately rather than at the deadline, since a failed send is
+known at once.
+
+### CLI
+
+`swift-ftr --json` gains `outcome` on each hop, plus `unreachable_reason` where one applies. Both
+are additive; every existing key keeps its name and meaning.
+
+### Compatibility
+
+Additive throughout. The hop types keep `ipAddress`/`ip`, `rtt` and `reachedDestination`, and keep
+their previous initializers, which infer an outcome from the fields they have. Existing call sites
+compile and behave unchanged.
 
 0.15.0 — 2026-08-31
 -------------------

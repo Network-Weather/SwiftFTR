@@ -36,7 +36,7 @@ public enum HopOutcome: Sendable, Equatable, Codable {
 
   /// Whether this outcome came from a packet the host actually received.
   ///
-  /// `false` for ``notSent`` and ``timedOut``, which have no responder and no timing.
+  /// `false` for ``notSent(errno:)`` and ``timedOut``, which have no responder and no timing.
   public var didReceiveReply: Bool {
     switch self {
     case .unreachable, .replied: return true
@@ -98,7 +98,7 @@ public enum ICMPUnreachableReason: UInt8, Sendable, CaseIterable {
 }
 
 extension HopOutcome {
-  /// The parsed reason for an ``unreachable`` outcome, when the code is one this library names.
+  /// The parsed reason for an ``unreachable(code:)`` outcome, when the code is one this library names.
   ///
   /// `nil` for every other outcome, and for codes outside the IPv4 table.
   public var unreachableReason: ICMPUnreachableReason? {
