@@ -45,7 +45,7 @@ func ipString(_ sin: sockaddr_in) -> String {
 /// `scopeID != 0` so link-local addresses round-trip as `fe80::1%interface-name` rather than
 /// losing their zone (which would collide on string keys across interfaces).
 ///
-/// Downstream contract (NWX): every address SwiftFTR emits goes through this
+/// Downstream contract: every address SwiftFTR emits goes through this
 /// formatter so that `String → resolve → String` is stable for any input.
 @inline(__always)
 func ipv6String(_ addr: in6_addr, scopeID: UInt32 = 0) -> String {

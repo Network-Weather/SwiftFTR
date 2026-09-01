@@ -210,7 +210,7 @@ struct PingExecutor: Sendable {
   /// Perform ping operation. Dispatches on the resolved destination's family —
   /// IPv4 via `IPPROTO_ICMP`, IPv6 via `IPPROTO_ICMPV6`. Each call allocates its
   /// own ephemeral socket, so concurrent `ping()` calls from a shared `SwiftFTR`
-  /// instance never share identifier/sequence space (NWX contract).
+  /// instance never share identifier/sequence space (downstream contract).
   func ping(to target: String, config: PingConfig) async throws -> PingResult {
     try config.validateForOperation()
     guard !Task.isCancelled else { throw TracerouteError.cancelled }
@@ -330,7 +330,7 @@ struct PingExecutor: Sendable {
             interface: iface, errno: errno, details: "Interface not found")
         }
         var index = ifaceIndex
-        // IP_BOUND_IF for v4, IPV6_BOUND_IF for v6 — same caller-visible semantics, NWX contract.
+        // IP_BOUND_IF for v4, IPV6_BOUND_IF for v6 — same caller-visible semantics, downstream contract.
         let level = (family == AF_INET6) ? IPPROTO_IPV6 : IPPROTO_IP
         let optname = (family == AF_INET6) ? IPV6_BOUND_IF : IP_BOUND_IF
         if setsockopt(sockfd, level, optname, &index, socklen_t(MemoryLayout<UInt32>.size)) < 0 {

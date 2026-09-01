@@ -295,7 +295,7 @@ examples and a checklist.
 ### Behavior changes (no source breakage)
 
 - **`PingResponse.ttl`** now carries the IPv6 hop limit for v6 replies (same field, same units 1–255). Doc-comment updated to describe the dual meaning. Same shape, no new field added.
-- **Canonical-form contract**: every emitted address (`PingResult.resolvedIP`, `TraceHop.ipAddress`, `STUNPublicIP.ip`, `ParsedICMP.sourceAddress`) is in `inet_ntop` canonical form. Round-tripping `String → resolve → String` is stable. Link-local addresses keep their `%<ifname>` zone suffix via `if_indextoname` — downstream consumers (NWX) use these strings as dictionary keys, and consistency matters.
+- **Canonical-form contract**: every emitted address (`PingResult.resolvedIP`, `TraceHop.ipAddress`, `STUNPublicIP.ip`, `ParsedICMP.sourceAddress`) is in `inet_ntop` canonical form. Round-tripping `String → resolve → String` is stable. Link-local addresses keep their `%<ifname>` zone suffix via `if_indextoname` — downstream consumers use these strings as dictionary keys, and consistency matters.
 - **`interface: "en0"`** binds v6 sockets via `IPV6_BOUND_IF` (mirrors v4 `IP_BOUND_IF`). Same `interface` field as before.
 - **`sourceIP`** auto-routes to the matching family's bind path for `getPublicIPs` (v6 source-IP doesn't try to bind a v4 socket and vice versa).
 - **`.auto` mode + v4 literal** now goes through `getaddrinfo(AI_V4MAPPED | AI_ADDRCONFIG)` rather than the `inet_pton` fast path. On dual-stack hosts behavior is unchanged; on v6-only NAT64 networks macOS synthesizes a v6 mapping per RFC 6147 and the trace/probe completes transparently. Matches [Apple's IPv6 guidance](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/NetworkingOverview/SupportingIPv6DNS64NAT64/SupportingIPv6DNS64NAT64.html). Force modes (`.v4` / `.v6`) keep the `inet_pton` fast path.
@@ -833,7 +833,7 @@ Since 0.7.1 was never shipped, this is the first DNS API for SwiftFTR.
   - Added `interface` and `sourceIP` parameters to `PingConfig`, `TCPProbeConfig`, `DNSProbeConfig`, and `BufferbloatConfig`
   - Operation-level config overrides global `SwiftFTRConfig` settings
   - Maximum flexibility for multi-interface monitoring (WiFi + Ethernet + VPN scenarios)
-  - **Use case**: NWX hop monitoring can now bind pings to specific interface per-operation
+  - **Use case**: downstream hop monitoring can now bind pings to specific interface per-operation
   - **Benefits**: Eliminates 83% packet loss during interface transitions
   - **API**: `ping(to: "1.1.1.1", config: PingConfig(interface: "en14"))` - per-operation override
   - **Backward compatible**: nil values default to global SwiftFTRConfig settings
@@ -1071,7 +1071,7 @@ Since 0.7.1 was never shipped, this is the first DNS API for SwiftFTR.
 - **ENHANCED**: Updated `docs/guides/EXAMPLES.md` with v0.5.0 features
   - 4 ping examples: basic, continuous monitoring, fast reachability, concurrent
   - 6 multipath examples: basic discovery, monitoring workflow, path analysis, ECMP detection
-  - Key example: Extract unique hops from multipath for monitoring (NWX use case)
+  - Key example: Extract unique hops from multipath for monitoring (downstream use case)
   - ICMP vs UDP limitation explanation with reference to ROADMAP
 - **ENHANCED**: Updated `docs/development/ROADMAP.md`
   - Added v0.5.5 UDP-based multipath discovery section (high priority)

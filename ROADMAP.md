@@ -55,7 +55,7 @@ Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner.
   the "all public types are Sendable" contract into the source rather than inference.
 - **SE-0509 SBOM**: add `swift package generate-sbom` to the release checklist.
 - **Constraint**: raising `swift-tools-version` above 6.0 raises the minimum toolchain for
-  every consumer (NWX is primary). Any adoption that forces a bump is a deliberate,
+  every consumer. Any adoption that forces a bump is a deliberate,
   consumer-visible decision, not a side effect.
 
 ### Enterprise Proxy & VPN Telemetry
