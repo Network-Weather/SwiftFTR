@@ -18,4 +18,28 @@ final class SwiftFTRUtilsTests: XCTestCase {
     XCTAssertFalse(isCGNATIPv4("100.63.255.255"))
     XCTAssertFalse(isCGNATIPv4("8.8.8.8"))
   }
+
+  func testPrivateAndCGNATDetectionRejectsMalformedAddresses() {
+    let malformedPrivateAddresses = [
+      "10.0.-1.999",
+      "172.16.0",
+      "192.168.0.1.2",
+      "169.254.256.1",
+      "::ffff:192.168.1.1",
+    ]
+    for address in malformedPrivateAddresses {
+      XCTAssertFalse(isPrivateIPv4(address), address)
+    }
+
+    let malformedCGNATAddresses = [
+      "100.64.-1.999",
+      "100.64.0",
+      "100.64.0.1.2",
+      "100.64.256.1",
+      "::ffff:100.64.0.1",
+    ]
+    for address in malformedCGNATAddresses {
+      XCTAssertFalse(isCGNATIPv4(address), address)
+    }
+  }
 }
