@@ -6,6 +6,11 @@ All notable changes to this project are documented here. This project follows Se
 Unreleased
 ----------
 
+### Tooling
+
+- Pull requests are now gated on the DocC documentation build: broken doc links and
+  documentation warnings fail CI instead of surfacing at release time.
+
 ### Behavior changes
 
 - **ASN lookups now use the embedded database by default.** The default `asnResolverStrategy`
