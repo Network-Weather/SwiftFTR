@@ -11,16 +11,23 @@ import Foundation
 /// One budget covers the whole burst rather than each probe: a per-probe budget
 /// of the same size would let 40 probes consume ten seconds and blow the
 /// receive deadline. At 250 ms the worst case spends a quarter of the default
-/// receive window recovering from buffer pressure and still leaves 750 ms for
-/// replies.
+/// receive window recovering and still leaves 750 ms for replies.
+///
+/// 250 ms covers the only pressure this socket type has been measured to reach:
+/// `ENOBUFS` from a burst that then stops resolves within 206 ms at the
+/// observed maximum. It is a guess against the condition the field actually
+/// reports, `EAGAIN`, whose cause is not established — see
+/// `docs/EAGAIN-MECHANISM.md`. Nothing depends on the guess being right: a
+/// probe whose budget runs out is reported as `HopOutcome.notSent(errno:)` and
+/// the trace continues, so the budget trades one hop's detail, not the trace.
 internal let traceBurstSendRetryBudget: TimeInterval = 0.25
 
 /// Wall-clock budget for a single ping send.
 ///
 /// Ping sends one packet at a time, on the same serial queue that runs its read
 /// source, so a send that waits also postpones reply processing and inflates the
-/// measured RTT of packets already in flight. 50 ms bounds that distortion while
-/// still covering the millisecond-scale buffer pressure the field reports.
+/// measured RTT of packets already in flight. 50 ms bounds that distortion; a
+/// send that needs longer costs one sample rather than delaying the rest.
 internal let pingSendRetryBudget: TimeInterval = 0.05
 
 /// Longest nap taken between attempts when `sendto` reports `ENOBUFS`.
