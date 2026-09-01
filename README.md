@@ -442,6 +442,51 @@ Formatting & Hooks
   git config core.hooksPath .githooks
   ```
 
+Prior Art & Related Tools
+-------------------------
+
+SwiftFTR builds on decades of traceroute technique, and other tools may fit your
+needs better than an embeddable Swift library.
+
+Lineage and techniques:
+
+- Van Jacobson's original `traceroute` (1987) established TTL-stepped probing.
+- [Paris traceroute](https://paris-traceroute.net) (Augustin et al., IMC 2006)
+  showed that holding flow-identifying header fields constant keeps probes on a
+  single path under ECMP load balancing, and that varying them enumerates paths.
+- [Dublin Traceroute](https://dublin-traceroute.net) (Andrea Barberio) extended
+  Paris-style probing with NAT detection. SwiftFTR's multipath discovery
+  (`discoverPaths`) is modeled on its approach.
+- Unprivileged operation relies on Darwin's ICMP datagram sockets
+  (`SOCK_DGRAM` + `IPPROTO_ICMP`/`IPPROTO_ICMPV6`), which permit echo probes
+  without root.
+- Public-IP discovery speaks STUN
+  ([RFC 8489](https://datatracker.ietf.org/doc/html/rfc8489)).
+
+Data and services:
+
+- Default ASN classification queries [Team Cymru's IP-to-ASN mapping
+  service](https://www.team-cymru.com/ip-asn-mapping) over DNS. The embedded
+  alternative is [swift-ip2asn](https://github.com/network-weather/swift-ip2asn),
+  whose database is built from [iptoasn.com](https://iptoasn.com) data.
+
+Peer tools doing analogous work:
+
+- [mtr](https://github.com/traviscross/mtr) — combined traceroute and
+  continuous ping monitoring (C, cross-platform).
+- [trippy](https://github.com/fujiapple852/trippy) — traceroute TUI and
+  analysis (Rust).
+- [scamper](https://www.caida.org/catalog/software/scamper/) — CAIDA's
+  research-grade Internet measurement tool.
+- [dublin-traceroute](https://github.com/insomniacslk/dublin-traceroute) — the
+  C++/Python original.
+- [ftr](https://github.com/dweekly/ftr) — sibling project: parallel traceroute
+  as a Rust CLI.
+
+SwiftFTR's niche among these: an embeddable Swift 6 library — actor-based async
+API, unprivileged sockets, and classification/enrichment (ASN, reverse DNS,
+VPN/segment labeling) for applications rather than terminals.
+
 License
 -------
 MIT — see LICENSE.
