@@ -1,10 +1,10 @@
 # What actually makes `sendto` return `EAGAIN` on an unprivileged ICMP datagram socket
 
-Investigation of the `errno=35` production signal recorded in
-[BUGS.md](../BUGS.md) ("Signal 1"). This is a measurement record, not a plan.
+Measured constraints on the `errno=35` failures that downstream production
+telemetry attributes to `sendto` on the trace socket. This is a measurement
+record, not a plan.
 
-**Bottom line:** the socket-send-buffer explanation in the original bug writeup
-is wrong. On `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` the send buffer is pure
+**Bottom line:** on `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` the send buffer is pure
 accounting and never holds a byte, so it cannot fill and cannot produce `EAGAIN`.
 Interface pressure — the thing a probe burst could in principle cause — reports
 `ENOBUFS` (55), never `EAGAIN` (35), and a burst of SwiftFTR's shape does not
