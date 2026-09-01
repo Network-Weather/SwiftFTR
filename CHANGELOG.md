@@ -3,6 +3,33 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Behavior changes
+
+- **ASN lookups now use the embedded database by default.** The default `asnResolverStrategy`
+  changes from `.dns` to `.hybrid(.embedded)`: the local database answers first, and DNS is
+  consulted only for addresses it does not cover. Until now the embedded database shipped but was
+  never loaded unless a caller opted in, so every ASN lookup was a Team Cymru DNS query.
+
+  Measured on a fixed set of ten public addresses: both strategies resolve 10/10, so this is a
+  latency and reliability change rather than a coverage change. Cold resolution drops from 0.215s
+  to 0.094s, and the common path no longer depends on the resolver at all — which matters because
+  a cold DNS lookup against an unresponsive resolver stalls for 30 seconds, and callers that
+  discard caches on a network change re-pay the cold path every time.
+
+  Costs ~6MB of memory for the database. Callers who want the old behavior can pass
+  `asnResolverStrategy: .dns`; those who want no network under any circumstances can pass
+  `.embedded`. Call `preloadASNDatabase()` early to move the first-load cost off the first trace.
+
+### Dependencies
+
+- SwiftIP2ASN 0.4.1 → 0.5.0, which adds observable database freshness and conditional-GET
+  refreshes. The existing `from: "0.4.1"` requirement already permitted 0.5.0, so consumers
+  resolved to it regardless; this pins our own CI to what they get. SwiftFTR never referenced
+  `UltraCompactError`, so the breaking change in that release does not reach us.
+
 0.16.0 — 2026-08-31
 -------------------
 
