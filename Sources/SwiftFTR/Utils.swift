@@ -245,16 +245,9 @@ public func reverseIPv6Nibbles(_ ip: String) -> String? {
 /// Returns true if the IPv4 string is in RFC1918 private or 169.254/16 link-local space.
 @inline(__always)
 public func isPrivateIPv4(_ ip: String) -> Bool {
-  // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, link-local 169.254/16
-  let parts = ip.split(separator: ".").compactMap { Int($0) }
-  guard parts.count == 4 else { return false }
-  let a = parts[0]
-  let b = parts[1]
-  if a == 10 { return true }
-  if a == 172 && (16...31).contains(b) { return true }
-  if a == 192 && b == 168 { return true }
-  if a == 169 && b == 254 { return true }
-  return false
+  guard detectAddressFamily(ip) == AF_INET else { return false }
+  guard let scope = ParsedIPAddress(ip)?.scope else { return false }
+  return scope == .privateNetwork || scope == .linkLocal
 }
 
 /// Returns true if the IPv4 string is in RFC6598 CGNAT range (100.64.0.0/10).
@@ -263,12 +256,8 @@ public func isPrivateIPv4(_ ip: String) -> Bool {
 /// Use `VPNContext` to distinguish between them during classification.
 @inline(__always)
 public func isCGNATIPv4(_ ip: String) -> Bool {
-  // 100.64.0.0/10
-  let parts = ip.split(separator: ".").compactMap { Int($0) }
-  guard parts.count == 4 else { return false }
-  let a = parts[0]
-  let b = parts[1]
-  return a == 100 && (64...127).contains(b)
+  guard detectAddressFamily(ip) == AF_INET else { return false }
+  return ParsedIPAddress(ip)?.scope == .carrierGradeNAT
 }
 
 typealias NameInfoLookup = (

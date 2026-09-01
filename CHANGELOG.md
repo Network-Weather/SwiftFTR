@@ -13,6 +13,11 @@ Unreleased
 
 ### Behavior changes
 
+- `isPrivateIPv4(_:)` and `isCGNATIPv4(_:)` now validate addresses with the same strict,
+  byte-based parser used by scope classification. Malformed dotted strings return `false` instead
+  of being classified from only their first one or two components; valid IPv4 behavior is
+  unchanged.
+
 - **ASN lookups now use the embedded database by default.** The default `asnResolverStrategy`
   changes from `.dns` to `.hybrid(.embedded)`: the local database answers first, and DNS is
   consulted only for addresses it does not cover. Until now the embedded database shipped but was
