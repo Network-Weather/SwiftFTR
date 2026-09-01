@@ -418,7 +418,6 @@ Documentation
 - DocC bundle at `Sources/SwiftFTR/SwiftFTR.docc`.
 - [`docs/IPV6.md`](docs/IPV6.md) — sequenced plan and architectural contracts for IPv6 feature parity (ping, traceroute, probes, STUN, ASN).
 - [`docs/BUG2-INVESTIGATION.md`](docs/BUG2-INVESTIGATION.md) — audit and measurements behind the bounded-and-cancellable-enrichment work: continuation exit paths, the shared blocking-IO executor, and what did and did not reproduce.
-- [`BUGS.md`](BUGS.md) — field evidence from downstream production telemetry, and how to refresh it.
 
 Generate and view the docs:
 
