@@ -4,6 +4,23 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 
 ## Priority Queue
 
+### Cache and network-transition lifecycle
+**Goal**: Give callers independent control over trace cancellation,
+public-IP freshness, network-scoped rDNS eviction, and per-operation hop
+budgets, so a network transition never requires replacing the `SwiftFTR` actor.
+
+- **Problem**: `networkChanged()` cancels traces and clears every cache as one
+  operation. A caller with evidence that only part of the network state changed
+  (a local roam vs. a WAN change) cannot act selectively; the workaround of
+  recreating the actor risks orphaned tasks on the process-global blocking-I/O
+  executor and encourages writing transient observations into the immutable
+  `SwiftFTRConfig.publicIP` override.
+- **Approach**: Add `cancelActiveTraces()`, `invalidateNetworkScopedRDNS()`,
+  `seedPublicIP(_:source:)`, and an operation-scoped `TraceOptions` override,
+  all additive. `invalidatePublicIP()` already exists. Keep `networkChanged()`
+  as the conservative composition.
+- **Design and acceptance**: [Cache and network-transition lifecycle](docs/CACHE-AND-TRANSITION-LIFECYCLE.md).
+
 ### STUN server list provides no actual redundancy
 **Goal**: Make public-IP discovery fail over to a genuinely different endpoint.
 
