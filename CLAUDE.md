@@ -121,13 +121,11 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - **Commits**: Conventional Commits with scopes (`feat(tracer):`, `fix(dns):`, `docs:`)
 - **Dependencies**: SwiftPM only — `swift-argument-parser`, `swift-docc-plugin`, `swift-ip2asn`
 
-## Downstream consumer
+## Downstream contracts
 
-NetworkWeather (NWX, `~/dev/nwx`) is the primary SwiftFTR consumer. For non-trivial API changes:
+SwiftFTR has production consumers whose integrations depend on contracts that are easy to break silently: single dest-string entry points, canonical `inet_ntop` address form, link-local zone-suffix preservation, family-agnostic errors, concurrent-ping safety, unprivileged sockets only. For non-trivial API changes, surface the relevant constraints up front in your plan, not during PR review.
 
-1. Read the `project-nwx-downstream-contracts` memory before designing. It captures the contracts NWX depends on (single dest-string entry points, canonical address form, link-local scope preservation, family-agnostic errors, concurrent-ping safety, unprivileged sockets only).
-2. Surface the relevant constraints up front in your plan, not during PR review.
-3. Save new constraints to that memory as you discover them.
+Never name, link, or path-reference specific downstream applications or their private repositories anywhere in this repository — docs, code comments, commit messages, telemetry excerpts. Refer to them as "downstream consumers" / "the host app", and strip consumer-internal details (source paths, line numbers, commit hashes, infrastructure identifiers) when recording field evidence here.
 
 ## After every PR merges
 

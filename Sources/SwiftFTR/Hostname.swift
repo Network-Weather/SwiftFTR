@@ -7,7 +7,7 @@ import Foundation
 /// Resolved destination: address family + storage + canonical printable form.
 ///
 /// The canonical string is what shows up in user-facing fields like
-/// `PingResult.resolvedIP` and what NWX-style consumers use as dictionary keys.
+/// `PingResult.resolvedIP` and what downstream consumers use as dictionary keys.
 /// For IPv6 link-local destinations the canonical includes the `%<ifname>` zone
 /// suffix (see `ipv6String` in `Utils.swift`). Consistency matters: the same
 /// input string must always produce the same canonical form.
@@ -119,7 +119,7 @@ internal func bindInterface(sockfd: Int32, family: Int32, ifIndex: UInt32) -> St
 /// - `.v4` / `.v6`: forces the family; throws `.resolutionFailed` if unavailable.
 ///
 /// The canonical printable form (`inet_ntop`) is returned in `ResolvedHost.canonical`,
-/// with link-local scope suffix preserved as `addr%ifname` (NWX downstream contract).
+/// with link-local scope suffix preserved as `addr%ifname` (downstream contract).
 ///
 /// This helper lives at file scope rather than inside a particular executor so
 /// `Ping`, `Trace`, and (eventually) the probes can share it without duplication

@@ -32,7 +32,8 @@ struct TransientSendRetryTests {
     #expect(isTransientSendErrno(EWOULDBLOCK))
     #expect(isTransientSendErrno(ENOBUFS))
 
-    // NWX maps these to offline states and to a permissions diagnostic; they
+    // Downstream consumers map these to offline states and to a permissions
+    // diagnostic; they
     // must keep failing fast.
     #expect(!isTransientSendErrno(EHOSTUNREACH))
     #expect(!isTransientSendErrno(ENETDOWN))

@@ -2,7 +2,7 @@
 
 Investigation notes, 2026-08-30. Code audited at HEAD (e5b1cea). Verified that
 `git diff 46de63af..HEAD -- Sources/SwiftFTR/` touches only a docc file, so this
-audit applies exactly to the 0.14.0 code NWX ships.
+audit applies exactly to the 0.14.0 code the downstream fleet ships.
 
 ## Part 1: Static audit
 
@@ -43,7 +43,7 @@ Part 2). Hypothesis 1 is NOT supported by the source.
 | 4 | rDNS `rdnsCache.batchLookup` (up to maxHops IPs) → per IP `runDetachedBlockingIO(.background) { getnameinfo }` | **No deadline on `getnameinfo`** — bounded only by system resolver | **No** (same executor caveat); `try Task.checkCancellation()` only AFTER the whole batch returns |
 | 5 | second rDNS batch for dest/public IP | same as 4 | same |
 | 6 | `classifier.classify` → **if step 1 returned nil, ANOTHER `getPublicIPv4(stun 0.8, dns 2.0)`** — 3 more `getaddrinfo` calls | same as 1 | No |
-| 7 | Cymru ASN resolve (NWX uses default `.dns` strategy) | Yes — per-query SO_RCVTIMEO 1.5s, literal-IP servers (no getaddrinfo), 8-wide semaphore | queued through same executor; not cancellable but bounded |
+| 7 | Cymru ASN resolve (the downstream consumer uses the default `.dns` strategy) | Yes — per-query SO_RCVTIMEO 1.5s, literal-IP servers (no getaddrinfo), 8-wide semaphore | queued through same executor; not cancellable but bounded |
 
 ### 1c. The shared bottleneck: `BlockingIOExecutor` (Utils.swift:359-431)
 
@@ -61,14 +61,14 @@ doc comment):
   by a stream of `.userInitiated` ops (Cymru/DNS probes) from concurrent
   measurements.
 - Therefore a single `traceClassified()`'s wall time includes the queue wait for
-  *every* op it enqueues, behind whatever else the process (NWX runs many
-  concurrent measurements) has queued.
+  *every* op it enqueues, behind whatever else the process (the host app runs
+  many concurrent measurements) has queued.
 
 ### 1d. Worst-case arithmetic (network "up but broken", e.g. DNS unresponsive)
 
 G = one `getaddrinfo`/`getnameinfo` stall against an unresponsive system
-resolver = **30.0s, measured** (Part 2d). The enrichment phase crosses NWX's
-60s watchdog once G exceeds roughly 8s on the STUN path alone, so this clears
+resolver = **30.0s, measured** (Part 2d). The enrichment phase crosses the
+caller's 60s watchdog once G exceeds roughly 8s on the STUN path alone, so this clears
 that bar by nearly 4x:
 
 - Step 1: 3 STUN hostnames × G (serial, one blocking op) → **90s**, over the
@@ -81,7 +81,7 @@ form rather than an error. A degraded-resolver rDNS phase therefore costs its
 full 150s and then reports nothing wrong; there is no error anywhere in this
 path for a caller to key on.
 
-None of it cancellable. The NWX watchdog fires at 60s, cancels the group; the
+None of it cancellable. The caller's watchdog fires at 60s, cancels the group; the
 traceClassified task remains suspended inside `runDetachedBlockingIO` — which is
 exactly the field signature: "did not complete within 60 seconds" + apparent
 hang, with no crash and no error from SwiftFTR.
@@ -89,22 +89,23 @@ hang, with no crash and no error from SwiftFTR.
 **This is not an unbounded hang** (system resolver eventually gives up; ops
 eventually drain) but it is unbounded *relative to the trace's configuration*,
 easily exceeds 60s, and ignores cancellation. Telemetry cannot distinguish
-"never returned" from "returned after 60s" — NWX stops awaiting at the watchdog.
+"never returned" from "returned after 60s" — the caller stops awaiting at the
+watchdog.
 
-### 1e. Production configuration facts (read from NWX source)
+### 1e. Production configuration facts (verified in the consumer's source)
 
-- Destination is the literal `"1.1.1.1"` (`MeasurementManager.swift:112`), so
+- Destination is the literal `"1.1.1.1"`, so
   `resolveHost` never calls `getaddrinfo` for the destination. The remaining
   `getaddrinfo` exposure is the 3 STUN hostnames; `getnameinfo` exposure is
   per-hop rDNS.
 - The watchdog tracer's config uses `publicIP: cachedPublicIP`,
   `noReverseDNS: false`, default ASN strategy `.dns` (Cymru).
-- **On every network change NWX sets `cachedPublicIP = nil` and clears its rDNS
-  caches** (`MeasurementManager.swift:2092`, `:3342`). So the first
+- **On every network change the consumer sets `cachedPublicIP = nil` and clears
+  its rDNS caches.** So the first
   traceClassified after a network transition — precisely when the resolver is
   most likely degraded — always runs full STUN discovery plus a cold rDNS wave
   through the blocking-IO executor.
-- NWX runs continuous concurrent measurements (DNS probes, pings, topology
+- The host app runs continuous concurrent measurements (DNS probes, pings, topology
   discovery) in the same process; their DNSClient/STUN calls share the same
   8-slot executor at `.userInitiated` priority, outranking rDNS's `.background`.
 
@@ -156,8 +157,8 @@ no ICMP unreachable. A resolver that actively refuses, returns SERVFAIL, or sits
 behind a downed interface fails fast instead, so G is the worst case under
 silent packet loss toward the resolver, not a universal "degraded network"
 constant. That failure mode is the relevant one here: captive portals, flaky
-Wi-Fi, and network transitions all produce it, and NWX's post-network-change
-path runs precisely in that window.
+Wi-Fi, and network transitions all produce it, and the consumer's
+post-network-change path runs precisely in that window.
 
 The tight ±10ms spread across calls suggests a hard cap rather than a summed
 retry schedule, and `RES_MAXRETRANS` in `resolv.h` is exactly 30 — documented in
@@ -172,7 +173,7 @@ answer — the defect is that SwiftFTR bounds this call not at all.
 traceClassified runs: trace completed in **1.01s**, essentially unimpeded, on
 this machine/Swift runtime. Plain equal-priority pool saturation did not delay
 the trace. (A host-app *blocking syscall pinning cooperative threads*, as in
-the pre-1.3.0 NWX SSDP loop, is a different and stronger condition — not
+a since-fixed host-app SSDP receive loop, is a different and stronger condition — not
 reproducible from inside SwiftFTR's test suite.) Hypothesis 3, in the
 busy-tasks form, is not supported.
 
@@ -193,20 +194,20 @@ from the host app defers an in-flight trace's rDNS phase without bound.
    (b) queue waits behind the host app's other SwiftFTR calls are unbounded,
    (c) rDNS ops are additionally starved by priority (2f), and
    (d) cancellation is explicitly not honored while queued or running (2c).
-   NWX's post-network-change cache clearing guarantees the worst-case path runs
+   The consumer's post-network-change cache clearing guarantees the worst-case path runs
    exactly when the resolver is most likely broken. With G measured at 30s
    (2d), STUN discovery alone costs 90s and the rDNS phase 150s, so 60s is not
    merely reachable — it is exceeded by the enrichment phase without any
    SwiftFTR bug in the probe path. Telemetry cannot distinguish "hung forever"
-   from "returned after >60s" because NWX abandons the await.
+   from "returned after >60s" because the caller abandons the await.
 2. **NOT SUPPORTED — Hypothesis 1 (dropped continuation):** every exit path of
    both receive operations resumes exactly once (audit table 1a); dynamic
    cancel/blackhole tests terminate promptly with no leaked fd or continuation.
 3. **NOT SUPPORTED (in testable form) — Hypothesis 3 (cooperative-pool
    starvation):** busy-task saturation did not delay the trace (2e). The
-   pre-1.3.0 NWX SSDP thread-pinning variant remains possible for old-version
-   clients but is untestable from here; getting `app_version` into NWX `log.*`
-   telemetry remains the cheap discriminator.
+   since-fixed host-app SSDP thread-pinning variant remains possible for
+   old-version clients but is untestable from here; getting `app_version` into
+   the fleet's telemetry remains the cheap discriminator.
 
 ## Part 4: Follow-ups requiring approval (sudo)
 

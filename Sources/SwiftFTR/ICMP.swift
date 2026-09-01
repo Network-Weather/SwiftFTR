@@ -248,7 +248,7 @@ func makeICMPv6EchoRequest(identifier: UInt16, sequence: UInt16, payloadSize: In
 ///   reads from recvmsg ancillary data and passes it here as `hopLimit:`).
 /// - Source address is the IPv6 address in `saStorage` (sockaddr_in6), formatted via
 ///   `ipv6String` which preserves `%<ifname>` zone suffix for link-local addresses
-///   (the canonical-form contract NWX depends on for dictionary keys).
+///   (the canonical-form contract downstream consumers depend on for dictionary keys).
 func parseICMPv6Message(
   buffer: UnsafeRawBufferPointer, hopLimit: Int?, from saStorage: sockaddr_storage
 ) -> ParsedICMP? {
