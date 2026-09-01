@@ -40,3 +40,21 @@ jobs:
         run: swift build --package-path IntegrationPackage
       - name: Build external API compatibility consumer
         run: swift build --package-path TestLibraryUsage
+
+  docs:
+    name: Documentation (DocC)
+    runs-on: macos-15
+    needs: format
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Swift version
+        run: swift --version
+      # Symbol links to enum cases need their full signature, and a broken one is invisible
+      # until docs are built. Gated here because a release is the wrong time to find out.
+      - name: Generate documentation (warnings as errors)
+        run: |
+          swift package --allow-writing-to-directory docc \
+            generate-documentation --target SwiftFTR \
+            --output-path docc --transform-for-static-hosting \
+            --warnings-as-errors
