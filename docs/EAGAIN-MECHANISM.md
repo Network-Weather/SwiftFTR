@@ -227,21 +227,21 @@ It also fits the field shape better than buffer pressure does: ~80 events a week
 concentrated on four machines, rather than spread across the fleet, is what you
 would expect from a property of *those machines' software* (Little Snitch, LuLu,
 CrowdStrike, Netskope, Zscaler, Cisco Umbrella and similar all ship
-`NEFilterDataProvider`s) rather than from a burst shape every NWX install
-produces.
+`NEFilterDataProvider`s) rather than from a burst shape every install of a
+host app produces.
 
-NWX itself does not install one: it imports `NetworkExtension` only for
-`NEVPNManager`-based VPN detection
-(`clients/macos/NWX/NWX/Monitors/LocalNetworkMonitor.swift`,
-`Detection/VPN/EnterpriseVPN.swift`).
+The reporting host app installs no such filter itself — it uses
+`NetworkExtension` only for `NEVPNManager`-based VPN detection — so any filter
+present belongs to other software on those machines.
 
 ### How to settle it
 
 Two cheap steps, neither of which I can take from here:
 
-1. Have NWX telemetry report `net.cfil.active_count` (readable unprivileged via
-   `sysctlbyname`) alongside the errno. If the four reporting machines have a
-   filter attached and the quiet ones do not, the question is closed.
+1. Have the host app's telemetry report `net.cfil.active_count` (readable
+   unprivileged via `sysctlbyname`) alongside the errno. If the reporting
+   machines have a filter attached and the quiet ones do not, the question is
+   closed.
 2. On a machine with a content filter installed, run
    `Scripts/eagain/t2_load.c` and see whether `EAGAIN` appears.
 
