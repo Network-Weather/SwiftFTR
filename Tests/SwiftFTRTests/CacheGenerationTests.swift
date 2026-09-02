@@ -193,6 +193,84 @@ struct CacheGenerationTests {
     await tracer.invalidateNetworkScopedRDNS()
     #expect(await tracer.rdnsCache.count == 1)
   }
+
+  @Test("seedPublicIP accepts valid global IPv4 and IPv6 and canonicalizes")
+  func seedValidPublicIP() async {
+    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
+
+    #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
+    #expect(await tracer.publicIP == "1.1.1.1")
+
+    #expect(
+      await tracer.seedPublicIP("2606:4700:4700:0:0:0:0:1111", source: .gatewayReported))
+    #expect(await tracer.publicIP == "2606:4700:4700::1111")
+  }
+
+  @Test("seedPublicIP rejects non-global, malformed, and sentinel strings")
+  func seedRejectsNonGlobalAndSentinels() async {
+    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
+    #expect(await tracer.seedPublicIP("8.8.8.8", source: .validatedCallerCache))
+    #expect(await tracer.publicIP == "8.8.8.8")
+
+    let invalidSeeds = [
+      "unknown",
+      "",
+      "not-an-ip",
+      "192.168.1.1",  // RFC 1918
+      "10.0.0.1",  // RFC 1918
+      "172.16.0.1",  // RFC 1918
+      "100.64.1.1",  // CGNAT
+      "169.254.1.1",  // link-local
+      "127.0.0.1",  // loopback
+      "::1",  // loopback v6
+      "fe80::1",  // link-local v6
+      "fc00::1",  // ULA v6
+      "224.0.0.1",  // multicast
+      "0.0.0.0",  // unspecified
+    ]
+
+    for seed in invalidSeeds {
+      let accepted = await tracer.seedPublicIP(seed, source: .validatedCallerCache)
+      #expect(!accepted, Comment(rawValue: "\(seed) should have been rejected by seedPublicIP"))
+      // Existing seed remains untouched
+      #expect(await tracer.publicIP == "8.8.8.8")
+    }
+  }
+
+  @Test("seedPublicIP does not survive invalidation, clear, or network change")
+  func seedInvalidationLifecycle() async {
+    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
+
+    // Test invalidatePublicIP
+    #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
+    #expect(await tracer.publicIP == "1.1.1.1")
+    await tracer.invalidatePublicIP()
+    #expect(await tracer.publicIP == nil)
+
+    // Test clearCaches
+    #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
+    #expect(await tracer.publicIP == "1.1.1.1")
+    await tracer.clearCaches()
+    #expect(await tracer.publicIP == nil)
+
+    // Test networkChanged
+    #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
+    #expect(await tracer.publicIP == "1.1.1.1")
+    await tracer.networkChanged()
+    #expect(await tracer.publicIP == nil)
+  }
+
+  @Test("seedPublicIP bypasses discovery in effectivePublicIPForClassification")
+  func seedBypassesDiscovery() async {
+    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
+    #expect(await tracer.seedPublicIP("9.9.9.9", source: .validatedCallerCache))
+
+    let discovered = await tracer.effectivePublicIPForClassification {
+      Issue.record("Discovery should not run when seeded")
+      return "1.2.3.4"
+    }
+    #expect(discovered == "9.9.9.9")
+  }
 }
 
 private actor MultiSuspendedLookup {

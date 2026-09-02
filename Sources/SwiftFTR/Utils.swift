@@ -65,6 +65,27 @@ func ipv6String(_ addr: in6_addr, scopeID: UInt32 = 0) -> String {
   return "\(bare)%\(scopeID)"
 }
 
+/// Canonical presentation form (inet_ntop) of an IPv4 or IPv6 address string.
+/// Returns nil if the string is not a syntactically valid numeric IP address.
+func canonicalIPAddress(_ presentation: String) -> String? {
+  var address4 = in_addr()
+  if presentation.withCString({ inet_pton(AF_INET, $0, &address4) }) == 1 {
+    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+    _ = withUnsafePointer(to: &address4) { ptr in
+      inet_ntop(AF_INET, ptr, &buf, socklen_t(INET_ADDRSTRLEN))
+    }
+    return buf.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+  }
+
+  let (bare, scopeID) = parseIPv6Scoped(presentation)
+  var address6 = in6_addr()
+  if bare.withCString({ inet_pton(AF_INET6, $0, &address6) }) == 1 {
+    return ipv6String(address6, scopeID: scopeID)
+  }
+
+  return nil
+}
+
 /// The routing scope of a numeric IP address.
 enum IPAddressScope: Sendable, Equatable {
   case global
