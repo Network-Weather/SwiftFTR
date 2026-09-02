@@ -21,6 +21,35 @@ budgets, so a network transition never requires replacing the `SwiftFTR` actor.
   as the conservative composition.
 - **Design and acceptance**: [Cache and network-transition lifecycle](docs/CACHE-AND-TRANSITION-LIFECYCLE.md).
 
+### Shared ASN database across tracer instances
+**Goal**: Constructing several `SwiftFTR` instances costs one embedded ASN database load, not
+one per instance.
+
+- **Problem**: `SwiftFTRConfig` fixes `interface`, `publicIP` and `maxHops` at construction, so
+  a host app that needs several binding contexts holds several tracers; one tracer per interface
+  per topology trace is a real downstream pattern. Each `init` builds its own `LocalASNResolver`,
+  whose load state is per-instance with no shared store, so every tracer decompresses and holds
+  its own ~6 MB copy of the database, and `preloadASNDatabase()` warms only the instance it is
+  called on. `EmbeddedDatabase.loadUltraCompact()` in SwiftIP2ASN constructs a fresh
+  `UltraCompactDatabase` on every call, so the sharing has to live in SwiftFTR. With
+  `.hybrid(.embedded)` now the default strategy, every tracer pays this, including ones built
+  with `SwiftFTR()`. The DNS path already shares: `CachingASNResolver` sits on the process-wide
+  `_ASNMemoryCache.shared`.
+- **Approach**: a process-wide store inside `LocalASNResolver`, keyed by `LocalASNSource`, that
+  coalesces concurrent loads of the same source and hands every resolver the same
+  `UltraCompactDatabase` value. Hold entries weakly so the database is released when the last
+  resolver using it goes away, which keeps today's memory lifetime. No public API change;
+  `preloadASNDatabase()` on any instance then warms every instance that shares its source.
+  Document on `SwiftFTRConfig` and `preloadASNDatabase()` which state is per-instance (rDNS
+  cache, public IP, active traces) and which is shared (ASN database, ASN lookup cache).
+- **Not proposed**: a `resolver:` parameter on `trace` and `traceStream`, since neither performs
+  ASN lookups and `traceClassified` already accepts one; and moving `interface` or `publicIP` to
+  per-call parameters, which would partition every cache by binding context and move validation
+  off the config to save allocating a small struct. Binding at construction is the right model.
+- **Follow-up, kept separate**: sharing an `RDNSCache` between sibling tracers. One instance's
+  `networkChanged()` would then evict for all of them, so it belongs with the cache-lifecycle
+  item above rather than here.
+
 ### STUN server list provides no actual redundancy
 **Goal**: Make public-IP discovery fail over to a genuinely different endpoint.
 
@@ -113,45 +142,6 @@ Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner.
 - **NAT Traversal**: UDP is often better at punching through NATs and firewalls than ICMP.
 - **Implementation**: Requires raw sockets (`SOCK_RAW`) or experimental `IP_TTL` on connected UDP sockets. May require elevated privileges (sudo) or specific entitlements.
 - **Reality check**: macOS sandbox restrictions make this harder than expected; TCP traceroute may be more practical.
-
----
-
-### Shared expensive state across tracer instances
-
-Raised by Network Weather, 2026-09-01, from a survey of its own SwiftFTR usage.
-
-`SwiftFTRConfig` fixes `interface`, `publicIP` and `maxHops` at `init`, and `trace`,
-`traceStream` and `discoverPaths` accept no per-call override. That is correct for
-interface binding, which is a socket property that must be set before use and which
-`validateForOperation()` checks per operation. The consequence is that a consumer needing
-several binding contexts must hold several tracers, and Network Weather holds one per
-interface per trace for topology discovery.
-
-The cost is not the instances, it is what each one rebuilds. `init` constructs a fresh
-`LocalASNResolver`, an actor whose `loadState` is per-instance with no shared store, so
-every tracer pays the 35-40 ms embedded-database load that `preloadASNDatabase()` exists
-to avoid, and holds its own copy while alive. The rDNS cache is per-instance for the same
-reason.
-
-`traceClassified(to:vpnContext:resolver:)` already solves this for classified traces:
-`effectiveResolver = resolver ?? asnResolver` lets a consumer own one preloaded resolver
-and pass it in. Three changes would finish the idea:
-
-- Accept `resolver:` on `trace` and `traceStream` as well, so the escape hatch is
-  consistent rather than available on one entry point. A consumer currently cannot share
-  a resolver with an unclassified trace at all.
-- Allow an `RDNSCache` to be supplied at construction the way a resolver can be supplied
-  per call, so sibling tracers share hostname lookups instead of each starting cold. Keep
-  per-instance as the default, since a cold cache per trace is sometimes what a caller
-  wants.
-- Document the instance cost in `SwiftFTRConfig`, naming which state is per-instance and
-  which can be shared. A consumer holding several tracers has no way to discover today
-  that it is paying for several ASN databases.
-
-Deliberately not proposed: moving `interface` or `publicIP` to per-call parameters. It
-would require partitioning every cache by binding context and moving validation off the
-config, which is a large change to save allocating a small struct. The binding-at-
-construction model is the right one.
 
 ## Future & Research
 
