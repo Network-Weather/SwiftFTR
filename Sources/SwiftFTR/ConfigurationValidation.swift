@@ -110,6 +110,17 @@ extension StreamingTraceConfig {
   }
 }
 
+extension TraceOptions {
+  /// Validates per-operation options before socket operations begin.
+  func validateForOperation() throws {
+    if let maxHops {
+      guard (1...255).contains(maxHops) else {
+        throw TracerouteError.invalidConfiguration(reason: "maxHops must be in 1...255")
+      }
+    }
+  }
+}
+
 extension PingConfig {
   /// Validates values before constructing packets, sequence numbers, sleeps, or timers.
   func validateForOperation() throws {

@@ -121,6 +121,19 @@ public struct TraceResult: Sendable {
   }
 }
 
+/// Per-operation options for traceroute executions.
+public struct TraceOptions: Sendable, Equatable {
+  /// Maximum TTL/hops to probe for this trace.
+  ///
+  /// When `nil`, defaults to the configuration's `maxHops`.
+  /// If specified, must be in the range `1...255`.
+  public var maxHops: Int?
+
+  public init(maxHops: Int? = nil) {
+    self.maxHops = maxHops
+  }
+}
+
 /// Errors that can occur while performing a traceroute.
 public enum TracerouteError: Error, CustomStringConvertible {
   /// DNS resolution failed for the destination host.
@@ -463,6 +476,21 @@ public actor SwiftFTR {
   public func trace(
     to host: String
   ) async throws -> TraceResult {
+    try await trace(to: host, options: .init())
+  }
+
+  /// Perform a fast traceroute with per-operation options.
+  ///
+  /// - Parameters:
+  ///   - host: Destination hostname or IPv4/IPv6 address.
+  ///   - options: Per-operation trace options such as `maxHops` override.
+  /// - Returns: A `TraceResult` with ordered hops and whether the destination responded.
+  /// - Throws: `TracerouteError` if resolution, socket operations fail, or trace is cancelled
+  public func trace(
+    to host: String,
+    options: TraceOptions
+  ) async throws -> TraceResult {
+    try options.validateForOperation()
     let handle = TraceHandle()
 
     // Register active trace
@@ -471,7 +499,7 @@ public actor SwiftFTR {
 
     // Run trace in a task so we can check cancellation
     return try await withTaskCancellationHandler {
-      try await performTrace(to: host, handle: handle)
+      try await performTrace(to: host, handle: handle, maxHopsOverride: options.maxHops)
     } onCancel: {
       Task { await handle.cancel() }
     }
@@ -708,11 +736,12 @@ public actor SwiftFTR {
   internal func performTrace(
     to host: String,
     handle: TraceHandle,
-    flowIdentifier: UInt16? = nil
+    flowIdentifier: UInt16? = nil,
+    maxHopsOverride: Int? = nil
   ) async throws -> TraceResult {
     try config.validateForOperation()
 
-    let maxHops = config.maxHops
+    let maxHops = maxHopsOverride ?? config.maxHops
     let timeout = TimeInterval(config.maxWaitMs) / 1000.0
     let payloadSize = config.payloadSize
 
@@ -900,7 +929,27 @@ public actor SwiftFTR {
     vpnContext: VPNContext? = nil,
     resolver: ASNResolver? = nil
   ) async throws -> ClassifiedTrace {
+    try await traceClassified(
+      to: host, vpnContext: vpnContext, resolver: resolver, options: .init())
+  }
+
+  /// Perform a classified traceroute with per-operation options.
+  ///
+  /// - Parameters:
+  ///   - host: Destination hostname or IPv4/IPv6 address.
+  ///   - vpnContext: Context for VPN-aware classification (optional, auto-detected from interface).
+  ///   - resolver: ASN resolver implementation (default: uses internal cached resolver).
+  ///   - options: Per-operation trace options such as `maxHops` override.
+  /// - Returns: A ClassifiedTrace containing segment labels and (when available) ASN info.
+  /// - Throws: `TracerouteError` if resolution or socket operations fail
+  public func traceClassified(
+    to host: String,
+    vpnContext: VPNContext? = nil,
+    resolver: ASNResolver? = nil,
+    options: TraceOptions
+  ) async throws -> ClassifiedTrace {
     try config.validateForOperation()
+    try options.validateForOperation()
 
     // Validate interface early if specified (before any network operations)
     if let interfaceName = config.interface {
@@ -925,7 +974,7 @@ public actor SwiftFTR {
     try Task.checkCancellation()
 
     // Perform base trace (includes rDNS if enabled)
-    let tr = try await trace(to: host)
+    let tr = try await trace(to: host, options: options)
 
     guard let destIP = tr.resolvedIP else {
       throw TracerouteError.resolutionFailed(
@@ -1201,6 +1250,19 @@ public actor SwiftFTR {
 
   // MARK: - Cache Management
 
+  /// Cancel all active traceroute operations without clearing caches.
+  ///
+  /// Snapshots the currently running trace handles and cancels them.
+  /// Traces registered after this call begins remain tracked for subsequent cancellation.
+  /// This method does not invalidate rDNS, public IP, or ASN caches.
+  public func cancelActiveTraces() async {
+    let tracesToCancel = activeTraces
+    activeTraces.removeAll()
+    for trace in tracesToCancel {
+      await trace.cancel()
+    }
+  }
+
   /// Handle network changes by cancelling active traces and clearing caches.
   ///
   /// Call this method when the network configuration changes (e.g., WiFi to cellular,
@@ -1211,13 +1273,8 @@ public actor SwiftFTR {
     // subsequent network change instead of being silently removed.
     cacheGeneration &+= 1
     cachedPublicIP = nil
-    let tracesToCancel = activeTraces
-    activeTraces.removeAll()
+    await cancelActiveTraces()
     await rdnsCache.clear()
-
-    for trace in tracesToCancel {
-      await trace.cancel()
-    }
 
     // Note: ASN cache could optionally be cleared too
   }

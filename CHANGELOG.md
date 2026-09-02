@@ -6,6 +6,13 @@ All notable changes to this project are documented here. This project follows Se
 Unreleased
 ----------
 
+### Added
+
+- `cancelActiveTraces()` cancels currently active traces without invalidating cached rDNS,
+  public IP, or ASN resolution.
+- `TraceOptions` and per-operation options on `trace(to:options:)` and `traceClassified(to:vpnContext:resolver:options:)`
+  permit overriding `maxHops` on individual traces without reconfiguring the actor.
+
 ### Tooling
 
 - Pull requests are now gated on the DocC documentation build: broken doc links and
