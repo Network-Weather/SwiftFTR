@@ -416,6 +416,8 @@ Fuzzing
 Documentation
 -------------
 - DocC bundle at `Sources/SwiftFTR/SwiftFTR.docc`.
+- [`BENCHMARKS.md`](BENCHMARKS.md) — measured throughput, memory and ASN-database load cost per release,
+  with the `ResourceBenchmark` and `asnloadprobe` commands that reproduce them (fresh as of 2026-09-01).
 - [`docs/IPV6.md`](docs/IPV6.md) — sequenced plan and architectural contracts for IPv6 feature parity (ping, traceroute, probes, STUN, ASN).
 - [`docs/BUG2-INVESTIGATION.md`](docs/BUG2-INVESTIGATION.md) — audit and measurements behind the bounded-and-cancellable-enrichment work: continuation exit paths, the shared blocking-IO executor, and what did and did not reproduce.
 

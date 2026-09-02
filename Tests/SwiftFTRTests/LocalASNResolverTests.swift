@@ -188,4 +188,110 @@ final class LocalASNResolverTests: XCTestCase {
     let tracer = SwiftFTR(config: config)
     XCTAssertNotNil(tracer)
   }
+
+  // MARK: - Shared Database Store Tests
+
+  /// Two resolvers for the same source load the database once and both answer from it.
+  func testSiblingResolversShareOneLoad() async throws {
+    let store = LocalASNDatabaseStore()
+    let first = LocalASNResolver(source: .embedded, store: store)
+    let second = LocalASNResolver(source: .embedded, store: store)
+
+    await first.preload()
+    await second.preload()
+
+    let loads = await store.loadCount
+    XCTAssertEqual(loads, 1, "Second resolver should reuse the first resolver's database")
+
+    let firstResult = try await first.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
+    let secondResult = try await second.resolve(ipv4Addrs: ["1.1.1.1"], timeout: 1.0)
+    XCTAssertEqual(firstResult["8.8.8.8"]?.asn, 15169)
+    XCTAssertEqual(secondResult["1.1.1.1"]?.asn, 13335)
+  }
+
+  /// Resolvers constructed and preloaded at the same time join one in-flight load.
+  func testConcurrentPreloadsCoalesceIntoOneLoad() async throws {
+    let store = LocalASNDatabaseStore()
+    let resolvers = (0..<8).map { _ in LocalASNResolver(source: .embedded, store: store) }
+
+    await withTaskGroup(of: Void.self) { group in
+      for resolver in resolvers {
+        group.addTask { await resolver.preload() }
+      }
+    }
+
+    let loads = await store.loadCount
+    XCTAssertEqual(loads, 1, "Eight concurrent preloads should share one load")
+    for resolver in resolvers {
+      let result = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
+      XCTAssertEqual(result["8.8.8.8"]?.asn, 15169)
+    }
+  }
+
+  /// The store holds databases weakly: once the last resolver goes away, the next one reloads.
+  func testDatabaseReleasedAfterLastResolverGoesAway() async throws {
+    let store = LocalASNDatabaseStore()
+
+    do {
+      let resolver = LocalASNResolver(source: .embedded, store: store)
+      await resolver.preload()
+      let resident = await store.isResident(.embedded)
+      XCTAssertTrue(resident, "Database should be resident while a resolver holds it")
+      withExtendedLifetime(resolver) {}
+    }
+
+    let residentAfterRelease = await store.isResident(.embedded)
+    XCTAssertFalse(residentAfterRelease, "Database should be released with its last resolver")
+
+    let again = LocalASNResolver(source: .embedded, store: store)
+    await again.preload()
+    let loads = await store.loadCount
+    XCTAssertEqual(loads, 2, "A resolver created after release should load again")
+  }
+
+  /// A failed load is not cached by the store, so a later resolver retries instead of inheriting it.
+  func testFailedLoadIsNotCachedByStore() async throws {
+    let store = LocalASNDatabaseStore()
+    let missing = LocalASNSource.bundled("/nonexistent/swiftftr-asn-test.ultra")
+
+    let first = LocalASNResolver(source: missing, store: store)
+    let firstResult = try await first.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
+    XCTAssertTrue(firstResult.isEmpty, "A resolver whose database failed to load answers nothing")
+
+    let second = LocalASNResolver(source: missing, store: store)
+    await second.preload()
+
+    let loads = await store.loadCount
+    XCTAssertEqual(loads, 2, "Each resolver should attempt the load; failures are not shared")
+    let resident = await store.isResident(missing)
+    XCTAssertFalse(resident)
+  }
+
+  /// Hybrid resolvers built for the same source share one database through the process-wide store.
+  func testHybridResolversShareOneLoad() async throws {
+    let first = HybridASNResolver(source: .embedded)
+    await first.preload()
+    let loadsBefore = await LocalASNDatabaseStore.shared.loadCount
+
+    let second = HybridASNResolver(source: .embedded)
+    await second.preload()
+    let loadsAfter = await LocalASNDatabaseStore.shared.loadCount
+
+    XCTAssertEqual(loadsAfter, loadsBefore, "Second hybrid resolver should not load again")
+    withExtendedLifetime(first) {}
+  }
+
+  /// Tracers built with the embedded strategy share one database through the process-wide store.
+  func testTracersShareOneEmbeddedDatabase() async throws {
+    let first = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: .embedded))
+    await first.preloadASNDatabase()
+    let loadsBefore = await LocalASNDatabaseStore.shared.loadCount
+
+    let second = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: .embedded))
+    await second.preloadASNDatabase()
+    let loadsAfter = await LocalASNDatabaseStore.shared.loadCount
+
+    XCTAssertEqual(loadsAfter, loadsBefore, "Second tracer should not load the database again")
+    withExtendedLifetime(first) {}
+  }
 }

@@ -29,7 +29,8 @@ public enum ASNResolverStrategy: Sendable {
   case dns
 
   /// Use embedded local database from SwiftIP2ASN package resources.
-  /// Fast (~10μs), works offline. Adds ~6MB memory footprint.
+  /// Fast (~10μs), works offline. The database is loaded once per process and shared by every
+  /// resolver that uses it; it costs about 50 MB of resident memory after load.
   case embedded
 
   /// Use remote database with optional bundled fallback.

@@ -29,9 +29,21 @@ Unreleased
   a cold DNS lookup against an unresponsive resolver stalls for 30 seconds, and callers that
   discard caches on a network change re-pay the cold path every time.
 
-  Costs ~6MB of memory for the database. Callers who want the old behavior can pass
-  `asnResolverStrategy: .dns`; those who want no network under any circumstances can pass
-  `.embedded`. Call `preloadASNDatabase()` early to move the first-load cost off the first trace.
+  One loaded database costs about 50 MB of resident memory, shared by every instance in the
+  process. Callers who want the old behavior can pass `asnResolverStrategy: .dns`; those who want
+  no network under any circumstances can pass `.embedded`. Call `preloadASNDatabase()` early to
+  move the first-load cost off the first trace.
+
+- **The local ASN database is loaded once per process and shared.** Every `LocalASNResolver`, and
+  so every `SwiftFTR` and `HybridASNResolver` built for the same source, reads one copy through
+  a process-wide store that also coalesces concurrent loads. Until now each instance decompressed
+  and held its own copy, and `preloadASNDatabase()` warmed only the instance it was called on.
+
+  Measured in a release build on Apple M4, 2026-09-01, with `swift run -c release asnloadprobe 8`:
+  constructing and preloading 16 tracers took the process from 6 MB to 508 MB resident at 56–62 ms
+  per tracer; it now reaches 57 MB after one 61 ms load, and every further tracer is free. The copy
+  is released when the last resolver using it goes away, so a host that wants it resident keeps one
+  instance alive. No API change.
 
 ### Dependencies
 
