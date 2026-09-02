@@ -174,6 +174,15 @@ public enum TracerouteError: Error, CustomStringConvertible {
 ///
 /// Values are retained by the initializer and validated when a throwing operation starts.
 /// Invalid values fail with ``TracerouteError/invalidConfiguration(reason:)``.
+///
+/// ## What each tracer instance owns
+///
+/// `interface`, `sourceIP`, `publicIP` and `maxHops` are fixed per instance, so a host that
+/// needs several binding contexts holds several `SwiftFTR` instances. Each instance owns its
+/// reverse-DNS cache, its cached public address and its set of active traces. The ASN state is
+/// shared across instances in the process: the local ASN database is loaded once per source and
+/// the DNS lookup cache is process-wide, so extra instances cost neither another database load
+/// nor another copy in memory.
 public struct SwiftFTRConfig: Sendable {
   /// Default budget for public-IP discovery (STUN, with DNS fallback), in seconds.
   ///
@@ -408,8 +417,12 @@ public actor SwiftFTR {
   /// Preload the ASN database for faster first classification.
   ///
   /// Only relevant when using `.embedded`, `.remote`, or `.hybrid` strategies.
-  /// Call this early in your app lifecycle to avoid the 35-40ms database load
-  /// latency on the first `traceClassified()` call.
+  /// Call this early in your app lifecycle to move the database load, tens of milliseconds
+  /// for the embedded database, off the first `traceClassified()` call.
+  ///
+  /// The database is shared: every tracer in the process built for the same source reads one
+  /// copy, so preloading through one instance also serves the others while it stays alive. The
+  /// copy is released when the last tracer using it goes away.
   ///
   /// Example:
   /// ```swift

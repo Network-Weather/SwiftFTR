@@ -68,7 +68,7 @@ let package = Package(
             name: "ResourceBenchmark",
             dependencies: ["SwiftFTR"],
             path: "Tests/TestSupport",
-            exclude: ["icmpv6probe", "ip2asnv6probe", "traceroute6probe"]
+            exclude: ["icmpv6probe", "ip2asnv6probe", "traceroute6probe", "asnloadprobe"]
         ),
         .executableTarget(
             name: "icmpv6probe",
@@ -79,6 +79,11 @@ let package = Package(
             name: "ip2asnv6probe",
             dependencies: [.product(name: "SwiftIP2ASN", package: "swift-ip2asn")],
             path: "Tests/TestSupport/ip2asnv6probe"
+        ),
+        .executableTarget(
+            name: "asnloadprobe",
+            dependencies: ["SwiftFTR"],
+            path: "Tests/TestSupport/asnloadprobe"
         ),
         .executableTarget(
             name: "traceroute6probe",
