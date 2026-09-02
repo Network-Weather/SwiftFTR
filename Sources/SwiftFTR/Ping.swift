@@ -210,7 +210,7 @@ struct PingExecutor: Sendable {
   /// Perform ping operation. Dispatches on the resolved destination's family —
   /// IPv4 via `IPPROTO_ICMP`, IPv6 via `IPPROTO_ICMPV6`. Each call allocates its
   /// own ephemeral socket, so concurrent `ping()` calls from a shared `SwiftFTR`
-  /// instance never share identifier/sequence space (NWX contract).
+  /// instance never share identifier/sequence space (downstream contract).
   func ping(to target: String, config: PingConfig) async throws -> PingResult {
     try config.validateForOperation()
     guard !Task.isCancelled else { throw TracerouteError.cancelled }
@@ -330,7 +330,7 @@ struct PingExecutor: Sendable {
             interface: iface, errno: errno, details: "Interface not found")
         }
         var index = ifaceIndex
-        // IP_BOUND_IF for v4, IPV6_BOUND_IF for v6 — same caller-visible semantics, NWX contract.
+        // IP_BOUND_IF for v4, IPV6_BOUND_IF for v6 — same caller-visible semantics, downstream contract.
         let level = (family == AF_INET6) ? IPPROTO_IPV6 : IPPROTO_IP
         let optname = (family == AF_INET6) ? IPV6_BOUND_IF : IP_BOUND_IF
         if setsockopt(sockfd, level, optname, &index, socklen_t(MemoryLayout<UInt32>.size)) < 0 {
@@ -384,24 +384,39 @@ struct PingExecutor: Sendable {
     }
   }
 
-  // Fileprivate to allow access from PingOperation. Sends to a pre-resolved
+  // Internal to allow access from PingOperation. Sends to a pre-resolved
   // sockaddr_storage rather than re-parsing a string each call.
-  fileprivate func sendPacket(
+  //
+  // The socket is non-blocking, so transient send-buffer pressure is retried
+  // within `pingSendRetryBudget` instead of dropping the packet. Returns the
+  // monotonic timestamp of the attempt that reached the wire, so the caller
+  // records a send time that excludes any waiting.
+  internal func sendPacket(
     sockfd: Int32, packet: [UInt8], to resolved: ResolvedHost
-  ) throws {
+  ) throws -> TimeInterval {
     var addr = resolved.address
-    let sent = withUnsafePointer(to: &addr) { destPtr in
-      destPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        packet.withUnsafeBytes { bufPtr in
-          sendto(
-            sockfd, bufPtr.baseAddress, packet.count, 0, sa, resolved.addressLen)
+    var sendTime: TimeInterval = 0
+    let sent = try sendRetryingTransientPressure(
+      sockfd: sockfd, deadline: monotonicNow() + pingSendRetryBudget
+    ) {
+      sendTime = monotonicTime()
+      return withUnsafePointer(to: &addr) { destPtr in
+        destPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+          packet.withUnsafeBytes { bufPtr in
+            sendto(
+              sockfd, bufPtr.baseAddress, packet.count, 0, sa, resolved.addressLen)
+          }
         }
       }
     }
     if sent != packet.count { throw TracerouteError.sendFailed(errno: errno) }
+    return sendTime
   }
 
-  fileprivate func monotonicTime() -> TimeInterval {
+  // Ping's own monotonic clock. Send and receive timestamps must both come from
+  // here so that RTTs subtract two readings of the same clock; `monotonicNow()`
+  // reads `CLOCK_MONOTONIC` and has a different epoch.
+  internal func monotonicTime() -> TimeInterval {
     var info = mach_timebase_info_data_t()
     mach_timebase_info(&info)
     let rawTime = TimeInterval(mach_absolute_time())
@@ -452,7 +467,7 @@ final class PingOperation: @unchecked Sendable {
   private let resolved: ResolvedHost
   private let config: PingConfig
   private let identifier: UInt16
-  private let sendPacket: @Sendable (Int32, [UInt8], ResolvedHost) throws -> Void
+  private let sendPacket: @Sendable (Int32, [UInt8], ResolvedHost) throws -> TimeInterval
   private let monotonicTime: @Sendable () -> TimeInterval
   private let closeSocket: @Sendable (Int32) -> Void
   private var family: Int32 { resolved.family }
@@ -499,7 +514,7 @@ final class PingOperation: @unchecked Sendable {
     resolved: ResolvedHost,
     config: PingConfig,
     identifier: UInt16,
-    sendPacket: @escaping @Sendable (Int32, [UInt8], ResolvedHost) throws -> Void,
+    sendPacket: @escaping @Sendable (Int32, [UInt8], ResolvedHost) throws -> TimeInterval,
     monotonicTime: @escaping @Sendable () -> TimeInterval,
     closeSocket: @escaping @Sendable (Int32) -> Void
   ) {
@@ -636,17 +651,17 @@ final class PingOperation: @unchecked Sendable {
         )
       }
 
-      // Capture sendTime on the serial queue, immediately before sendto, so it
-      // reflects what actually went on the wire rather than enqueue time.
+      // sendPacket runs on the serial queue and returns the monotonic timestamp
+      // of the attempt that reached the wire, so the recorded send time reflects
+      // what actually went out rather than enqueue time.
       queue.async {
         guard self.isRunning, self.descriptorState == .open else { return }
         do {
-          let sendTime = self.monotonicTime()
-          try self.sendPacket(self.sockfd, packet, self.resolved)
-          self.sentTimes[seq] = sendTime
+          self.sentTimes[seq] = try self.sendPacket(self.sockfd, packet, self.resolved)
         } catch {
-          // Send error (e.g. ENOBUFS): leave sentTimes[seq] unset so this
-          // packet is excluded from the sent count rather than reported as loss.
+          // A hard send failure, or buffer pressure that outlasted the retry
+          // budget: leave sentTimes[seq] unset so this packet is excluded from
+          // the sent count rather than reported as loss.
         }
       }
 

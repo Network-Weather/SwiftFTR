@@ -96,8 +96,9 @@ final class SwiftFTRICMPTests: XCTestCase {
     let ok = pkt.withUnsafeBytes { raw -> Bool in
       guard let parsed = __parseICMPMessage(buffer: raw, from: ss) else { return false }
       switch parsed.kind {
-      case .destinationUnreachable(let id, let seq):
-        return id == 0x1234 && seq == 0x5678
+      case .destinationUnreachable(let id, let seq, let code):
+        // Packet header above sets code 0x01 — host unreachable.
+        return id == 0x1234 && seq == 0x5678 && code == 1
       default:
         return false
       }

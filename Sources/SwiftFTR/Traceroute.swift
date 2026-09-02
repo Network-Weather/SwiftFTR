@@ -16,7 +16,20 @@ public struct TraceHop: Sendable {
   public let reachedDestination: Bool
   /// Hostname from reverse DNS lookup. `nil` if lookup disabled, failed, or timed out.
   public let hostname: String?
+  /// What actually happened at this hop.
+  ///
+  /// Authoritative where the other fields are derived. In particular it separates a router that
+  /// forwarded the probe onward from one that refused to route it — both of which report an
+  /// address and a round-trip time — and separates a probe that was never sent from one that drew
+  /// no answer, which otherwise look identical.
+  public let outcome: HopOutcome
 
+  /// Creates a hop, inferring ``outcome`` from the other fields.
+  ///
+  /// Retains the callable shape published before ``HopOutcome`` existed. A hop built this way
+  /// reports ``HopOutcome/replied`` when it has an address and ``HopOutcome/timedOut`` when it does
+  /// not; it never reports ``HopOutcome/unreachable(code:)`` or ``HopOutcome/notSent(errno:)``, which cannot be
+  /// recovered from these fields. Prefer the initializer that takes an explicit outcome.
   public init(
     ttl: Int,
     ipAddress: String?,
@@ -24,11 +37,29 @@ public struct TraceHop: Sendable {
     reachedDestination: Bool,
     hostname: String? = nil
   ) {
+    self.init(
+      ttl: ttl,
+      ipAddress: ipAddress,
+      rtt: rtt,
+      reachedDestination: reachedDestination,
+      hostname: hostname,
+      outcome: ipAddress == nil ? .timedOut : .replied)
+  }
+
+  public init(
+    ttl: Int,
+    ipAddress: String?,
+    rtt: TimeInterval?,
+    reachedDestination: Bool,
+    hostname: String? = nil,
+    outcome: HopOutcome
+  ) {
     self.ttl = ttl
     self.ipAddress = ipAddress
     self.rtt = rtt
     self.reachedDestination = reachedDestination
     self.hostname = hostname
+    self.outcome = outcome
   }
 
 }
@@ -144,6 +175,20 @@ public enum TracerouteError: Error, CustomStringConvertible {
 /// Values are retained by the initializer and validated when a throwing operation starts.
 /// Invalid values fail with ``TracerouteError/invalidConfiguration(reason:)``.
 public struct SwiftFTRConfig: Sendable {
+  /// Default budget for public-IP discovery (STUN, with DNS fallback), in seconds.
+  ///
+  /// The per-socket timeouts inside discovery do not cover resolving each STUN hostname, and the
+  /// server list is walked serially, so the enclosing call needs a bound of its own. Sized to admit
+  /// a slow-but-working discovery while staying well below any plausible caller watchdog.
+  public static let defaultPublicIPDiscoveryTimeout: TimeInterval = 6.0
+
+  /// Default budget for a single reverse-DNS lookup, in seconds.
+  ///
+  /// Lookups run concurrently, so this bounds the reverse-DNS phase as a whole rather than being
+  /// paid once per hop — which is why it can afford to be generous toward slow-but-working
+  /// resolvers.
+  public static let defaultRDNSLookupTimeout: TimeInterval = 5.0
+
   /// Maximum TTL/hops to probe (default: 40)
   public let maxHops: Int
   /// Maximum wait time per probe in milliseconds (default: 1000ms)
@@ -164,6 +209,21 @@ public struct SwiftFTRConfig: Sendable {
   public let rdnsCacheTTL: TimeInterval?
   /// Maximum rDNS cache size (default: 1000 entries)
   public let rdnsCacheSize: Int?
+  /// How long a single reverse-DNS lookup may take before the trace gives up on it.
+  ///
+  /// Reverse DNS runs through `getnameinfo`, which consults the system resolver and has no timeout
+  /// parameter of its own; an unanswered query holds it for 30 seconds. Hops whose lookup exceeds
+  /// this budget report numerically instead. Lookups run concurrently, so this bounds the whole
+  /// reverse-DNS phase rather than costing this much per hop.
+  ///
+  /// Raise it on links whose legitimate resolver latency is high. `nil` uses the default of 5s.
+  public let rdnsLookupTimeout: TimeInterval?
+  /// How long public-IP discovery (STUN, with DNS fallback) may take before the trace gives up.
+  ///
+  /// This bounds the whole discovery, including resolving each STUN hostname — which the
+  /// per-socket timeouts inside discovery do not cover. Classification proceeds without a public
+  /// address when it elapses. `nil` uses the default of 6s.
+  public let publicIPDiscoveryTimeout: TimeInterval?
   /// Default BSD interface name for operations that support binding.
   /// If nil, those operations use system routing.
   public let interface: String?
@@ -204,10 +264,16 @@ public struct SwiftFTRConfig: Sendable {
   /// Defaults to `.dns` (Team Cymru DNS) for backward compatibility.
   ///
   /// Options:
-  /// - `.dns`: DNS-based lookups (default, always current, requires network)
-  /// - `.embedded`: Local database from SwiftIP2ASN (~10μs lookups, +6MB memory)
+  /// - `.hybrid(source, fallbackTimeout:)`: **Default.** Local database first, DNS only for
+  ///   addresses it does not cover. Costs ~6MB of memory for the embedded database and removes
+  ///   the network from the common path, which matters because a caller that discards caches on
+  ///   a network change re-pays the cold path every time — and a cold DNS lookup against an
+  ///   unresponsive resolver stalls for 30 seconds.
+  /// - `.dns`: DNS-based lookups via Team Cymru. No memory cost, but every uncached address is a
+  ///   network round trip, and enrichment is only as reliable as the resolver.
+  /// - `.embedded`: Local database only (~10μs lookups, +6MB memory). No network at any point;
+  ///   an address the database does not cover simply has no ASN.
   /// - `.remote(bundledPath:url:)`: Remote database with optional offline fallback
-  /// - `.hybrid(source, fallbackTimeout:)`: Local first, DNS fallback for missing
   ///
   /// Example:
   /// ```swift
@@ -238,10 +304,14 @@ public struct SwiftFTRConfig: Sendable {
   ///   - noReverseDNS: Disable reverse DNS lookups (default: false)
   ///   - rdnsCacheTTL: TTL for rDNS cache entries in seconds (default: 86400 = 1 day)
   ///   - rdnsCacheSize: Maximum rDNS cache size (default: 1000 entries)
+  ///   - rdnsLookupTimeout: Per-lookup reverse-DNS budget in seconds (default: 5). Bounds the
+  ///     reverse-DNS phase as a whole, since lookups run concurrently.
+  ///   - publicIPDiscoveryTimeout: Budget for public-IP discovery in seconds (default: 6)
   ///   - interface: BSD interface name returned by ``NetworkInterfaceDiscovery``. If nil, uses system routing.
   ///   - sourceIP: Source address reported on the selected interface. It must match the
   ///     destination family. If nil, the system chooses an address.
-  ///   - asnResolverStrategy: Strategy for ASN lookups during classification (default: .dns)
+  ///   - asnResolverStrategy: Strategy for ASN lookups during classification
+  ///     (default: `.hybrid(.embedded)`)
   ///   - preferredFamily: IP family preference for resolution (default: .auto)
   public init(
     maxHops: Int = 40,
@@ -252,9 +322,11 @@ public struct SwiftFTRConfig: Sendable {
     noReverseDNS: Bool = false,
     rdnsCacheTTL: TimeInterval? = nil,
     rdnsCacheSize: Int? = nil,
+    rdnsLookupTimeout: TimeInterval? = nil,
+    publicIPDiscoveryTimeout: TimeInterval? = nil,
     interface: String? = nil,
     sourceIP: String? = nil,
-    asnResolverStrategy: ASNResolverStrategy = .dns,
+    asnResolverStrategy: ASNResolverStrategy = .hybrid(.embedded),
     preferredFamily: PreferredFamily = .auto
   ) {
     self.maxHops = maxHops
@@ -265,6 +337,8 @@ public struct SwiftFTRConfig: Sendable {
     self.noReverseDNS = noReverseDNS
     self.rdnsCacheTTL = rdnsCacheTTL
     self.rdnsCacheSize = rdnsCacheSize
+    self.rdnsLookupTimeout = rdnsLookupTimeout
+    self.publicIPDiscoveryTimeout = publicIPDiscoveryTimeout
     self.interface = interface
     self.sourceIP = sourceIP
     self.asnResolverStrategy = asnResolverStrategy
@@ -311,7 +385,8 @@ public actor SwiftFTR {
     self.config = config
     self.rdnsCache = RDNSCache(
       ttl: config.cacheTTLForConstruction,
-      maxSize: config.cacheSizeForConstruction
+      maxSize: config.cacheSizeForConstruction,
+      lookupDeadline: config.rdnsLookupTimeoutForConstruction
     )
     self.asnResolver = Self.createResolver(for: config.asnResolverStrategy)
   }
@@ -533,21 +608,30 @@ public actor SwiftFTR {
     if config.enableLogging {
       print("[SwiftFTR] Streaming trace: sending \(maxHops) probes...")
     }
-    for ttl in 1...maxHops {
-      try setTraceHopLimit(sockfd: fd, family: resolved.family, ttl: ttl)
-      let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
-      let sentAt = monotonicNow()
-      try sendTraceProbe(
-        sockfd: fd, resolved: resolved, identifier: identifier,
-        sequence: seq, payloadSize: payloadSize)
-      outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
-    }
+    let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
+    let unsentTTLs = try sendTraceBurst(
+      sockfd: fd, resolved: resolved, identifier: identifier, maxHops: maxHops,
+      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, outstanding: &outstanding)
 
     // Collect responses via DispatchSourceRead with retry support.
     if config.enableLogging {
       print(
         "[SwiftFTR] Streaming trace: timeout \(streamConfig.probeTimeout)s, retry after \(streamConfig.retryAfter.map { "\($0)s" } ?? "disabled")"
       )
+    }
+
+    // Probes that never left the host are known now, not at the deadline, so report them
+    // immediately. A consumer that sees only the hops that answered cannot tell a router that
+    // ignored us from a probe we never sent.
+    for ttl in unsentTTLs.keys.sorted() {
+      guard let code = unsentTTLs[ttl] else { continue }
+      if !yield(
+        StreamingHop(
+          ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false,
+          outcome: .notSent(errno: code)))
+      {
+        return
+      }
     }
 
     let streamOperation = StreamingTraceReceiveOperation(
@@ -679,15 +763,10 @@ public actor SwiftFTR {
     if config.enableLogging {
       print("[SwiftFTR] Sending \(maxHops) probes...")
     }
-    for ttl in 1...maxHops {
-      try setTraceHopLimit(sockfd: fd, family: resolved.family, ttl: ttl)
-      let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
-      let sentAt = monotonicNow()
-      try sendTraceProbe(
-        sockfd: fd, resolved: resolved, identifier: identifier,
-        sequence: seq, payloadSize: payloadSize)
-      outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
-    }
+    let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
+    let unsentTTLs = try sendTraceBurst(
+      sockfd: fd, resolved: resolved, identifier: identifier, maxHops: maxHops,
+      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, outstanding: &outstanding)
 
     // Collect responses via DispatchSourceRead (kqueue-backed on macOS).
     // All probes are already in-flight; we wait for responses until the deadline
@@ -734,12 +813,16 @@ public actor SwiftFTR {
     var hops = receiveResult.hops
     let reachedTTL = receiveResult.reachedTTL
 
-    // Finalize hops: mark unresolved up to reachedTTL (or max) as timeouts
+    // Finalize hops up to reachedTTL (or max). A TTL whose probe never left the host is reported
+    // as such rather than as a timeout: both render without an address, but only one of them means
+    // the network stayed silent.
     let cutoff = reachedTTL ?? maxHops
     for ttl in 1...cutoff {
       let idx = ttl - 1
       if hops[idx] == nil {
-        hops[idx] = TraceHop(ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false)
+        hops[idx] = TraceHop(
+          ttl: ttl, ipAddress: nil, rtt: nil, reachedDestination: false,
+          outcome: unsentTTLs[ttl].map { .notSent(errno: $0) } ?? .timedOut)
       }
     }
 
@@ -761,7 +844,8 @@ public actor SwiftFTR {
           ipAddress: hop.ipAddress,
           rtt: hop.rtt,
           reachedDestination: hop.reachedDestination,
-          hostname: hop.ipAddress.flatMap { hostnames[$0] }
+          hostname: hop.ipAddress.flatMap { hostnames[$0] },
+          outcome: hop.outcome
         )
       }
     }
@@ -816,9 +900,16 @@ public actor SwiftFTR {
       }
     }
 
+    // Each enrichment step submits blocking work to a shared, bounded executor. Checking
+    // cancellation between steps keeps a cancelled trace from queueing work whose result nobody
+    // will read, and returns the caller promptly rather than at the end of the pipeline.
+    try Task.checkCancellation()
+
     let effectivePublicIP = await effectivePublicIPForClassification {
       try? await self.discoverPublicIP()
     }
+
+    try Task.checkCancellation()
 
     // Perform base trace (includes rDNS if enabled)
     let tr = try await trace(to: host)
@@ -832,6 +923,8 @@ public actor SwiftFTR {
     var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
     allIPs.insert(destIP)
     if let pip = effectivePublicIP { allIPs.insert(pip) }
+
+    try Task.checkCancellation()
 
     // Get hostnames (either from trace or via rDNS)
     var hostnameMap: [String: String] = [:]
@@ -870,7 +963,8 @@ public actor SwiftFTR {
       interface: config.interface,
       sourceIP: config.sourceIP,
       vpnContext: effectiveVPNContext,
-      enableLogging: config.enableLogging
+      enableLogging: config.enableLogging,
+      publicIPDiscoveryTimeout: config.publicIPDiscoveryTimeoutForOperation
     )
 
     // Enhance classified result with hostnames
@@ -884,7 +978,8 @@ public actor SwiftFTR {
         category: hop.category,
         hostname: hop.ip.flatMap {
           hostnameMap[$0] ?? tr.hops.first { $0.ipAddress == hop.ip }?.hostname
-        }
+        },
+        outcome: hop.outcome
       )
     }
 
@@ -992,7 +1087,10 @@ public actor SwiftFTR {
     let interface = config.interface
     let sourceIP = config.sourceIP
     let enableLogging = config.enableLogging
-    return try await runDetachedBlockingIO {
+    // `stunTimeout` and `dnsTimeout` bound the socket waits, not the `getaddrinfo` that resolves
+    // each STUN hostname first. That call holds its worker for 30 seconds against an unresponsive
+    // resolver, and the server list is walked serially, so discovery needs a bound of its own.
+    return try await runDetachedBlockingIO(deadline: config.publicIPDiscoveryTimeoutForOperation) {
       try getPublicIPv4(
         stunTimeout: 2.0,
         dnsTimeout: 3.0,
@@ -1224,11 +1322,59 @@ internal func bindTraceSourceIP(
   }
 }
 
+/// Sends one probe per TTL, tolerating probes that transient send pressure kept off the wire.
+///
+/// A probe whose send fails with a transient errno past the shared retry budget is recorded rather
+/// than aborting the burst: the caller renders that TTL as ``HopOutcome/notSent(errno:)``, which a
+/// consumer can tell apart from a router that simply did not answer. Losing one hop of a topology
+/// beats losing the topology.
+///
+/// Any other errno still throws immediately — callers map `EHOSTUNREACH`, `ENETDOWN`,
+/// `ENETUNREACH` and `EACCES` to states they act on, and delaying those delays the diagnosis.
+/// A burst where *no* probe reached the wire also throws: a result full of holes would claim we
+/// measured something when we measured nothing.
+///
+/// - Returns: TTLs that never left the host, mapped to the errno that stopped them.
+internal func sendTraceBurst(
+  sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, maxHops: Int, payloadSize: Int,
+  retryDeadline: TimeInterval, outstanding: inout [UInt16: TraceSendInfo]
+) throws -> [Int: Int32] {
+  var unsent: [Int: Int32] = [:]
+  var lastTransientError: Error?
+
+  for ttl in 1...maxHops {
+    try setTraceHopLimit(sockfd: sockfd, family: resolved.family, ttl: ttl)
+    let seq: UInt16 = UInt16(truncatingIfNeeded: ttl)
+    let sentAt = monotonicNow()
+    do {
+      try sendTraceProbe(
+        sockfd: sockfd, resolved: resolved, identifier: identifier,
+        sequence: seq, payloadSize: payloadSize, retryDeadline: retryDeadline)
+      outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
+    } catch let error as TracerouteError {
+      guard case .sendFailed(let code) = error, isTransientSendErrno(code) else { throw error }
+      unsent[ttl] = code
+      lastTransientError = error
+    }
+  }
+
+  if outstanding.isEmpty, let lastTransientError {
+    throw lastTransientError
+  }
+  return unsent
+}
+
 /// Family-aware ICMP send: v4 uses `makeICMPEchoRequest`, v6 uses
 /// `makeICMPv6EchoRequest`. Caller resolves destination via `resolveHost`.
+///
+/// The trace socket is non-blocking, so `sendto` reports transient buffer
+/// pressure rather than waiting. `retryDeadline` is the monotonic timestamp past
+/// which such a send gives up; callers compute one deadline per burst and pass
+/// the same value to every probe in it, so the whole burst shares a single
+/// bounded budget. Non-transient errnos propagate on the first attempt.
 internal func sendTraceProbe(
   sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, sequence: UInt16,
-  payloadSize: Int
+  payloadSize: Int, retryDeadline: TimeInterval
 ) throws {
   let packet: [UInt8]
   if resolved.family == AF_INET6 {
@@ -1239,14 +1385,15 @@ internal func sendTraceProbe(
       identifier: identifier, sequence: sequence, payloadSize: payloadSize)
   }
   var addr = resolved.address
-  let sent = packet.withUnsafeBytes { raw in
-    withUnsafePointer(to: &addr) { ap -> ssize_t in
-      ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
+  _ = try sendRetryingTransientPressure(sockfd: sockfd, deadline: retryDeadline) {
+    packet.withUnsafeBytes { raw in
+      withUnsafePointer(to: &addr) { ap -> ssize_t in
+        ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+          sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
+        }
       }
     }
   }
-  if sent < 0 { throw TracerouteError.sendFailed(errno: errno) }
 }
 
 /// Family-aware receive that yields a parsed ICMP/ICMPv6 message and the
@@ -1321,7 +1468,7 @@ private struct TraceReceiveResult {
 }
 
 /// Shared send info for probe tracking.
-private struct TraceSendInfo {
+internal struct TraceSendInfo {
   let ttl: Int
   let sentAt: TimeInterval
 }
@@ -1469,14 +1616,15 @@ private final class TraceReceiveOperation: @unchecked Sendable {
           }
         }
 
-      case .destinationUnreachable(let originalID, let originalSeq):
+      case .destinationUnreachable(let originalID, let originalSeq, let code):
         guard originalID == nil || originalID == identifier else { continue }
         if let seq = originalSeq, let info = outstanding.removeValue(forKey: seq) {
           let hopIndex = min(max(info.ttl - 1, 0), maxHops - 1)
           let rtt = monotonicNow() - info.sentAt
           if hops[hopIndex] == nil {
             hops[hopIndex] = TraceHop(
-              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false)
+              ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false,
+              outcome: .unreachable(code: code))
           }
         }
 
@@ -1700,10 +1848,12 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
           if !emitIntermediateHop(seq: seq, parsed: parsed) { return }
         }
 
-      case .destinationUnreachable(let originalID, let originalSeq):
+      case .destinationUnreachable(let originalID, let originalSeq, let code):
         guard originalID == nil || originalID == identifier else { continue }
         if let seq = originalSeq {
-          if !emitIntermediateHop(seq: seq, parsed: parsed) { return }
+          if !emitIntermediateHop(seq: seq, parsed: parsed, outcome: .unreachable(code: code)) {
+            return
+          }
         }
 
       case .other:
@@ -1727,7 +1877,9 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     }
   }
 
-  private func emitIntermediateHop(seq: UInt16, parsed: ParsedICMP) -> Bool {
+  private func emitIntermediateHop(
+    seq: UInt16, parsed: ParsedICMP, outcome: HopOutcome = .replied
+  ) -> Bool {
     guard let info = outstanding[seq] else { return true }
     if let destTTL = reachedTTL, info.ttl > destTTL { return true }
     if receivedTTLs.contains(info.ttl) { return true }
@@ -1737,7 +1889,8 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     guard
       yieldHop(
         StreamingHop(
-          ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false))
+          ttl: info.ttl, ipAddress: parsed.sourceAddress, rtt: rtt, reachedDestination: false,
+          outcome: outcome))
     else {
       cancel()
       return false
@@ -1766,6 +1919,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       )
     }
 
+    let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
     for ttl in missingTTLs {
       do {
         try setTraceHopLimit(sockfd: sockfd, family: family, ttl: ttl)
@@ -1777,7 +1931,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       do {
         try sendTraceProbe(
           sockfd: sockfd, resolved: resolved, identifier: identifier,
-          sequence: seq, payloadSize: payloadSize)
+          sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
         outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
       } catch {
         // Best-effort retry — silently skip if send fails (will time out instead).

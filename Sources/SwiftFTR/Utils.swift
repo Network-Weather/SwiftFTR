@@ -45,7 +45,7 @@ func ipString(_ sin: sockaddr_in) -> String {
 /// `scopeID != 0` so link-local addresses round-trip as `fe80::1%interface-name` rather than
 /// losing their zone (which would collide on string keys across interfaces).
 ///
-/// Downstream contract (NWX): every address SwiftFTR emits goes through this
+/// Downstream contract: every address SwiftFTR emits goes through this
 /// formatter so that `String → resolve → String` is stable for any input.
 @inline(__always)
 func ipv6String(_ addr: in6_addr, scopeID: UInt32 = 0) -> String {
@@ -245,16 +245,9 @@ public func reverseIPv6Nibbles(_ ip: String) -> String? {
 /// Returns true if the IPv4 string is in RFC1918 private or 169.254/16 link-local space.
 @inline(__always)
 public func isPrivateIPv4(_ ip: String) -> Bool {
-  // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, link-local 169.254/16
-  let parts = ip.split(separator: ".").compactMap { Int($0) }
-  guard parts.count == 4 else { return false }
-  let a = parts[0]
-  let b = parts[1]
-  if a == 10 { return true }
-  if a == 172 && (16...31).contains(b) { return true }
-  if a == 192 && b == 168 { return true }
-  if a == 169 && b == 254 { return true }
-  return false
+  guard detectAddressFamily(ip) == AF_INET else { return false }
+  guard let scope = ParsedIPAddress(ip)?.scope else { return false }
+  return scope == .privateNetwork || scope == .linkLocal
 }
 
 /// Returns true if the IPv4 string is in RFC6598 CGNAT range (100.64.0.0/10).
@@ -263,12 +256,8 @@ public func isPrivateIPv4(_ ip: String) -> Bool {
 /// Use `VPNContext` to distinguish between them during classification.
 @inline(__always)
 public func isCGNATIPv4(_ ip: String) -> Bool {
-  // 100.64.0.0/10
-  let parts = ip.split(separator: ".").compactMap { Int($0) }
-  guard parts.count == 4 else { return false }
-  let a = parts[0]
-  let b = parts[1]
-  return a == 100 && (64...127).contains(b)
+  guard detectAddressFamily(ip) == AF_INET else { return false }
+  return ParsedIPAddress(ip)?.scope == .carrierGradeNAT
 }
 
 typealias NameInfoLookup = (
@@ -374,11 +363,50 @@ extension TaskPriority {
   }
 }
 
+/// Raised when a blocking operation outlives the deadline its caller supplied.
+///
+/// The caller is resumed; the underlying syscall keeps running on its executor worker until it
+/// returns on its own. Callers that can degrade (reverse DNS, public-IP discovery) should treat
+/// this as "no answer" rather than as a trace failure.
+struct BlockingIOTimeout: Error {}
+
+/// Guards a checked continuation so exactly one of the competing outcomes — the operation
+/// finishing, the caller being cancelled, or the deadline elapsing — resumes it.
+///
+/// The losers of that race observe `hasResumed` and drop their result. This is what allows the
+/// executor to honor cancellation without reintroducing the double-resume or stranded-continuation
+/// hazards that a private, uncancellable queue avoided by construction.
+private final class ContinuationBox<T: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<T, Error>?
+
+  init(_ continuation: CheckedContinuation<T, Error>) {
+    self.continuation = continuation
+  }
+
+  /// Resumes the continuation if no other outcome has claimed it. Returns whether this call won.
+  @discardableResult
+  func resume(with result: Result<T, Error>) -> Bool {
+    lock.lock()
+    guard let claimed = continuation else {
+      lock.unlock()
+      return false
+    }
+    continuation = nil
+    lock.unlock()
+    claimed.resume(with: result)
+    return true
+  }
+}
+
 /// A bounded bridge from Swift concurrency to synchronous system calls.
 ///
 /// `OperationQueue` retains pending operations but submits no more than the configured number to
-/// its Dispatch-backed workers. The queue is private so no caller can cancel a queued operation and
-/// strand its checked continuation.
+/// its Dispatch-backed workers.
+///
+/// Cancelling the calling task removes the operation if it has not started, and resumes the caller
+/// promptly either way. A syscall already in flight still runs to completion on its worker — the
+/// caller stops waiting for it, but the executor slot is not reclaimed until it returns.
 final class BlockingIOExecutor: Sendable {
   private let operationQueue: OperationQueue
 
@@ -392,22 +420,123 @@ final class BlockingIOExecutor: Sendable {
     self.operationQueue = operationQueue
   }
 
+  /// - Parameter deadline: Seconds the caller will wait before abandoning the operation with
+  ///   ``BlockingIOTimeout``. `nil` waits for as long as the syscall takes.
   func run<T: Sendable>(
     priority: TaskPriority,
+    deadline: TimeInterval? = nil,
     _ operation: @Sendable @escaping () throws -> T
   ) async throws -> T {
-    try await withCheckedThrowingContinuation { continuation in
-      let queuedOperation = BlockOperation {
-        do {
-          continuation.resume(returning: try operation())
-        } catch {
-          continuation.resume(throwing: error)
+    let queuedOperation = BlockOperation()
+    let deadlineTimer = DeadlineTimerBox()
+
+    return try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+        let box = ContinuationBox(continuation)
+
+        queuedOperation.addExecutionBlock {
+          // A cancelled operation that already started still runs its block; skip the syscall
+          // rather than paying for work whose result nobody can observe.
+          guard !queuedOperation.isCancelled else {
+            box.resume(with: .failure(CancellationError()))
+            return
+          }
+          box.resume(with: Result { try operation() })
+          deadlineTimer.cancel()
         }
+        queuedOperation.qualityOfService = priority.blockingIOQualityOfService
+        queuedOperation.queuePriority = priority.blockingIOQueuePriority
+
+        // Losing a cancellation race before submission must not strand the continuation.
+        guard !Task.isCancelled else {
+          box.resume(with: .failure(CancellationError()))
+          return
+        }
+
+        if let deadline {
+          deadlineTimer.arm(after: deadline) {
+            if box.resume(with: .failure(BlockingIOTimeout())) {
+              queuedOperation.cancel()
+            }
+          }
+        }
+
+        cancellationBridge.register(queuedOperation, box: box)
+        operationQueue.addOperation(queuedOperation)
       }
-      queuedOperation.qualityOfService = priority.blockingIOQualityOfService
-      queuedOperation.queuePriority = priority.blockingIOQueuePriority
-      operationQueue.addOperation(queuedOperation)
+    } onCancel: {
+      queuedOperation.cancel()
+      deadlineTimer.cancel()
+      cancellationBridge.cancel(queuedOperation)
     }
+  }
+}
+
+/// Bridges the synchronous `onCancel` handler to the type-erased continuation it must resume.
+///
+/// `onCancel` cannot name the generic `ContinuationBox<T>` of the call it belongs to, so each
+/// in-flight operation registers a type-erased resume closure here for the duration of its run.
+private final class BlockingIOCancellationBridge: @unchecked Sendable {
+  private let lock = NSLock()
+  private var pending: [ObjectIdentifier: @Sendable () -> Void] = [:]
+
+  func register<T: Sendable>(_ operation: Operation, box: ContinuationBox<T>) {
+    let key = ObjectIdentifier(operation)
+    lock.lock()
+    pending[key] = { box.resume(with: .failure(CancellationError())) }
+    lock.unlock()
+    operation.completionBlock = { [weak self] in
+      self?.forget(key)
+    }
+  }
+
+  func cancel(_ operation: Operation) {
+    let key = ObjectIdentifier(operation)
+    lock.lock()
+    let resume = pending.removeValue(forKey: key)
+    lock.unlock()
+    resume?()
+  }
+
+  private func forget(_ key: ObjectIdentifier) {
+    lock.lock()
+    pending.removeValue(forKey: key)
+    lock.unlock()
+  }
+}
+
+private let cancellationBridge = BlockingIOCancellationBridge()
+
+/// Holds the timer backing a `deadline`, so both the operation completing and the caller being
+/// cancelled can stop it without leaking a pending timer per call.
+private final class DeadlineTimerBox: @unchecked Sendable {
+  private let lock = NSLock()
+  private var timer: DispatchSourceTimer?
+  private var isCancelled = false
+
+  func arm(after seconds: TimeInterval, _ fire: @escaping @Sendable () -> Void) {
+    let source = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+    source.schedule(deadline: .now() + seconds)
+    source.setEventHandler(handler: fire)
+
+    lock.lock()
+    if isCancelled {
+      lock.unlock()
+      source.cancel()
+      return
+    }
+    timer = source
+    lock.unlock()
+    source.resume()
+  }
+
+  func cancel() {
+    lock.lock()
+    let source = timer
+    timer = nil
+    isCancelled = true
+    lock.unlock()
+    source?.cancel()
   }
 }
 
@@ -419,14 +548,19 @@ private let blockingIOExecutor = BlockingIOExecutor(
 /// Runs a blocking syscall (socket I/O, STUN, legacy DNS clients) on a bounded Dispatch-backed
 /// executor rather than Swift's cooperative executor.
 ///
-/// Cancellation neither removes a queued operation nor interrupts a synchronous syscall once it
-/// has started. After submission, cancelling the caller therefore does not resume it early: the
-/// caller remains suspended until the operation finishes, preserving single ownership of the
-/// operation's result and exact-once continuation resumption. Callers should pass lightweight
-/// closures that capture only the values required by the syscall.
+/// Cancelling the calling task removes the operation if it has not started, and resumes the caller
+/// with `CancellationError` either way. A syscall already in flight runs to completion on its
+/// worker: the caller stops waiting, but the executor slot is held until it returns. Bound anything
+/// that can stall — an unresponsive resolver holds `getaddrinfo` and `getnameinfo` for 30 seconds —
+/// with `deadline`, and prefer degrading over waiting.
+///
+/// Callers should pass lightweight closures that capture only the values required by the syscall.
+///
+/// - Parameter deadline: Seconds to wait before abandoning the operation with ``BlockingIOTimeout``.
 func runDetachedBlockingIO<T: Sendable>(
   priority: TaskPriority = .userInitiated,
+  deadline: TimeInterval? = nil,
   _ operation: @Sendable @escaping () throws -> T
 ) async throws -> T {
-  try await blockingIOExecutor.run(priority: priority, operation)
+  try await blockingIOExecutor.run(priority: priority, deadline: deadline, operation)
 }

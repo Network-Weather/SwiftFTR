@@ -20,7 +20,15 @@ public struct ClassifiedHop: Sendable, Codable {
   public let category: HopCategory
   /// Hostname from reverse DNS lookup
   public let hostname: String?
+  /// What actually happened at this hop. See ``HopOutcome``.
+  ///
+  /// Carries through from the underlying ``TraceHop``, so a hop refused by a router is
+  /// distinguishable from one that forwarded the probe on, and both from one never sent.
+  public let outcome: HopOutcome
 
+  /// Creates a classified hop, inferring ``outcome`` from the other fields.
+  ///
+  /// Retains the callable shape published before ``HopOutcome`` existed.
   public init(
     ttl: Int,
     ip: String?,
@@ -30,6 +38,21 @@ public struct ClassifiedHop: Sendable, Codable {
     category: HopCategory,
     hostname: String? = nil
   ) {
+    self.init(
+      ttl: ttl, ip: ip, rtt: rtt, asn: asn, asName: asName, category: category,
+      hostname: hostname, outcome: ip == nil ? .timedOut : .replied)
+  }
+
+  public init(
+    ttl: Int,
+    ip: String?,
+    rtt: TimeInterval?,
+    asn: Int?,
+    asName: String?,
+    category: HopCategory,
+    hostname: String? = nil,
+    outcome: HopOutcome
+  ) {
     self.ttl = ttl
     self.ip = ip
     self.rtt = rtt
@@ -37,6 +60,7 @@ public struct ClassifiedHop: Sendable, Codable {
     self.asName = asName
     self.category = category
     self.hostname = hostname
+    self.outcome = outcome
   }
 }
 
@@ -178,7 +202,9 @@ public struct TraceClassifier: Sendable {
   ///   - interface: Network interface to use for STUN discovery (if needed).
   ///   - sourceIP: Source IP address to bind to for STUN discovery (if needed).
   ///   - vpnContext: Context for VPN-aware classification (optional).
-  ///   - enableLogging: Enable verbose logging for debugging.
+  ///   - enableLogging: Enable verbose logging for debugging
+  ///   - publicIPDiscoveryTimeout: Budget for discovering the public address when `publicIP` is
+  ///     not supplied. Classification proceeds without one when it elapses..
   /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
   public func classify(
     trace: TraceResult,
@@ -189,7 +215,8 @@ public struct TraceClassifier: Sendable {
     interface: String? = nil,
     sourceIP: String? = nil,
     vpnContext: VPNContext? = nil,
-    enableLogging: Bool = false
+    enableLogging: Bool = false,
+    publicIPDiscoveryTimeout: TimeInterval = SwiftFTRConfig.defaultPublicIPDiscoveryTimeout
   ) async throws -> ClassifiedTrace {
     // Gather IPs
     let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
@@ -202,11 +229,19 @@ public struct TraceClassifier: Sendable {
       // Try to discover public IP (STUN with DNS fallback) if not provided.
       // Must run off the cooperative pool to avoid deadlocking callers that
       // are already actor-isolated (e.g. SwiftFTR.traceClassified).
-      if let pub = try? await runDetachedBlockingIO({
-        try getPublicIPv4(
-          stunTimeout: 0.8, dnsTimeout: 2.0,
-          interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
-      }) {
+      //
+      // The deadline covers resolving the STUN hostnames, which the per-socket timeouts below do
+      // not: `getaddrinfo` holds its worker for 30 seconds against an unresponsive resolver, and
+      // the server list is walked serially. Classification degrades without a public IP, so a
+      // timeout here costs enrichment detail rather than the trace.
+      if let pub = try? await runDetachedBlockingIO(
+        deadline: publicIPDiscoveryTimeout,
+        {
+          try getPublicIPv4(
+            stunTimeout: 0.8, dnsTimeout: 2.0,
+            interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+        })
+      {
         resolvedPublicIP = pub.ip
         allIPs.insert(pub.ip)
       }
@@ -327,7 +362,8 @@ public struct TraceClassifier: Sendable {
           asn: asn,
           asName: name,
           category: cat,
-          hostname: hop.hostname
+          hostname: hop.hostname,
+          outcome: hop.outcome
         )
       )
     }
@@ -369,7 +405,8 @@ public struct TraceClassifier: Sendable {
                   asn: fillASN,
                   asName: fillName,
                   category: cat,
-                  hostname: hop.hostname
+                  hostname: hop.hostname,
+                  outcome: hop.outcome
                 )
               }
             }

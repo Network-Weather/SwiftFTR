@@ -3,6 +3,165 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Tooling
+
+- Pull requests are now gated on the DocC documentation build: broken doc links and
+  documentation warnings fail CI instead of surfacing at release time.
+
+### Behavior changes
+
+- `isPrivateIPv4(_:)` and `isCGNATIPv4(_:)` now validate addresses with the same strict,
+  byte-based parser used by scope classification. Malformed dotted strings return `false` instead
+  of being classified from only their first one or two components; valid IPv4 behavior is
+  unchanged.
+
+- **ASN lookups now use the embedded database by default.** The default `asnResolverStrategy`
+  changes from `.dns` to `.hybrid(.embedded)`: the local database answers first, and DNS is
+  consulted only for addresses it does not cover. Until now the embedded database shipped but was
+  never loaded unless a caller opted in, so every ASN lookup was a Team Cymru DNS query.
+
+  Measured on a fixed set of ten public addresses: both strategies resolve 10/10, so this is a
+  latency and reliability change rather than a coverage change. Cold resolution drops from 0.215s
+  to 0.094s, and the common path no longer depends on the resolver at all — which matters because
+  a cold DNS lookup against an unresponsive resolver stalls for 30 seconds, and callers that
+  discard caches on a network change re-pay the cold path every time.
+
+  Costs ~6MB of memory for the database. Callers who want the old behavior can pass
+  `asnResolverStrategy: .dns`; those who want no network under any circumstances can pass
+  `.embedded`. Call `preloadASNDatabase()` early to move the first-load cost off the first trace.
+
+### Dependencies
+
+- SwiftIP2ASN 0.4.1 → 0.5.0, which adds observable database freshness and conditional-GET
+  refreshes. The existing `from: "0.4.1"` requirement already permitted 0.5.0, so consumers
+  resolved to it regardless; this pins our own CI to what they get. SwiftFTR never referenced
+  `UltraCompactError`, so the breaking change in that release does not reach us.
+
+0.16.0 — 2026-08-31
+-------------------
+
+A hop can now tell you what actually happened to it, rather than leaving you to infer it from
+which fields came back empty. That closes a gap 0.15.0 opened: transient send-pressure retry
+could still lose a whole trace when its budget ran out, and now it loses one hop instead.
+
+### Hops report an outcome
+
+`HopOutcome` on `TraceHop`, `ClassifiedHop` and `StreamingHop` names the four things that can
+happen at a hop: the probe never left the host (with its `errno`), it was sent and nothing came
+back, a router reported it undeliverable (with the ICMP code), or it drew a normal reply.
+
+Two distinctions were previously unrecoverable:
+
+- **A router that forwarded your probe and a router that refused to route it produced identical
+  hops** — same address, same round-trip time, same `reachedDestination: false`. The ICMP code
+  explaining the refusal was parsed and then discarded.
+- **A probe we never sent looked exactly like a probe the network ignored.** Both render as
+  `* * *`.
+
+`ICMPUnreachableReason` names the IPv4 Destination Unreachable codes, with a `displayName` and an
+`isAdministrative` flag, so a firewall dropping traffic deliberately reads differently from a
+network that could not deliver it. `HopOutcome.unreachableReason` parses the code.
+
+### A probe that never left no longer fails the trace
+
+When transient send pressure keeps a probe off the wire past the retry budget, that TTL is now
+reported as `.notSent(errno:)` and the trace continues. You lose one hop of a topology instead of
+the topology.
+
+Two guards keep this from hiding real failures. A burst where **no** probe reached the wire still
+throws, because a result full of holes would claim we measured something when we measured nothing.
+Every **non-transient** errno still aborts on the first attempt, so `EHOSTUNREACH`, `ENETDOWN`,
+`ENETUNREACH` and `EACCES` arrive exactly as promptly as before.
+
+The streaming API emits unsent hops immediately rather than at the deadline, since a failed send is
+known at once.
+
+### CLI
+
+`swift-ftr --json` gains `outcome` on each hop, plus `unreachable_reason` where one applies. Both
+are additive; every existing key keeps its name and meaning.
+
+### Compatibility
+
+Additive throughout. The hop types keep `ipAddress`/`ip`, `rtt` and `reachedDestination`, and keep
+their previous initializers, which infer an outcome from the fields they have. Existing call sites
+compile and behave unchanged.
+
+0.15.0 — 2026-08-31
+-------------------
+
+This release makes traceroute survive two conditions that previously destroyed a measurement:
+momentary send-buffer pressure, and a system resolver that stops answering. Both were found in
+downstream production telemetry rather than in testing.
+
+### Traces no longer fail on transient send pressure
+
+Probe sockets are non-blocking and a trace pushes every hop's probe out in one burst, so a single
+`sendto` returning `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS` — the kernel saying "no room right now" — used
+to fail the entire traceroute with `TracerouteError.sendFailed`. This was the most common traceroute
+failure observed in the field.
+
+Those three errnos are now retried: `poll(POLLOUT)` for socket-buffer pressure, and a 1 ms sleep for
+`ENOBUFS`, which reports the interface output queue and leaves the socket reporting itself writable.
+The budget is 250 ms shared across the whole burst rather than per probe, so the default 1 s receive
+window is not at risk. Ping applies the same retry with a 50 ms per-send budget, so transient
+pressure no longer silently drops a packet from the sample.
+
+**Every other errno still fails on the first attempt with no added latency.** Callers that map
+`EHOSTUNREACH`, `ENETDOWN`, `ENETUNREACH` and `EACCES` to offline or permission states see them
+exactly as promptly as before. When the retry budget is exhausted, the same `sendFailed(errno:)` is
+thrown as in 0.14.
+
+### `traceClassified()` is now bounded and cancellable
+
+`traceClassified()` completes, or throws, within a budget derived from its own configuration, and
+honors task cancellation during enrichment as it already did during the probe phase. A cancelled
+classified trace now returns in about 0.1s, where it previously returned only when a slot on the
+shared blocking-I/O executor happened to free.
+
+The enrichment phase could previously run far past any caller watchdog while ignoring cancellation.
+`getaddrinfo` (once per STUN hostname, walked serially) and `getnameinfo` (once per hop) have no
+timeout of their own and stall 30 seconds against a resolver that drops queries silently, so
+public-IP discovery alone could consume 90 seconds before a single hostname lookup began.
+
+### Reverse DNS now degrades rather than stalling — read this if you rely on hostnames
+
+**This is the one change that can take something away.** Reverse DNS gives up after
+`rdnsLookupTimeout` (default 5s), and two consecutive stalled lookups suppress further attempts
+until the cache is cleared, which callers already do on a network change. Hops whose lookup does not
+finish in time report numerically.
+
+Previously a slow-but-working resolver would eventually return a hostname — after up to 30 seconds.
+**On genuinely slow links, hostnames that used to appear may now be absent.** If you see fewer
+hostnames after upgrading, raise `SwiftFTRConfig.rdnsLookupTimeout`; the budget bounds the
+reverse-DNS phase as a whole rather than being paid per hop, because lookups run concurrently, so
+raising it costs one wall-clock wait and not one per hop.
+
+Public-IP discovery degrades the same way: classification proceeds without a public address when
+discovery exceeds its budget.
+
+### New public API
+
+- `SwiftFTRConfig.rdnsLookupTimeout` and `SwiftFTRConfig.publicIPDiscoveryTimeout` set the
+  enrichment budgets. Both are optional and fall back to the defaults when absent or invalid,
+  matching the existing `rdnsCacheTTL` / `rdnsCacheSize` pattern.
+- `SwiftFTRConfig.defaultRDNSLookupTimeout` (5s) and `SwiftFTRConfig.defaultPublicIPDiscoveryTimeout`
+  (6s) expose those defaults, so callers can adjust relative to them.
+- `TraceClassifier.classify(...)` gains a defaulted `publicIPDiscoveryTimeout` parameter for callers
+  that reach discovery without a config in hand.
+
+All additions are additive and defaulted; existing call sites compile unchanged.
+
+### Known limitation
+
+A blocking syscall that has already started still occupies its executor slot until it returns — up
+to 30 seconds for a stalled resolver. The calling trace is released; the slot is not. Removing this
+requires not calling `getnameinfo` at all, which depends on discovering the effective system
+resolver. Tracked in [ROADMAP.md](ROADMAP.md).
+
 0.14.0 — 2026-07-22
 -------------------
 
@@ -173,7 +332,7 @@ examples and a checklist.
 ### Behavior changes (no source breakage)
 
 - **`PingResponse.ttl`** now carries the IPv6 hop limit for v6 replies (same field, same units 1–255). Doc-comment updated to describe the dual meaning. Same shape, no new field added.
-- **Canonical-form contract**: every emitted address (`PingResult.resolvedIP`, `TraceHop.ipAddress`, `STUNPublicIP.ip`, `ParsedICMP.sourceAddress`) is in `inet_ntop` canonical form. Round-tripping `String → resolve → String` is stable. Link-local addresses keep their `%<ifname>` zone suffix via `if_indextoname` — downstream consumers (NWX) use these strings as dictionary keys, and consistency matters.
+- **Canonical-form contract**: every emitted address (`PingResult.resolvedIP`, `TraceHop.ipAddress`, `STUNPublicIP.ip`, `ParsedICMP.sourceAddress`) is in `inet_ntop` canonical form. Round-tripping `String → resolve → String` is stable. Link-local addresses keep their `%<ifname>` zone suffix via `if_indextoname` — downstream consumers use these strings as dictionary keys, and consistency matters.
 - **`interface: "en0"`** binds v6 sockets via `IPV6_BOUND_IF` (mirrors v4 `IP_BOUND_IF`). Same `interface` field as before.
 - **`sourceIP`** auto-routes to the matching family's bind path for `getPublicIPs` (v6 source-IP doesn't try to bind a v4 socket and vice versa).
 - **`.auto` mode + v4 literal** now goes through `getaddrinfo(AI_V4MAPPED | AI_ADDRCONFIG)` rather than the `inet_pton` fast path. On dual-stack hosts behavior is unchanged; on v6-only NAT64 networks macOS synthesizes a v6 mapping per RFC 6147 and the trace/probe completes transparently. Matches [Apple's IPv6 guidance](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/NetworkingOverview/SupportingIPv6DNS64NAT64/SupportingIPv6DNS64NAT64.html). Force modes (`.v4` / `.v6`) keep the `inet_pton` fast path.
@@ -711,7 +870,7 @@ Since 0.7.1 was never shipped, this is the first DNS API for SwiftFTR.
   - Added `interface` and `sourceIP` parameters to `PingConfig`, `TCPProbeConfig`, `DNSProbeConfig`, and `BufferbloatConfig`
   - Operation-level config overrides global `SwiftFTRConfig` settings
   - Maximum flexibility for multi-interface monitoring (WiFi + Ethernet + VPN scenarios)
-  - **Use case**: NWX hop monitoring can now bind pings to specific interface per-operation
+  - **Use case**: downstream hop monitoring can now bind pings to specific interface per-operation
   - **Benefits**: Eliminates 83% packet loss during interface transitions
   - **API**: `ping(to: "1.1.1.1", config: PingConfig(interface: "en14"))` - per-operation override
   - **Backward compatible**: nil values default to global SwiftFTRConfig settings
@@ -949,7 +1108,7 @@ Since 0.7.1 was never shipped, this is the first DNS API for SwiftFTR.
 - **ENHANCED**: Updated `docs/guides/EXAMPLES.md` with v0.5.0 features
   - 4 ping examples: basic, continuous monitoring, fast reachability, concurrent
   - 6 multipath examples: basic discovery, monitoring workflow, path analysis, ECMP detection
-  - Key example: Extract unique hops from multipath for monitoring (NWX use case)
+  - Key example: Extract unique hops from multipath for monitoring (downstream use case)
   - ICMP vs UDP limitation explanation with reference to ROADMAP
 - **ENHANCED**: Updated `docs/development/ROADMAP.md`
   - Added v0.5.5 UDP-based multipath discovery section (high priority)

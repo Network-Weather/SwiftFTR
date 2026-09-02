@@ -4,7 +4,7 @@ Forward-looking plan for full IPv6 feature parity in SwiftFTR. Updated as stages
 
 ## Goal & non-goals
 
-**Goal**: Feature parity with the existing IPv4 surface across `ping`, `trace`, TCP/UDP/HTTP probes, STUN, and ASN classification — without breaking the `String`-based public API that callers (notably [NetworkWeather](https://networkweather.com)) already depend on.
+**Goal**: Feature parity with the existing IPv4 surface across `ping`, `trace`, TCP/UDP/HTTP probes, STUN, and ASN classification — without breaking the `String`-based public API that existing callers already depend on.
 
 **Non-goals**:
 - 6to4 / Teredo / ISATAP — native v4/v6 only.
@@ -13,11 +13,11 @@ Forward-looking plan for full IPv6 feature parity in SwiftFTR. Updated as stages
 
 ## Architectural principles
 
-All of these are NWX downstream contracts. Changing any of them in a stage past Stage 1 requires explicit alignment.
+All of these are downstream contracts. Changing any of them in a stage past Stage 1 requires explicit alignment.
 
 - **Single dest-string entry point.** `tracer.ping(to: "1.1.1.1")` and `tracer.ping(to: "2606:4700:4700::1111")` both go through the same `ping(to:config:)` method. The library detects the family from the resolved address and dispatches. No `pingV4`/`pingV6` API split.
 - **`PreferredFamily` opt-in.** Optional `preferredFamily: .v4 | .v6 | .auto` (default `.auto`) on `PingConfig` (and later `SwiftFTRConfig`). `.auto` uses the literal's family for IP literals and the first `getaddrinfo(AF_UNSPEC)` answer for hostnames.
-- **Canonical-form contract.** Every address SwiftFTR emits (`PingResult.resolvedIP`, `TraceHop.ipAddress`, `ParsedICMP.sourceAddress`) is the `inet_ntop` canonical form. Round-tripping `String → resolve → String` is stable for any input. NWX uses these strings as dictionary keys; inconsistency would silently break lookups.
+- **Canonical-form contract.** Every address SwiftFTR emits (`PingResult.resolvedIP`, `TraceHop.ipAddress`, `ParsedICMP.sourceAddress`) is the `inet_ntop` canonical form. Round-tripping `String → resolve → String` is stable for any input. Downstream consumers use these strings as dictionary keys; inconsistency would silently break lookups.
 - **Link-local scope IDs preserved.** When a hop or reply source is link-local (`fe80::/10`), the emitted string includes the operating system's zone suffix (`fe80::xxxx%interface-name`) via `if_indextoname(sin6_scope_id)`. Never strip. Multiple link-local hops on different interfaces must not collide on string keys.
 - **Hop limit in the same `ttl` field.** `PingResponse.ttl: Int?` carries the IPv4 TTL for v4 replies and the IPv6 hop limit for v6 replies. Same field, same units (1–255). No new `hopLimit` field added.
 - **Interface binding works identically.** Passing a name returned by `NetworkInterfaceDiscovery` to `SwiftFTRConfig(interface:)` binds v6 sockets via `IPV6_BOUND_IF` and produces source-address-selected output on that interface, mirroring the v4 `IP_BOUND_IF` path.
@@ -111,7 +111,7 @@ To exercise the v6 paths in CI:
 
 ## Known-good v6 test endpoints
 
-NWX-validated, used in SwiftFTR's tests and the spike:
+Validated downstream; used in SwiftFTR's tests and the spike:
 
 - `2606:4700:4700::1111` — Cloudflare DNS (the v6 1.1.1.1).
 - `2606:4700:4700::1001` — Cloudflare DNS secondary.

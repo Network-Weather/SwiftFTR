@@ -13,29 +13,63 @@ actor RDNSCache {
     let timestamp: ContinuousClock.Instant
   }
 
+  /// How long a single reverse lookup may take before the caller stops waiting for it.
+  ///
+  /// `getnameinfo` consults the system resolver and holds its worker for 30 seconds when DNS
+  /// queries go unanswered, against a healthy-network cost of a few milliseconds. Hostnames are
+  /// cosmetic enrichment, so a trace degrades to numeric addresses rather than waiting.
+  ///
+  /// Sized generously because ``batchLookup(_:)`` issues lookups concurrently: this bounds the
+  /// reverse-DNS phase as a whole rather than being paid once per hop. Links with legitimately
+  /// slow resolvers should not lose hostnames, so the budget favors them over shaving a failure
+  /// case that the circuit breaker already handles after two stalls.
+  /// Callers override it with `SwiftFTRConfig.rdnsLookupTimeout`.
+  static let lookupDeadline: TimeInterval = SwiftFTRConfig.defaultRDNSLookupTimeout
+
+  /// Consecutive stalled lookups after which the cache stops attempting reverse DNS.
+  ///
+  /// Without this, every trace re-pays ``lookupDeadline`` per hop while the resolver stays broken.
+  /// The breaker resets in ``clear()``, which callers invoke on a network change — the event most
+  /// likely to have fixed the resolver.
+  static let stallsBeforeSuppressing = 2
+
   private var cache: [String: CacheEntry] = [:]
   private let ttl: Duration
   private let maxSize: Int
   private let clock = ContinuousClock()
   private let resolver: Resolver
+  private let lookupDeadline: TimeInterval
   private var generation: UInt64 = 0
+  private var consecutiveStalls = 0
 
   /// Initialize a new rDNS cache.
   /// - Parameters:
   ///   - ttl: Time to live for cache entries in seconds (default: 86400 = 1 day)
   ///   - maxSize: Maximum number of entries to cache (default: 1000)
+  ///   - lookupDeadline: Seconds a single lookup may take before it counts as stalled.
   init(
     ttl: TimeInterval = 86400,
     maxSize: Int = 1000,
-    resolver: @escaping Resolver = { ip in
-      try? await runDetachedBlockingIO(priority: .background) {
-        reverseDNS(ip)
-      }
-    }
+    lookupDeadline: TimeInterval = RDNSCache.lookupDeadline,
+    resolver: Resolver? = nil
   ) {
     self.ttl = .seconds(ttl)
     self.maxSize = maxSize
-    self.resolver = resolver
+    self.lookupDeadline = lookupDeadline
+    self.resolver =
+      resolver
+      ?? { ip in
+        // `.background` keeps reverse DNS behind probe and ASN work on the shared executor. The
+        // deadline is what bounds the caller, so queue position cannot extend a trace.
+        try? await runDetachedBlockingIO(priority: .background, deadline: lookupDeadline) {
+          reverseDNS(ip)
+        }
+      }
+  }
+
+  /// Whether reverse DNS is currently suppressed because lookups keep stalling.
+  var isSuppressingLookups: Bool {
+    consecutiveStalls >= Self.stallsBeforeSuppressing
   }
 
   /// Look up a hostname for an IP address, using cache if available.
@@ -49,8 +83,21 @@ actor RDNSCache {
       return entry.hostname
     }
 
+    // Lookups keep stalling, so skip the wait and report numerically until `clear()` reopens.
+    guard !isSuppressingLookups else { return nil }
+
     let lookupGeneration = generation
+    let startedAt = clock.now
     let hostname = await resolver(ip)
+    let elapsed = startedAt.duration(to: clock.now)
+
+    // A lookup that consumed its whole budget did not answer; it timed out or was starved. Track
+    // that separately from a resolver that answered "no such name", which is a normal fast result.
+    if elapsed >= .seconds(lookupDeadline * 0.9) {
+      consecutiveStalls += 1
+    } else {
+      consecutiveStalls = 0
+    }
 
     // `clear()` may run while the resolver is suspended. A result from the old
     // network generation must neither escape to the caller nor repopulate the
@@ -93,6 +140,7 @@ actor RDNSCache {
   func clear() {
     generation &+= 1
     cache.removeAll()
+    consecutiveStalls = 0
   }
 
   /// Get the current number of cached entries.
