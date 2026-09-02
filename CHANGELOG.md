@@ -22,6 +22,13 @@ Unreleased
 - `TraceOptions` and per-operation options on `trace(to:options:)` and `traceClassified(to:vpnContext:resolver:options:)`
   permit overriding `maxHops` on individual traces without reconfiguring the actor.
 
+### Changed
+
+- STUN public IP fallback now resolves endpoints concurrently across worker threads to avoid
+  serial DNS stalls. Deduplicated the fallback server list by dropping redundant `stun1.l.google.com`
+  (which pointed to the exact same IP as `stun.l.google.com`), ensuring genuine multi-provider failover
+  between independent providers (Google and Cloudflare) on distinct networks.
+
 ### Tooling
 
 - Pull requests are now gated on the DocC documentation build: broken doc links and

@@ -39,12 +39,11 @@ public struct PublicIPs: Sendable {
 }
 
 /// Well-known public STUN servers for fallback.
-/// Uses multiple providers and ports for resilience. Cloudflare and Google's
-/// STUN servers resolve to both v4 and v6 records; the family preference passed
-/// to the resolver determines which is used.
+/// Uses multiple independent providers on distinct networks for genuine redundancy.
+/// Cloudflare and Google's STUN servers resolve to both v4 and v6 records; the family
+/// preference passed to the resolver determines which is used.
 let stunServers: [(host: String, port: UInt16)] = [
   ("stun.l.google.com", 19302),  // Google (port 19302)
-  ("stun1.l.google.com", 19302),  // Google backup (port 19302)
   ("stun.cloudflare.com", 3478),  // Cloudflare (port 3478)
 ]
 
@@ -102,11 +101,37 @@ enum STUNError: Error, CustomStringConvertible {
 ///
 /// Pass `family: AF_INET6` to discover the v6 public IP; the resolver, socket,
 /// and bind paths all dispatch on family. The XOR-MAPPED-ADDRESS parser handles
-/// both v4 (Family 0x01) and v6 (Family 0x02) per RFC 5389 §15.2.
-internal func stunGetPublicIP(
-  family: Int32,
+/// Resolves a STUN server host and port for the given family.
+internal func resolveSTUNServer(
   host: String,
   port: UInt16,
+  family: Int32
+) -> (server: sockaddr_storage, serverLen: socklen_t)? {
+  var hints = addrinfo(
+    ai_flags: AI_ADDRCONFIG, ai_family: family, ai_socktype: SOCK_DGRAM,
+    ai_protocol: IPPROTO_UDP, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
+  var res: UnsafeMutablePointer<addrinfo>? = nil
+  let resolveResult = getaddrinfo(host, String(port), &hints, &res)
+  guard resolveResult == 0, let info = res, let sa = info.pointee.ai_addr else {
+    return nil
+  }
+  defer { freeaddrinfo(info) }
+
+  var server = sockaddr_storage()
+  let serverLen = socklen_t(min(MemoryLayout<sockaddr_storage>.size, Int(info.pointee.ai_addrlen)))
+  _ = withUnsafeMutablePointer(to: &server) { dst in
+    memcpy(dst, sa, Int(serverLen))
+  }
+  return (server, serverLen)
+}
+
+/// Family-parameterized STUN core with pre-resolved endpoint. Builds the binding request,
+/// sends it, and parses the XOR-MAPPED-ADDRESS attribute. Supports both AF_INET and AF_INET6.
+internal func stunGetPublicIP(
+  family: Int32,
+  server: sockaddr_storage,
+  serverLen: socklen_t,
+  serverLabel: String,
   timeout: TimeInterval = 1.0,
   interface: String? = nil,
   sourceIP: String? = nil,
@@ -116,28 +141,7 @@ internal func stunGetPublicIP(
     throw STUNError.invalidTimeout(timeout)
   }
 
-  var hints = addrinfo(
-    ai_flags: AI_ADDRCONFIG, ai_family: family, ai_socktype: SOCK_DGRAM,
-    ai_protocol: IPPROTO_UDP, ai_addrlen: 0, ai_canonname: nil, ai_addr: nil, ai_next: nil)
-  var res: UnsafeMutablePointer<addrinfo>? = nil
-  let resolveResult = getaddrinfo(host, String(port), &hints, &res)
-  guard resolveResult == 0, let info = res, let sa = info.pointee.ai_addr else {
-    let error = errno
-    let famName = family == AF_INET6 ? "v6" : "v4"
-    throw STUNError.resolveFailed(
-      errno: error,
-      details: "Failed to resolve STUN server '\(host):\(port)' (\(famName))")
-  }
-  defer { freeaddrinfo(info) }
-
-  // Copy the resolved sockaddr into sockaddr_storage so we can sendto from a
-  // single family-agnostic value.
-  var server = sockaddr_storage()
-  let serverLen = socklen_t(min(MemoryLayout<sockaddr_storage>.size, Int(info.pointee.ai_addrlen)))
-  _ = withUnsafeMutablePointer(to: &server) { dst in
-    memcpy(dst, sa, Int(serverLen))
-  }
-
+  var server = server
   let fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
   if fd < 0 {
     let error = errno
@@ -198,7 +202,7 @@ internal func stunGetPublicIP(
   guard connectResult == 0 else {
     let error = errno
     throw STUNError.connectFailed(
-      errno: error, details: "Failed to connect to \(host):\(port)")
+      errno: error, details: "Failed to connect to \(serverLabel)")
   }
 
   // Set timeouts. A zero timeval disables SO_RCVTIMEO, so invalid values are
@@ -246,7 +250,7 @@ internal func stunGetPublicIP(
   if sent < 0 {
     let error = errno
     throw STUNError.sendFailed(
-      errno: error, details: "Failed to send STUN request to \(host):\(port)")
+      errno: error, details: "Failed to send STUN request to \(serverLabel)")
   }
 
   // The connected UDP socket accepts responses only from the selected server.
@@ -358,6 +362,31 @@ internal func parseSTUNBindingResponse(
   throw STUNError.invalidResponse("missing mapped address for requested family")
 }
 
+/// Resolves and queries a STUN server by hostname and port.
+internal func stunGetPublicIP(
+  family: Int32,
+  host: String,
+  port: UInt16,
+  timeout: TimeInterval = 1.0,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
+    throw STUNError.invalidTimeout(timeout)
+  }
+  guard let (server, serverLen) = resolveSTUNServer(host: host, port: port, family: family) else {
+    let error = errno
+    let famName = family == AF_INET6 ? "v6" : "v4"
+    throw STUNError.resolveFailed(
+      errno: error,
+      details: "Failed to resolve STUN server '\(host):\(port)' (\(famName))")
+  }
+  return try stunGetPublicIP(
+    family: family, server: server, serverLen: serverLen, serverLabel: "\(host):\(port)",
+    timeout: timeout, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+}
+
 /// Back-compat wrapper for v4-only callers. Same signature/behavior as before
 /// Stage 4; delegates to the family-parameterized `stunGetPublicIP`.
 func stunGetPublicIPv4(
@@ -381,8 +410,36 @@ func stunGetPublicIPv6(
 
 // MARK: - Multi-Server STUN Fallback
 
+private final class STUNResolvedEndpoints: @unchecked Sendable {
+  private let lock = NSLock()
+  private var endpoints:
+    [(host: String, port: UInt16, server: sockaddr_storage, serverLen: socklen_t)?]
+
+  init(count: Int) {
+    self.endpoints = Array(repeating: nil, count: count)
+  }
+
+  func set(
+    _ index: Int,
+    value: (host: String, port: UInt16, server: sockaddr_storage, serverLen: socklen_t)
+  ) {
+    lock.lock()
+    defer { lock.unlock() }
+    endpoints[index] = value
+  }
+
+  func get(_ index: Int)
+    -> (host: String, port: UInt16, server: sockaddr_storage, serverLen: socklen_t)?
+  {
+    lock.lock()
+    defer { lock.unlock() }
+    return endpoints[index]
+  }
+}
+
 /// Attempts to discover the public IP of a given family by trying multiple STUN
-/// servers in sequence. Falls back through the server list until one succeeds.
+/// servers in sequence with concurrent DNS resolution. Falls back through the server
+/// list until one succeeds.
 ///
 /// - Parameters:
 ///   - family: `AF_INET` for v4 or `AF_INET6` for v6.
@@ -402,21 +459,47 @@ internal func stunGetPublicIPWithFallback(
   var lastError: Error = STUNError.recvTimeout
   let famName = family == AF_INET6 ? "v6" : "v4"
 
-  for (host, port) in stunServers {
+  if enableLogging {
+    print("[STUN] Resolving \(stunServers.count) servers concurrently (\(famName))...")
+  }
+
+  // Resolve all endpoints concurrently across worker threads to avoid serial DNS stalls
+  let collector = STUNResolvedEndpoints(count: stunServers.count)
+
+  DispatchQueue.concurrentPerform(iterations: stunServers.count) { i in
+    let (host, port) = stunServers[i]
+    if let (storage, len) = resolveSTUNServer(host: host, port: port, family: family) {
+      collector.set(i, value: (host, port, storage, len))
+    }
+  }
+
+  for i in 0..<stunServers.count {
+    guard let endpoint = collector.get(i) else {
+      let (host, port) = stunServers[i]
+      if enableLogging {
+        print("[STUN] Resolution failed for \(host):\(port) (\(famName))")
+      }
+      lastError = STUNError.resolveFailed(
+        errno: 0,
+        details: "Failed to resolve STUN server '\(host):\(port)' (\(famName))")
+      continue
+    }
+
     if enableLogging {
-      print("[STUN] Trying \(host):\(port) (\(famName))...")
+      print("[STUN] Trying \(endpoint.host):\(endpoint.port) (\(famName))...")
     }
     do {
       let result = try stunGetPublicIP(
-        family: family, host: host, port: port, timeout: timeout,
+        family: family, server: endpoint.server, serverLen: endpoint.serverLen,
+        serverLabel: "\(endpoint.host):\(endpoint.port)", timeout: timeout,
         interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
       if enableLogging {
-        print("[STUN] Success from \(host):\(port) (\(famName)) -> \(result.ip)")
+        print("[STUN] Success from \(endpoint.host):\(endpoint.port) (\(famName)) -> \(result.ip)")
       }
       return result
     } catch {
       if enableLogging {
-        print("[STUN] Failed \(host):\(port) (\(famName)): \(error)")
+        print("[STUN] Failed \(endpoint.host):\(endpoint.port) (\(famName)): \(error)")
       }
       lastError = error
       continue
