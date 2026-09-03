@@ -1205,8 +1205,11 @@ public actor SwiftFTR {
     if let cachedPublicIP { return cachedPublicIP }
 
     let discoveryGeneration = cacheGeneration
-    guard let discovered = await discover() else { return nil }
-    guard discoveryGeneration == cacheGeneration else { return nil }
+    guard let discovered = await discover() else { return cachedPublicIP }
+    // If cache was seeded or invalidated while discovery was in flight, do not overwrite the newer value.
+    guard discoveryGeneration == cacheGeneration, cachedPublicIP == nil else {
+      return cachedPublicIP
+    }
 
     cachedPublicIP = discovered
     return discovered
@@ -1369,12 +1372,14 @@ public actor SwiftFTR {
     _ address: String,
     source: PublicIPSource
   ) -> Bool {
-    guard let scope = ipAddressScope(of: address), scope == .global else {
+    guard isGloballyRoutablePublicIP(address) else {
       return false
     }
     guard let canonical = canonicalIPAddress(address) else {
       return false
     }
+    // Increment generation so any older in-flight discovery is superseded and cannot overwrite this seed
+    cacheGeneration &+= 1
     cachedPublicIP = canonical
     return true
   }

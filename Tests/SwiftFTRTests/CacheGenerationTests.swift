@@ -227,6 +227,16 @@ struct CacheGenerationTests {
       "fc00::1",  // ULA v6
       "224.0.0.1",  // multicast
       "0.0.0.0",  // unspecified
+      "192.0.2.1",  // RFC 5737 TEST-NET-1
+      "198.18.0.1",  // RFC 2544 Benchmarking
+      "198.51.100.1",  // RFC 5737 TEST-NET-2
+      "203.0.113.1",  // RFC 5737 TEST-NET-3
+      "240.0.0.1",  // RFC 1112 Class E reserved
+      "255.255.255.255",  // Limited broadcast
+      "2001:db8::1",  // RFC 3849 IPv6 documentation
+      "2606:4700::1%en0",  // Global IPv6 with zone suffix
+      "2606:4700::1%invalid",  // Global IPv6 with invalid zone suffix
+      "%en0",  // Malformed zone-only string
     ]
 
     for seed in invalidSeeds {
@@ -235,6 +245,31 @@ struct CacheGenerationTests {
       // Existing seed remains untouched
       #expect(await tracer.publicIP == "8.8.8.8")
     }
+  }
+
+  @Test("In-flight discovery cannot overwrite a newer manual seed")
+  func discoveryCannotOverwriteManualSeed() async {
+    let lookup = SuspendedLookup()
+    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
+
+    let task = Task {
+      await tracer.effectivePublicIPForClassification {
+        await lookup.resolve("public-ip")
+      }
+    }
+    await lookup.waitUntilStarted()
+
+    // Caller seeds a newer public IP while discovery is in-flight
+    #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
+    #expect(await tracer.publicIP == "1.1.1.1")
+
+    // Older discovery now finishes with a different IP
+    await lookup.resume(returning: "8.8.8.8")
+
+    let result = await task.value
+    // Should return the newer seed, NOT the discovered IP
+    #expect(result == "1.1.1.1")
+    #expect(await tracer.publicIP == "1.1.1.1")
   }
 
   @Test("seedPublicIP does not survive invalidation, clear, or network change")
