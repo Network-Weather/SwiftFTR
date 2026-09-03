@@ -688,7 +688,7 @@ public actor SwiftFTR {
       yield: yield
     )
 
-    await handle.installCancellationHandler { streamOperation.cancel() }
+    let registrationID = await handle.installCancellationHandler { streamOperation.cancel() }
     do {
       try await withTaskCancellationHandler {
         try await withCheckedThrowingContinuation {
@@ -698,9 +698,9 @@ public actor SwiftFTR {
       } onCancel: {
         streamOperation.cancel()
       }
-      await handle.clearCancellationHandler()
+      await handle.clearCancellationHandler(id: registrationID)
     } catch {
-      await handle.clearCancellationHandler()
+      await handle.clearCancellationHandler(id: registrationID)
       throw error
     }
 
@@ -830,7 +830,7 @@ public actor SwiftFTR {
       enableLogging: config.enableLogging
     )
 
-    await handle.installCancellationHandler { operation.cancel() }
+    let registrationID = await handle.installCancellationHandler { operation.cancel() }
     let receiveResult: TraceReceiveResult
     do {
       receiveResult = try await withTaskCancellationHandler {
@@ -840,9 +840,9 @@ public actor SwiftFTR {
       } onCancel: {
         operation.cancel()
       }
-      await handle.clearCancellationHandler()
+      await handle.clearCancellationHandler(id: registrationID)
     } catch {
-      await handle.clearCancellationHandler()
+      await handle.clearCancellationHandler(id: registrationID)
       throw error
     }
 
@@ -1185,19 +1185,30 @@ public actor SwiftFTR {
       }
     }
 
+    let registrationID: UInt64?
     if let handle {
-      await handle.installCancellationHandler {
+      registrationID = await handle.installCancellationHandler {
         discoveryTask.cancel()
       }
-    }
-    defer {
-      Task { await handle?.clearCancellationHandler() }
+    } else {
+      registrationID = nil
     }
 
-    return try await withTaskCancellationHandler {
-      try await discoveryTask.value
-    } onCancel: {
-      discoveryTask.cancel()
+    do {
+      let result = try await withTaskCancellationHandler {
+        try await discoveryTask.value
+      } onCancel: {
+        discoveryTask.cancel()
+      }
+      if let handle, let registrationID {
+        await handle.clearCancellationHandler(id: registrationID)
+      }
+      return result
+    } catch {
+      if let handle, let registrationID {
+        await handle.clearCancellationHandler(id: registrationID)
+      }
+      throw error
     }
   }
 

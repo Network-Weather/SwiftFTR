@@ -32,6 +32,34 @@ struct StreamingLifecycleTests {
     #expect(counter.value == 1)
   }
 
+  @Test("Clearing an older registration ID does not clear the next phase's handler")
+  func handlerRegistrationIsolation() async {
+    let handle = TraceHandle()
+    let counterA = LockedCounter()
+    let counterB = LockedCounter()
+
+    // Phase 1 installs handler A
+    let idA = await handle.installCancellationHandler {
+      counterA.increment()
+    }
+    #expect(await handle.hasCancellationHandler)
+
+    // Phase 2 installs handler B
+    _ = await handle.installCancellationHandler {
+      counterB.increment()
+    }
+
+    // Phase 1 cleanup attempts to clear its handler using idA
+    await handle.clearCancellationHandler(id: idA)
+
+    // Handler B must NOT have been cleared
+    #expect(await handle.hasCancellationHandler)
+
+    await handle.cancel()
+    #expect(counterA.value == 0)
+    #expect(counterB.value == 1)
+  }
+
   @Test("networkChanged stops an active streaming receive operation", .timeLimit(.minutes(1)))
   func networkChangeStopsStreamingOperation() async throws {
     let tracer = SwiftFTR(

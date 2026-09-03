@@ -9,6 +9,7 @@ import Foundation
 public actor TraceHandle {
   private var _isCancelled = false
   private var cancellationHandler: (@Sendable () -> Void)?
+  private var handlerRegistrationID: UInt64 = 0
 
   /// Whether this trace has been cancelled.
   public var isCancelled: Bool {
@@ -31,16 +32,29 @@ public actor TraceHandle {
   ///
   /// If cancellation already happened, the handler is invoked immediately so
   /// setup cannot race ahead with an already-cancelled trace.
-  internal func installCancellationHandler(_ handler: @escaping @Sendable () -> Void) {
+  ///
+  /// - Returns: A monotonically increasing registration ID identifying this handler.
+  @discardableResult
+  internal func installCancellationHandler(_ handler: @escaping @Sendable () -> Void) -> UInt64 {
+    handlerRegistrationID &+= 1
+    let id = handlerRegistrationID
     if _isCancelled {
       handler()
     } else {
       cancellationHandler = handler
     }
+    return id
   }
 
   /// Removes an operation-specific cleanup handler after the operation ends.
-  internal func clearCancellationHandler() {
+  ///
+  /// If `id` is provided, the handler is only cleared if it matches the specified
+  /// registration ID. This prevents an asynchronous or delayed cleanup from clearing
+  /// a subsequent phase's newly installed cancellation handler.
+  internal func clearCancellationHandler(id: UInt64? = nil) {
+    if let id {
+      guard id == handlerRegistrationID else { return }
+    }
     cancellationHandler = nil
   }
 
