@@ -180,8 +180,9 @@ struct ParsedIPAddress: Hashable, Sendable {
   }
 
   /// Returns whether this address is eligible to be a globally routable public address.
-  /// Rejects RFC 5737 (TEST-NET), RFC 2544 (Benchmarking), RFC 1112 (Class E / broadcast),
-  /// RFC 3849 (IPv6 documentation), RFC 5180 (IPv6 benchmarking), RFC 6666 (discard), etc.
+  /// Rejects non-globally-reachable entries from the IANA IPv4 and IPv6 Special-Purpose Address
+  /// Registries (RFC 6890, RFC 5737, RFC 2544, RFC 1112, RFC 8215, RFC 6666, RFC 9780, RFC 3849,
+  /// RFC 9637, RFC 9602, etc.).
   var isGloballyRoutablePublicAddress: Bool {
     guard scope == .global else { return false }
     switch family {
@@ -189,9 +190,15 @@ struct ParsedIPAddress: Hashable, Sendable {
       let first = bytes[0]
       let second = bytes[1]
       let third = bytes[2]
+      let fourth = bytes[3]
       if first == 0 { return false }
-      // 192.0.0.0/24 (RFC 6890)
-      if first == 192 && second == 0 && third == 0 { return false }
+      // 192.0.0.0/24 (RFC 6890):
+      // 192.0.0.9/32 (PCP Anycast, RFC 7723) and 192.0.0.10/32 (TURN Anycast, RFC 8155)
+      // are marked Globally Reachable in the IANA IPv4 Special-Purpose Address Registry.
+      // All other addresses in 192.0.0.0/24 are not globally reachable.
+      if first == 192 && second == 0 && third == 0 {
+        return fourth == 9 || fourth == 10
+      }
       // 192.0.2.0/24 (TEST-NET-1, RFC 5737)
       if first == 192 && second == 0 && third == 2 { return false }
       // 192.88.99.0/24 (6to4 relay anycast, RFC 7526)
@@ -207,18 +214,17 @@ struct ParsedIPAddress: Hashable, Sendable {
       return true
 
     case .ipv6:
-      // 100::/64 (Discard-only, RFC 6666)
-      if bytes[0] == 0x01 && bytes[1] == 0x00 && bytes[2..<8].allSatisfy({ $0 == 0 }) {
-        return false
-      }
-      // 64:ff9b::/96 (IPv4/IPv6 translation, RFC 6052)
+      // 64:ff9b:1::/48 (Local-Use IPv4/IPv6 Translation, RFC 8215)
+      // Note: 64:ff9b::/96 (Well-Known Prefix, RFC 6052) IS marked Globally Reachable.
       if bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xff && bytes[3] == 0x9b
-        && bytes[4..<12].allSatisfy({ $0 == 0 })
+        && bytes[4] == 0x00 && bytes[5] == 0x01
       {
         return false
       }
-      // 2001:db8::/32 (Documentation, RFC 3849)
-      if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0d && bytes[3] == 0xb8 {
+      // 100::/64 (Discard-Only, RFC 6666) & 100:0:0:1::/64 (Dummy IPv6 Prefix, RFC 9780)
+      if bytes[0] == 0x01 && bytes[1] == 0x00 && bytes[2..<7].allSatisfy({ $0 == 0 })
+        && (bytes[7] == 0x00 || bytes[7] == 0x01)
+      {
         return false
       }
       // 2001:2::/48 (Benchmarking, RFC 5180)
@@ -227,8 +233,23 @@ struct ParsedIPAddress: Hashable, Sendable {
       {
         return false
       }
-      // 2001:20::/28 (ORCHIDv2, RFC 7343)
-      if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x00 && (bytes[3] & 0xf0) == 0x20 {
+      // 2001:10::/28 (Deprecated ORCHID, RFC 4843)
+      if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x00 && (bytes[3] & 0xf0) == 0x10 {
+        return false
+      }
+      // Note: 2001:20::/28 (ORCHIDv2, RFC 7343) and 2001:30::/28 (DETs, RFC 9374)
+      // ARE marked Globally Reachable in the IANA IPv6 Special-Purpose Address Registry.
+
+      // 2001:db8::/32 (Documentation, RFC 3849)
+      if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0d && bytes[3] == 0xb8 {
+        return false
+      }
+      // 3fff::/20 (Documentation, RFC 9637)
+      if bytes[0] == 0x3f && bytes[1] == 0xff && (bytes[2] & 0xf0) == 0x00 {
+        return false
+      }
+      // 5f00::/16 (Segment Routing SRv6 SIDs, RFC 9602)
+      if bytes[0] == 0x5f && bytes[1] == 0x00 {
         return false
       }
       return true

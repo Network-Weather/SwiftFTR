@@ -204,6 +204,16 @@ struct CacheGenerationTests {
     #expect(
       await tracer.seedPublicIP("2606:4700:4700:0:0:0:0:1111", source: .gatewayReported))
     #expect(await tracer.publicIP == "2606:4700:4700::1111")
+
+    // IANA Special-Purpose registry entries marked Globally Reachable
+    #expect(await tracer.seedPublicIP("192.0.0.9", source: .validatedCallerCache))  // PCP Anycast
+    #expect(await tracer.publicIP == "192.0.0.9")
+    #expect(await tracer.seedPublicIP("192.0.0.10", source: .validatedCallerCache))  // TURN Anycast
+    #expect(await tracer.publicIP == "192.0.0.10")
+    #expect(await tracer.seedPublicIP("64:ff9b::1", source: .validatedCallerCache))  // RFC 6052 WKP
+    #expect(await tracer.publicIP == "64:ff9b::1")
+    #expect(await tracer.seedPublicIP("2001:20::1", source: .validatedCallerCache))  // ORCHIDv2
+    #expect(await tracer.publicIP == "2001:20::1")
   }
 
   @Test("seedPublicIP rejects non-global, malformed, and sentinel strings")
@@ -227,13 +237,21 @@ struct CacheGenerationTests {
       "fc00::1",  // ULA v6
       "224.0.0.1",  // multicast
       "0.0.0.0",  // unspecified
+      "192.0.0.1",  // RFC 6890 non-reachable in 192.0.0.0/24
       "192.0.2.1",  // RFC 5737 TEST-NET-1
       "198.18.0.1",  // RFC 2544 Benchmarking
       "198.51.100.1",  // RFC 5737 TEST-NET-2
       "203.0.113.1",  // RFC 5737 TEST-NET-3
       "240.0.0.1",  // RFC 1112 Class E reserved
       "255.255.255.255",  // Limited broadcast
+      "64:ff9b:1::1",  // RFC 8215 Local-Use IPv4/IPv6 translation
+      "100::1",  // RFC 6666 Discard-only
+      "100:0:0:1::1",  // RFC 9780 Dummy IPv6 prefix
+      "2001:2::1",  // RFC 5180 Benchmarking
+      "2001:10::1",  // RFC 4843 Deprecated ORCHID
       "2001:db8::1",  // RFC 3849 IPv6 documentation
+      "3fff::1",  // RFC 9637 IPv6 documentation
+      "5f00::1",  // RFC 9602 SRv6 SIDs
       "2606:4700::1%en0",  // Global IPv6 with zone suffix
       "2606:4700::1%invalid",  // Global IPv6 with invalid zone suffix
       "%en0",  // Malformed zone-only string
