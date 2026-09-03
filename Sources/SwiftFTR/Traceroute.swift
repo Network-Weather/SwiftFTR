@@ -951,112 +951,128 @@ public actor SwiftFTR {
     try config.validateForOperation()
     try options.validateForOperation()
 
-    // Validate interface early if specified (before any network operations)
-    if let interfaceName = config.interface {
-      if config.enableLogging {
-        print("[SwiftFTR] Validating interface '\(interfaceName)' for classified trace...")
-      }
-      _ = try validateInterface(interfaceName)
-      if config.enableLogging {
-        print("[SwiftFTR] Interface '\(interfaceName)' validated successfully")
-      }
-    }
+    let handle = TraceHandle()
+    activeTraces.insert(handle)
+    defer { activeTraces.remove(handle) }
 
-    // Each enrichment step submits blocking work to a shared, bounded executor. Checking
-    // cancellation between steps keeps a cancelled trace from queueing work whose result nobody
-    // will read, and returns the caller promptly rather than at the end of the pipeline.
-    try Task.checkCancellation()
-
-    let effectivePublicIP = await effectivePublicIPForClassification {
-      try? await self.discoverPublicIP()
-    }
-
-    try Task.checkCancellation()
-
-    // Perform base trace (includes rDNS if enabled)
-    let tr = try await trace(to: host, options: options)
-
-    guard let destIP = tr.resolvedIP else {
-      throw TracerouteError.resolutionFailed(
-        host: host, details: "Trace completed without a resolved destination address")
-    }
-
-    // Collect IPs for batch operations
-    var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
-    allIPs.insert(destIP)
-    if let pip = effectivePublicIP { allIPs.insert(pip) }
-
-    try Task.checkCancellation()
-
-    // Get hostnames (either from trace or via rDNS)
-    var hostnameMap: [String: String] = [:]
-    if !config.noReverseDNS {
-      // Get any missing hostnames (destination and public IP)
-      let ipsNeedingRDNS = allIPs.filter { ip in
-        !tr.hops.contains { $0.ipAddress == ip && $0.hostname != nil }
-      }
-      if !ipsNeedingRDNS.isEmpty {
-        let additionalHostnames = await rdnsCache.batchLookup(Array(ipsNeedingRDNS))
-        hostnameMap = additionalHostnames
-      }
-
-      // Add hostnames from trace
-      for hop in tr.hops {
-        if let ip = hop.ipAddress, let hostname = hop.hostname {
-          hostnameMap[ip] = hostname
+    return try await withTaskCancellationHandler {
+      // Validate interface early if specified (before any network operations)
+      if let interfaceName = config.interface {
+        if config.enableLogging {
+          print("[SwiftFTR] Validating interface '\(interfaceName)' for classified trace...")
+        }
+        _ = try validateInterface(interfaceName)
+        if config.enableLogging {
+          print("[SwiftFTR] Interface '\(interfaceName)' validated successfully")
         }
       }
-    }
 
-    // Use provided resolver or internal one
-    let effectiveResolver = resolver ?? asnResolver
+      try Task.checkCancellation()
+      if await handle.isCancelled { throw TracerouteError.cancelled }
 
-    // Determine VPN context - use provided or auto-detect from interface
-    let effectiveVPNContext = vpnContext ?? VPNContext.forInterface(config.interface)
+      let effectivePublicIP = await effectivePublicIPForClassification {
+        if await handle.isCancelled { return nil }
+        return try? await self.discoverPublicIP(handle: handle)
+      }
 
-    // Classify with enhanced data
-    let classifier = TraceClassifier()
-    let baseClassified = try await classifier.classify(
-      trace: tr,
-      destinationIP: destIP,
-      resolver: effectiveResolver,
-      timeout: 1.5,
-      publicIP: effectivePublicIP,
-      interface: config.interface,
-      sourceIP: config.sourceIP,
-      vpnContext: effectiveVPNContext,
-      enableLogging: config.enableLogging,
-      publicIPDiscoveryTimeout: config.publicIPDiscoveryTimeoutForOperation
-    )
+      try Task.checkCancellation()
+      if await handle.isCancelled { throw TracerouteError.cancelled }
 
-    // Enhance classified result with hostnames
-    let enhancedHops = baseClassified.hops.map { hop in
-      ClassifiedHop(
-        ttl: hop.ttl,
-        ip: hop.ip,
-        rtt: hop.rtt,
-        asn: hop.asn,
-        asName: hop.asName,
-        category: hop.category,
-        hostname: hop.ip.flatMap {
-          hostnameMap[$0] ?? tr.hops.first { $0.ipAddress == hop.ip }?.hostname
-        },
-        outcome: hop.outcome
+      // Perform base trace using the classified trace's handle
+      let tr = try await performTrace(to: host, handle: handle, maxHopsOverride: options.maxHops)
+
+      guard let destIP = tr.resolvedIP else {
+        throw TracerouteError.resolutionFailed(
+          host: host, details: "Trace completed without a resolved destination address")
+      }
+
+      // Collect IPs for batch operations
+      var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
+      allIPs.insert(destIP)
+      if let pip = effectivePublicIP { allIPs.insert(pip) }
+
+      try Task.checkCancellation()
+      if await handle.isCancelled { throw TracerouteError.cancelled }
+
+      // Get hostnames (either from trace or via rDNS)
+      var hostnameMap: [String: String] = [:]
+      if !config.noReverseDNS {
+        // Get any missing hostnames (destination and public IP)
+        let ipsNeedingRDNS = allIPs.filter { ip in
+          !tr.hops.contains { $0.ipAddress == ip && $0.hostname != nil }
+        }
+        if !ipsNeedingRDNS.isEmpty {
+          if await handle.isCancelled { throw TracerouteError.cancelled }
+          let additionalHostnames = await rdnsCache.batchLookup(Array(ipsNeedingRDNS))
+          if await handle.isCancelled { throw TracerouteError.cancelled }
+          hostnameMap = additionalHostnames
+        }
+
+        // Add hostnames from trace
+        for hop in tr.hops {
+          if let ip = hop.ipAddress, let hostname = hop.hostname {
+            hostnameMap[ip] = hostname
+          }
+        }
+      }
+
+      try Task.checkCancellation()
+      if await handle.isCancelled { throw TracerouteError.cancelled }
+
+      // Use provided resolver or internal one
+      let effectiveResolver = resolver ?? asnResolver
+
+      // Determine VPN context - use provided or auto-detect from interface
+      let effectiveVPNContext = vpnContext ?? VPNContext.forInterface(config.interface)
+
+      // Classify with enhanced data
+      let classifier = TraceClassifier()
+      let baseClassified = try await classifier.classify(
+        trace: tr,
+        destinationIP: destIP,
+        resolver: effectiveResolver,
+        timeout: 1.5,
+        publicIP: effectivePublicIP,
+        interface: config.interface,
+        sourceIP: config.sourceIP,
+        vpnContext: effectiveVPNContext,
+        enableLogging: config.enableLogging,
+        publicIPDiscoveryTimeout: config.publicIPDiscoveryTimeoutForOperation
       )
-    }
 
-    return ClassifiedTrace(
-      destinationHost: baseClassified.destinationHost,
-      destinationIP: baseClassified.destinationIP,
-      destinationHostname: hostnameMap[destIP],
-      publicIP: baseClassified.publicIP,
-      publicHostname: effectivePublicIP.flatMap { hostnameMap[$0] },
-      clientASN: baseClassified.clientASN,
-      clientASName: baseClassified.clientASName,
-      destinationASN: baseClassified.destinationASN,
-      destinationASName: baseClassified.destinationASName,
-      hops: enhancedHops
-    )
+      if await handle.isCancelled { throw TracerouteError.cancelled }
+
+      // Enhance classified result with hostnames
+      let enhancedHops = baseClassified.hops.map { hop in
+        ClassifiedHop(
+          ttl: hop.ttl,
+          ip: hop.ip,
+          rtt: hop.rtt,
+          asn: hop.asn,
+          asName: hop.asName,
+          category: hop.category,
+          hostname: hop.ip.flatMap {
+            hostnameMap[$0] ?? tr.hops.first { $0.ipAddress == hop.ip }?.hostname
+          },
+          outcome: hop.outcome
+        )
+      }
+
+      return ClassifiedTrace(
+        destinationHost: baseClassified.destinationHost,
+        destinationIP: baseClassified.destinationIP,
+        destinationHostname: hostnameMap[destIP],
+        publicIP: baseClassified.publicIP,
+        publicHostname: effectivePublicIP.flatMap { hostnameMap[$0] },
+        clientASN: baseClassified.clientASN,
+        clientASName: baseClassified.clientASName,
+        destinationASN: baseClassified.destinationASN,
+        destinationASName: baseClassified.destinationASName,
+        hops: enhancedHops
+      )
+    } onCancel: {
+      Task { await handle.cancel() }
+    }
   }
 
   /// Ping a target host with specified configuration.
@@ -1145,21 +1161,43 @@ public actor SwiftFTR {
   }
 
   /// Discover public IP via STUN (with DNS fallback)
-  internal func discoverPublicIP() async throws -> String {
+  internal func discoverPublicIP(handle: TraceHandle? = nil) async throws -> String {
     let interface = config.interface
     let sourceIP = config.sourceIP
     let enableLogging = config.enableLogging
+
+    if let handle, await handle.isCancelled {
+      throw TracerouteError.cancelled
+    }
+
     // `stunTimeout` and `dnsTimeout` bound the socket waits, not the `getaddrinfo` that resolves
     // each STUN hostname first. That call holds its worker for 30 seconds against an unresponsive
     // resolver, and the server list is walked serially, so discovery needs a bound of its own.
-    return try await runDetachedBlockingIO(deadline: config.publicIPDiscoveryTimeoutForOperation) {
-      try getPublicIPv4(
-        stunTimeout: 2.0,
-        dnsTimeout: 3.0,
-        interface: interface,
-        sourceIP: sourceIP,
-        enableLogging: enableLogging
-      ).ip
+    let discoveryTask = Task {
+      try await runDetachedBlockingIO(deadline: config.publicIPDiscoveryTimeoutForOperation) {
+        try getPublicIPv4(
+          stunTimeout: 2.0,
+          dnsTimeout: 3.0,
+          interface: interface,
+          sourceIP: sourceIP,
+          enableLogging: enableLogging
+        ).ip
+      }
+    }
+
+    if let handle {
+      await handle.installCancellationHandler {
+        discoveryTask.cancel()
+      }
+    }
+    defer {
+      Task { await handle?.clearCancellationHandler() }
+    }
+
+    return try await withTaskCancellationHandler {
+      try await discoveryTask.value
+    } onCancel: {
+      discoveryTask.cancel()
     }
   }
 

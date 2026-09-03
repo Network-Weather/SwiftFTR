@@ -87,7 +87,7 @@ struct TraceLifecycleTests {
       do {
         _ = try await tracer.trace(to: "127.0.0.1", options: options)
         Issue.record("\(name) should have thrown invalidConfiguration")
-      } catch let TracerouteError.invalidConfiguration(reason) {
+      } catch TracerouteError.invalidConfiguration(let reason) {
         #expect(reason.contains("maxHops must be in 1...255"))
       } catch {
         Issue.record("\(name) threw unexpected error: \(error)")
@@ -96,7 +96,7 @@ struct TraceLifecycleTests {
       do {
         _ = try await tracer.traceClassified(to: "127.0.0.1", options: options)
         Issue.record("\(name) should have thrown invalidConfiguration for classified trace")
-      } catch let TracerouteError.invalidConfiguration(reason) {
+      } catch TracerouteError.invalidConfiguration(let reason) {
         #expect(reason.contains("maxHops must be in 1...255"))
       } catch {
         Issue.record("\(name) threw unexpected error: \(error)")
@@ -108,6 +108,41 @@ struct TraceLifecycleTests {
   func traceOptionsDefaultInit() {
     let options = TraceOptions()
     #expect(options.maxHops == nil)
+  }
+
+  @Test("cancelActiveTraces cancels in-flight classified trace")
+  func cancelActiveTracesCancelsClassifiedTrace() async throws {
+    let tracer = SwiftFTR(
+      config: SwiftFTRConfig(
+        maxHops: 30,
+        maxWaitMs: 1000,
+        enableLogging: false,
+        noReverseDNS: false
+      )
+    )
+
+    let task = Task {
+      try await tracer.traceClassified(to: "192.0.2.1")
+    }
+
+    let started = await waitUntil {
+      await !tracer.activeTraces.isEmpty
+    }
+    #expect(started)
+
+    await tracer.cancelActiveTraces()
+
+    do {
+      _ = try await task.value
+      Issue.record("traceClassified should have thrown cancelled")
+    } catch TracerouteError.cancelled {
+      // Expected
+    } catch {
+      Issue.record("Unexpected error from cancelled traceClassified: \(error)")
+    }
+
+    let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
+    #expect(unregistered)
   }
 
   private func waitUntil(
