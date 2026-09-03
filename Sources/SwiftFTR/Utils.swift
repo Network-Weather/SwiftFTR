@@ -227,18 +227,45 @@ struct ParsedIPAddress: Hashable, Sendable {
       {
         return false
       }
-      // 2001:2::/48 (Benchmarking, RFC 5180)
-      if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x00 && bytes[3] == 0x02
-        && bytes[4] == 0x00 && bytes[5] == 0x00
-      {
+      // 2001::/23 (IETF Protocol Assignments, RFC 2928):
+      // By default, addresses within 2001::/23 are not globally reachable unless permitted
+      // by a more specific allocation in the IANA IPv6 Special-Purpose Address Registry.
+      if bytes[0] == 0x20 && bytes[1] == 0x01 && (bytes[2] & 0xfe) == 0x00 {
+        let third = bytes[2]
+        let fourth = bytes[3]
+
+        // 2001:1::1/128 (PCP Anycast), 2001:1::2/128 (TURN Anycast), 2001:1::3/128 (DNS-SD Anycast)
+        if third == 0x00 && fourth == 0x01
+          && bytes[4..<15].allSatisfy({ $0 == 0 })
+          && (bytes[15] == 1 || bytes[15] == 2 || bytes[15] == 3)
+        {
+          return true
+        }
+
+        // 2001:3::/32 (AMT, RFC 7450)
+        if third == 0x00 && fourth == 0x03 {
+          return true
+        }
+
+        // 2001:4:112::/48 (AS112-v6, RFC 7535)
+        if third == 0x00 && fourth == 0x04 && bytes[4] == 0x01 && bytes[5] == 0x12 {
+          return true
+        }
+
+        // 2001:20::/28 (ORCHIDv2, RFC 7343)
+        if third == 0x00 && (fourth & 0xf0) == 0x20 {
+          return true
+        }
+
+        // 2001:30::/28 (Drone Remote ID DETs, RFC 9374)
+        if third == 0x00 && (fourth & 0xf0) == 0x30 {
+          return true
+        }
+
+        // All other addresses in 2001::/23 (e.g. 2001::/32 Teredo, 2001:2::/48 benchmarking,
+        // 2001:5::/32 unallocated, 2001:10::/28 deprecated) are not globally reachable.
         return false
       }
-      // 2001:10::/28 (Deprecated ORCHID, RFC 4843)
-      if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x00 && (bytes[3] & 0xf0) == 0x10 {
-        return false
-      }
-      // Note: 2001:20::/28 (ORCHIDv2, RFC 7343) and 2001:30::/28 (DETs, RFC 9374)
-      // ARE marked Globally Reachable in the IANA IPv6 Special-Purpose Address Registry.
 
       // 2001:db8::/32 (Documentation, RFC 3849)
       if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0d && bytes[3] == 0xb8 {
