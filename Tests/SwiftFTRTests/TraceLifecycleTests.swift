@@ -145,6 +145,62 @@ struct TraceLifecycleTests {
     #expect(unregistered)
   }
 
+  final class HangingASNResolver: ASNResolver, @unchecked Sendable {
+    private let started = DispatchSemaphore(value: 0)
+
+    func waitUntilStarted() {
+      started.wait()
+    }
+
+    func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+      started.signal()
+      // Suspends indefinitely, simulating an unresponsive resolver that ignores its timeout
+      while true {
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+      }
+    }
+  }
+
+  @Test("cancelActiveTraces interrupts ASN enrichment when resolver is suspended")
+  func cancelActiveTracesInterruptsASNEnrichment() async throws {
+    let resolver = HangingASNResolver()
+    let tracer = SwiftFTR(
+      config: SwiftFTRConfig(
+        maxHops: 1,
+        maxWaitMs: 100,
+        enableLogging: false,
+        noReverseDNS: true
+      )
+    )
+
+    let task = Task {
+      try await tracer.traceClassified(to: "127.0.0.1", resolver: resolver)
+    }
+
+    // Wait until the resolver is actively invoked during the enrichment phase
+    await withCheckedContinuation { continuation in
+      DispatchQueue.global().async {
+        resolver.waitUntilStarted()
+        continuation.resume()
+      }
+    }
+
+    // Cancel while classifier.classify() is actively awaiting the suspended resolver
+    await tracer.cancelActiveTraces()
+
+    do {
+      _ = try await task.value
+      Issue.record("traceClassified should have thrown cancelled during ASN enrichment")
+    } catch TracerouteError.cancelled {
+      // Expected: immediately interrupted rather than waiting on hanging resolver
+    } catch {
+      Issue.record("Unexpected error from cancelled traceClassified: \(error)")
+    }
+
+    let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
+    #expect(unregistered)
+  }
+
   private func waitUntil(
     _ condition: @escaping @Sendable () async -> Bool
   ) async -> Bool {

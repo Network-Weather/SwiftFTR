@@ -1003,7 +1003,9 @@ public actor SwiftFTR {
         }
         if !ipsNeedingRDNS.isEmpty {
           if await handle.isCancelled { throw TracerouteError.cancelled }
-          let additionalHostnames = await rdnsCache.batchLookup(Array(ipsNeedingRDNS))
+          let additionalHostnames = try await withTraceCancellation(handle: handle) {
+            await self.rdnsCache.batchLookup(Array(ipsNeedingRDNS))
+          }
           if await handle.isCancelled { throw TracerouteError.cancelled }
           hostnameMap = additionalHostnames
         }
@@ -1027,18 +1029,20 @@ public actor SwiftFTR {
 
       // Classify with enhanced data
       let classifier = TraceClassifier()
-      let baseClassified = try await classifier.classify(
-        trace: tr,
-        destinationIP: destIP,
-        resolver: effectiveResolver,
-        timeout: 1.5,
-        publicIP: effectivePublicIP,
-        interface: config.interface,
-        sourceIP: config.sourceIP,
-        vpnContext: effectiveVPNContext,
-        enableLogging: config.enableLogging,
-        publicIPDiscoveryTimeout: config.publicIPDiscoveryTimeoutForOperation
-      )
+      let baseClassified = try await withTraceCancellation(handle: handle) {
+        try await classifier.classify(
+          trace: tr,
+          destinationIP: destIP,
+          resolver: effectiveResolver,
+          timeout: 1.5,
+          publicIP: effectivePublicIP,
+          interface: self.config.interface,
+          sourceIP: self.config.sourceIP,
+          vpnContext: effectiveVPNContext,
+          enableLogging: self.config.enableLogging,
+          publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeoutForOperation
+        )
+      }
 
       if await handle.isCancelled { throw TracerouteError.cancelled }
 
@@ -1166,15 +1170,8 @@ public actor SwiftFTR {
     let sourceIP = config.sourceIP
     let enableLogging = config.enableLogging
 
-    if let handle, await handle.isCancelled {
-      throw TracerouteError.cancelled
-    }
-
-    // `stunTimeout` and `dnsTimeout` bound the socket waits, not the `getaddrinfo` that resolves
-    // each STUN hostname first. That call holds its worker for 30 seconds against an unresponsive
-    // resolver, and the server list is walked serially, so discovery needs a bound of its own.
-    let discoveryTask = Task {
-      try await runDetachedBlockingIO(deadline: config.publicIPDiscoveryTimeoutForOperation) {
+    return try await withTraceCancellation(handle: handle) {
+      try await runDetachedBlockingIO(deadline: self.config.publicIPDiscoveryTimeoutForOperation) {
         try getPublicIPv4(
           stunTimeout: 2.0,
           dnsTimeout: 3.0,
@@ -1183,32 +1180,6 @@ public actor SwiftFTR {
           enableLogging: enableLogging
         ).ip
       }
-    }
-
-    let registrationID: UInt64?
-    if let handle {
-      registrationID = await handle.installCancellationHandler {
-        discoveryTask.cancel()
-      }
-    } else {
-      registrationID = nil
-    }
-
-    do {
-      let result = try await withTaskCancellationHandler {
-        try await discoveryTask.value
-      } onCancel: {
-        discoveryTask.cancel()
-      }
-      if let handle, let registrationID {
-        await handle.clearCancellationHandler(id: registrationID)
-      }
-      return result
-    } catch {
-      if let handle, let registrationID {
-        await handle.clearCancellationHandler(id: registrationID)
-      }
-      throw error
     }
   }
 

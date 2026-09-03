@@ -76,3 +76,110 @@ extension TraceHandle: Hashable {
     ObjectIdentifier(self).hash(into: &hasher)
   }
 }
+
+/// A thread-safe box that synchronizes task completion with cancellation.
+private final class CancellationContinuationBox<T: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<T, Error>?
+  private var isCancelled = false
+  private var hasResumed = false
+
+  func cancel() {
+    lock.lock()
+    guard !hasResumed else {
+      lock.unlock()
+      return
+    }
+    isCancelled = true
+    if let cont = continuation {
+      continuation = nil
+      hasResumed = true
+      lock.unlock()
+      cont.resume(throwing: TracerouteError.cancelled)
+    } else {
+      lock.unlock()
+    }
+  }
+
+  func attach(continuation: CheckedContinuation<T, Error>, task: Task<T, Error>) {
+    lock.lock()
+    if isCancelled {
+      hasResumed = true
+      lock.unlock()
+      continuation.resume(throwing: TracerouteError.cancelled)
+      return
+    }
+    self.continuation = continuation
+    lock.unlock()
+
+    Task {
+      do {
+        let value = try await task.value
+        self.resume(with: .success(value))
+      } catch {
+        self.resume(with: .failure(error))
+      }
+    }
+  }
+
+  private func resume(with result: Result<T, Error>) {
+    lock.lock()
+    guard !hasResumed else {
+      lock.unlock()
+      return
+    }
+    hasResumed = true
+    let cont = continuation
+    continuation = nil
+    lock.unlock()
+    cont?.resume(with: result)
+  }
+}
+
+/// Executes an async throwing operation wrapped in an interruptible cancellation race with a `TraceHandle`.
+///
+/// If `handle` is cancelled (e.g. via `cancelActiveTraces()`) or the calling task is cancelled while the
+/// operation is in flight, the operation task is cancelled and this function immediately throws
+/// `TracerouteError.cancelled` without stranding the caller.
+internal func withTraceCancellation<T: Sendable>(
+  handle: TraceHandle?,
+  _ operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+  guard let handle else {
+    return try await operation()
+  }
+  if await handle.isCancelled {
+    throw TracerouteError.cancelled
+  }
+
+  let task = Task {
+    try await operation()
+  }
+
+  let box = CancellationContinuationBox<T>()
+  let registrationID = await handle.installCancellationHandler {
+    task.cancel()
+    box.cancel()
+  }
+
+  do {
+    let result = try await withTaskCancellationHandler {
+      try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+        box.attach(continuation: continuation, task: task)
+      }
+    } onCancel: {
+      task.cancel()
+      box.cancel()
+    }
+    await handle.clearCancellationHandler(id: registrationID)
+    return result
+  } catch {
+    await handle.clearCancellationHandler(id: registrationID)
+    task.cancel()
+    box.cancel()
+    if await handle.isCancelled || error is CancellationError {
+      throw TracerouteError.cancelled
+    }
+    throw error
+  }
+}
