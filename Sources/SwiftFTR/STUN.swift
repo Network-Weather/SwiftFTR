@@ -456,6 +456,10 @@ internal func stunGetPublicIPWithFallback(
   sourceIP: String? = nil,
   enableLogging: Bool = false
 ) throws -> STUNPublicIP {
+  guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
+    throw STUNError.invalidTimeout(timeout)
+  }
+
   var lastError: Error = STUNError.recvTimeout
   let famName = family == AF_INET6 ? "v6" : "v4"
 

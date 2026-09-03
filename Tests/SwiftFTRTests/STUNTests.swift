@@ -221,6 +221,18 @@ struct STUNTests {
     }
   }
 
+  @Test(
+    "stunGetPublicIPWithFallback rejects invalid timeouts before DNS",
+    arguments: [0.0, -1.0, .infinity])
+  func testFallbackInvalidTimeout(timeout: TimeInterval) {
+    #expect {
+      try stunGetPublicIPWithFallback(family: AF_INET, timeout: timeout)
+    } throws: { error in
+      guard case STUNError.invalidTimeout = error else { return false }
+      return true
+    }
+  }
+
   // MARK: - Integration with SwiftFTR
 
   @Test("SwiftFTR caches STUN result")
