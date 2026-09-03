@@ -123,6 +123,40 @@ struct CacheGenerationTests {
     #expect(await cache.isSuppressingLookups == false)
   }
 
+  @Test("Stale lookups finishing after invalidateNetworkScoped do not re-trip the breaker")
+  func staleScopedLookupsDoNotRetripBreaker() async {
+    let lookup = MultiSuspendedLookup()
+    let cache = RDNSCache(
+      lookupDeadline: 0.05,
+      resolver: { ip in
+        _ = await lookup.resolve(ip)
+        try? await Task.sleep(for: .milliseconds(60))
+        return nil
+      }
+    )
+
+    // Start 2 scoped lookups on the old network
+    let task1 = Task { await cache.lookup("192.168.1.1") }
+    let task2 = Task { await cache.lookup("192.168.1.2") }
+
+    await lookup.waitUntilStarted("192.168.1.1")
+    await lookup.waitUntilStarted("192.168.1.2")
+
+    // Invalidate network-scoped rDNS and reset breaker
+    await cache.invalidateNetworkScoped()
+    #expect(await cache.isSuppressingLookups == false)
+
+    // Resume the stale lookups so they complete with stall durations
+    await lookup.resume("192.168.1.1", returning: nil)
+    await lookup.resume("192.168.1.2", returning: nil)
+
+    _ = await task1.value
+    _ = await task2.value
+
+    // The breaker must NOT be re-tripped by stale lookups
+    #expect(await cache.isSuppressingLookups == false)
+  }
+
   @Test("In-flight scoped lookup is rejected while concurrent global lookup succeeds")
   func inFlightScopedVsGlobal() async {
     let lookup = MultiSuspendedLookup()

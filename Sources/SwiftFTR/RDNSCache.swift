@@ -41,6 +41,7 @@ actor RDNSCache {
   private let lookupDeadline: TimeInterval
   private var scopedGeneration: UInt64 = 0
   private var globalGeneration: UInt64 = 0
+  private var breakerGeneration: UInt64 = 0
   private var consecutiveStalls = 0
 
   /// Initialize a new rDNS cache.
@@ -89,16 +90,19 @@ actor RDNSCache {
 
     let isScoped = ipAddressScope(of: ip) != .global
     let lookupGeneration = isScoped ? scopedGeneration : globalGeneration
+    let lookupBreakerGeneration = breakerGeneration
     let startedAt = clock.now
     let hostname = await resolver(ip)
     let elapsed = startedAt.duration(to: clock.now)
 
-    // A lookup that consumed its whole budget did not answer; it timed out or was starved. Track
-    // that separately from a resolver that answered "no such name", which is a normal fast result.
-    if elapsed >= .seconds(lookupDeadline * 0.9) {
-      consecutiveStalls += 1
-    } else {
-      consecutiveStalls = 0
+    // Only lookups initiated under the current breaker generation may update breaker state.
+    // Stale lookups from a prior network generation must not re-trip or reset the breaker on the new network.
+    if lookupBreakerGeneration == breakerGeneration {
+      if elapsed >= .seconds(lookupDeadline * 0.9) {
+        consecutiveStalls += 1
+      } else {
+        consecutiveStalls = 0
+      }
     }
 
     // A result from an invalidated network generation must neither escape to the caller nor
@@ -143,6 +147,7 @@ actor RDNSCache {
   func clear() {
     scopedGeneration &+= 1
     globalGeneration &+= 1
+    breakerGeneration &+= 1
     cache.removeAll()
     consecutiveStalls = 0
   }
@@ -155,6 +160,7 @@ actor RDNSCache {
   /// global lookups continue to complete and cache normally.
   func invalidateNetworkScoped() {
     scopedGeneration &+= 1
+    breakerGeneration &+= 1
     cache = cache.filter { ip, _ in ipAddressScope(of: ip) == .global }
     consecutiveStalls = 0
   }
