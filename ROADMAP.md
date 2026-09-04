@@ -4,39 +4,24 @@ Forward-looking work, stack-ranked top-to-bottom by priority. For what has alrea
 
 ## Priority Queue
 
-### Cache and network-transition lifecycle
-**Goal**: Give callers independent control over trace cancellation,
-public-IP freshness, network-scoped rDNS eviction, and per-operation hop
-budgets, so a network transition never requires replacing the `SwiftFTR` actor.
+### Share the reverse-DNS cache across tracer instances
+**Goal**: Sibling tracers reuse hostname lookups instead of each starting cold, without one
+instance's network change evicting another's entries.
 
-- **Problem**: `networkChanged()` cancels traces and clears every cache as one
-  operation. A caller with evidence that only part of the network state changed
-  (a local roam vs. a WAN change) cannot act selectively; the workaround of
-  recreating the actor risks orphaned tasks on the process-global blocking-I/O
-  executor and encourages writing transient observations into the immutable
-  `SwiftFTRConfig.publicIP` override.
-- **Approach**: Add `cancelActiveTraces()`, `invalidateNetworkScopedRDNS()`,
-  `seedPublicIP(_:source:)`, and an operation-scoped `TraceOptions` override,
-  all additive. `invalidatePublicIP()` already exists. Keep `networkChanged()`
-  as the conservative composition.
-- **Also in scope**: letting sibling tracers share one `RDNSCache`. The local ASN database is
-  already shared per process; the rDNS cache stays per instance until eviction is network-scoped,
-  because one instance's `networkChanged()` would otherwise evict for all of them.
-- **Design and acceptance**: [Cache and network-transition lifecycle](docs/CACHE-AND-TRANSITION-LIFECYCLE.md).
-
-### STUN server list provides no actual redundancy
-**Goal**: Make public-IP discovery fail over to a genuinely different endpoint.
-
-- **Problem**: `stunServers` lists multiple Google hostnames, and discovery walks them serially,
-  paying a `getaddrinfo` for each. Measured 2026-08-30: `stun.l.google.com` and
-  `stun1.l.google.com` both resolve to `74.125.250.129` — the same address. The list costs 3x the
-  DNS work of one server while providing no IP-level failover, and against an unresponsive
-  resolver each of those lookups stalls 30s.
-- **Approach**: pick endpoints operated by different providers so failover means something, and
-  resolve them concurrently rather than serially. Two servers on distinct networks beat three
-  hostnames pointing at one address.
-- **Note**: verify the duplication still holds before acting — Google's records carry a ~150s TTL
-  and are geo-steered, so a different vantage point may resolve them differently.
+- **Problem**: `interface` is fixed at construction, so a caller needing several binding contexts
+  holds several tracers, and each owns a private `RDNSCache`. The local ASN database is already
+  shared per process; reverse DNS is the remaining per-instance cost, and it is the expensive one
+  on a cold network because each lookup can stall.
+- **Blocker, and why this did not ship with the rest of the lifecycle work**: eviction is
+  per-instance today. `networkChanged()` on one tracer would clear a shared cache for all of them,
+  which is wrong when the instances are bound to different interfaces that changed independently.
+  Sharing needs eviction scoped to the network a cache entry was observed on, not to the actor
+  that happens to call it.
+- **Approach**: accept an `RDNSCache` at construction the way `traceClassified` accepts a
+  resolver, keeping per-instance as the default. Gate it on scoping eviction by network identity
+  so a shared cache cannot be cleared out from under a sibling.
+- **Design context**: [Cache and network-transition lifecycle](docs/CACHE-AND-TRANSITION-LIFECYCLE.md)
+  describes the cache classes and their invalidation rules.
 
 ### Literal-IP STUN endpoints
 **Goal**: Remove DNS from public-IP discovery entirely, rather than bounding its cost.

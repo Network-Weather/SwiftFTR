@@ -416,6 +416,8 @@ Fuzzing
 Documentation
 -------------
 - DocC bundle at `Sources/SwiftFTR/SwiftFTR.docc`.
+- [`docs/CACHE-AND-TRANSITION-LIFECYCLE.md`](docs/CACHE-AND-TRANSITION-LIFECYCLE.md) — what the tracer caches,
+  what invalidates each class, and the controls a caller gets across a network transition (fresh as of 2026-09-03).
 - [`BENCHMARKS.md`](BENCHMARKS.md) — measured throughput, memory and ASN-database load cost per release,
   with the `ResourceBenchmark` and `asnloadprobe` commands that reproduce them (fresh as of 2026-09-01).
 - [`docs/IPV6.md`](docs/IPV6.md) — sequenced plan and architectural contracts for IPv6 feature parity (ping, traceroute, probes, STUN, ASN).

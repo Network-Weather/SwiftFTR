@@ -135,6 +135,11 @@ public struct TraceOptions: Sendable, Equatable {
 }
 
 /// Origin of a dynamically seeded public IP address.
+///
+/// ``SwiftFTR/seedPublicIP(_:source:)`` requires the caller to state where a seeded address came
+/// from, but does not retain the value: a seeded address is cached the same way whatever its
+/// source, and the library exposes no way to read the source back. Whether to persist it and act
+/// on the difference is an open question recorded in the lifecycle design document.
 public enum PublicIPSource: Sendable, Equatable {
   /// Seeded from a validated caller-side cache or observation.
   case validatedCallerCache
@@ -295,18 +300,18 @@ public struct SwiftFTRConfig: Sendable {
   /// ASN resolver strategy for trace classification.
   ///
   /// Controls how IP-to-ASN lookups are performed during `traceClassified()`.
-  /// Defaults to `.dns` (Team Cymru DNS) for backward compatibility.
   ///
   /// Options:
   /// - `.hybrid(source, fallbackTimeout:)`: **Default.** Local database first, DNS only for
-  ///   addresses it does not cover. Costs ~6MB of memory for the embedded database and removes
-  ///   the network from the common path, which matters because a caller that discards caches on
-  ///   a network change re-pays the cold path every time — and a cold DNS lookup against an
-  ///   unresponsive resolver stalls for 30 seconds.
+  ///   addresses it does not cover. Removes the network from the common path, which matters
+  ///   because a caller that discards caches on a network change re-pays the cold path every
+  ///   time — and a cold DNS lookup against an unresponsive resolver stalls for 30 seconds.
+  ///   Loads the embedded database; see `.embedded` for what that costs.
   /// - `.dns`: DNS-based lookups via Team Cymru. No memory cost, but every uncached address is a
   ///   network round trip, and enrichment is only as reliable as the resolver.
-  /// - `.embedded`: Local database only (~10μs lookups, +6MB memory). No network at any point;
-  ///   an address the database does not cover simply has no ASN.
+  /// - `.embedded`: Local database only (~10μs lookups). No network at any point; an address the
+  ///   database does not cover simply has no ASN. The database is loaded once per process and
+  ///   shared, so it costs about 15 MB however many tracers exist.
   /// - `.remote(bundledPath:url:)`: Remote database with optional offline fallback
   ///
   /// Example:
@@ -1365,7 +1370,8 @@ public actor SwiftFTR {
   ///
   /// - Parameters:
   ///   - address: The public IP address string to seed.
-  ///   - source: The origin of this observation (e.g. validated caller cache or gateway).
+  ///   - source: The origin of this observation. Stating it is required; the library does not
+  ///     retain it and treats every accepted address identically. See ``PublicIPSource``.
   /// - Returns: `true` if the address was accepted and cached; `false` if rejected.
   @discardableResult
   public func seedPublicIP(

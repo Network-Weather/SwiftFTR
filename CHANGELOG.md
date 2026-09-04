@@ -3,77 +3,115 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-Unreleased
-----------
+0.17.0 — 2026-09-03
+-------------------
 
-### Added
+Two themes. A caller no longer has to replace the `SwiftFTR` actor to react to a network change:
+cancellation, reverse-DNS eviction, public-IP freshness, and hop budgets are now independently
+controllable. And ASN enrichment no longer depends on the network by default, because the
+embedded database is now the default source and is loaded once per process rather than once per
+tracer.
 
-- `cancelActiveTraces()` cancels currently active traces without invalidating cached rDNS,
-  public IP, or ASN resolution.
-- `invalidateNetworkScopedRDNS()` evicts network-scoped (private, CGNAT, link-local, loopback,
-  ULA) rDNS entries and resets the stall breaker while preserving globally routable internet
-  hostnames and allowing in-flight global lookups to finish normally.
-- `seedPublicIP(_:source:)` dynamically seeds a validated public IP address into the actor's
-  cache for the current generation, allowing classified traces to bypass discovery without
-  the permanent suppression of `SwiftFTRConfig.publicIP`. Rejects non-global (RFC 1918, CGNAT,
-  link-local, loopback, ULA, multicast), malformed, and placeholder sentinels.
-- `PublicIPSource` indicates the origin of a seeded public IP address (`.validatedCallerCache`,
-  `.gatewayReported`).
-- `TraceOptions` and per-operation options on `trace(to:options:)` and `traceClassified(to:vpnContext:resolver:options:)`
-  permit overriding `maxHops` on individual traces without reconfiguring the actor.
-
-### Changed
-
-- STUN public IP fallback now resolves endpoints concurrently across worker threads to avoid
-  serial DNS stalls. Deduplicated the fallback server list by dropping redundant `stun1.l.google.com`
-  (which pointed to the exact same IP as `stun.l.google.com`), ensuring genuine multi-provider failover
-  between independent providers (Google and Cloudflare) on distinct networks.
-
-### Tooling
-
-- Pull requests are now gated on the DocC documentation build: broken doc links and
-  documentation warnings fail CI instead of surfacing at release time.
+Everything here is additive. `swift package diagnose-api-breaking-changes v0.16.0` reports no
+breaking changes, so upgrading is a version bump. Read the behavior changes below, since two of
+them alter what an unmodified caller does at runtime.
 
 ### Behavior changes
-
-- `isPrivateIPv4(_:)` and `isCGNATIPv4(_:)` now validate addresses with the same strict,
-  byte-based parser used by scope classification. Malformed dotted strings return `false` instead
-  of being classified from only their first one or two components; valid IPv4 behavior is
-  unchanged.
 
 - **ASN lookups now use the embedded database by default.** The default `asnResolverStrategy`
   changes from `.dns` to `.hybrid(.embedded)`: the local database answers first, and DNS is
   consulted only for addresses it does not cover. Until now the embedded database shipped but was
   never loaded unless a caller opted in, so every ASN lookup was a Team Cymru DNS query.
 
-  Measured on a fixed set of ten public addresses: both strategies resolve 10/10, so this is a
-  latency and reliability change rather than a coverage change. Cold resolution drops from 0.215s
-  to 0.094s, and the common path no longer depends on the resolver at all — which matters because
-  a cold DNS lookup against an unresponsive resolver stalls for 30 seconds, and callers that
-  discard caches on a network change re-pay the cold path every time.
+  Measured by `AsnStrategyBench` on a fixed set of ten public addresses, release build, 2026-09-03:
+  every strategy resolves 10/10, so this is a latency and reliability change rather than a coverage
+  change. Cold resolution of the set drops from 0.187s on `.dns` to 0.059s on `.hybrid(.embedded)`,
+  where the local figure is dominated by the one-time database load and the DNS figure varies with
+  the resolver in front of you. The point is less the millisecond count than what the common path
+  depends on: nothing on the network. That matters because a cold DNS lookup against an
+  unresponsive resolver stalls for 30 seconds, and callers that discard caches on a network change
+  re-pay the cold path every time.
 
-  One loaded database costs about 50 MB of resident memory, shared by every instance in the
-  process. Callers who want the old behavior can pass `asnResolverStrategy: .dns`; those who want
-  no network under any circumstances can pass `.embedded`. Call `preloadASNDatabase()` early to
-  move the first-load cost off the first trace.
+  The cost is memory. One loaded database is about 15 MB, and the first load takes process
+  footprint to roughly 50 MB, because the decoder's scratch buffers are retained by the allocator
+  rather than returned to the system. That is paid once per process however many tracers exist.
+  Callers who want the old behavior can pass `asnResolverStrategy: .dns`; those who want no
+  network under any circumstances can pass `.embedded`. Call `preloadASNDatabase()` early to move
+  the first-load cost off the first trace.
+
+- **`isPrivateIPv4(_:)` and `isCGNATIPv4(_:)` validate addresses strictly.** Both now use the same
+  byte-based parser as scope classification. Malformed dotted strings return `false` instead of
+  being classified from only their first one or two components. Valid IPv4 behavior is unchanged.
+
+### New public API: network-transition lifecycle
+
+`networkChanged()` cancels traces and clears every cache as one operation, so a caller with
+evidence that only part of the network state changed had to either over-invalidate or replace the
+actor. Replacing the actor risks orphaned tasks on the shared blocking-I/O executor. Each control
+below is now independently callable, and `networkChanged()` remains the conservative composition
+of all of them.
+
+- `cancelActiveTraces()` cancels in-flight traces while preserving cached reverse-DNS entries, the
+  discovered public IP, and ASN results. Cancellation interrupts in-flight reverse-DNS and ASN
+  enrichment rather than letting those phases run to completion. Traces registered while
+  cancellation is in progress stay tracked for the next call rather than being silently dropped.
+- `invalidateNetworkScopedRDNS()` evicts only network-scoped entries — private, CGNAT, link-local,
+  loopback and unique-local — and resets the reverse-DNS stall breaker. Globally routable
+  hostnames survive, and in-flight global lookups finish normally.
+- `seedPublicIP(_:source:)` seeds a validated public address into the actor's cache for the current
+  generation, so a caller that already knows the answer can skip discovery without the permanent
+  suppression that setting `SwiftFTRConfig.publicIP` implies. It rejects non-global addresses
+  (RFC 1918, CGNAT, link-local, loopback, unique-local, multicast), malformed input, zone-suffixed
+  addresses, and placeholder sentinels; it canonicalizes what it accepts, so a seeded address reads
+  back in the same form the rest of the API reports; and it supersedes any in-flight discovery, so a
+  slower lookup already running cannot overwrite it. A seed does not survive `invalidatePublicIP()`,
+  `clearCaches()` or `networkChanged()`. `PublicIPSource` (`.validatedCallerCache`,
+  `.gatewayReported`) makes the caller state where the address came from, but the library does not
+  retain it and treats every accepted address identically; whether to persist and act on the
+  distinction is an open question, and until it is answered the parameter is documentation at the
+  call site rather than behavior.
+- `TraceOptions` carries per-operation overrides, currently `maxHops`, via `trace(to:options:)` and
+  `traceClassified(to:vpnContext:resolver:options:)`. Out-of-range values throw
+  `TracerouteError.invalidConfiguration`.
+
+The existing `trace(to:)` and `traceClassified(to:vpnContext:resolver:)` entry points keep their
+exact shapes, so callers and DocC symbol links continue to resolve unchanged.
+
+### Performance and reliability
 
 - **The local ASN database is loaded once per process and shared.** Every `LocalASNResolver`, and
-  so every `SwiftFTR` and `HybridASNResolver` built for the same source, reads one copy through
-  a process-wide store that also coalesces concurrent loads. Until now each instance decompressed
-  and held its own copy, and `preloadASNDatabase()` warmed only the instance it was called on.
+  so every `SwiftFTR` and `HybridASNResolver` built for the same source, reads one copy through a
+  process-wide store that also coalesces concurrent loads. Until now each instance decompressed and
+  held its own copy, and `preloadASNDatabase()` warmed only the instance it was called on. This
+  matters for callers that hold one tracer per interface, since interface binding is fixed at
+  construction.
 
-  Measured in a release build on Apple M4, 2026-09-01, with `swift run -c release asnloadprobe 8`:
-  constructing and preloading 16 tracers took the process from 6 MB to 508 MB resident at 56–62 ms
-  per tracer; it now reaches 57 MB after one 61 ms load, and every further tracer is free. The copy
-  is released when the last resolver using it goes away, so a host that wants it resident keeps one
-  instance alive. No API change.
+  Measured in a release build on Apple M4 with `swift run -c release asnloadprobe 8`: constructing
+  and preloading 16 tracers took the process from 6 MB to 508 MB resident at 56–62 ms per tracer;
+  it now reaches 57 MB after one 57 ms load, and every further tracer is free. The copy is released
+  when the last resolver using it goes away, so a caller that wants it resident keeps one instance
+  alive. No API change; the reproducer ships as `Tests/TestSupport/asnloadprobe`.
+
+- **Public-IP discovery fails over between independent providers, concurrently.** The STUN server
+  list previously held multiple Google hostnames that resolved to a single address, so it paid
+  several DNS lookups for no IP-level redundancy, serially, with each unanswered lookup able to
+  stall for 30 seconds. The list is now Google and Cloudflare on distinct networks, resolved
+  concurrently. `stunGetPublicIPWithFallback` also validates its timeout before starting DNS
+  resolution rather than after.
 
 ### Dependencies
 
-- SwiftIP2ASN 0.4.1 → 0.5.0, which adds observable database freshness and conditional-GET
-  refreshes. The existing `from: "0.4.1"` requirement already permitted 0.5.0, so consumers
-  resolved to it regardless; this pins our own CI to what they get. SwiftFTR never referenced
-  `UltraCompactError`, so the breaking change in that release does not reach us.
+- SwiftIP2ASN: the requirement remains `from: "0.4.1"`, which permits any 0.x at or above that.
+  This release is tested against 0.5.1, which adds observable database freshness and conditional-GET
+  refreshes. `Package.resolved` is deliberately not committed, and SwiftPM ignores a library's
+  resolution when it is consumed as a dependency, so consumers resolve to the newest permitted
+  version independently of what our CI pins. SwiftFTR never referenced `UltraCompactError`, so the
+  breaking change in 0.5.0 does not reach us.
+
+### Tooling
+
+- Pull requests are gated on the DocC documentation build: broken doc links and documentation
+  warnings fail CI instead of surfacing at release time.
 
 0.16.0 — 2026-08-31
 -------------------
