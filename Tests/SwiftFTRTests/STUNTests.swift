@@ -221,6 +221,18 @@ struct STUNTests {
     }
   }
 
+  @Test(
+    "stunGetPublicIPWithFallback rejects invalid timeouts before DNS",
+    arguments: [0.0, -1.0, .infinity])
+  func testFallbackInvalidTimeout(timeout: TimeInterval) {
+    #expect {
+      try stunGetPublicIPWithFallback(family: AF_INET, timeout: timeout)
+    } throws: { error in
+      guard case STUNError.invalidTimeout = error else { return false }
+      return true
+    }
+  }
+
   // MARK: - Integration with SwiftFTR
 
   @Test("SwiftFTR caches STUN result")
@@ -334,11 +346,25 @@ struct STUNTests {
 
   // MARK: - Multi-Server STUN Fallback Tests
 
-  @Test("STUN server list is populated")
+  @Test("STUN server list is populated with unique providers")
   func testSTUNServerList() {
-    #expect(stunServers.count >= 3)
+    #expect(stunServers.count >= 2)
     #expect(stunServers.contains { $0.host.contains("google") })
     #expect(stunServers.contains { $0.host.contains("cloudflare") })
+    let uniqueHosts = Set(stunServers.map(\.host))
+    #expect(
+      uniqueHosts.count == stunServers.count, "STUN servers must not contain duplicate hostnames")
+  }
+
+  @Test("resolveSTUNServer resolves valid host and rejects invalid host")
+  func testResolveSTUNServer() {
+    let resolved = resolveSTUNServer(host: "127.0.0.1", port: 3478, family: AF_INET)
+    #expect(resolved != nil)
+    #expect(resolved?.serverLen == socklen_t(MemoryLayout<sockaddr_in>.size))
+
+    let invalid = resolveSTUNServer(
+      host: "invalid.domain.that.does.not.exist.example", port: 3478, family: AF_INET)
+    #expect(invalid == nil)
   }
 
   @Test(
