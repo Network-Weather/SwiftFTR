@@ -2,10 +2,14 @@
 
 ## Status
 
-Proposal. Scope is the SwiftFTR library contract only: what the actor caches,
+Implemented in 0.17.0, except for sharing an `RDNSCache` between tracer
+instances, which is tracked in [ROADMAP.md](../ROADMAP.md). This document is
+the design of record for the lifecycle contract: what the actor caches, what
+invalidates it, and which controls callers get. Scope is the SwiftFTR library
+contract only. How a caller decides
 what invalidates it, and which controls callers get. How a caller decides
 *when* to invoke these controls — network identity heuristics, revalidation
-policy, telemetry — is caller policy and out of scope for this document.
+policy, telemetry — is caller policy and out of scope.
 
 ## Decision summary
 
@@ -13,16 +17,14 @@ A caller should keep a long-lived `SwiftFTR` actor for a measurement context.
 A network transition must not require replacing that actor merely to cancel
 active work or refresh cached discovery state.
 
-The library therefore needs its lifecycle controls to be independently
-callable:
+The library's lifecycle controls are therefore independently callable:
 
-- cancelling active traces (**proposed**: `cancelActiveTraces()`);
-- invalidating the discovered public IP (**exists**: `invalidatePublicIP()`);
-- evicting only network-scoped rDNS entries (**proposed**:
-  `invalidateNetworkScopedRDNS()`);
-- seeding a validated public IP without suppressing discovery (**proposed**:
-  `seedPublicIP(_:source:)`); and
-- supplying a per-operation hop budget (**proposed**: `TraceOptions`).
+- cancelling active traces: `cancelActiveTraces()`;
+- invalidating the discovered public IP: `invalidatePublicIP()`;
+- evicting only network-scoped rDNS entries: `invalidateNetworkScopedRDNS()`;
+- seeding a validated public IP without suppressing discovery:
+  `seedPublicIP(_:source:)`; and
+- supplying a per-operation hop budget: `TraceOptions`.
 
 `networkChanged()` remains the conservative composition — cancel everything,
 invalidate everything — for callers without finer-grained evidence.
@@ -85,10 +87,10 @@ The library-owned state and what may invalidate it:
 
 | Data | Key | Invalidated by |
 |---|---|---|
-| Active trace handles | cache generation | `networkChanged()`; proposed `cancelActiveTraces()` |
+| Active trace handles | cache generation | `networkChanged()`; `cancelActiveTraces()` |
 | Discovered public IP | current generation | `invalidatePublicIP()`, `clearCaches()`, `networkChanged()` |
 | Globally routable rDNS | IP address | 86400 s TTL or LRU capacity; should survive local transitions |
-| Network-scoped rDNS (private, CGNAT, link-local, ULA, loopback) | IP address | Proposed `invalidateNetworkScopedRDNS()`; today only full `clear()` |
+| Network-scoped rDNS (private, CGNAT, link-local, ULA, loopback) | IP address | `invalidateNetworkScopedRDNS()`; `networkChanged()` |
 | ASN results | globally routable address | Capacity only (no TTL); local transitions must not clear it |
 
 Anything keyed on the caller's understanding of network identity — which
@@ -96,10 +98,10 @@ gateway it is behind, whether a WAN lease changed, how confident it is in a
 path — is caller state. The library's contract is only that each control above
 does exactly what it says and nothing more.
 
-## Proposed API
+## The controls
 
-All four additions are additive; existing overloads remain source-compatible.
-Snippets establish semantics, not final spellings.
+All four additions are additive; the pre-existing overloads remain
+source-compatible.
 
 ### `cancelActiveTraces()`
 
@@ -199,20 +201,11 @@ existing `1...255` range and applies only to that operation. The library
 provides the mechanism; when to shorten a budget, how much headroom to add,
 and when to retry at full budget are caller policy.
 
-## Migration plan
+## What the tests hold to
 
-- Add the three new controls and `TraceOptions` as additive API, each with
-  deterministic unit tests (injected resolvers; no live network).
-- Keep `networkChanged()` byte-for-byte equivalent to the composition of
-  cancellation, public-IP invalidation, and full rDNS eviction, so existing
-  callers see no behavior change.
-- Document on `SwiftFTRConfig.publicIP` that it is an authoritative override,
-  not a cache-seeding mechanism, and point to `seedPublicIP(_:source:)`.
-
-## Acceptance
-
-The implementation is not complete when it compiles. Library-level tests must
-demonstrate:
+`networkChanged()` stays equivalent to the composition of cancellation,
+public-IP invalidation, and full rDNS eviction, so callers that only ever call
+it see no behavior change. Beyond that, library-level tests demonstrate:
 
 - `cancelActiveTraces()` cancels the snapshot generation, leaves
   later-registered traces tracked, and leaves every cache intact.
@@ -232,15 +225,17 @@ demonstrate:
 
 - Whether `seedPublicIP` should take a generation token instead of relying on
   the documented invalidate-then-seed ordering.
-- Whether CGNAT-range (`100.64.0.0/10`) rDNS entries should be treated as
-  network-scoped for eviction: overlay networks assign stable addresses from
-  this range, so evicting them on every local transition re-pays lookups for
-  addresses that did not change. Options: evict (current proposal), retain,
-  or make the scope set configurable.
+- Whether CGNAT-range (`100.64.0.0/10`) rDNS entries should stay network-scoped
+  for eviction. They are evicted today. Overlay networks assign stable addresses
+  from this range, so evicting them on every local transition re-pays lookups for
+  addresses that did not change. The alternatives are retaining them or making
+  the scope set configurable.
 - Whether the ASN cache should gain a TTL while this area is open, or remain
   capacity-only.
 - Whether `seedPublicIP` should accept a typed address once the library has a
   public address representation; today the public surface is string
   presentations.
-- Whether a gateway-reported WAN value should be seedable at all, or only
-  usable by callers to decide that a revalidation is redundant.
+- Whether a gateway-reported WAN value should be seedable at all. It is today,
+  labelled `PublicIPSource.gatewayReported` so a caller can tell seeded values
+  apart by trust level; the alternative is to let callers use it only to decide
+  that a revalidation is redundant.

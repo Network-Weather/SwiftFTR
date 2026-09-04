@@ -30,7 +30,9 @@ public enum ASNResolverStrategy: Sendable {
 
   /// Use embedded local database from SwiftIP2ASN package resources.
   /// Fast (~10μs), works offline. The database is loaded once per process and shared by every
-  /// resolver that uses it; it costs about 50 MB of resident memory after load.
+  /// resolver that uses it, so additional resolvers cost nothing. One copy is about 15 MB;
+  /// the first load takes process footprint to roughly 50 MB, because the decoder's scratch
+  /// buffers are retained by the allocator rather than returned to the system.
   case embedded
 
   /// Use remote database with optional bundled fallback.
