@@ -13,6 +13,12 @@ Unreleased
 - `invalidateNetworkScopedRDNS()` evicts network-scoped (private, CGNAT, link-local, loopback,
   ULA) rDNS entries and resets the stall breaker while preserving globally routable internet
   hostnames and allowing in-flight global lookups to finish normally.
+- `seedPublicIP(_:source:)` dynamically seeds a validated public IP address into the actor's
+  cache for the current generation, allowing classified traces to bypass discovery without
+  the permanent suppression of `SwiftFTRConfig.publicIP`. Rejects non-global (RFC 1918, CGNAT,
+  link-local, loopback, ULA, multicast), malformed, and placeholder sentinels.
+- `PublicIPSource` indicates the origin of a seeded public IP address (`.validatedCallerCache`,
+  `.gatewayReported`).
 - `TraceOptions` and per-operation options on `trace(to:options:)` and `traceClassified(to:vpnContext:resolver:options:)`
   permit overriding `maxHops` on individual traces without reconfiguring the actor.
 

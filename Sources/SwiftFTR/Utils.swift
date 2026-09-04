@@ -65,6 +65,33 @@ func ipv6String(_ addr: in6_addr, scopeID: UInt32 = 0) -> String {
   return "\(bare)%\(scopeID)"
 }
 
+/// Canonical presentation form (inet_ntop) of an IPv4 or IPv6 address string.
+/// Returns nil if the string is not a syntactically valid numeric IP address.
+func canonicalIPAddress(_ presentation: String) -> String? {
+  var address4 = in_addr()
+  if presentation.withCString({ inet_pton(AF_INET, $0, &address4) }) == 1 {
+    var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+    _ = withUnsafePointer(to: &address4) { ptr in
+      inet_ntop(AF_INET, ptr, &buf, socklen_t(INET_ADDRSTRLEN))
+    }
+    return buf.withUnsafeBufferPointer { String(cString: $0.baseAddress!) }
+  }
+
+  let (bare, scopeID) = parseIPv6Scoped(presentation)
+  if presentation.contains("%") {
+    // Zone identifiers are only valid if successfully resolved to a non-zero index,
+    // and only on non-global addresses (RFC 4007 §11).
+    guard scopeID != 0 else { return nil }
+    guard let parsed = ParsedIPAddress(bare), parsed.scope != .global else { return nil }
+  }
+  var address6 = in6_addr()
+  if bare.withCString({ inet_pton(AF_INET6, $0, &address6) }) == 1 {
+    return ipv6String(address6, scopeID: scopeID)
+  }
+
+  return nil
+}
+
 /// The routing scope of a numeric IP address.
 enum IPAddressScope: Sendable, Equatable {
   case global
@@ -94,9 +121,15 @@ struct ParsedIPAddress: Hashable, Sendable {
       return
     }
 
-    let bare =
-      presentation.split(separator: "%", maxSplits: 1).first.map(String.init)
-      ?? presentation
+    let bare: String
+    if let percentIdx = presentation.firstIndex(of: "%") {
+      let zone = presentation[presentation.index(after: percentIdx)...]
+      guard !zone.isEmpty else { return nil }
+      bare = String(presentation[..<percentIdx])
+    } else {
+      bare = presentation
+    }
+
     var address6 = in6_addr()
     guard bare.withCString({ inet_pton(AF_INET6, $0, &address6) }) == 1 else {
       return nil
@@ -146,6 +179,110 @@ struct ParsedIPAddress: Hashable, Sendable {
     }
   }
 
+  /// Returns whether this address is eligible to be a globally routable public address.
+  /// Rejects non-globally-reachable entries from the IANA IPv4 and IPv6 Special-Purpose Address
+  /// Registries (RFC 6890, RFC 5737, RFC 2544, RFC 1112, RFC 8215, RFC 6666, RFC 9780, RFC 3849,
+  /// RFC 9637, RFC 9602, etc.).
+  var isGloballyRoutablePublicAddress: Bool {
+    guard scope == .global else { return false }
+    switch family {
+    case .ipv4:
+      let first = bytes[0]
+      let second = bytes[1]
+      let third = bytes[2]
+      let fourth = bytes[3]
+      if first == 0 { return false }
+      // 192.0.0.0/24 (RFC 6890):
+      // 192.0.0.9/32 (PCP Anycast, RFC 7723) and 192.0.0.10/32 (TURN Anycast, RFC 8155)
+      // are marked Globally Reachable in the IANA IPv4 Special-Purpose Address Registry.
+      // All other addresses in 192.0.0.0/24 are not globally reachable.
+      if first == 192 && second == 0 && third == 0 {
+        return fourth == 9 || fourth == 10
+      }
+      // 192.0.2.0/24 (TEST-NET-1, RFC 5737)
+      if first == 192 && second == 0 && third == 2 { return false }
+      // 192.88.99.0/24 (6to4 relay anycast, RFC 7526)
+      if first == 192 && second == 88 && third == 99 { return false }
+      // 198.18.0.0/15 (Benchmarking, RFC 2544)
+      if first == 198 && (second == 18 || second == 19) { return false }
+      // 198.51.100.0/24 (TEST-NET-2, RFC 5737)
+      if first == 198 && second == 51 && third == 100 { return false }
+      // 203.0.113.0/24 (TEST-NET-3, RFC 5737)
+      if first == 203 && second == 0 && third == 113 { return false }
+      // 240.0.0.0/4 (Class E reserved / broadcast, RFC 1112)
+      if first >= 240 { return false }
+      return true
+
+    case .ipv6:
+      // 64:ff9b:1::/48 (Local-Use IPv4/IPv6 Translation, RFC 8215)
+      // Note: 64:ff9b::/96 (Well-Known Prefix, RFC 6052) IS marked Globally Reachable.
+      if bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xff && bytes[3] == 0x9b
+        && bytes[4] == 0x00 && bytes[5] == 0x01
+      {
+        return false
+      }
+      // 100::/64 (Discard-Only, RFC 6666) & 100:0:0:1::/64 (Dummy IPv6 Prefix, RFC 9780)
+      if bytes[0] == 0x01 && bytes[1] == 0x00 && bytes[2..<7].allSatisfy({ $0 == 0 })
+        && (bytes[7] == 0x00 || bytes[7] == 0x01)
+      {
+        return false
+      }
+      // 2001::/23 (IETF Protocol Assignments, RFC 2928):
+      // By default, addresses within 2001::/23 are not globally reachable unless permitted
+      // by a more specific allocation in the IANA IPv6 Special-Purpose Address Registry.
+      if bytes[0] == 0x20 && bytes[1] == 0x01 && (bytes[2] & 0xfe) == 0x00 {
+        let third = bytes[2]
+        let fourth = bytes[3]
+
+        // 2001:1::1/128 (PCP Anycast), 2001:1::2/128 (TURN Anycast), 2001:1::3/128 (DNS-SD Anycast)
+        if third == 0x00 && fourth == 0x01
+          && bytes[4..<15].allSatisfy({ $0 == 0 })
+          && (bytes[15] == 1 || bytes[15] == 2 || bytes[15] == 3)
+        {
+          return true
+        }
+
+        // 2001:3::/32 (AMT, RFC 7450)
+        if third == 0x00 && fourth == 0x03 {
+          return true
+        }
+
+        // 2001:4:112::/48 (AS112-v6, RFC 7535)
+        if third == 0x00 && fourth == 0x04 && bytes[4] == 0x01 && bytes[5] == 0x12 {
+          return true
+        }
+
+        // 2001:20::/28 (ORCHIDv2, RFC 7343)
+        if third == 0x00 && (fourth & 0xf0) == 0x20 {
+          return true
+        }
+
+        // 2001:30::/28 (Drone Remote ID DETs, RFC 9374)
+        if third == 0x00 && (fourth & 0xf0) == 0x30 {
+          return true
+        }
+
+        // All other addresses in 2001::/23 (e.g. 2001::/32 Teredo, 2001:2::/48 benchmarking,
+        // 2001:5::/32 unallocated, 2001:10::/28 deprecated) are not globally reachable.
+        return false
+      }
+
+      // 2001:db8::/32 (Documentation, RFC 3849)
+      if bytes[0] == 0x20 && bytes[1] == 0x01 && bytes[2] == 0x0d && bytes[3] == 0xb8 {
+        return false
+      }
+      // 3fff::/20 (Documentation, RFC 9637)
+      if bytes[0] == 0x3f && bytes[1] == 0xff && (bytes[2] & 0xf0) == 0x00 {
+        return false
+      }
+      // 5f00::/16 (Segment Routing SRv6 SIDs, RFC 9602)
+      if bytes[0] == 0x5f && bytes[1] == 0x00 {
+        return false
+      }
+      return true
+    }
+  }
+
   /// The canonical dotted-quad form when the address has IPv4 routing semantics.
   var canonicalIPv4Presentation: String? {
     guard family == .ipv4 else { return nil }
@@ -176,7 +313,19 @@ private func ipAddressScopeIdentifier(in presentation: String) -> IPAddressScope
 /// Returns the routing scope of a numeric IPv4 or IPv6 address.
 @inline(__always)
 func ipAddressScope(of presentation: String) -> IPAddressScope? {
-  ParsedIPAddress(presentation)?.scope
+  guard let parsed = ParsedIPAddress(presentation) else { return nil }
+  if presentation.contains("%") {
+    // Zone indices (%zone) are only valid for non-global scopes where address space is ambiguous
+    // without an interface qualifier (RFC 4007 §11). Global or reserved addresses with a zone index
+    // are malformed.
+    guard parsed.scope == .linkLocal || parsed.scope == .multicast else {
+      return nil
+    }
+    guard ipAddressScopeIdentifier(in: presentation) != nil else {
+      return nil
+    }
+  }
+  return parsed.scope
 }
 
 /// Returns whether two numeric address presentations identify the same IP address.
@@ -200,6 +349,19 @@ func ipAddressesAreEqual(_ lhs: String, _ rhs: String) -> Bool {
 @inline(__always)
 func isGloballyRoutableIPAddress(_ presentation: String) -> Bool {
   ipAddressScope(of: presentation) == .global
+}
+
+/// Returns whether the numeric address is a valid, globally routable public IP.
+///
+/// Rejects private networks (RFC 1918, ULA), CGNAT (RFC 6598), link-local, loopback,
+/// multicast, unspecified, documentation / test networks (RFC 5737, RFC 3849),
+/// benchmark ranges (RFC 2544, RFC 5180), Class E reserved (240.0.0.0/4), limited broadcast,
+/// and any address with a scope/zone index (%zone).
+@inline(__always)
+func isGloballyRoutablePublicIP(_ presentation: String) -> Bool {
+  guard !presentation.contains("%") else { return false }
+  guard let parsed = ParsedIPAddress(presentation) else { return false }
+  return parsed.isGloballyRoutablePublicAddress
 }
 
 /// Returns the address presentation to send to an ASN resolver.

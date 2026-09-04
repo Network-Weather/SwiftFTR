@@ -134,6 +134,14 @@ public struct TraceOptions: Sendable, Equatable {
   }
 }
 
+/// Origin of a dynamically seeded public IP address.
+public enum PublicIPSource: Sendable, Equatable {
+  /// Seeded from a validated caller-side cache or observation.
+  case validatedCallerCache
+  /// Reported by an upstream gateway (e.g. router WAN interface or NAT-PMP/PCP).
+  case gatewayReported
+}
+
 /// Errors that can occur while performing a traceroute.
 public enum TracerouteError: Error, CustomStringConvertible {
   /// DNS resolution failed for the destination host.
@@ -217,11 +225,15 @@ public struct SwiftFTRConfig: Sendable {
   public let maxWaitMs: Int
   /// Size in bytes of the Echo payload (default: 56)
   public let payloadSize: Int
-  /// Public-address override for classified trace and multipath enrichment.
+  /// Authoritative public-address override for classified trace and multipath enrichment.
   ///
-  /// When set, these enrichment paths bypass public-IP discovery. The standalone
-  /// ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` function and
-  /// ``SwiftFTR/discoverPublicIPWithHostname()`` do not use this value.
+  /// When set, this is an immutable configuration override that permanently bypasses
+  /// public-IP discovery for the lifetime of the actor. It is not a cache-seeding mechanism.
+  /// To provide a known-valid public IP dynamically across network transitions without
+  /// disabling discovery permanently, use ``SwiftFTR/seedPublicIP(_:source:)`` instead.
+  ///
+  /// The standalone ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` function
+  /// and ``SwiftFTR/discoverPublicIPWithHostname()`` do not use this value.
   public let publicIP: String?
   /// Enable verbose logging for debugging
   public let enableLogging: Bool
@@ -1193,8 +1205,11 @@ public actor SwiftFTR {
     if let cachedPublicIP { return cachedPublicIP }
 
     let discoveryGeneration = cacheGeneration
-    guard let discovered = await discover() else { return nil }
-    guard discoveryGeneration == cacheGeneration else { return nil }
+    guard let discovered = await discover() else { return cachedPublicIP }
+    // If cache was seeded or invalidated while discovery was in flight, do not overwrite the newer value.
+    guard discoveryGeneration == cacheGeneration, cachedPublicIP == nil else {
+      return cachedPublicIP
+    }
 
     cachedPublicIP = discovered
     return discovered
@@ -1331,6 +1346,42 @@ public actor SwiftFTR {
   /// Also resets the reverse-DNS stall breaker so subsequent lookups are attempted.
   public func invalidateNetworkScopedRDNS() async {
     await rdnsCache.invalidateNetworkScoped()
+  }
+
+  /// Dynamically seeds a validated public IP address for the current cache generation.
+  ///
+  /// This provides a known-valid public IP so the next classified trace or multipath
+  /// enrichment can skip discovery, without permanently overriding discovery like
+  /// ``SwiftFTRConfig/publicIP`` does.
+  ///
+  /// The address must be a syntactically valid, globally routable IPv4 or IPv6 address.
+  /// Private (RFC 1918), carrier-grade NAT (100.64.0.0/10), link-local, loopback,
+  /// multicast, and malformed strings (including placeholder sentinels like `"unknown"`)
+  /// are rejected.
+  ///
+  /// A successful seed applies only to the cache generation active at the call. Any
+  /// subsequent invalidation (such as ``invalidatePublicIP()``, ``clearCaches()``, or
+  /// ``networkChanged()``) discards the seeded value.
+  ///
+  /// - Parameters:
+  ///   - address: The public IP address string to seed.
+  ///   - source: The origin of this observation (e.g. validated caller cache or gateway).
+  /// - Returns: `true` if the address was accepted and cached; `false` if rejected.
+  @discardableResult
+  public func seedPublicIP(
+    _ address: String,
+    source: PublicIPSource
+  ) -> Bool {
+    guard isGloballyRoutablePublicIP(address) else {
+      return false
+    }
+    guard let canonical = canonicalIPAddress(address) else {
+      return false
+    }
+    // Increment generation so any older in-flight discovery is superseded and cannot overwrite this seed
+    cacheGeneration &+= 1
+    cachedPublicIP = canonical
+    return true
   }
 }
 
