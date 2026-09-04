@@ -1322,6 +1322,16 @@ public actor SwiftFTR {
     cacheGeneration &+= 1
     cachedPublicIP = nil
   }
+
+  /// Invalidate network-scoped reverse DNS cache entries.
+  ///
+  /// Evicts cached reverse DNS entries whose address is not globally routable
+  /// (e.g. RFC 1918 private addresses, CGNAT, link-local, loopback, IPv6 ULA).
+  /// Globally routable Internet hostnames and their TTLs are preserved.
+  /// Also resets the reverse-DNS stall breaker so subsequent lookups are attempted.
+  public func invalidateNetworkScopedRDNS() async {
+    await rdnsCache.invalidateNetworkScoped()
+  }
 }
 
 // MARK: - Dual-stack trace helpers (Stage 2 IPv6)

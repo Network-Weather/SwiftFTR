@@ -58,6 +58,168 @@ struct CacheGenerationTests {
     #expect(current == "198.51.100.8")
     #expect(await tracer.publicIP == "198.51.100.8")
   }
+
+  @Test("invalidateNetworkScoped evicts only non-global entries and preserves global ones")
+  func scopedEvictionPreservesGlobal() async {
+    let resolver = CountingResolver(result: "resolved.example")
+    let cache = RDNSCache(resolver: { ip in await resolver.resolve(ip) })
+
+    let scopedIPs = [
+      "192.168.1.1",
+      "10.0.0.1",
+      "172.16.0.1",
+      "100.64.0.1",
+      "169.254.1.1",
+      "127.0.0.1",
+      "::1",
+      "fe80::1",
+      "fc00::1",
+    ]
+
+    let globalIPs = [
+      "1.1.1.1",
+      "8.8.8.8",
+      "2606:4700:4700::1111",
+    ]
+
+    for ip in scopedIPs + globalIPs {
+      _ = await cache.lookup(ip)
+    }
+    #expect(await cache.count == scopedIPs.count + globalIPs.count)
+
+    let callsBefore = await resolver.callCount
+
+    // Perform network-scoped eviction
+    await cache.invalidateNetworkScoped()
+
+    // Global IPs should remain cached (no additional resolver call)
+    for ip in globalIPs {
+      #expect(await cache.lookup(ip) == "resolved.example")
+    }
+    #expect(await resolver.callCount == callsBefore)
+
+    // Scoped IPs were evicted, so looking them up hits the resolver again
+    for ip in scopedIPs {
+      _ = await cache.lookup(ip)
+    }
+    #expect(await resolver.callCount == callsBefore + scopedIPs.count)
+  }
+
+  @Test("invalidateNetworkScoped resets the stall breaker")
+  func scopedEvictionResetsStallBreaker() async {
+    let cache = RDNSCache(
+      lookupDeadline: 0.05,
+      resolver: { _ in
+        try? await Task.sleep(for: .milliseconds(60))
+        return nil
+      }
+    )
+
+    _ = await cache.lookup("192.0.2.1")
+    _ = await cache.lookup("192.0.2.2")
+    #expect(await cache.isSuppressingLookups)
+
+    await cache.invalidateNetworkScoped()
+    #expect(await cache.isSuppressingLookups == false)
+  }
+
+  @Test("Stale lookups finishing after invalidateNetworkScoped do not re-trip the breaker")
+  func staleScopedLookupsDoNotRetripBreaker() async {
+    let lookup = MultiSuspendedLookup()
+    let cache = RDNSCache(
+      lookupDeadline: 0.05,
+      resolver: { ip in
+        _ = await lookup.resolve(ip)
+        try? await Task.sleep(for: .milliseconds(60))
+        return nil
+      }
+    )
+
+    // Start 2 scoped lookups on the old network
+    let task1 = Task { await cache.lookup("192.168.1.1") }
+    let task2 = Task { await cache.lookup("192.168.1.2") }
+
+    await lookup.waitUntilStarted("192.168.1.1")
+    await lookup.waitUntilStarted("192.168.1.2")
+
+    // Invalidate network-scoped rDNS and reset breaker
+    await cache.invalidateNetworkScoped()
+    #expect(await cache.isSuppressingLookups == false)
+
+    // Resume the stale lookups so they complete with stall durations
+    await lookup.resume("192.168.1.1", returning: nil)
+    await lookup.resume("192.168.1.2", returning: nil)
+
+    _ = await task1.value
+    _ = await task2.value
+
+    // The breaker must NOT be re-tripped by stale lookups
+    #expect(await cache.isSuppressingLookups == false)
+  }
+
+  @Test("In-flight scoped lookup is rejected while concurrent global lookup succeeds")
+  func inFlightScopedVsGlobal() async {
+    let lookup = MultiSuspendedLookup()
+    let cache = RDNSCache(resolver: { ip in await lookup.resolve(ip) })
+
+    let scopedTask = Task { await cache.lookup("192.168.1.1") }
+    let globalTask = Task { await cache.lookup("1.1.1.1") }
+
+    await lookup.waitUntilStarted("192.168.1.1")
+    await lookup.waitUntilStarted("1.1.1.1")
+
+    // Invalidate network-scoped rDNS while both are in flight
+    await cache.invalidateNetworkScoped()
+
+    await lookup.resume("192.168.1.1", returning: "router.local")
+    await lookup.resume("1.1.1.1", returning: "one.one.one.one")
+
+    let scopedResult = await scopedTask.value
+    let globalResult = await globalTask.value
+
+    #expect(scopedResult == nil)
+    #expect(globalResult == "one.one.one.one")
+
+    // Global result is cached; scoped result is NOT cached
+    #expect(await cache.count == 1)
+  }
+
+  @Test("SwiftFTR.invalidateNetworkScopedRDNS clears scoped entries via actor")
+  func tracerScopedEviction() async {
+    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: false))
+    _ = await tracer.rdnsCache.lookup("192.168.1.1")
+    _ = await tracer.rdnsCache.lookup("1.1.1.1")
+
+    await tracer.invalidateNetworkScopedRDNS()
+    #expect(await tracer.rdnsCache.count == 1)
+  }
+}
+
+private actor MultiSuspendedLookup {
+  private var startedKeys: Set<String> = []
+  private var startWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
+  private var continuations: [String: CheckedContinuation<String?, Never>] = [:]
+
+  func resolve(_ key: String) async -> String? {
+    startedKeys.insert(key)
+    if let waiters = startWaiters.removeValue(forKey: key) {
+      for waiter in waiters { waiter.resume() }
+    }
+    return await withCheckedContinuation { cont in
+      continuations[key] = cont
+    }
+  }
+
+  func waitUntilStarted(_ key: String) async {
+    if startedKeys.contains(key) { return }
+    await withCheckedContinuation { cont in
+      startWaiters[key, default: []].append(cont)
+    }
+  }
+
+  func resume(_ key: String, returning value: String?) {
+    continuations.removeValue(forKey: key)?.resume(returning: value)
+  }
 }
 
 private actor SuspendedLookup {

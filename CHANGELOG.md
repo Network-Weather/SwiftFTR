@@ -10,6 +10,9 @@ Unreleased
 
 - `cancelActiveTraces()` cancels currently active traces without invalidating cached rDNS,
   public IP, or ASN resolution.
+- `invalidateNetworkScopedRDNS()` evicts network-scoped (private, CGNAT, link-local, loopback,
+  ULA) rDNS entries and resets the stall breaker while preserving globally routable internet
+  hostnames and allowing in-flight global lookups to finish normally.
 - `TraceOptions` and per-operation options on `trace(to:options:)` and `traceClassified(to:vpnContext:resolver:options:)`
   permit overriding `maxHops` on individual traces without reconfiguring the actor.
 
