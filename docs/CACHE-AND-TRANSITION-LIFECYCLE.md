@@ -235,7 +235,12 @@ it see no behavior change. Beyond that, library-level tests demonstrate:
 - Whether `seedPublicIP` should accept a typed address once the library has a
   public address representation; today the public surface is string
   presentations.
-- Whether a gateway-reported WAN value should be seedable at all. It is today,
-  labelled `PublicIPSource.gatewayReported` so a caller can tell seeded values
-  apart by trust level; the alternative is to let callers use it only to decide
-  that a revalidation is redundant.
+- What `PublicIPSource` is for. `seedPublicIP` requires it and then discards it:
+  a gateway-reported address and a caller-validated one are cached identically,
+  and nothing reads the source back. Either the library should persist it and act
+  on the difference — a lower-trust source might be treated as a hint that expires
+  sooner, or might not satisfy classification on its own — or the parameter should
+  be dropped, since a required argument that does nothing misleads the caller.
+  Resolve this before the seeding API is considered settled.
+- Whether a gateway-reported WAN value should be seedable at all, or only usable
+  by callers to decide that a revalidation is redundant.

@@ -65,8 +65,11 @@ of all of them.
   addresses, and placeholder sentinels; it canonicalizes what it accepts, so a seeded address reads
   back in the same form the rest of the API reports; and it supersedes any in-flight discovery, so a
   slower lookup already running cannot overwrite it. A seed does not survive `invalidatePublicIP()`,
-  `clearCaches()` or `networkChanged()`. `PublicIPSource` records where a seeded address came from
-  (`.validatedCallerCache`, `.gatewayReported`).
+  `clearCaches()` or `networkChanged()`. `PublicIPSource` (`.validatedCallerCache`,
+  `.gatewayReported`) makes the caller state where the address came from, but the library does not
+  retain it and treats every accepted address identically; whether to persist and act on the
+  distinction is an open question, and until it is answered the parameter is documentation at the
+  call site rather than behavior.
 - `TraceOptions` carries per-operation overrides, currently `maxHops`, via `trace(to:options:)` and
   `traceClassified(to:vpnContext:resolver:options:)`. Out-of-range values throw
   `TracerouteError.invalidConfiguration`.

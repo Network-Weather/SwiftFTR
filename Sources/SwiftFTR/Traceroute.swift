@@ -135,6 +135,11 @@ public struct TraceOptions: Sendable, Equatable {
 }
 
 /// Origin of a dynamically seeded public IP address.
+///
+/// ``SwiftFTR/seedPublicIP(_:source:)`` requires the caller to state where a seeded address came
+/// from, but does not retain the value: a seeded address is cached the same way whatever its
+/// source, and the library exposes no way to read the source back. Whether to persist it and act
+/// on the difference is an open question recorded in the lifecycle design document.
 public enum PublicIPSource: Sendable, Equatable {
   /// Seeded from a validated caller-side cache or observation.
   case validatedCallerCache
@@ -1365,7 +1370,8 @@ public actor SwiftFTR {
   ///
   /// - Parameters:
   ///   - address: The public IP address string to seed.
-  ///   - source: The origin of this observation (e.g. validated caller cache or gateway).
+  ///   - source: The origin of this observation. Stating it is required; the library does not
+  ///     retain it and treats every accepted address identically. See ``PublicIPSource``.
   /// - Returns: `true` if the address was accepted and cached; `false` if rejected.
   @discardableResult
   public func seedPublicIP(
