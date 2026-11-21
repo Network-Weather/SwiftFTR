@@ -3,6 +3,18 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Bug fixes
+
+- **A cancelled call with a deadline no longer crashes the process.** When the calling task was
+  cancelled in the instant between the bridge's cancellation check and arming its deadline timer,
+  the timer was created, cancelled and released without ever being resumed, which libdispatch
+  treats as a client bug and traps on (`EXC_BREAKPOINT` in `_dispatch_queue_xref_dispose`). Every
+  blocking call that carries a deadline went through this path. A downstream consumer saw it in
+  the field as rare crashes. The timer is now created only when it will be armed.
+
 0.17.0 — 2026-09-03
 -------------------
 

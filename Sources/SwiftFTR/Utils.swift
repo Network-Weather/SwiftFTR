@@ -671,24 +671,24 @@ private let cancellationBridge = BlockingIOCancellationBridge()
 
 /// Holds the timer backing a `deadline`, so both the operation completing and the caller being
 /// cancelled can stop it without leaking a pending timer per call.
-private final class DeadlineTimerBox: @unchecked Sendable {
+final class DeadlineTimerBox: @unchecked Sendable {
   private let lock = NSLock()
   private var timer: DispatchSourceTimer?
   private var isCancelled = false
 
   func arm(after seconds: TimeInterval, _ fire: @escaping @Sendable () -> Void) {
+    lock.lock()
+    defer { lock.unlock() }
+
+    // Decide before creating the source: libdispatch traps when a source is released without
+    // ever having been resumed, so a cancelled box must not make one it will only throw away.
+    guard !isCancelled else { return }
+
     let source = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
     source.schedule(deadline: .now() + seconds)
     source.setEventHandler(handler: fire)
-
-    lock.lock()
-    if isCancelled {
-      lock.unlock()
-      source.cancel()
-      return
-    }
     timer = source
-    lock.unlock()
+    // Resumed under the lock, so `cancel()` only ever sees a source that is safe to release.
     source.resume()
   }
 
