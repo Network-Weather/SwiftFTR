@@ -1,9 +1,11 @@
 import Foundation
 
-/// Actor-based cache for reverse DNS lookups with TTL and LRU eviction.
+/// Actor-based cache for reverse DNS lookups with TTL and size-bounded eviction.
 ///
 /// This cache provides thread-safe storage for hostname lookups with automatic
-/// expiration and size-based eviction. It uses Swift 6.1's actor isolation for
+/// expiration and size-based eviction. When an insertion takes it past `maxSize`, the entry
+/// stored longest ago is evicted; a cache hit does not refresh an entry, so this is
+/// insertion-order eviction, not least-recently-used. It uses Swift 6.1's actor isolation for
 /// thread safety and the Clock API for accurate timing.
 actor RDNSCache {
   typealias Resolver = @Sendable (String) async -> String?
