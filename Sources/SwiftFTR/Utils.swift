@@ -702,7 +702,7 @@ final class DeadlineTimerBox: @unchecked Sendable {
   }
 }
 
-private let blockingIOExecutor = BlockingIOExecutor(
+let blockingIOExecutor = BlockingIOExecutor(
   maximumConcurrentOperations: blockingIOConcurrencyLimit,
   name: "com.networkweather.SwiftFTR.blocking-io"
 )
