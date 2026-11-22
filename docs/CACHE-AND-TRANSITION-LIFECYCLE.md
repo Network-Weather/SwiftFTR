@@ -49,8 +49,9 @@ As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
 - `RDNSCache` holds entries for 86400 s, evicting the oldest-inserted entry at 1000 entries
   (both configurable through `SwiftFTRConfig`), caches negative results, and
   has a stall breaker: after two consecutive lookups that take at least 90% of their
-  deadline, further lookups are suppressed until `clear()` or
-  `invalidateNetworkScoped()` runs. `clear()` also generation-guards against
+  deadline, further lookups are suppressed while that count stays at two or
+  more. `clear()` and `invalidateNetworkScoped()` reset it, and so does a
+  lookup that was already in flight finishing quickly. `clear()` also generation-guards against
   in-flight lookups repopulating the cache.
 - The ASN cache is capacity-bounded (2048 entries) with **no TTL**; entries
   live until evicted or the cache is reset.
@@ -237,8 +238,8 @@ it see no behavior change. Beyond that, library-level tests demonstrate:
 - A seed made before an invalidation does not survive it.
 - `TraceOptions.maxHops` outside `1...255` throws the existing configuration
   error; a valid value bounds exactly that operation.
-- No cancellation path leaves an orphaned task holding a blocking-I/O
-  executor slot beyond its deadline.
+- Cancellation drops queued work and releases the caller; a system call that
+  is already running keeps its blocking-I/O executor slot until it returns.
 
 ## Open decisions
 

@@ -317,7 +317,7 @@ Notes for Embedding
 -------------------
 - **Thread Safety**: The `SwiftFTR` actor protects shared state, while operations designed for parallel use keep independent per-operation state. Its async API can be called from any actor or task.
 - **Public IP enrichment**: `SwiftFTRConfig(publicIP:)` overrides discovery for classified trace and multipath enrichment; it does not change `getPublicIPs()` or `discoverPublicIPWithHostname()`.
-- **ASN Lookups**: `traceClassified` resolves ASNs with `SwiftFTRConfig.asnResolverStrategy`, which defaults to `.hybrid(.embedded)`: the embedded database (about 15 MB, shared by every tracer in the process and kept loaded while at least one resolver using it is alive), with Team Cymru DNS only for addresses it does not cover. Use `.dns` for DNS-only lookups, `.embedded` for no network at all, or `.remote(bundledPath:url:)` for an updatable database. Results are cached in memory.
+- **ASN Lookups**: `traceClassified` resolves ASNs with `SwiftFTRConfig.asnResolverStrategy`, which defaults to `.hybrid(.embedded)`: the embedded database (about 15 MB, shared by every tracer in the process and kept loaded while at least one resolver using it is alive), with Team Cymru DNS only for addresses it does not cover. Use `.dns` for DNS-only lookups, `.embedded` for no network at all, or `.remote(bundledPath:url:)` for an updatable database. DNS results are cached in memory; local lookups are answered from the loaded database each time.
 - **Timeout Behavior**: `maxWaitMs` bounds the ICMP receive phase of `trace`. Resolution and optional STUN, rDNS, or ASN enrichment have their own I/O and timeout behavior.
 - **Error Handling**: Detailed `TracerouteError` with context about failures (permissions, network, platform).
 - **SwiftUI Ready**: No MainActor requirements - integrate directly into SwiftUI views and view models.
@@ -518,7 +518,8 @@ Data and services:
   [swift-ip2asn](https://github.com/network-weather/swift-ip2asn), built from
   [iptoasn.com](https://iptoasn.com) data, and falls back to [Team Cymru's
   IP-to-ASN mapping service](https://www.team-cymru.com/ip-asn-mapping) over DNS
-  for addresses the database does not cover.
+  for addresses the database does not cover. The CLI's `trace --json` output is an exception: it
+  also sends every hop, the destination and the public IP to Team Cymru for its ASN fields.
 
 Peer tools doing analogous work:
 
@@ -544,7 +545,7 @@ MIT — see LICENSE.
 Versioning & Releases
 ---------------------
 - Semantic Versioning. See CHANGELOG.md for release notes.
-- To consume via SwiftPM, use the `0.17.1` tag or a later compatible release.
+- To consume via SwiftPM, use version `0.17.1` (Git tag `v0.17.1`) or a later compatible release.
 
 Contributing
 ------------

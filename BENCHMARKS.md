@@ -8,7 +8,8 @@ Tools in the tree today:
 
 - `swift run -c release ResourceBenchmark` (`Tests/TestSupport/ResourceBenchmark.swift`):
   lookup time and memory for the `.dns`, `.embedded`, `.hybrid` and `.remote` ASN resolver
-  strategies. DNS and remote are timed on a first and then a cached lookup; embedded and hybrid
+  strategies. DNS and remote are timed on a first and then a second lookup (cached for DNS; for
+  remote, answered again from the loaded database); embedded and hybrid
   are preloaded first, so their figures are a preload time and a post-preload lookup time, not
   a cold lookup. Needs network for the DNS and remote strategies. The remote run first
   clears the SwiftIP2ASN download cache and then fetches a fresh database, so running it offline

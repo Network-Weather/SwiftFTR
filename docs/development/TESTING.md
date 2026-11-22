@@ -217,7 +217,7 @@ swift test --parallel --num-workers 8
 1. **Network Tests**: Some tests require network access and may fail in restricted environments
 2. **Timing Tests**: Performance tests may vary based on system load
 3. **ICMP Permissions**: Tests require ICMP datagram socket support (available on macOS without root)
-4. **IPv6**: v6 integration tests run only when a real v6 path is detected (`IPv6Reachability`); GitHub-hosted runners have none, so they skip there
+4. **IPv6**: v6 integration tests check for a v6 route by default (`IPv6Reachability`); `FORCE_IPV6_TESTS=1` bypasses that check, though not the network skip gates; GitHub-hosted runners have none, so they skip there
 
 ## Continuous Improvement
 
