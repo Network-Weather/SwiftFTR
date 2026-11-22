@@ -52,7 +52,17 @@ struct CymruEventBasedTests {
     }
     #expect(thrown is CancellationError, "\(String(describing: thrown))")
 
-    // The cancelled waiter took no permit: the one held is handed to the next waiter.
+    // A task cancelled before it waits is refused too.
+    let early = Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      try await semaphore.wait()
+    }
+    let (refused, _) = try await measure(within: Self.watchdog) {
+      await EventBasedDNSTests.error { try await early.value }
+    }
+    #expect(refused is CancellationError, "\(String(describing: refused))")
+
+    // The cancelled waiters took no permit: the one held is handed to the next waiter.
     let next = Task { try await semaphore.wait() }
     await semaphore.signal()
     _ = try await measure(within: Self.watchdog) { try await next.value }

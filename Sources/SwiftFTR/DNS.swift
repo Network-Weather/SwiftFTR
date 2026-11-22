@@ -1720,12 +1720,12 @@ struct DNSClient {
   /// TXT strings for `name` from the first of `servers` that answers, or `nil`.
   ///
   /// Each server gets `timeout` seconds. The wait holds no thread, and cancelling the calling
-  /// task stops at the current server.
+  /// task ends it at once.
   static func queryTXT(
     name: String, timeout: TimeInterval = 1.0, servers: [String] = defaultTXTServers
   ) async -> [String]? {
     for server in servers {
-      guard !Task.isCancelled else { return nil }
+      // After cancellation each remaining attempt throws before it opens a socket.
       let answers = try? await runDNSQuery(
         server: server, query: name, queryType: DNSRecordType.txt.rawValue, timeout: timeout,
         interface: nil, sourceIP: nil

@@ -376,9 +376,11 @@ actor _ConcurrencySemaphore {
     try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation {
         (continuation: CheckedContinuation<Void, Error>) in
-        enqueue(Waiter(id: id, continuation: continuation))
+        waiters.append(Waiter(id: id, continuation: continuation))
       }
     } onCancel: {
+      // The actor is busy until this wait suspends, so `cancelWaiter` always runs after the
+      // waiter is listed, even when the task was cancelled before it called `wait()`.
       Task { await self.cancelWaiter(id) }
     }
   }
@@ -389,15 +391,6 @@ actor _ConcurrencySemaphore {
       waiter.continuation.resume()
     } else {
       available += 1
-    }
-  }
-
-  /// Runs on the actor before `onCancel` can, or after it: a waiter cancelled first is refused.
-  private func enqueue(_ waiter: Waiter) {
-    if Task.isCancelled {
-      waiter.continuation.resume(throwing: CancellationError())
-    } else {
-      waiters.append(waiter)
     }
   }
 
