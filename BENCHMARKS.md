@@ -18,7 +18,7 @@ Tools in the tree today:
   database load cost across tracer instances.
 - `swift test -c release --filter AsnStrategyBench`: resolver strategy comparison as a test.
 
-The ASN figures below were measured against SwiftIP2ASN 0.5.1. The 0.17.1 floor is 0.5.2, whose
+The ASN figures below were measured against SwiftIP2ASN 0.5.1. The current floor is 0.6.0, whose
 database is slightly different in size; they have not been re-measured against it.
 
 ## Concurrent ping throughput
