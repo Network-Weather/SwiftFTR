@@ -637,7 +637,10 @@ public actor SwiftFTR {
     }
 
     let fd = try createTraceSocket(family: resolved.family, enableLogging: config.enableLogging)
-    defer { close(fd) }
+    // Closed here until the receive operation exists; from then on it closes the descriptor from
+    // its read source's cancel handler.
+    var receiveOwnsSocket = false
+    defer { if !receiveOwnsSocket { close(fd) } }
 
     if let ifIndex = interfaceIndex {
       try bindTraceInterface(
@@ -652,8 +655,7 @@ public actor SwiftFTR {
         enableLogging: config.enableLogging)
     }
 
-    let flags = fcntl(fd, F_GETFL, 0)
-    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    try setProbeSocketNonBlocking(fd)
 
     if resolved.family == AF_INET {
       var on: Int32 = 1
@@ -704,6 +706,7 @@ public actor SwiftFTR {
       enableLogging: config.enableLogging,
       yield: yield
     )
+    receiveOwnsSocket = true
 
     let registrationID = await handle.installCancellationHandler { streamOperation.cancel() }
     do {
@@ -793,7 +796,10 @@ public actor SwiftFTR {
     }
 
     let fd = try createTraceSocket(family: resolved.family, enableLogging: config.enableLogging)
-    defer { close(fd) }
+    // Closed here until the receive operation exists; from then on it closes the descriptor from
+    // its read source's cancel handler.
+    var receiveOwnsSocket = false
+    defer { if !receiveOwnsSocket { close(fd) } }
 
     if let interfaceName = config.interface, let ifIndex = interfaceIndex {
       try bindTraceInterface(
@@ -807,8 +813,7 @@ public actor SwiftFTR {
         enableLogging: config.enableLogging)
     }
 
-    let flags = fcntl(fd, F_GETFL, 0)
-    _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+    try setProbeSocketNonBlocking(fd)
 
     // Best-effort IP_RECVTTL for v4 (v6 already enabled IPV6_RECVHOPLIMIT in createTraceSocket).
     if resolved.family == AF_INET {
@@ -846,6 +851,7 @@ public actor SwiftFTR {
       destinationIP: resolved.canonical,
       enableLogging: config.enableLogging
     )
+    receiveOwnsSocket = true
 
     let registrationID = await handle.installCancellationHandler { operation.cancel() }
     let receiveResult: TraceReceiveResult
@@ -1447,6 +1453,22 @@ internal func createTraceSocket(family: Int32, enableLogging: Bool) throws -> In
   return fd
 }
 
+/// Makes a trace or ping socket non-blocking, or throws.
+///
+/// The receive loops read until the socket reports no more data. On a blocking socket that last
+/// read would wait for the next datagram on the queue that also delivers the operation's deadline
+/// and cancellation, so no operation may run on one.
+internal func setProbeSocketNonBlocking(_ fd: Int32) throws {
+  let control = TestSeams.fileControl ?? { fcntl($0, $1, $2) }
+  let flags = control(fd, F_GETFL, 0)
+  guard flags >= 0 else {
+    throw TracerouteError.socketCreateFailed(errno: errno, details: "fcntl F_GETFL failed")
+  }
+  guard control(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
+    throw TracerouteError.socketCreateFailed(errno: errno, details: "fcntl F_SETFL failed")
+  }
+}
+
 /// Family-aware hop-limit setter: v4 → `IP_TTL`, v6 → `IPV6_UNICAST_HOPS`.
 internal func setTraceHopLimit(sockfd: Int32, family: Int32, ttl: Int) throws {
   var v = Int32(ttl)
@@ -1630,6 +1652,79 @@ private enum Constants {
   static let receiveBufferSize = 2048
 }
 
+/// The most datagrams one read callback handles before it returns to its queue.
+///
+/// Each receive operation reads on the serial queue that also delivers its deadline, its
+/// cancellation and, for a stream, its retry. A socket that stays readable, such as one flooded
+/// with replies for other identifiers, would otherwise keep a single callback running past all
+/// of them. A dispatch read source fires again while data remains, so a longer backlog is read
+/// over several callbacks and none of it is lost.
+let receiveBatchLimit = 64
+
+/// The descriptor a trace's receive operation reads, confined to the operation's serial queue.
+///
+/// Dispatch may use a descriptor until its read source's cancel handler runs, so the descriptor is
+/// closed there, never while a source still holds it. Completions passed to ``close(then:)`` run
+/// after the descriptor is closed: an operation that resumes its caller from one no longer owns
+/// the descriptor, and its number cannot be reused under a callback.
+private final class ReceiveSocket: @unchecked Sendable {
+  private enum State {
+    case open
+    case closing
+    case closed
+  }
+
+  let fd: Int32
+  private let queue: DispatchQueue
+  private var source: DispatchSourceRead?
+  private var state = State.open
+  private var afterClose: [() -> Void] = []
+
+  init(fd: Int32, queue: DispatchQueue) {
+    self.fd = fd
+    self.queue = queue
+  }
+
+  /// Starts delivering read events to `handler` on the queue. Call on the queue.
+  func startReading(_ handler: @escaping () -> Void) {
+    guard state == .open, source == nil else { return }
+    let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+    source.setEventHandler(handler: handler)
+    source.setCancelHandler { self.closeDescriptor() }
+    source.activate()
+    self.source = source
+  }
+
+  /// Stops reading, closes the descriptor once dispatch has let go of it, then runs `completion`.
+  /// Call on the queue; later calls only add their completion.
+  func close(then completion: @escaping () -> Void) {
+    switch state {
+    case .closed:
+      completion()
+    case .closing:
+      afterClose.append(completion)
+    case .open:
+      afterClose.append(completion)
+      state = .closing
+      if let source {
+        self.source = nil
+        source.cancel()
+      } else {
+        closeDescriptor()
+      }
+    }
+  }
+
+  private func closeDescriptor() {
+    guard state != .closed else { return }
+    Darwin.close(fd)
+    state = .closed
+    let pending = afterClose
+    afterClose = []
+    for completion in pending { completion() }
+  }
+}
+
 // MARK: - Trace Receive Result
 
 /// Result returned by TraceReceiveOperation.
@@ -1653,7 +1748,7 @@ internal struct TraceSendInfo {
 /// by identifier/sequence. Completes when all hops are filled or the
 /// deadline expires.
 private final class TraceReceiveOperation: @unchecked Sendable {
-  private let sockfd: Int32
+  private let socket: ReceiveSocket
   private let family: Int32
   private let identifier: UInt16
   private let maxHops: Int
@@ -1665,8 +1760,10 @@ private final class TraceReceiveOperation: @unchecked Sendable {
   private var reachedTTL: Int?
 
   private var continuation: CheckedContinuation<TraceReceiveResult, Error>?
-  private var readSource: DispatchSourceRead?
   private var timerSource: DispatchSourceTimer?
+  /// When the receive window closes, set when the sources start. The timer is scheduled on this
+  /// same value, so the timer and the read loop's check cannot disagree, even across a sleep.
+  private var deadline = DispatchTime.distantFuture
   private var recvBuffer = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
   private var cmsgBuffer = [UInt8](repeating: 0, count: 64)
 
@@ -1685,7 +1782,6 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     destinationIP: String,
     enableLogging: Bool
   ) {
-    self.sockfd = sockfd
     self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
@@ -1696,13 +1792,18 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     self.hops = Array(repeating: nil, count: maxHops)
     self.queue = DispatchQueue(
       label: "com.swiftftr.trace.\(UInt64.random(in: 0...UInt64.max))", qos: .userInitiated)
+    self.socket = ReceiveSocket(fd: sockfd, queue: queue)
   }
 
+  /// Takes ownership of the descriptor: it is closed before `continuation` is resumed, however
+  /// the operation ends.
   func start(continuation: CheckedContinuation<TraceReceiveResult, Error>) {
     lock.lock()
     if isFinished {
       lock.unlock()
-      continuation.resume(throwing: TracerouteError.cancelled)
+      queue.async {
+        self.tearDown { continuation.resume(throwing: TracerouteError.cancelled) }
+      }
       return
     }
     self.continuation = continuation
@@ -1712,7 +1813,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
   }
 
   func cancel() {
-    // Set cancelled flag synchronously so start() can detect it
+    // Set cancelled flag synchronously so start() and the read loop can detect it
     lock.lock()
     if isFinished {
       lock.unlock()
@@ -1725,11 +1826,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
 
     // Dispatch cleanup to serial queue to avoid racing with handleRead/setupSources
     queue.async {
-      self.readSource?.cancel()
-      self.timerSource?.cancel()
-      self.readSource = nil
-      self.timerSource = nil
-      currentContinuation?.resume(throwing: TracerouteError.cancelled)
+      self.tearDown { currentContinuation?.resume(throwing: TracerouteError.cancelled) }
     }
   }
 
@@ -1737,28 +1834,28 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     // Guard against setup after cancel() already completed
     if checkFinishedSync() { return }
 
-    let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
-    source.setEventHandler { self.handleRead() }
-    source.setCancelHandler {}
-    source.activate()
-    self.readSource = source
+    deadline = .now() + timeout
+    socket.startReading { self.handleRead() }
 
     let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + timeout)
+    timer.schedule(deadline: deadline)
     timer.setEventHandler { self.finish() }
     timer.activate()
     self.timerSource = timer
   }
 
   private func handleRead() {
-    if checkFinishedSync() { return }
-
-    while true {
+    for _ in 0..<receiveBatchLimit {
+      if checkFinishedSync() { return }
+      if DispatchTime.now() >= deadline {
+        finish()
+        return
+      }
       guard
         let received = recvTraceMessage(
-          sockfd: sockfd, family: family,
+          sockfd: socket.fd, family: family,
           recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer)
-      else { break }  // EAGAIN/EWOULDBLOCK or parse-fail
+      else { return }  // EAGAIN/EWOULDBLOCK or parse-fail
       let parsed = received.parsed
 
       switch parsed.kind {
@@ -1836,14 +1933,15 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     self.continuation = nil
     lock.unlock()
 
-    readSource?.cancel()
-    timerSource?.cancel()
-    readSource = nil
-    timerSource = nil
+    let result = TraceReceiveResult(hops: hops, reachedTTL: reachedTTL)
+    tearDown { currentContinuation?.resume(returning: result) }
+  }
 
-    guard let continuation = currentContinuation else { return }
-    continuation.resume(
-      returning: TraceReceiveResult(hops: hops, reachedTTL: reachedTTL))
+  /// Stops the timer and closes the socket, then runs `completion`. Only called on the queue.
+  private func tearDown(then completion: @escaping () -> Void) {
+    timerSource?.cancel()
+    timerSource = nil
+    socket.close(then: completion)
   }
 
   private func checkFinishedSync() -> Bool {
@@ -1860,7 +1958,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
 /// Yields StreamingHop values as ICMP responses arrive. Supports retry
 /// of unresponsive TTLs via a secondary DispatchSourceTimer.
 private final class StreamingTraceReceiveOperation: @unchecked Sendable {
-  private let sockfd: Int32
+  private let socket: ReceiveSocket
   private let family: Int32
   private let identifier: UInt16
   private let maxHops: Int
@@ -1876,9 +1974,12 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private var didRetry = false
 
   private var continuation: CheckedContinuation<Void, Error>?
-  private var readSource: DispatchSourceRead?
   private var deadlineTimer: DispatchSourceTimer?
   private var retryTimer: DispatchSourceTimer?
+  /// When the probe timeout expires, set when the sources start. The deadline timer is scheduled
+  /// on this same value, so the timer and the read loop's check cannot disagree, even across a
+  /// sleep.
+  private var deadline = DispatchTime.distantFuture
   private var recvBuffer = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
   private var cmsgBuffer = [UInt8](repeating: 0, count: 64)
 
@@ -1898,7 +1999,6 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     enableLogging: Bool,
     yield: @Sendable @escaping (StreamingHop) -> Bool
   ) {
-    self.sockfd = sockfd
     self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
@@ -1910,13 +2010,18 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     self.yieldHop = yield
     self.queue = DispatchQueue(
       label: "com.swiftftr.stream.\(UInt64.random(in: 0...UInt64.max))", qos: .userInitiated)
+    self.socket = ReceiveSocket(fd: sockfd, queue: queue)
   }
 
+  /// Takes ownership of the descriptor: it is closed before `continuation` is resumed, however
+  /// the operation ends.
   func start(continuation: CheckedContinuation<Void, Error>) {
     lock.lock()
     if isFinished {
       lock.unlock()
-      continuation.resume(throwing: TracerouteError.cancelled)
+      queue.async {
+        self.tearDown { continuation.resume(throwing: TracerouteError.cancelled) }
+      }
       return
     }
     self.continuation = continuation
@@ -1939,13 +2044,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
 
     // Dispatch cleanup to serial queue to avoid racing with handleRead/setupSources
     queue.async {
-      self.readSource?.cancel()
-      self.deadlineTimer?.cancel()
-      self.retryTimer?.cancel()
-      self.readSource = nil
-      self.deadlineTimer = nil
-      self.retryTimer = nil
-      currentContinuation?.resume(throwing: TracerouteError.cancelled)
+      self.tearDown { currentContinuation?.resume(throwing: TracerouteError.cancelled) }
     }
   }
 
@@ -1953,19 +2052,16 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     // Guard against setup after cancel() already completed
     if checkFinishedSync() { return }
 
-    // Read source for incoming ICMP responses
-    let source = DispatchSource.makeReadSource(fileDescriptor: sockfd, queue: queue)
-    source.setEventHandler { self.handleRead() }
-    source.setCancelHandler {}
-    source.activate()
-    self.readSource = source
+    // Read events for incoming ICMP responses
+    deadline = .now() + streamConfig.probeTimeout
+    socket.startReading { self.handleRead() }
 
     // Overall deadline timer
-    let deadline = DispatchSource.makeTimerSource(queue: queue)
-    deadline.schedule(deadline: .now() + streamConfig.probeTimeout)
-    deadline.setEventHandler { self.finish() }
-    deadline.activate()
-    self.deadlineTimer = deadline
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: deadline)
+    timer.setEventHandler { self.finish() }
+    timer.activate()
+    self.deadlineTimer = timer
 
     // Retry timer (if configured)
     if let retryAfter = streamConfig.retryAfter {
@@ -1978,14 +2074,17 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   }
 
   private func handleRead() {
-    if checkFinishedSync() { return }
-
-    while true {
+    for _ in 0..<receiveBatchLimit {
+      if checkFinishedSync() { return }
+      if DispatchTime.now() >= deadline {
+        finish()
+        return
+      }
       guard
         let received = recvTraceMessage(
-          sockfd: sockfd, family: family,
+          sockfd: socket.fd, family: family,
           recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer)
-      else { break }
+      else { return }
       let parsed = received.parsed
 
       switch parsed.kind {
@@ -2093,7 +2192,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
     for ttl in missingTTLs {
       do {
-        try setTraceHopLimit(sockfd: sockfd, family: family, ttl: ttl)
+        try setTraceHopLimit(sockfd: socket.fd, family: family, ttl: ttl)
       } catch {
         continue
       }
@@ -2101,7 +2200,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       let sentAt = monotonicNow()
       do {
         try sendTraceProbe(
-          sockfd: sockfd, resolved: resolved, identifier: identifier,
+          sockfd: socket.fd, resolved: resolved, identifier: identifier,
           sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
         outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
       } catch {
@@ -2126,10 +2225,8 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     self.continuation = nil
     lock.unlock()
 
-    readSource?.cancel()
     deadlineTimer?.cancel()
     retryTimer?.cancel()
-    readSource = nil
     deadlineTimer = nil
     retryTimer = nil
 
@@ -2152,8 +2249,16 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       )
     }
 
-    guard let continuation = currentContinuation else { return }
-    continuation.resume()
+    socket.close { currentContinuation?.resume() }
+  }
+
+  /// Stops both timers and closes the socket, then runs `completion`. Only called on the queue.
+  private func tearDown(then completion: @escaping () -> Void) {
+    deadlineTimer?.cancel()
+    retryTimer?.cancel()
+    deadlineTimer = nil
+    retryTimer = nil
+    socket.close(then: completion)
   }
 
   private func checkFinishedSync() -> Bool {

@@ -32,6 +32,11 @@ What an unmodified caller will see differently:
   blocking-I/O worker.
 - **`discoverPaths` honours `publicIPDiscoveryTimeout`.** Its flows used the 6 s default whatever
   was configured.
+- **A trace whose socket cannot be made non-blocking now fails instead of running.** `trace`,
+  `traceClassified` and `traceStream` throw `TracerouteError.socketCreateFailed` when either
+  `fcntl` call that sets `O_NONBLOCK` fails, before any probe is sent, as `ping` already did.
+  Previously the failure was ignored and the trace ran on a blocking socket, where its receive
+  loop could wait past its deadline for a reply that never came.
 
 ### Bug fixes
 
@@ -43,6 +48,17 @@ What an unmodified caller will see differently:
   waits on an ASN database load shared with other resolvers.
 - **A STUN timeout under one microsecond no longer waits forever.** It truncated to a zero socket
   timeout, which means none. Reachable through `getPublicIPs(stunTimeout:)`.
+- **Traces, streams and pings end on time under a flood of irrelevant replies.** Each receive
+  loop drained its socket without a limit on the queue that also delivers its deadline, its
+  cancellation, ping's sends and a stream's retry. A socket kept readable by well-formed replies
+  for another identifier could hold that queue, so the operation outlived its own timeout,
+  ignored cancellation, and, for ping, sent no further probes. Each read callback now handles at
+  most 64 datagrams and checks for cancellation and its deadline before every read; a longer
+  backlog is read over later callbacks, so no reply is lost.
+- **A trace's socket is closed only once dispatch has let go of it.** The trace paths closed the
+  descriptor as the call returned, while the cancelled read source could still hold it, so the
+  number could be reused under it. The descriptor is now closed from the read source's
+  cancellation handler, before the call returns, as ping and the TCP and UDP probes already did.
 
 ### Tooling
 
