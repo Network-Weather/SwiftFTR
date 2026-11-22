@@ -35,10 +35,11 @@ the "Migrating to SwiftFTR 0.18" DocC article.
 - **`discoverPaths` throws `TracerouteError.cancelled` on `networkChanged()` and
   `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
   measured on the old network. A topology or flow error that arrives after the invalidation began
-  but before the call returned is discarded too. Cancelling the calling task now throws
-  `CancellationError`; 0.17 threw `TracerouteError.cancelled` for it, because each flow's trace
-  reported the caller's cancellation as the tracer's. When both happened,
-  `TracerouteError.cancelled` is reported.
+  but before the call returned is discarded too. Cancelling the calling task now always
+  throws `CancellationError`. In 0.17 it depended on when the cancellation landed:
+  `CancellationError` at a checkpoint between flows, but `TracerouteError.cancelled` inside a
+  running flow, because each flow's trace reported the caller's cancellation as the tracer's.
+  When both happened, `TracerouteError.cancelled` is reported.
 - **A network change ends a trace waiting on reverse DNS at once.** `networkChanged()` and
   `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
   `traceClassified()`, so the trace threw `TracerouteError.cancelled` only when the slowest lookup
@@ -94,10 +95,11 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   blocking-I/O workers, which stalled reverse-DNS lookups can hold for seconds, and socket setup.
 - **Invalid DNS inputs are reported before any socket is opened.** A query with an invalid
   timeout, name or server address, or a source address of the wrong family for the server, throws
-  that error (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) at once. In 0.17 all
-  four were checked only once a blocking-I/O worker ran the query, and the source address's family
-  only after the socket was opened. `dnsProbe` reports an invalid server address or a wrong-family
-  source address in its result's `error` rather than throwing, as before.
+  that error (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) at once. In 0.17 the
+  entry points already rejected an invalid timeout or name before queueing, but the server
+  address and the source address's family were checked only once a blocking-I/O worker ran the
+  query. `dnsProbe` reports an invalid server address or a wrong-family source address in its
+  result's `error` rather than throwing, as before.
 
 **Traces and multipath**
 
@@ -155,9 +157,6 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   `cancelActiveTraces()` or `networkChanged()` that landed after a `traceStream` had finished
   probing but before it ended the stream was recorded and then ignored: the consumer saw a normal
   end. The stream now decides its outcome, unregisters and ends in one step on the tracer.
-- **A `traceStream` whose consumer cancels its task stops at once.** The stream now stops probing
-  and closes its socket before it ends. The consumer still sees a normal end of iteration, as in
-  0.17.
 - **A trace cancelled by both its caller and the tracer reports the tracer's cancellation.**
   `traceClassified` cancelled at a checkpoint between phases, public-IP discovery among them,
   reported `CancellationError` even when `networkChanged()` had also ended it.
@@ -170,7 +169,7 @@ the "Migrating to SwiftFTR 0.18" DocC article.
 
 - An offline fault-injection battery (`FaultInjection*Tests`) stages failing networks phase by
   phase through task-local test seams and loopback fixtures, and asserts that every operation
-  returns while its stall is still in force, under a watchdog set well beyond its configured timeouts. See
+  returns while its stall is still in force, under a watchdog chosen to expire before the staged stall ends. See
   `docs/ROBUSTNESS-TESTING.md`.
 - Tests that wait for a fixture to start, become ready or be cancelled, or poll until a fixture
   has run, now fail after ten seconds instead of hanging the run when that never happens (#105).

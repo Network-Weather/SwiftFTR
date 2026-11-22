@@ -39,9 +39,10 @@ too, so a call that returns a topology returned it before `networkChanged()` or
 `cancelActiveTraces()` started.
 
 **What a caller sees.** `discoverPaths` throws `TracerouteError.cancelled` where 0.17 returned a
-topology measured on the old network. Cancelling the calling task now throws
-`CancellationError`, where 0.17 threw `TracerouteError.cancelled` for that too, so the two sources
-can be told apart; when both happened, the tracer's `TracerouteError.cancelled` is reported.
+topology measured on the old network. Cancelling the calling task now always throws
+`CancellationError`, where 0.17 threw `TracerouteError.cancelled` if the cancellation landed inside
+a running flow, so the two sources can be told apart; when both happened, the tracer's
+`TracerouteError.cancelled` is reported.
 
 **What to change.** Catch `TracerouteError.cancelled` wherever `discoverPaths` is called and treat
 it as "this measurement was abandoned", not as a failure of the network being diagnosed. Do not
@@ -78,9 +79,9 @@ do {
 }
 ```
 
-In 0.17 a caller that cancelled its own `discoverPaths` task also received
-`TracerouteError.cancelled`, so the "Before" code reported that as a failure. With the "After"
-code both arrive in a handler that returns.
+In 0.17 a caller that cancelled its own `discoverPaths` task while a flow was running received
+`TracerouteError.cancelled`, which the "Before" code reported as a failure. With the "After" code
+both errors arrive in a handler that returns.
 
 Keep any check the consumer already makes before it displays or stores a result, such as
 comparing a network generation counter of its own. The tracer orders its own return against
@@ -124,12 +125,13 @@ caller cancelled its own task. `TracerouteError.cancelled`: the tracer ended the
 `TracerouteError.cancelled` for its own task's cancellation, and `trace` and `traceClassified`
 threw it in most phases and `CancellationError` at some checkpoints between phases. `ping` is still not ended by
 `networkChanged()` or `cancelActiveTraces()`, so it now only ever throws `CancellationError` for a
-cancellation. `discoverPaths` follows the same rule: 0.17 threw `TracerouteError.cancelled`
-when its caller cancelled it, and 0.18 throws `CancellationError`. A `traceStream` consumer that
-cancels its task sees iteration end normally, as in 0.17, unless the tracer had already ended the
-stream; what is new is that the stream stops probing and closes its socket at once. A stream the
-tracer ends before it finishes throws `TracerouteError.cancelled`, even after its last hop has
-been delivered. Breaking out of a loop over a
+cancellation. `discoverPaths` follows the same rule: in 0.17 a caller's cancellation threw
+`CancellationError` at a checkpoint between flows but `TracerouteError.cancelled` inside a running
+flow, and 0.18 always throws `CancellationError`. A `traceStream` consumer that cancels its task
+sees iteration end normally, as in 0.17, unless the tracer had already ended the stream; the
+cancellation prompts the stream to stop probing and close its socket. A stream the tracer ends
+before it finishes throws `TracerouteError.cancelled`, even after its last hop has been
+delivered. Breaking out of a loop over a
 stream held in a variable cancels nothing: the trace runs until it finishes or the stream is
 released.
 
@@ -225,9 +227,10 @@ let topology = try await multipathTracer.discoverPaths(to: target)
 
 **What changed.** Every DNS query (`dnsProbe`, the `tracer.dns` queries, `reverseDNS`,
 `reverseIPv6`, `queryA`, `queryAAAA`) checks its timeout, name, server address and the family of
-its source address before it opens a socket. In 0.17 all four were checked only once one of
-the shared blocking-I/O workers ran the query, and the source-address family only after the socket
-was opened, so behind busy workers the error was late.
+its source address before it opens a socket. In 0.17 the entry points already rejected an
+invalid timeout or name before queueing, but the server address and the source-address family were
+checked only once one of the shared blocking-I/O workers ran the query, so behind busy workers
+those two errors were late.
 
 **What a caller sees.** The same `DNSError` case as 0.17 (`invalidTimeout`, `invalidHostname`,
 `invalidIP`, or `bindFailed` for a source address of the wrong family), at once. `dnsProbe` throws
