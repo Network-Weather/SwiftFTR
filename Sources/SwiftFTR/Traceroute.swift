@@ -890,7 +890,11 @@ public actor SwiftFTR {
     // Perform rDNS lookups if enabled
     if !config.noReverseDNS {
       let ips = finalHops.compactMap { $0.ipAddress }
-      let hostnames = await rdnsCache.batchLookup(ips)
+      // Raced against the handle like every other enrichment phase, so a network change ends the
+      // trace now rather than after the slowest lookup's deadline.
+      let hostnames = try await withTraceCancellation(handle: handle) {
+        await self.rdnsCache.batchLookup(ips)
+      }
 
       try Task.checkCancellation()
       if await handle.isCancelled {
