@@ -85,6 +85,37 @@ private func _dnsSocketTimeout(_ timeout: TimeInterval) throws -> timeval {
   return timeval(tv_sec: seconds, tv_usec: __darwin_suseconds_t(microseconds))
 }
 
+/// Rejects a source address whose family cannot reach `serverFamily`, before any socket exists.
+private func _validateDNSSourceFamily(_ sourceIP: String?, serverFamily: Int32) throws {
+  guard let sourceIP else { return }
+  let sourceFamily = detectAddressFamily(sourceIP)
+  guard sourceFamily == serverFamily else {
+    throw DNSError.bindFailed(
+      "Source IP family (\(sourceFamily == AF_INET ? "IPv4" : "IPv6")) doesn't match server family")
+  }
+}
+
+/// Runs a blocking DNS query on the shared executor after rejecting inputs that need no I/O.
+///
+/// The checks `performDNSQueryInternal` would make on its worker (`invalidTimeout`,
+/// `invalidHostname`, `invalidIP`, and `bindFailed` for a source address of the wrong family)
+/// run here first, so a query that can never succeed reports why at once, even when every
+/// worker is busy.
+private func runDNSQuery<T: Sendable>(
+  server: String,
+  query name: String,
+  sourceIP: String?,
+  timeout: TimeInterval,
+  _ query: @Sendable @escaping () throws -> T
+) async throws -> T {
+  try _validateDNSTimeout(timeout)
+  _ = try _encodeQName(name)
+  let family = detectAddressFamily(server)
+  guard family == AF_INET || family == AF_INET6 else { throw DNSError.invalidIP(server) }
+  try _validateDNSSourceFamily(sourceIP, serverFamily: family)
+  return try await runDetachedBlockingIO(query)
+}
+
 private func _applyDNSSocketTimeout(fd: Int32, timeout: TimeInterval) throws {
   var socketTimeout = try _dnsSocketTimeout(timeout)
   let optionSize = socklen_t(MemoryLayout<timeval>.size)
@@ -231,7 +262,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query A record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -306,7 +339,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query AAAA record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -382,7 +417,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: arpaQuery, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: arpaQuery,
@@ -462,7 +499,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: arpaQuery, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: arpaQuery,
@@ -541,7 +580,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query TXT record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -618,7 +659,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Perform query
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: name, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: name,
@@ -1092,7 +1135,9 @@ public func reverseDNS(
   }
 
   // Query PTR record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(
+    server: server, query: reverseName, sourceIP: sourceIP, timeout: timeout
+  ) {
     try performDNSQueryInternal(
       server: server,
       query: reverseName,
@@ -1161,7 +1206,9 @@ public func reverseIPv6(
   }
 
   // Query PTR record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(
+    server: server, query: reverseName, sourceIP: sourceIP, timeout: timeout
+  ) {
     try performDNSQueryInternal(
       server: server,
       query: reverseName,
@@ -1243,7 +1290,9 @@ public func queryAAAA(
   }
 
   // Query AAAA record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(
+    server: server, query: hostname, sourceIP: sourceIP, timeout: timeout
+  ) {
     try performDNSQueryInternal(
       server: server,
       query: hostname,
@@ -1316,7 +1365,9 @@ public func queryA(
   }
 
   // Query A record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(
+    server: server, query: hostname, sourceIP: sourceIP, timeout: timeout
+  ) {
     try performDNSQueryInternal(
       server: server,
       query: hostname,
@@ -1459,11 +1510,7 @@ private func performDNSQueryInternal(
 
   // Bind to source IP if specified
   if let srcIP = sourceIP {
-    let srcFamily = detectAddressFamily(srcIP)
-    guard srcFamily == serverFamily else {
-      throw DNSError.bindFailed(
-        "Source IP family (\(srcFamily == AF_INET ? "IPv4" : "IPv6")) doesn't match server family")
-    }
+    try _validateDNSSourceFamily(srcIP, serverFamily: serverFamily)
 
     if serverFamily == AF_INET6 {
       let (bare6, scopeID) = parseIPv6Scoped(srcIP)
@@ -1567,7 +1614,9 @@ private func performDNSProbe(
 ) async -> DNSProbeResultInternal {
   do {
     // Try to perform query - success means RCODE=0
-    _ = try await runDetachedBlockingIO {
+    _ = try await runDNSQuery(
+      server: server, query: query, sourceIP: sourceIP, timeout: timeout
+    ) {
       try performDNSQueryInternal(
         server: server,
         query: query,

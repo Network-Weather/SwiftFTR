@@ -142,7 +142,12 @@ reports from it. Overall Deadline later adds a third reason to the same state.
 
 The rule, as `discoverPaths` already has it from Independent Fixes: task cancellation throws
 `CancellationError`; a library-side cancel throws `TracerouteError.cancelled`; when both
-happened, the library-side cancel is reported. Trace, streaming trace and ping follow it, the
+happened, the library-side cancel is reported. Trace and ping follow it. A streaming trace
+follows it for a library-side cancel of a live stream, which throws `TracerouteError.cancelled`
+to the consumer. A consumer that cancels its own task is different: iteration of an
+`AsyncThrowingStream` can end normally (`next()` returns `nil`) before the producer sees the
+cancellation, and no change to `TraceHandle` can make that completed call throw. That case is
+documented as a normal end of iteration and tested for producer cleanup instead. The
 battery's cancellation tests stop accepting either type, and the two follow-ups from the review
 of #100 are done here (the `cancelActiveTraces()` doc comment; one gated trace per cancellation
 source). This is a behavior change and gets an upgrade-guide entry.
@@ -160,15 +165,19 @@ The transport contract (it is shared with STUN later, so it is one small type):
   the read source exists; from then on it is closed exactly once, in the source's cancel
   handler, after every source watching it has been cancelled. The continuation resumes after
   the close. A source that was created is always activated before it is cancelled.
-- **Send.** A UDP send is all or nothing; a short count is a failure. `EINTR` retries. `EAGAIN`,
-  `EWOULDBLOCK` and `ENOBUFS` wait for writability and retry the whole datagram, inside the
-  deadline, with no blocking `poll` or `usleep`.
+- **Send.** A UDP send is all or nothing; a short count is a failure. `EINTR` retries. `EAGAIN`
+  and `EWOULDBLOCK` wait for writability and retry the whole datagram. `ENOBUFS` retries after
+  a short timer instead, because the socket reports writable at once while the interface's
+  output queue is still full (`docs/EAGAIN-MECHANISM.md`). Both stay inside the deadline, with
+  no blocking `poll` or `usleep`.
 - **Receive.** Read `errno` on a negative `recv`. `EAGAIN` waits. `ECONNREFUSED`,
   `EHOSTUNREACH` and `ENETUNREACH` end the exchange at once (the ICMP error arrives as a read
-  event with no data). Zero bytes is an empty datagram, not a timeout. The drain is bounded and
+  event with no data). Zero bytes is an empty datagram, not a timeout; this
+  is a change, listed below. The drain is bounded and
   the absolute deadline is checked before a reply is accepted.
-- **Foreign and malformed replies keep today's meaning.** The first datagram decides: a wrong
-  transaction ID or garbage fails with `malformedResponse`, as now. Ignoring them until the
+- **Foreign and malformed replies keep today's meaning**, with the one exception of the empty
+  datagram. The first datagram decides: a wrong transaction ID or garbage fails with
+  `malformedResponse`, as now. Ignoring them until the
   deadline would change a probe's verdict and is not part of this stage.
 - **Truncation stays an error.** There is no TCP fallback today and none is added here.
 - **Timing.** RTT is stamped at `send` and in the read handler.
@@ -181,8 +190,17 @@ until Async Public-IP Discovery removes its last caller; the tests move to the a
 The limit on concurrent Cymru queries stays (it now bounds sockets, not slots) and its wait
 becomes cancellation-aware.
 
-Behavior changes for the upgrade guide: a DNS probe no longer waits for a worker, so `rttMs`
-no longer includes that wait; a refused port is reported at once instead of after the timeout.
+Behavior changes for the upgrade guide, each with a test of the public verdict:
+
+- A DNS probe no longer waits for a worker, so `rttMs` no longer includes that wait.
+- A refused port. Today `recv` fails at once with `ECONNREFUSED` and the client labels it
+  `DNSError.timeout`, so the probe says "no response" although the host answered with a
+  refusal. The new transport distinguishes a delivered refusal from silence. Which existing
+  error it reports is chosen in this stage; no `DNSError` case is added. This is a change of
+  reported outcome, not of speed.
+- An empty datagram. Today it is reported as `DNSError.timeout`, so `dnsProbe` says unreachable.
+  As a malformed reply, `dnsProbe` reports the server reachable, like any other malformed
+  reply.
 
 Tests: the existing DNS fault battery against the new transport; refused port; `EAGAIN` on send
 (injected); cancellation returns while the fixture is still silent, and the descriptor is closed
@@ -252,9 +270,11 @@ callback queue crashed a stress loop in 4 of 4 runs):
 Outcomes are typed: answer, no such record, error, timeout, cancelled. What "no such record"
 proves is decided here: the daemon can report it for a suppressed question as well as a real
 negative answer, so if the two cannot be told apart, only answers are cached. Link-local
-addresses are resolved by multicast, which never says "no such name" and so always ends in a
-timeout; they get a short cap of their own and do not count toward the stall breaker, or every
-IPv6 trace would wait out the full budget on its first hop. The stall breaker stays: it saves
+addresses are resolved by multicast. A peer that advertises a PTR answers and the lookup
+succeeds at once; but multicast never says "no such name", so an unanswered link-local lookup
+runs until its cap. Those lookups get a short cap of their own and an unanswered one does not
+count toward the stall breaker, or every IPv6 trace whose first hop has no name would wait out
+the full budget. The stall breaker stays: it saves
 each trace the lookup budget while the resolver is broken.
 
 The public optional hostname and the public synchronous `reverseDNS(_:)` are unchanged; the
@@ -456,7 +476,7 @@ document is that version with their findings folded in:
   before the release.
 - The `DNSServiceRef` rules, the required flag, the synchronous start call and the descriptor
   cap (all three; crash and descriptor limit measured by Fable).
-- Link-local reverse lookups always time out (Gemini).
+- An unanswered link-local reverse lookup has no negative answer and runs to its cap (Gemini).
 - Consistent Cancellation needs the reason-carrying cancel state, not just different `throw`s
   (Gemini).
 - Standalone `getPublicIPs` does not use the executor today, the DNS client has a synchronous
