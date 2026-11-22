@@ -1,8 +1,8 @@
 # Event-based I/O: no thread held while waiting, one deadline per operation
 
 Sequenced plan for the ROADMAP item "Robustness under network and DNS failure, proven by tests".
-Stage: product. Status: plan, reviewed twice (see Review record). Completed stages get struck
-through as they land.
+Stage: product. Status: Independent Fixes has landed (#100); Receive Loop Bounds is next. The
+plan was reviewed twice (see Review record). Completed stages are struck through.
 
 ## Why
 
@@ -45,9 +45,10 @@ executor. Keep `getaddrinfo` for forward resolution, because it is the only thin
 the address the system itself would connect to (see Resolution Off The Actor), and move it onto
 the executor, which by then carries nothing else. The executor's internals do not change.
 
-Two further defects are independent of this and are fixed first: the receive handlers for trace,
-streaming trace and ping can starve their own deadline timer, and `traceClassified` has no
-overall deadline (#84).
+Two further defects are independent of this. The receive handlers for trace, streaming trace
+and ping can starve their own deadline timer; that is fixed first. `traceClassified` has no
+overall deadline (#84); that is a later stage, after Consistent Cancellation, which it builds
+on.
 
 ## What stays
 
@@ -76,7 +77,7 @@ four that close known defects. The event-based conversions follow in order of ri
 transports the library fully owns, then reverse DNS, where a difference costs only a hostname,
 then forward resolution, where it would change what is measured.
 
-### Independent Fixes
+### ~~Independent Fixes~~ (landed in #100)
 
 The part of #95 that does not touch the executor's internals (about 1,700 of its 1,773 changed
 lines; 69 are in `Utils.swift`):
@@ -142,7 +143,10 @@ reports from it. Overall Deadline later adds a third reason to the same state.
 
 The rule, as `discoverPaths` already has it from Independent Fixes: task cancellation throws
 `CancellationError`; a library-side cancel throws `TracerouteError.cancelled`; when both
-happened, the library-side cancel is reported. Trace and ping follow it. A streaming trace
+happened, the library-side cancel is reported. Trace follows both halves. Ping is not tied to
+`networkChanged()` or `cancelActiveTraces()` (it registers no trace handle, and that does not
+change here), so for ping the only change is that cancelling its own task throws
+`CancellationError`. A streaming trace
 follows it for a library-side cancel of a live stream, which throws `TracerouteError.cancelled`
 to the consumer. A consumer that cancels its own task is different: iteration of an
 `AsyncThrowingStream` can end normally (`next()` returns `nil`) before the producer sees the
@@ -192,7 +196,10 @@ becomes cancellation-aware.
 
 Behavior changes for the upgrade guide, each with a test of the public verdict:
 
-- A DNS probe no longer waits for a worker, so `rttMs` no longer includes that wait.
+- DNS timing no longer includes the wait for a worker. That is `DNSQueryResult.rttMs`
+  (milliseconds), returned by the query methods such as `DNSQueries.a`, and
+  `DNSProbeResult.rtt` (optional seconds), returned by `dnsProbe`. Both start timing before the
+  executor submission today.
 - A refused port. Today `recv` fails at once with `ECONNREFUSED` and the client labels it
   `DNSError.timeout`, so the probe says "no response" although the host answered with a
   refusal. The new transport distinguishes a delivered refusal from silence. Which existing
