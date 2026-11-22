@@ -45,9 +45,9 @@ final class StallGate: @unchecked Sendable {
       return
     }
     lock.unlock()
-    _ = semaphore.wait(timeout: .now() + limit)
-    // Pass the wake-up on, so every waiter is released by one `open()`.
-    semaphore.signal()
+    // Pass a wake-up from `open()` on, so every waiter is released by one call. A wait that
+    // merely timed out must not, or it would release waiters the gate should still be holding.
+    if semaphore.wait(timeout: .now() + limit) == .success { semaphore.signal() }
   }
 
   func open() {
@@ -64,6 +64,74 @@ func measure<T>(_ body: () async throws -> T) async rethrows -> (T, TimeInterval
   let start = monotonicNow()
   let value = try await body()
   return (value, monotonicNow() - start)
+}
+
+/// Thrown by ``measure(within:_:)`` when the operation outlives its watchdog.
+struct WatchdogExpired: Error, CustomStringConvertible {
+  let limit: TimeInterval
+  var description: String { "operation still running after the \(limit)s watchdog" }
+}
+
+/// Seconds elapsed while running `body`, or ``WatchdogExpired`` once `limit` seconds pass.
+///
+/// The operation runs in its own task and the watchdog does not wait for it to finish, so an
+/// operation that never returns fails the test instead of hanging the run. The abandoned task is
+/// cancelled.
+func measure<T: Sendable>(
+  within limit: TimeInterval, _ body: @escaping @Sendable () async throws -> T
+) async throws -> (T, TimeInterval) {
+  let start = monotonicNow()
+  let outcome = WatchdogRace<T>()
+  let work = Task {
+    do {
+      outcome.finish(.success(try await body()))
+    } catch {
+      outcome.finish(.failure(error))
+    }
+  }
+  let watchdog = Task {
+    try? await Task.sleep(nanoseconds: UInt64(limit * 1_000_000_000))
+    outcome.finish(.failure(WatchdogExpired(limit: limit)))
+  }
+  let result = await outcome.value
+  watchdog.cancel()
+  if case .failure(let error) = result, error is WatchdogExpired { work.cancel() }
+  return (try result.get(), monotonicNow() - start)
+}
+
+/// The first of an operation and its watchdog to finish.
+private final class WatchdogRace<T: Sendable>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var result: Result<T, Error>?
+  private var waiter: CheckedContinuation<Result<T, Error>, Never>?
+
+  var value: Result<T, Error> {
+    get async {
+      await withCheckedContinuation { continuation in
+        lock.lock()
+        if let result {
+          lock.unlock()
+          continuation.resume(returning: result)
+        } else {
+          waiter = continuation
+          lock.unlock()
+        }
+      }
+    }
+  }
+
+  func finish(_ outcome: Result<T, Error>) {
+    lock.lock()
+    guard result == nil else {
+      lock.unlock()
+      return
+    }
+    result = outcome
+    let pending = waiter
+    waiter = nil
+    lock.unlock()
+    pending?.resume(returning: outcome)
+  }
 }
 
 /// Polls `condition` until it holds or `limit` seconds pass. Returns whether it held.
@@ -427,6 +495,12 @@ func pathScript(family: Int32 = AF_INET, destinationTTL: Int, after delay: TimeI
 // MARK: - Loopback TCP server
 
 /// A loopback TCP listener whose behaviour after accepting is scripted per test.
+///
+/// Each accepted connection belongs to the thread that handles it, which is the only code that
+/// reads, writes or closes it. `stop()` only shuts connections down, which wakes any pending I/O,
+/// and then waits for every handler to close its own descriptor. So a descriptor number is never
+/// touched after it is closed, and a parallel test that is handed the same number is never
+/// disturbed.
 final class LoopbackTCPServer: @unchecked Sendable {
   enum Behavior: Sendable {
     /// Accept, then never read or write.
@@ -446,7 +520,11 @@ final class LoopbackTCPServer: @unchecked Sendable {
   private let behavior: Behavior
   private let lock = NSLock()
   private var stopped = false
-  private var connections: [Int32] = []
+  /// Connections whose handler has not closed them yet.
+  private var live: Set<Int32> = []
+  private let handlers = DispatchGroup()
+  /// Signalled once by `stop()`; handlers that wait use it instead of sleeping.
+  private let stopping = DispatchSemaphore(value: 0)
   private let loopExited = DispatchSemaphore(value: 0)
 
   init(family: Int32 = AF_INET, behavior: Behavior) throws {
@@ -466,11 +544,13 @@ final class LoopbackTCPServer: @unchecked Sendable {
     lock.unlock()
     guard !wasStopped else { return }
     loopExited.wait()
-    lock.lock()
-    for c in connections { close(c) }
-    connections.removeAll()
     close(fd)
+    // Wake every handler: pending reads return, and waits on `stopping` end.
+    lock.lock()
+    for connection in live { _ = shutdown(connection, SHUT_RDWR) }
     lock.unlock()
+    stopping.signal()
+    handlers.wait()
   }
 
   private func acceptLoop() {
@@ -486,29 +566,49 @@ final class LoopbackTCPServer: @unchecked Sendable {
       guard client >= 0 else { continue }
       accepted.increment()
       lock.lock()
-      connections.append(client)
+      live.insert(client)
       lock.unlock()
+      handlers.enter()
       let behavior = self.behavior
-      Thread.detachNewThread { [self] in self.handle(client, behavior) }
+      Thread.detachNewThread { [self] in
+        defer { handlers.leave() }
+        self.handle(client, behavior)
+      }
     }
   }
 
+  /// Runs on the connection's own thread, which owns `client` until it closes it here.
   private func handle(_ client: Int32, _ behavior: Behavior) {
+    var reset = false
     switch behavior {
     case .silent:
-      return
+      waitForStop(limit: .infinity)
     case .closeImmediately:
-      closeConnection(client, reset: false)
+      break
     case .resetAfter(let prefix):
       readRequest(client)
       write(prefix, to: client)
-      closeConnection(client, reset: true)
+      reset = true
     case .respond(let response, let delay):
       readRequest(client)
-      Thread.sleep(forTimeInterval: delay)
+      waitForStop(limit: delay)
       write(response, to: client)
-      closeConnection(client, reset: false)
     }
+    lock.lock()
+    live.remove(client)
+    lock.unlock()
+    if reset {
+      var option = Darwin.linger(l_onoff: 1, l_linger: 0)
+      _ = setsockopt(
+        client, SOL_SOCKET, SO_LINGER, &option, socklen_t(MemoryLayout<Darwin.linger>.size))
+    }
+    close(client)
+  }
+
+  /// Waits until `stop()` or `limit` seconds, passing a stop on to the next waiting handler.
+  private func waitForStop(limit: TimeInterval) {
+    let deadline: DispatchTime = limit.isFinite ? .now() + limit : .distantFuture
+    if stopping.wait(timeout: deadline) == .success { stopping.signal() }
   }
 
   private func readRequest(_ client: Int32) {
@@ -518,39 +618,54 @@ final class LoopbackTCPServer: @unchecked Sendable {
   }
 
   private func write(_ bytes: [UInt8], to client: Int32) {
-    lock.lock()
-    defer { lock.unlock() }
-    guard connections.contains(client) else { return }
     _ = bytes.withUnsafeBytes { Darwin.send(client, $0.baseAddress, $0.count, Int32(MSG_NOSIGNAL)) }
-  }
-
-  private func closeConnection(_ client: Int32, reset: Bool) {
-    lock.lock()
-    defer { lock.unlock() }
-    guard let index = connections.firstIndex(of: client) else { return }
-    connections.remove(at: index)
-    if reset {
-      var option = Darwin.linger(l_onoff: 1, l_linger: 0)
-      _ = setsockopt(
-        client, SOL_SOCKET, SO_LINGER, &option, socklen_t(MemoryLayout<Darwin.linger>.size))
-    }
-    close(client)
   }
 }
 
-/// A TCP port on loopback that refuses connections because nothing is bound to it.
+/// A loopback TCP port that refuses connections, reserved for the fixture's lifetime.
 ///
-/// The port is taken from a socket that is bound and released at once. A socket that stays bound
-/// without listening does not work: Darwin drops the SYN rather than resetting it, which looks
-/// like a filtered port.
-struct RefusingTCPPort {
+/// The port belongs to a socket that is connected to a private listener, so it stays allocated
+/// (no other socket is handed it) while no listener is bound to it, and a SYN to it is answered
+/// with a reset. A socket that is merely bound to the port without listening does not work:
+/// Darwin drops the SYN, which looks like a filtered port.
+final class RefusingTCPPort: @unchecked Sendable {
   let port: UInt16
+  private let descriptors: [Int32]
 
   init(family: Int32 = AF_INET) throws {
-    let (fd, port) = try bindLoopback(family: family, type: SOCK_STREAM)
-    close(fd)
-    self.port = port
+    let (listener, listenerPort) = try bindLoopback(family: family, type: SOCK_STREAM)
+    guard listen(listener, 1) == 0 else {
+      close(listener)
+      throw FixtureError.socket("listen", errno)
+    }
+    let holder = socket(family, SOCK_STREAM, 0)
+    guard holder >= 0 else {
+      close(listener)
+      throw FixtureError.socket("socket", errno)
+    }
+    var (address, length) = loopbackAddress(family: family, port: listenerPort)
+    let connected = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(holder, $0, length) }
+    }
+    let accepted = connected == 0 ? accept(listener, nil, nil) : -1
+    guard accepted >= 0 else {
+      let code = errno
+      close(holder)
+      close(listener)
+      throw FixtureError.socket("connect", code)
+    }
+    var local = sockaddr_storage()
+    var localLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    _ = withUnsafeMutablePointer(to: &local) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(holder, $0, &localLength) }
+    }
+    port = withUnsafeBytes(of: local) {
+      UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+    }
+    descriptors = [holder, accepted, listener]
   }
+
+  deinit { for descriptor in descriptors { close(descriptor) } }
 }
 
 // MARK: - Loopback UDP responder
@@ -612,7 +727,8 @@ final class LoopbackUDPResponder: @unchecked Sendable {
           }
         }
       }
-      guard n > 0 else { continue }
+      // A zero-byte datagram is a valid request; only a failed or timed-out receive is not.
+      guard n >= 0 else { continue }
       requests.increment()
       guard let (reply, delay) = script(Array(buffer.prefix(n))) else { continue }
       let deliver: @Sendable () -> Void = { [self, source, length] in

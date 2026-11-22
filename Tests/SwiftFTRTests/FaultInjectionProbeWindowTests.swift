@@ -26,7 +26,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 8, maxWaitMs: 3000, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure {
+    let (result, elapsed) = try await measure(within: 10) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
 
@@ -47,7 +47,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 6, maxWaitMs: 400, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure {
+    let (result, elapsed) = try await measure(within: 10) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
 
@@ -66,7 +66,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 300, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure {
+    let (result, elapsed) = try await measure(within: 10) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
     #expect(!result.reached)
@@ -124,7 +124,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 5, maxWaitMs: 3000, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure {
+    let (result, elapsed) = try await measure(within: 10) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
 
@@ -152,7 +152,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 6, maxWaitMs: 400, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure {
+    let (result, elapsed) = try await measure(within: 10) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
     #expect(result.hops.count <= 6)
@@ -242,8 +242,11 @@ struct FaultInjectionProbeWindowTests {
 
   @Test("Socket creation failure throws at once from every operation")
   func socketCreationFailure() async throws {
+    // Fails the way socket(2) does, so each operation's own descriptor check must notice it and
+    // report the errno.
     let refuse: TestSeams.MakeICMPSocket = { _ in
-      throw TracerouteError.socketCreateFailed(errno: EMFILE, details: "injected")
+      errno = EMFILE
+      return -1
     }
     let network = try FakeICMPNetwork { _ in [] }
     defer { network.stop() }
@@ -291,24 +294,27 @@ struct FaultInjectionProbeWindowTests {
       do {
         try await body()
         Issue.record("\(name) succeeded without resolving")
-      } catch TracerouteError.resolutionFailed {
-        // Expected.
+      } catch TracerouteError.resolutionFailed(_, let details) {
+        // Only the substitute says this, so a call that went around it cannot pass.
+        #expect(details == "injected NXDOMAIN", "\(name) resolved without the substitute")
       } catch {
         Issue.record("\(name) threw \(error)")
       }
       #expect(monotonicNow() - start < 1.0, "\(name) did not fail fast")
     }
 
+    // The destination is a loopback literal: an operation that went around the substitute would
+    // resolve it locally and fail the details check, without asking any DNS server.
     await TestSeams.$resolveHost.withValue(fail) {
-      await expectResolutionFailure("trace") { _ = try await tracer.trace(to: "nx.test") }
+      await expectResolutionFailure("trace") { _ = try await tracer.trace(to: "127.0.0.1") }
       await expectResolutionFailure("traceClassified") {
-        _ = try await tracer.traceClassified(to: "nx.test", resolver: EmptyASNResolver())
+        _ = try await tracer.traceClassified(to: "127.0.0.1", resolver: EmptyASNResolver())
       }
       await expectResolutionFailure("traceStream") {
-        for try await _ in tracer.traceStream(to: "nx.test") {}
+        for try await _ in tracer.traceStream(to: "127.0.0.1") {}
       }
       await expectResolutionFailure("ping") {
-        _ = try await tracer.ping(to: "nx.test", config: PingConfig(count: 1, timeout: 1))
+        _ = try await tracer.ping(to: "127.0.0.1", config: PingConfig(count: 1, timeout: 1))
       }
     }
     #expect(await tracer.activeTraces.isEmpty)
@@ -323,7 +329,7 @@ struct FaultInjectionProbeWindowTests {
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
     let config = StreamingTraceConfig(probeTimeout: 0.5, retryAfter: 0.2, maxHops: 5)
 
-    let (hops, elapsed) = try await measure {
+    let (hops, elapsed) = try await measure(within: 10) {
       try await network.install {
         var hops: [StreamingHop] = []
         for try await hop in tracer.traceStream(to: "fake.test", config: config) {
@@ -332,11 +338,14 @@ struct FaultInjectionProbeWindowTests {
         return hops
       }
     }
-    #expect(elapsed < 2.0, "silent stream took \(elapsed)s, timeout 0.5s")
-    #expect(Set(hops.map(\.ttl)) == Set(1...5))
+    // The stream must sit out its window, not give up early.
+    #expect(elapsed >= 0.45 && elapsed < 2.0, "silent stream took \(elapsed)s, timeout 0.5s")
+    #expect(hops.map(\.ttl).sorted() == Array(1...5), "one placeholder per TTL")
     #expect(hops.allSatisfy { $0.ipAddress == nil })
-    // The retry re-sends TTLs 1...4; the destination TTL is never retried because it is unknown.
-    #expect(network.probes.value >= 5)
+    // Five initial probes, then the retry at 0.2 s re-sends TTLs 1...4 (the retry stops below
+    // maxHops), so exactly nine reach the network.
+    #expect(
+      await eventually(within: 1) { network.probes.value == 9 }, "\(network.probes.value) probes")
   }
 
   @Test("Malformed datagrams do not stop a stream from delivering valid hops")
@@ -356,7 +365,7 @@ struct FaultInjectionProbeWindowTests {
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
     let config = StreamingTraceConfig(probeTimeout: 3, retryAfter: nil, maxHops: 5)
 
-    let (hops, elapsed) = try await measure {
+    let (hops, elapsed) = try await measure(within: 10) {
       try await network.install {
         var hops: [StreamingHop] = []
         for try await hop in tracer.traceStream(to: "fake.test", config: config) {
@@ -385,7 +394,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig())
 
-    let (result, elapsed) = try await measure {
+    let (result, elapsed) = try await measure(within: 10) {
       try await network.install {
         try await tracer.ping(
           to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: 1.0))
@@ -401,7 +410,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig())
 
-    let (result, elapsed) = try await measure {
+    let (result, elapsed) = try await measure(within: 10) {
       try await network.install {
         try await tracer.ping(
           to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: 0.3))
