@@ -225,24 +225,126 @@ struct FaultInjectionCancellationTests {
 
   // MARK: discoverPaths
 
-  @Test(
-    "discoverPaths ends promptly on a network change",
-    arguments: [Canceller.taskCancel, .networkChanged, .cancelActiveTraces])
-  func discoverPathsCancellation(canceller: Canceller) async throws {
-    let network = try FakeICMPNetwork { _ in [] }
-    defer { network.stop() }
-    let tracer = offlineTracer(
-      SwiftFTRConfig(maxHops: 4, publicIP: "198.51.100.7", noReverseDNS: true))
-    let config = MultipathConfig(
-      flowVariations: 5, maxPaths: 8, earlyStopThreshold: 5, timeoutMs: 10_000, maxHops: 4)
+  enum MultipathPhase: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case publicIPDiscovery, probeWindow, reverseDNS, asnLookup
+    var testDescription: String { rawValue }
+  }
 
-    try await network.install {
-      let task = Task { try await tracer.discoverPaths(to: "fake.test", config: config) }
-      #expect(await eventually(within: 3) { network.probes.value >= 20 })
-      let cancelledAt = monotonicNow()
-      await Self.cancel(task, on: tracer, by: canceller)
-      await Self.expectPromptCancellation(task, cancelledAt: cancelledAt, "discoverPaths")
+  @Test(
+    "discoverPaths ends promptly when cancelled in any phase, reporting who cancelled it",
+    arguments: MultipathPhase.allCases, Canceller.allCases)
+  func discoverPathsCancellation(phase: MultipathPhase, canceller: Canceller) async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let entered = FaultCounter()
+    let resolutions = FaultCounter()
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 8, name: "test.mp-phase")
+
+    let network = try FakeICMPNetwork { probe in
+      phase == .probeWindow ? [] : pathScript(destinationTTL: 2)(probe)
     }
+    defer { network.stop() }
+    let discovery: TestSeams.DiscoverPublicIPv4 = {
+      if phase == .publicIPDiscovery {
+        entered.increment()
+        gate.wait(limit: 20)
+      }
+      return STUNPublicIP(ip: "198.51.100.7")
+    }
+    // Reverse DNS on the executor under a long deadline, as production composes it.
+    let rdns = RDNSCache(lookupDeadline: 20) { _ in
+      guard phase == .reverseDNS else { return nil }
+      entered.increment()
+      return try? await runDetachedBlockingIO(priority: .background, deadline: 20) {
+        gate.wait(limit: 20)
+        return String?.none
+      }
+    }
+    let tracer = SwiftFTR(
+      config: SwiftFTRConfig(maxHops: 4, publicIPDiscoveryTimeout: 20),
+      rdnsCache: rdns,
+      asnResolver: UncancellableASNResolver(
+        stall: phase == .asnLookup, gate: gate, entered: entered),
+      cachedPublicIP: nil)
+    let config = MultipathConfig(
+      flowVariations: 2, maxPaths: 8, earlyStopThreshold: 2, timeoutMs: 10_000, maxHops: 4)
+
+    try await TestSeams.$blockingIOExecutor.withValue(executor) {
+      try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+        try await network.install {
+          let resolve: TestSeams.ResolveHost = { [network] _, _ in
+            resolutions.increment()
+            return network.resolved
+          }
+          try await TestSeams.$resolveHost.withValue(resolve) {
+            let task = Task { try await tracer.discoverPaths(to: "fake.test", config: config) }
+            let reached = await eventually(within: 3) {
+              phase == .probeWindow ? network.probes.value >= 8 : entered.value > 0
+            }
+            #expect(reached, "discovery never reached \(phase)")
+            let resolvedBeforeCancel = resolutions.value
+            let cancelledAt = monotonicNow()
+            await Self.cancel(task, on: tracer, by: canceller)
+            do {
+              _ = try await task.value
+              Issue.record("\(phase): discovery completed instead of being cancelled")
+            } catch TracerouteError.cancelled {
+              #expect(
+                canceller != .taskCancel, "\(phase): caller cancellation reported as a handle's")
+            } catch is CancellationError {
+              #expect(
+                canceller == .taskCancel, "\(phase): a network change reported as the caller's")
+            } catch {
+              Issue.record("\(phase): threw \(error)")
+            }
+            let lag = monotonicNow() - cancelledAt
+            #expect(lag < Self.promptly, "\(phase): returned \(lag)s after cancellation")
+            if phase == .publicIPDiscovery {
+              #expect(
+                resolutions.value == resolvedBeforeCancel,
+                "a cancelled flow went on to resolve its destination")
+            }
+          }
+        }
+      }
+    }
+  }
+
+  @Test("A reverse-DNS lookup cut short by cancellation is not cached as a miss")
+  func cancelledLookupNotCached() async throws {
+    let calls = FaultCounter()
+    let rdns = RDNSCache(lookupDeadline: 20) { _ in
+      calls.increment()
+      // Like the production resolver: a cancelled wait comes back as nil.
+      try? await Task.sleep(nanoseconds: 20_000_000_000)
+      return Task.isCancelled ? nil : "late.example"
+    }
+    let lookup = Task { await rdns.lookup("198.51.100.20") }
+    #expect(await eventually(within: 2) { calls.value == 1 })
+    lookup.cancel()
+    #expect(await lookup.value == nil)
+    #expect(await rdns.count == 0, "the cancelled lookup was cached")
+    #expect(await !rdns.isSuppressingLookups)
+  }
+}
+
+/// An ASN resolver that, when told to, waits for `gate` on a thread and ignores cancellation,
+/// the way a wait on a shared database load does.
+struct UncancellableASNResolver: ASNResolver {
+  let stall: Bool
+  let gate: StallGate
+  let entered: FaultCounter
+
+  func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+    guard stall else { return [:] }
+    entered.increment()
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global().async {
+        gate.wait(limit: 20)
+        continuation.resume()
+      }
+    }
+    return [:]
   }
 }
 

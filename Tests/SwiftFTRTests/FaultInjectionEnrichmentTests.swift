@@ -217,7 +217,8 @@ struct FaultInjectionEnrichmentTests {
         gate.wait(limit: seconds)
       }
     }
-    _ = await eventually(within: 2) { occupied.value > 0 }
+    let started = await eventually(within: 2) { occupied.value > 0 }
+    #expect(started, "the occupant never took the executor's slot")
     return gate
   }
 
@@ -266,9 +267,33 @@ struct FaultInjectionEnrichmentTests {
       }
     }
     #expect(!result.isReachable)
+    // Reported as a timeout, which is what an expired queue deadline must map to.
+    #expect(result.error == "Timeout - no response", "\(result.error ?? "no error")")
+    // Three timeouts, stated here rather than read from the code under test.
     #expect(
-      elapsed < dnsQueryDeadline(timeout: timeout) + 0.5,
-      "DNS probe waited \(elapsed)s for a slot, timeout \(timeout)s")
+      elapsed < 3 * timeout + 0.5, "DNS probe waited \(elapsed)s for a slot, timeout \(timeout)s")
+  }
+
+  @Test("An invalid DNS query is rejected as invalid even when no executor slot is free")
+  func invalidDNSQueryWithFullExecutor() async throws {
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.full-dns-input")
+    let gate = await Self.occupy(executor, for: 3)
+    defer { gate.open() }
+
+    try await TestSeams.$blockingIOExecutor.withValue(executor) {
+      await #expect {
+        try await queryA(hostname: "example..com", server: "127.0.0.1", timeout: 0.05)
+      } throws: { error in
+        if case DNSError.invalidHostname = error { return true }
+        return false
+      }
+      await #expect {
+        try await queryA(hostname: "example.com", server: "not-an-ip", timeout: 0.05)
+      } throws: { error in
+        if case DNSError.invalidIP = error { return true }
+        return false
+      }
+    }
   }
 
   // MARK: Concurrency under faults
