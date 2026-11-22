@@ -10,8 +10,8 @@ Robustness under a failing network, found by a new offline fault-injection batte
 each kind of failure phase by phase. A network change now ends every `trace`, `traceClassified`,
 `traceStream` and `discoverPaths` in flight (ping and the probes are not tied to the tracer's
 network changes), and several waits are now bounded by the caller's own configuration. DNS
-queries, `dnsProbe` and Team Cymru ASN lookups wait for their reply without holding a thread, so
-they no longer queue behind stalled reverse-DNS lookups for a blocking-I/O worker.
+queries and `dnsProbe` wait for their reply without holding a thread, so they no longer queue
+behind stalled reverse-DNS lookups for a blocking-I/O worker.
 One public API is added, a structured outcome on `dnsProbe` results; none is removed or changed:
 `swift package diagnose-api-breaking-changes v0.17.1` reports no breaking change. Upgrading from
 0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
@@ -83,12 +83,10 @@ What an unmodified caller will see differently:
 - **A cancelled `discoverPaths` flow stops promptly.** A flow cancelled during public-IP discovery
   no longer goes on to resolve its destination, and one cancelled during classification no longer
   waits on an ASN database load shared with other resolvers.
-- **DNS queries and Team Cymru lookups no longer wait for a blocking-I/O worker.** Each query is
-  one non-blocking UDP exchange watched by Dispatch sources, so it holds no thread and starts at
-  once even while every worker is held. Behind a full executor a DNS query waited without limit,
-  and a Cymru lookup gave up after three timeouts without sending anything, so a trace lost its
-  ASN data. Cancelling the calling task now ends a query, and a Cymru lookup waiting for one of
-  its eight concurrent queries, at once.
+- **DNS queries no longer wait for a blocking-I/O worker.** Each query is one non-blocking UDP
+  exchange watched by Dispatch sources, so it holds no thread and starts at once even while every
+  worker is held. Behind a full executor a DNS query waited without limit. Cancelling the calling
+  task now ends a query at once.
 - **A DNS query whose send meets a full interface queue is retried within its timeout.**
   `ENOBUFS` retries after a short timer, where it failed with `DNSError.sendFailed` at once, and
   `EAGAIN` waits for the socket to drain without holding a thread. A send that does not succeed

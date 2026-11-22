@@ -77,7 +77,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
 | DNS transport | refused port (IPv4 and IPv6); empty datagram; `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
 | DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; an empty datagram; `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; a failed send, an unclassified receive error and an invalid server; cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
-| Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
+| Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries and dnsProbe answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe | `Enrichment`, `EventBasedDNSTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase, with the error checked per source; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
@@ -85,8 +85,8 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
-Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests` and
-`CymruEventBasedTests` for the event-based DNS transport. Every timed operation runs under a watchdog
+Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests` and `DNSProbeOutcomeTests`
+for the event-based DNS transport. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
 Not covered, and why:
@@ -106,8 +106,8 @@ Not covered, and why:
   `EHOSTUNREACH` or `ENETUNREACH`, so `DNSProbeOutcomeTests.unreachable` injects them through the
   receive seam; no test shows the kernel reporting them on a connected UDP socket.
 - **The `.dns` and `.hybrid` strategies end to end**: their fallback is Team Cymru over the real
-  resolver. `CymruEventBasedTests` runs `CymruDNSResolver` against a loopback responder; the
-  battery passes a stub resolver to every classified trace so no test reaches it.
+  resolver. `CymruQueueDeadlineTests` covers their queueing bound; the battery passes a stub
+  resolver to every classified trace so no test reaches it.
 - **A TCP port that drops SYNs (filtered).** Producing one needs a firewall rule.
 
 ## Out of scope
@@ -176,11 +176,11 @@ numbers are as of the commit that added this section.
    query went onto the shared executor with no deadline, so its socket timeouts bounded the query
    but not the queueing: with the executor full, `dnsProbe` with a 0.3 s timeout waited as long as
    the occupant held it (3.0 s). A deadline counted from submission would have reported a healthy
-   server as unreachable when no packet was sent, so instead DNS queries and Team Cymru lookups
-   now wait on Dispatch sources (`UDPExchange.swift`) and need no worker. Tests:
+   server as unreachable when no packet was sent, so instead DNS queries now wait on Dispatch
+   sources (`UDPExchange.swift`) and need no worker. Team Cymru lookups still run on the executor,
+   behind the queue deadline `CymruQueueDeadlineTests` covers. Test:
    `EventBasedDNSTests.answersWithEveryWorkerHeld`, which waited out its 5 s watchdog before and
-   answers while every slot is held after, and `CymruEventBasedTests.resolvesWithEveryWorkerHeld`,
-   which returned no ASN data at its 1.5 s queue deadline before.
+   answers while every slot is held after.
 9. **`getPublicIPs` runs blocking STUN on Swift's cooperative pool, without a deadline.**
    Unverified, from reading the code. `STUN.swift:725` wraps `stunGetPublicIPWithFallback`,
    which calls `getaddrinfo` for each server hostname and blocks in `recv`, in plain `Task`s rather
