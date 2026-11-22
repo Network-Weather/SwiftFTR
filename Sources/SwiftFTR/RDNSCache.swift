@@ -95,6 +95,10 @@ actor RDNSCache {
     let hostname = await resolver(ip)
     let elapsed = startedAt.duration(to: clock.now)
 
+    // A cancelled lookup's nil means "stopped asking", not "no hostname": recording it would cache
+    // a negative answer for the full TTL and could trip the breaker on lookups nobody waited for.
+    guard !Task.isCancelled else { return nil }
+
     // Only lookups initiated under the current breaker generation may update breaker state.
     // Stale lookups from a prior network generation must not re-trip or reset the breaker on the new network.
     if lookupBreakerGeneration == breakerGeneration {

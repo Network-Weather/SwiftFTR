@@ -890,7 +890,11 @@ public actor SwiftFTR {
     // Perform rDNS lookups if enabled
     if !config.noReverseDNS {
       let ips = finalHops.compactMap { $0.ipAddress }
-      let hostnames = await rdnsCache.batchLookup(ips)
+      // Raced against the handle like every other enrichment phase, so a network change ends the
+      // trace now rather than after the slowest lookup's deadline.
+      let hostnames = try await withTraceCancellation(handle: handle) {
+        await self.rdnsCache.batchLookup(ips)
+      }
 
       try Task.checkCancellation()
       if await handle.isCancelled {
@@ -1295,7 +1299,8 @@ public actor SwiftFTR {
 
   /// Cancel all active traceroute operations without clearing caches.
   ///
-  /// Snapshots the currently running trace handles and cancels them.
+  /// Snapshots the currently running trace handles and cancels them: `trace`, `traceClassified`,
+  /// `traceStream` and `discoverPaths`, each of which then throws `TracerouteError.cancelled`.
   /// Traces registered after this call begins remain tracked for subsequent cancellation.
   /// This method does not invalidate rDNS, public IP, or ASN caches.
   public func cancelActiveTraces() async {
@@ -1309,7 +1314,9 @@ public actor SwiftFTR {
   /// Handle network changes by cancelling active traces and clearing caches.
   ///
   /// Call this method when the network configuration changes (e.g., WiFi to cellular,
-  /// VPN connect/disconnect) to ensure fresh data for subsequent traces.
+  /// VPN connect/disconnect) to ensure fresh data for subsequent traces. Operations in flight
+  /// (`trace`, `traceClassified`, `traceStream` and `discoverPaths`) are cancelled as by
+  /// ``cancelActiveTraces()`` and throw `TracerouteError.cancelled`.
   public func networkChanged() async {
     // Snapshot and remove the current generation before awaiting another actor.
     // Traces registered while cancellation is in progress remain tracked for a

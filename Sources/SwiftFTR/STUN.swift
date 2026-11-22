@@ -207,8 +207,10 @@ internal func stunGetPublicIP(
 
   // Set timeouts. A zero timeval disables SO_RCVTIMEO, so invalid values are
   // rejected above and option failures are surfaced rather than ignored.
+  // A positive timeout that rounds down to zero microseconds must still be a timeout.
   var tv = timeval(
     tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000))
+  if tv.tv_sec == 0, tv.tv_usec == 0 { tv.tv_usec = 1 }
   let receiveTimeoutResult = withUnsafePointer(to: &tv) { p in
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
   }
