@@ -45,17 +45,33 @@ that fail when any phase can wait without a bound or strand its caller.
 
 | Phase | Conditions | Operations |
 |---|---|---|
-| Forward resolution | fails; stalls (synchronous, see Findings) | trace, traceClassified, traceStream, ping |
-| Probe socket | creation fails; reads report EOF continuously | trace, traceStream, ping |
-| Probe window | no replies; replies after the deadline; truncated and garbage ICMPv4/ICMPv6; replies for another identifier; mixed valid and invalid in one burst | trace, traceStream, traceClassified |
-| Public-IP discovery | stalls past its budget; fails; network change while in flight | traceClassified, discoverPaths |
-| STUN wire | silent, garbage, slow server; sub-microsecond timeout | stunGetPublicIP |
-| Reverse DNS | stalls; handle cancellation during the lookup wave | trace, traceClassified |
-| ASN | `.remote` database download that stalls | LocalASNResolver |
-| DNS wire | silence, NXDOMAIN, SERVFAIL, garbage, oversized datagram, compression loop | dnsProbe, dns queries |
-| TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, slow first byte, timeout | tcpProbe, udpProbe, httpProbe |
-| Cancellation | task cancellation and `networkChanged()` / `cancelActiveTraces()` at varying points | trace, traceClassified, traceStream, ping, discoverPaths |
-| Concurrency | many simultaneous traces on one tracer and across tracers with faults injected | trace, traceClassified |
+| Forward resolution | fails; stalls (disabled, finding 5) | trace, traceClassified, traceStream, ping |
+| Probe socket | creation fails; every send fails with a non-transient errno | trace, traceClassified, traceStream, ping |
+| Probe window | no replies; replies after the deadline; truncated, garbage and seeded-random ICMPv4/ICMPv6 queued ahead of valid replies; replies for another identifier; unreachable | trace, traceStream, ping |
+| Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths |
+| STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP |
+| Reverse DNS | stalls past its deadline; the stall breaker; handle cancellation during the wave | trace |
+| ASN | resolver that stalls and ignores its timeout (cancellation only) | traceClassified |
+| DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized datagram, compression loop, overstated answer count | the `__dnsQuery` SPI (the production query path on a chosen port) |
+| Full executor | every blocking-I/O slot held while discovery, reverse DNS and DNS queue | traceClassified, dnsProbe |
+| TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte inside and outside the timeout, 503, cancellation | tcpProbe, udpProbe, httpProbe |
+| Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` swept across the operation, and in each stalled phase | trace, traceClassified, traceStream, ping, discoverPaths |
+| Concurrency | 33 simultaneous operations on one tracer and across five, with lossy and garbled replies and a network change mid-flight | trace, traceClassified |
+
+Not covered, and why:
+
+- **A socket that fails on read.** Darwin keeps delivering datagrams to a UDP socket after
+  `shutdown(SHUT_RD)`, and closing the descriptor under the trace would risk the number being
+  reused, so no test stages a read error. The receive loop's deadline timer is independent of the
+  read source, which is the property that bounds it; that is shown by the silent-network tests.
+- **A `.remote` ASN database download that stalls** (finding 7). The download is skipped whenever
+  a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which is shared
+  with every other user of SwiftIP2ASN on the machine, and the cache location cannot be redirected
+  from SwiftFTR. A test would have to delete that cache.
+- **The `.dns` and `.hybrid` strategies end to end**: their fallback is Team Cymru over the real
+  resolver. `CymruQueueDeadlineTests` covers their queueing bound; the battery passes a stub
+  resolver to every classified trace so no test reaches it.
+- **A TCP port that drops SYNs (filtered).** Producing one needs a firewall rule.
 
 ## Out of scope
 
@@ -80,4 +96,64 @@ swift package diagnose-api-breaking-changes v0.17.1 --products SwiftFTR
 
 ## Findings
 
-Defects the battery exposes are recorded here with their disposition as they are confirmed.
+Defects the battery exposed, with their disposition. Each "confirmed" finding has a test that
+failed before its fix (or fails today, if disabled), with the measurement quoted. File and line
+numbers are as of the commit that added this section.
+
+1. **A network change did not interrupt a trace's reverse-DNS wave.** Confirmed and fixed.
+   `performTrace` awaited `rdnsCache.batchLookup` outside `withTraceCancellation`
+   (`Traceroute.swift:895` after the fix), so `networkChanged()` and `cancelActiveTraces()`
+   returned the trace only when the slowest lookup hit its deadline (5 s by default). Test:
+   `FaultInjectionCancellationTests.reverseDNSWave`, 10.0 s before, under 0.1 s after.
+2. **`discoverPaths` ignored `networkChanged()` and `cancelActiveTraces()`.** Confirmed and fixed.
+   Each flow runs on a throwaway tracer, so the parent's handles never included them; discovery
+   ran to completion and returned a topology from the old network. Now `Multipath.swift:575`
+   registers a handle and races discovery inside one task group, which still joins every worker.
+   Test: `discoverPathsCancellation`, 10.0 s and a returned topology before, under 0.1 s after.
+3. **`discoverPaths` ignored `publicIPDiscoveryTimeout`.** Confirmed and fixed. Flow workers were
+   built from a configuration that dropped it (`Multipath.swift:618` and `:661` after the fix) and
+   their classifier was not passed it, so each flow paid the 6 s default. Test:
+   `multipathHonoursPublicIPBudget` with a 0.3 s budget, 12.0 s before, 0.6 s after.
+4. **A sub-microsecond STUN timeout waited forever.** Confirmed and fixed. `stunGetPublicIP`
+   truncated the timeout to a zero `timeval`, which disables `SO_RCVTIMEO`
+   (`STUN.swift:213` after the fix). Reachable through the public `getPublicIPs(stunTimeout:)`.
+   Test: `stunTinyTimeout`, still blocked at the 2 s watchdog before, immediate after.
+5. **Forward resolution is synchronous on the tracer actor and unbounded.** Confirmed (known from
+   #84), not fixed. `resolveHost` (`Traceroute.swift:629`, `:785`) calls `getaddrinfo` on the
+   actor, even for a literal under `.auto`, so a stalled resolver holds every other call on that
+   tracer, `cancelActiveTraces()` and `networkChanged()` included, and cannot be cancelled. With a
+   5 s injected stall, `cancelActiveTraces()` took 5.0 s to return. Not fixed: bounding it needs a
+   resolution budget, which is a configuration field. Test, disabled because it blocks for its
+   stall: `FaultInjectionEnrichmentTests.forwardResolutionStall`.
+6. **A failed public-IP discovery is paid twice.** Confirmed, not fixed. When discovery fails or
+   times out, `traceClassified` passes `publicIP: nil` to the classifier (`Traceroute.swift:1059`),
+   which runs discovery again with the same budget (`Segmentation.swift:240`), so the bound is two
+   budgets. Measured in `multipathHonoursPublicIPBudget` (0.6 s for a 0.3 s budget). Not fixed
+   here because the public `classify(publicIP: nil)` means "discover", so the fix is an internal
+   way to say "already tried", a small design choice. Test, disabled: `publicIPDiscoveredOnce`.
+7. **A `.remote` ASN database download is bounded only by URLSession's request timeout.**
+   Unverified, from reading the code. With no bundled or cached database, the first resolve waits
+   on `RemoteDatabase.load()` (`LocalASNResolver.swift:212`), which uses `URLSession.shared` with
+   its 60 s default, and ignores the resolver `timeout`. Could not be staged (see "Not covered").
+8. **DNS queries waited without limit for an executor slot.** Confirmed and fixed. Every DNS query
+   went onto the shared executor with no deadline, so its socket timeouts bounded the query but not
+   the queueing: with the executor full, `dnsProbe` with a 0.3 s timeout waited as long as the
+   occupant held it. Each query now gives up at three timeouts from submission
+   (`dnsQueryDeadline`, `DNS.swift:93`) and reports `DNSError.timeout`. Test:
+   `dnsQueryWithFullExecutor`, 3.0 s before, 0.9 s after.
+9. **`getPublicIPs` runs blocking STUN on Swift's cooperative pool, without a deadline.**
+   Unverified, from reading the code. `STUN.swift:725` wraps `stunGetPublicIPWithFallback`,
+   which calls `getaddrinfo` for each server hostname and blocks in `recv`, in plain `Task`s rather
+   than on the bounded executor. A stalled resolver can hold two cooperative threads for up to
+   30 s per server in the list, and the call cannot be cancelled. Not fixed: the right bound is a
+   budget the public signature does not have.
+
+Observations that are not defects of the library:
+
+- `traceStream` yields hops in arrival order, so when the destination answers several TTLs a hop
+  past the destination can arrive, flagged `reachedDestination`, before the real destination's.
+  This is the documented contract ("the caller is responsible for sorting"); the battery asserts
+  that the lowest such TTL is the destination.
+- `TraceLifecycleTests.cancelActiveTracesCancelsClassifiedTrace` is not gated on
+  `SKIP_NETWORK_TESTS`, so the offline suite sends a real trace toward `192.0.2.1` and real STUN
+  queries. The seams added here would let it run offline.

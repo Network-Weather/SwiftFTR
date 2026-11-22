@@ -12,19 +12,27 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
 - **Why this is first** (David, 2026-11-21): the library runs inside software that is itself
   diagnosing a broken network, so the failing network is its normal operating condition, not an
   edge case.
-- **Fault injection, phase by phase**: tests that stall or fail each dependency in turn (forward
-  DNS, reverse DNS, public-IP discovery, the probe window, ASN lookup, the blocking-I/O executor
-  being full) and assert a bound on the caller's wait and a degraded result rather than a hang or
-  a trap. The executor and the resolvers are already injectable; forward resolution and the
-  socket layer are not yet.
+- **The fault-injection battery exists** ([docs/ROBUSTNESS-TESTING.md](docs/ROBUSTNESS-TESTING.md)).
+  What remains is the findings it left open, each with a disabled or missing test named there.
 - **Known unbounded waits** (#84): `traceClassified` has no overall deadline, and forward
   resolution runs `getaddrinfo` synchronously on the actor where it can be neither bounded nor
-  cancelled. An overall deadline whose error names the phase that was running is the requested
-  API; a way to read executor pressure (queued and running operations) is the companion.
-- **A local HTTP fixture for the live probe tests**: they assert success against a third-party
-  test site, so when that site is slow they fail although the probe reported the truth. A
-  loopback server makes the success cases deterministic and lets the failure cases (stall after
-  accept, reset mid-response, slow first byte) be tested at all.
+  cancelled; a 5 s resolver stall made `cancelActiveTraces()` wait 5 s (finding 5). An overall
+  deadline whose error names the phase that was running is the requested API; a resolution
+  budget is what moving `getaddrinfo` onto the executor needs; a way to read executor pressure
+  (queued and running operations) is the companion.
+- **`getPublicIPs` blocks Swift's cooperative pool** (finding 9, from code reading): it runs STUN,
+  including `getaddrinfo` for each server, in plain tasks with no deadline. Move it onto the
+  bounded executor under a budget.
+- **A failed public-IP discovery is paid twice** (finding 6): the classifier rediscovers when
+  `traceClassified` hands it no address. Needs an internal way to say "already tried".
+- **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code
+  reading). Decide between failing classification fast and loading in the background, and make
+  the SwiftIP2ASN cache directory injectable so a test can stage it without touching the user's.
+- **Move the live probe tests onto the loopback fixtures**: they still assert success against a
+  third-party test site, so when that site is slow they fail although the probe reported the
+  truth. `FaultInjectionSupport.swift` now has the TCP and HTTP fixtures they need.
+- **Gate `TraceLifecycleTests.cancelActiveTracesCancelsClassifiedTrace` off the network**: it runs
+  in the offline suite but sends a real trace and real STUN queries.
 
 ### Share the reverse-DNS cache across tracer instances
 **Goal**: Sibling tracers reuse hostname lookups instead of each starting cold, without one

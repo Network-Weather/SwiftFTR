@@ -3,6 +3,33 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Bug fixes
+
+- **A network change now ends a trace that is waiting on reverse DNS.** `networkChanged()` and
+  `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
+  `traceClassified()`, so the trace threw only when the slowest lookup reached its deadline (5 s by
+  default). It now throws at once.
+- **A network change now ends `discoverPaths`.** It ignored `networkChanged()` and
+  `cancelActiveTraces()` entirely and returned a topology measured on the old network. It now
+  throws `TracerouteError.cancelled`. Cancelling the calling task still throws `CancellationError`.
+- **`discoverPaths` honours `publicIPDiscoveryTimeout`.** Its flows used the 6 s default whatever
+  was configured.
+- **DNS queries no longer wait without limit for a free worker.** Every DNS query (`dnsProbe`,
+  `tracer.dns`, `reverseDNS`, `queryA`, `queryAAAA`) bounded its own send and receive but not the
+  time it queued for one of the eight shared blocking-I/O slots. Each now gives up three timeouts
+  after it is submitted and reports `DNSError.timeout`.
+- **A STUN timeout under one microsecond no longer waits forever.** It truncated to a zero socket
+  timeout, which means none.
+
+### Tooling
+
+- An offline fault-injection battery (`FaultInjection*Tests`) stages failing networks phase by
+  phase through task-local test seams and loopback fixtures, and asserts that every operation
+  returns within a bound derived from its configuration. See `docs/ROBUSTNESS-TESTING.md`.
+
 0.17.1 — 2026-11-21
 -------------------
 
