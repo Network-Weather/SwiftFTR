@@ -14,6 +14,33 @@ Unreleased
   treats as a client bug and traps on (`EXC_BREAKPOINT` in `_dispatch_queue_xref_dispose`). Every
   blocking call that carries a deadline went through this path. A downstream consumer saw it in
   the field as rare crashes. The timer is now created only when it will be armed.
+- **A Team Cymru ASN lookup no longer waits without limit for a free worker.** The DNS fallback
+  that `.dns` and `.hybrid` use bounded each query once it was running, but not the time it spent
+  queued for one of the eight shared blocking-I/O slots. With every slot held by stalled resolver
+  calls from sibling tracers, ASN enrichment waited for as long as they stalled. Each lookup now
+  gives up three query timeouts after it is submitted (two server attempts, plus one timeout of
+  queueing) and that address is reported without ASN data, as it already is when the query itself
+  times out. This is one of the unbounded waits identified in #84; whether it is what holds
+  `traceClassified` past 60 seconds in the field is not yet established.
+
+### Dependencies
+
+- **SwiftIP2ASN floor raised from 0.4.1 to 0.5.2.** The embedded database, the default ASN source
+  since 0.17.0, moves to iptoasn data of 2026-11-02 (459,655 IPv4 and 119,798 IPv6 ranges across
+  86,901 ASNs). SwiftFTR's own API is unchanged. Callers that also import SwiftIP2ASN directly
+  should read its 0.5.0 notes: `UltraCompactError` gained a `validationFailed(_:)` case, so an
+  exhaustive `switch` over it needs the new case.
+
+### Tooling
+
+- `SendBurstDegradationTests` used a socket it had just closed as its "always fails" descriptor.
+  Under the parallel suite another test could be handed the same descriptor number, so the test
+  failed intermittently and could send probes on that other test's socket. It now uses a
+  descriptor that is never open (#86).
+- Probe tests force-unwrapped the round-trip time of a live probe, so an unreachable external test
+  site killed the test process with a trap instead of recording one failed expectation. They now
+  fail the expectation.
+- The self-hosted integration workflow uses `actions/checkout@v7`, matching the other workflows.
 
 0.17.0 — 2026-09-03
 -------------------
