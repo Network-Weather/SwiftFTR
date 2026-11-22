@@ -22,7 +22,7 @@ These variables only select tests; they do not change library or CLI behavior.
 
 | Variable | Effect |
 |---|---|
-| `SKIP_NETWORK_TESTS=1` | Skip the live-network tests; set together with `PTR_SKIP_STUN` for an offline run |
+| `SKIP_NETWORK_TESTS=1` | Skip the tests designated as live-network; set together with `PTR_SKIP_STUN` to select the same tests as CI |
 | `PTR_SKIP_STUN=1` | Skip the public-IP (STUN) integration subset, a legacy gate |
 | `SKIP_IPV6_TESTS=1` | Force-skip the IPv6 integration tests (`IPv6Reachability.swift`) |
 | `FORCE_IPV6_TESTS=1` | Run the IPv6 integration tests without probing for a v6 path |
@@ -158,8 +158,8 @@ func testNewFeature() async throws {
 
 ### Integration Tests
 There is no separate integration-test target: live-network tests also live in
-`Tests/SwiftFTRTests/`, gated on `SKIP_NETWORK_TESTS` and wrapped in `NetworkTestGate`. For
-example:
+`Tests/SwiftFTRTests/`. New ones should check `SKIP_NETWORK_TESTS` and take a `NetworkTestGate`
+permit, as below; not every existing one does.
 ```swift
 func testComplexScenario() async throws {
     try XCTSkipIf(ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil)

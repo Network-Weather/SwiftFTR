@@ -100,7 +100,7 @@ The library-owned state and what may invalidate it:
 |---|---|---|
 | Active trace handles | cache generation | `networkChanged()`; `cancelActiveTraces()` |
 | Discovered public IP | current generation | `invalidatePublicIP()`, `clearCaches()`, `networkChanged()` |
-| Globally routable rDNS | IP address | 86400 s TTL or LRU capacity; should survive local transitions |
+| Globally routable rDNS | IP address | 86400 s TTL or oldest-inserted capacity eviction; should survive local transitions |
 | Network-scoped rDNS (private, CGNAT, link-local, ULA, loopback) | IP address | `invalidateNetworkScopedRDNS()`; `networkChanged()` |
 | ASN results | globally routable address | Capacity only (no TTL); local transitions must not clear it |
 

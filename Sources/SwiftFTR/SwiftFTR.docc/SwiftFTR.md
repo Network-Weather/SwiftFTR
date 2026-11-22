@@ -100,10 +100,12 @@ network state changed, call the individual controls instead:
 - ``SwiftFTR/SwiftFTR/cancelActiveTraces()`` cancels in-flight traces and keeps all caches.
 - ``SwiftFTR/SwiftFTR/invalidateNetworkScopedRDNS()`` evicts only reverse-DNS entries for
   non-global addresses and resets the reverse-DNS stall breaker.
-- ``SwiftFTR/SwiftFTR/invalidatePublicIP()`` forces fresh public-IP discovery;
+- ``SwiftFTR/SwiftFTR/invalidatePublicIP()`` clears the cached public IP without changing a
+  configured ``SwiftFTR/SwiftFTRConfig/publicIP`` override;
   ``SwiftFTR/SwiftFTR/clearCaches()`` clears the public IP and the reverse-DNS cache.
-- ``SwiftFTR/SwiftFTR/seedPublicIP(_:source:)`` caches a validated, globally routable public
-  address for the current cache generation, with a ``SwiftFTR/PublicIPSource``.
+- ``SwiftFTR/SwiftFTR/seedPublicIP(_:source:)`` caches an address that passes the
+  library's special-range checks (which do not prove global routability) for the current cache
+  generation, with a ``SwiftFTR/PublicIPSource``.
 
 ## Topics
 
