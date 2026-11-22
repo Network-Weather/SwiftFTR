@@ -82,8 +82,9 @@ then forward resolution, where it would change what is measured.
 The part of #95 that does not touch the executor's internals (about 1,700 of its 1,773 changed
 lines; 69 are in `Utils.swift`):
 
-- A network change ends every operation in flight, including a trace's reverse-DNS wave and
-  `discoverPaths`, which now throws `TracerouteError.cancelled`.
+- A network change cancels active `trace`, `traceClassified`, `traceStream` and `discoverPaths`
+  operations, including a trace waiting on reverse DNS. `discoverPaths` now throws
+  `TracerouteError.cancelled`. Ping and the probes are not tied to network changes.
 - `discoverPaths` honors `publicIPDiscoveryTimeout`.
 - A cancelled reverse-DNS lookup is not cached as a miss.
 - A STUN timeout under one microsecond no longer waits forever.
