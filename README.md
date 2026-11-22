@@ -435,8 +435,8 @@ contributor and release-process notes in [docs/development/README.md](docs/devel
 Every tracked Markdown file has exactly one entry in one of these indexes.
 
 ### Project
-- [Changelog](CHANGELOG.md): release-by-release notes of new API, behavior changes, fixes and dependency changes, newest first. (updated 2026-11-21; update when: a PR merges to `main` or a release is cut)
-- [Roadmap](ROADMAP.md): forward-looking work, stack-ranked by priority, with the goal and constraints of each item. (updated 2026-11-21; update when: a PR completes or reprioritizes a roadmap item)
+- [Changelog](CHANGELOG.md): release-by-release notes of new API, behavior changes, fixes and dependency changes, newest first. (updated 2026-11-22; update when: a PR merges to `main` or a release is cut)
+- [Roadmap](ROADMAP.md): forward-looking work, stack-ranked by priority, with the goal and constraints of each item. (updated 2026-11-22; update when: a PR completes or reprioritizes a roadmap item)
 - [Benchmarks](BENCHMARKS.md): measured ping throughput, embedded ASN database load cost and memory, and ASN resolver strategy timings, each with its release, date and command. (updated 2026-11-21; update when: a release changes the ASN database, resolver defaults or the ping I/O path, or a benchmark is re-run)
 - [Contributing](CONTRIBUTING.md): development setup, formatting, testing, documentation, commit style and the maintainer release checklist. (updated 2026-11-21; update when: the build, test, CI or release procedure changes)
 - [Security policy](SECURITY.md): supported versions, how to report a vulnerability, response timeline and the library's security-relevant design choices. (updated 2026-11-21; update when: a release line is added or dropped from support, or the reporting channel changes)
@@ -452,6 +452,7 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 - [Bufferbloat](Sources/SwiftFTR/SwiftFTR.docc/Bufferbloat.md): `testBufferbloat` usage, load generation, grading and RPM calculation, video-call severity and baseline-only bound mode. (updated 2026-11-21; update when: grading thresholds, the RPM method, default load endpoints or `BufferbloatConfig` change)
 - [Multipath](Sources/SwiftFTR/SwiftFTR.docc/Multipath.md): `discoverPaths` usage, topology analysis, ICMP-versus-UDP limitations and the IPv4-only restriction. (updated 2026-11-21; update when: multipath gains UDP or IPv6 support, or `MultipathConfig` or `NetworkTopology` change)
 - [Interface binding](Sources/SwiftFTR/SwiftFTR.docc/InterfaceBinding.md): which operations honor interface and source-address binding, resolution order and binding errors. (updated 2026-11-21; update when: an operation gains or loses binding support, or HTTP probes become bindable)
+- [Migrating to 0.18](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo018.md): upgrade guide from 0.17 to 0.18 for people and coding agents, one entry per behavior change with what changed, what a caller sees and before-and-after code. (updated 2026-11-22; update when: a change bound for 0.18 alters behavior a caller can observe, or 0.17 adopters no longer need it)
 - [Migrating to 0.14](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo014.md): upgrade guide from 0.13 to 0.14 covering new `DNSError` cases, behavior and CLI changes, plus runtime changes in later releases. (updated 2026-11-21; update when: a later release changes a behavior it describes, or 0.13 adopters no longer need it)
 
 ### Reference and examples

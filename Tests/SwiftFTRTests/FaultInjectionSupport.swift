@@ -50,6 +50,16 @@ final class StallGate: @unchecked Sendable {
     if semaphore.wait(timeout: .now() + limit) == .success { semaphore.signal() }
   }
 
+  /// Suspends the calling task, without holding a cooperative thread, as ``wait(limit:)`` does.
+  func waitAsync(limit: TimeInterval) async {
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      DispatchQueue.global().async {
+        self.wait(limit: limit)
+        continuation.resume()
+      }
+    }
+  }
+
   func open() {
     lock.lock()
     let wasOpen = opened
@@ -681,6 +691,35 @@ final class RefusingTCPPort: @unchecked Sendable {
   }
 
   deinit { for descriptor in descriptors { close(descriptor) } }
+}
+
+/// A loopback UDP port that answers every datagram with ICMP port-unreachable, reserved for the
+/// fixture's lifetime.
+///
+/// The port belongs to a socket connected to another loopback address, so the kernel delivers it
+/// only datagrams from that peer and answers everyone else as it would for an unbound port, while
+/// no other socket can be handed the number.
+final class RefusingUDPPort: @unchecked Sendable {
+  let port: UInt16
+  private let fd: Int32
+
+  init(family: Int32 = AF_INET) throws {
+    let (bound, boundPort) = try bindLoopback(family: family, type: SOCK_DGRAM)
+    // Port 9 (discard): connecting a datagram socket sends nothing; it only fixes the peer.
+    var (peer, length) = loopbackAddress(family: family, port: 9)
+    let connected = withUnsafePointer(to: &peer) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(bound, $0, length) }
+    }
+    guard connected == 0 else {
+      let code = errno
+      close(bound)
+      throw FixtureError.socket("connect", code)
+    }
+    fd = bound
+    port = boundPort
+  }
+
+  deinit { close(fd) }
 }
 
 // MARK: - Loopback UDP responder

@@ -19,9 +19,10 @@ that fail when any phase can wait without a bound or strand its caller.
 
 ## Method
 
-- **Seams, not mocks of the whole tracer.** `Sources/SwiftFTR/TestSeams.swift` holds four
-  task-local overrides, all `nil` in production: the blocking-I/O executor, forward resolution,
-  the ICMP socket factory used by trace and ping, and IPv4 public-address discovery. Task-locals
+- **Seams, not mocks of the whole tracer.** `Sources/SwiftFTR/TestSeams.swift` holds task-local
+  overrides, all `nil` in production: the blocking-I/O executor, forward resolution, the ICMP
+  socket factory used by trace and ping, IPv4 public-address discovery, and a hook that holds
+  `discoverPaths` at the step where it commits its result. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
   unset, and the public API is unchanged
@@ -34,54 +35,66 @@ that fail when any phase can wait without a bound or strand its caller.
 - **Local fixtures for every other protocol.** TCP listeners that refuse, accept and stay silent,
   reset mid-response or answer slowly; an HTTP responder on the same listener; UDP responders for
   STUN and DNS that stay silent, answer late or answer garbage. All bind `127.0.0.1` or `::1` on an
-  ephemeral port. No new test sends a packet off the host. They land with the first slice, tested
-  on their own; the protocol tests that use them come with the next.
+  ephemeral port. No new test sends a packet off the host. The fixtures have tests of their own
+  (`FaultInjectionFixtureTests`).
 - **Private executors.** Any test that stalls a blocking call does it on a private
   `BlockingIOExecutor`, installed through the seam, never on the process-wide one.
-- **Discrimination.** Each test states the failure it catches. Where practical it was shown to fail
-  against a deliberately broken build (a negative control) before being kept; the PR body lists
-  which.
+- **Discrimination.** Each test states the failure it catches and was shown to fail against a
+  deliberately broken build (a negative control) before being kept; the PR body lists them.
+- **No bound assumes a fast machine.** A stall is held by a gate for far longer than the operation
+  is allowed. Tests assert that the operation returned while its stall was still in force, under a
+  watchdog derived from configuration (`measure(within:)`): half the shortest stall for
+  cancellation, the default public-IP budget for enrichment, the moment a slow fixture would have
+  answered for the wire protocols.
 
 ## Conditions covered
 
-The battery lands in two pull requests. The first lands the seams, the fixtures and the tests of
-the probe window, and changes no library behavior. The second lands the remaining tests together
-with the library fixes they motivated. Until the second lands, the `--filter FaultInjection` gate
-below runs only the first slice's tests, so a green gate means exactly the "Landed" rows.
-
-### Landed
+The battery landed in two pull requests: the seams, fixtures and probe-window tests first, then
+the remaining tests with the library fixes they motivated. All of it is below.
 
 | Phase | Conditions | Operations | Tests |
 |---|---|---|---|
-| Forward resolution | fails (the injected error is checked, so a call that went around the seam fails) | trace, traceClassified, traceStream, ping | `FaultInjectionProbeWindowTests` |
-| Probe socket | creation fails the way `socket(2)` does (`-1` with `errno`); every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `FaultInjectionProbeWindowTests` |
-| Probe window | no replies; replies after the deadline; truncated, garbage and seeded-random ICMPv4/ICMPv6 queued ahead of valid replies; replies for another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `FaultInjectionProbeWindowTests` |
-| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP requests; a refusing TCP port that stays reserved; TCP server teardown that joins its handlers | fixtures | `FaultInjectionFixtureTests` |
+| Forward resolution | fails (the injected error is checked, so a call that went around the seam fails); stalls (disabled, finding 5) | trace, traceClassified, traceStream, ping | `ProbeWindow`, `Enrichment` |
+| Probe socket | creation fails the way `socket(2)` does; every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `ProbeWindow` |
+| Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
+| Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
+| Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
+| STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
+| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, discoverPaths | `Enrichment`, `Cancellation` |
+| ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
+| DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count | the `__dnsQuery` SPI | `Wire` |
+| Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot | traceClassified, queryA | `Enrichment` |
+| TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
+| Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase, with the error checked per source; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
+| Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
+| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
-Every timed operation in these tests runs under a watchdog (`measure(within:)`), so an operation
-that never returns fails its test instead of hanging the run.
+Test suites are `FaultInjection<Name>Tests`. Every timed operation runs under a watchdog
+(`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
-### Planned for the next slice
+Not covered, and why:
 
-| Phase | Conditions | Operations |
-|---|---|---|
-| Forward resolution | stalls (a disabled test; see #84) | trace |
-| Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths |
-| STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP |
-| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave | trace |
-| ASN | resolver that stalls and ignores its timeout | traceClassified, discoverPaths |
-| DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count | the `__dnsQuery` SPI |
-| Full executor | every blocking-I/O slot held while discovery, reverse DNS and DNS queue | traceClassified, dnsProbe |
-| TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe |
-| Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase | trace, traceClassified, traceStream, ping, discoverPaths |
-| Concurrency | many simultaneous operations on one tracer and across tracers under faults | trace, traceClassified |
+- **A socket that fails on read.** Darwin keeps delivering datagrams to a UDP socket after
+  `shutdown(SHUT_RD)`, and closing the descriptor under the trace would risk the number being
+  reused, so no test stages a read error. The receive loop's deadline timer is independent of the
+  read source, which is the property that bounds it; that is shown by the silent-network tests.
+- **A `.remote` ASN database download that stalls** (finding 7). The download is skipped whenever
+  a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which is shared
+  with every other user of SwiftIP2ASN on the machine, and the cache location cannot be redirected
+  from SwiftFTR. A test would have to delete that cache.
+- **A DNS query queued behind a full executor.** Its wait for a worker is still unbounded
+  (finding 8); the tests for a bound arrive with the executor rewrite that provides one.
+- **The `.dns` and `.hybrid` strategies end to end**: their fallback is Team Cymru over the real
+  resolver. `CymruQueueDeadlineTests` covers their queueing bound; the battery passes a stub
+  resolver to every classified trace so no test reaches it.
+- **A TCP port that drops SYNs (filtered).** Producing one needs a firewall rule.
 
 ## Out of scope
 
 - An overall deadline on `traceClassified` with an error naming the phase, and an executor-pressure
   reading (#84). Both are API additions for a minor release.
 - Moving forward resolution off the actor. It needs a resolution budget, which is a new
-  configuration field. The test that shows the defect comes with the next slice, disabled.
+  configuration field. The test that shows the defect is checked in disabled (finding 5).
 - `testBufferbloat`, which needs real load traffic, and the interface-bound HTTPS spike.
 - Raw-socket or privileged fault injection, and any test that sends traffic off the host.
 
@@ -98,5 +111,92 @@ swift package diagnose-api-breaking-changes v0.17.1 --products SwiftFTR
 
 ## Findings
 
-This slice changes no library behavior. The defects the full battery found, and their fixes, are
-recorded here by the next slice, which lands them together.
+Defects the battery exposed, with their disposition. Each "confirmed" finding has a test that
+failed before its fix (or fails today, if disabled), with the measurement quoted. File and line
+numbers are as of the commit that added this section.
+
+1. **A network change did not interrupt a trace's reverse-DNS wave.** Confirmed and fixed.
+   `performTrace` awaited `rdnsCache.batchLookup` outside `withTraceCancellation`
+   (`Traceroute.swift:895` after the fix), so `networkChanged()` and `cancelActiveTraces()`
+   returned the trace only when the slowest lookup hit its deadline (5 s by default). Test:
+   `FaultInjectionCancellationTests.reverseDNSWave`, 10.0 s before, under 0.1 s after.
+2. **`discoverPaths` ignored `networkChanged()` and `cancelActiveTraces()`.** Confirmed and fixed.
+   Each flow runs on a throwaway tracer, so the parent's handles never included them; discovery
+   ran to completion and returned a topology from the old network. Now `Multipath.swift:575`
+   registers a handle and races discovery inside one task group, which still joins every worker.
+   Test: `discoverPathsCancellation`, 10.0 s and a returned topology before, under 0.1 s after.
+3. **`discoverPaths` ignored `publicIPDiscoveryTimeout`.** Confirmed and fixed. Flow workers were
+   built from a configuration that dropped it (`Multipath.swift:618` and `:661` after the fix) and
+   their classifier was not passed it, so each flow paid the 6 s default. Test:
+   `multipathHonoursPublicIPBudget` with a 0.3 s budget, 12.0 s before, 0.6 s after; it fails if
+   discovery outlasts the 6 s default.
+4. **A sub-microsecond STUN timeout waited forever.** Confirmed and fixed. `stunGetPublicIP`
+   truncated the timeout to a zero `timeval`, which disables `SO_RCVTIMEO`
+   (`STUN.swift:213` after the fix). Reachable through the public `getPublicIPs(stunTimeout:)`.
+   Test: `stunTinyTimeout`, still blocked at its watchdog before, immediate after.
+5. **Forward resolution is synchronous on the tracer actor and unbounded.** Confirmed (known from
+   #84), not fixed. `resolveHost` (`Traceroute.swift:629`, `:785`) calls `getaddrinfo` on the
+   actor, even for a literal under `.auto`, so a stalled resolver holds every other call on that
+   tracer, `cancelActiveTraces()` and `networkChanged()` included, and cannot be cancelled. With a
+   5 s injected stall, `cancelActiveTraces()` took 5.0 s to return. Not fixed: bounding it needs a
+   resolution budget, which is a configuration field. Test, disabled because it blocks for its
+   stall: `FaultInjectionEnrichmentTests.forwardResolutionStall`.
+6. **A failed public-IP discovery is paid twice.** Confirmed, not fixed. When discovery fails or
+   times out, `traceClassified` passes `publicIP: nil` to the classifier (`Traceroute.swift:1059`),
+   which runs discovery again with the same budget (`Segmentation.swift:240`), so the bound is two
+   budgets. Measured in `multipathHonoursPublicIPBudget` (0.6 s for a 0.3 s budget). Not fixed
+   here because the public `classify(publicIP: nil)` means "discover", so the fix is an internal
+   way to say "already tried", a small design choice. Test, disabled: `publicIPDiscoveredOnce`.
+7. **A `.remote` ASN database download is bounded only by URLSession's request timeout.**
+   Unverified, from reading the code. With no bundled or cached database, the first resolve waits
+   on `RemoteDatabase.load()` (`LocalASNResolver.swift:212`), which uses `URLSession.shared` with
+   its 60 s default, and ignores the resolver `timeout`. Could not be staged (see "Not covered").
+8. **DNS queries wait without limit for an executor slot.** Confirmed, not fixed. Every DNS
+   query goes onto the shared executor with no deadline, so its socket timeouts bound the query but
+   not the queueing: with the executor full, `dnsProbe` with a 0.3 s timeout waited as long as the
+   occupant held it (3.0 s). Bounding the queue wait needs the executor to withdraw work that has
+   not started, which belongs to the executor's rewrite rather than to a patch on it.
+9. **`getPublicIPs` runs blocking STUN on Swift's cooperative pool, without a deadline.**
+   Unverified, from reading the code. `STUN.swift:725` wraps `stunGetPublicIPWithFallback`,
+   which calls `getaddrinfo` for each server hostname and blocks in `recv`, in plain `Task`s rather
+   than on the bounded executor. A stalled resolver can hold two cooperative threads for up to
+   30 s per server in the list, and the call cannot be cancelled. Not fixed: the right bound is a
+   budget the public signature does not have.
+
+10. **A reverse-DNS lookup cut short by cancellation was cached as a miss for 24 hours.**
+    Confirmed and fixed; found by the Codex review of fix 1, which made it common. The resolver
+    reports a cancelled wait as `nil`, and `RDNSCache.lookup` cached that as a negative answer and
+    counted it toward the stall breaker. Test: `cancelledLookupNotCached`.
+11. **Follow-ups to fixes 2 and 8, from the same review.** Confirmed by test and fixed: a flow
+    cancelled during public-IP discovery went on to resolve its destination; a flow's
+    classification could wait on a shared ASN load after cancellation; caller cancellation could
+    surface from `discoverPaths` as `TracerouteError.cancelled`; and an invalid DNS query behind a
+    full executor waited for a worker to report its input error. Tests:
+    `discoverPathsCancellation` (every phase against every cancellation source) and
+    `invalidDNSQueryWithFullExecutor`.
+
+12. **The source address's family was checked only once a worker ran the query.** Fixed: the
+    inputs that can be judged without I/O (timeout, name, server address, and the source address's
+    family) are checked before a DNS query is queued, so a query that can never succeed reports
+    why without waiting behind busy workers. Test: `invalidDNSQueryWithFullExecutor`, which fails
+    at its watchdog without the check.
+13. **`discoverPaths` could return a topology from the old network.** Confirmed and fixed; found
+    by the second Codex review of fix 2. A network change that landed after the flows finished but before
+    the result reached the caller was not seen, because the race against the handle covers only
+    the flows, and the task group's join is a suspension point. In a stress loop of 20,000
+    discoveries with a network change at spread offsets, 13 returned a topology although the
+    change began while the discovery was still registered; with the fix, none. `discoverPaths` now
+    commits in one non-suspending step on the tracer: it checks that its handle is still
+    registered, which invalidation undoes synchronously before cancelling anything, and returns.
+    Tests: `discoverPathsInvalidatedBeforeCommit` and `discoverPathsCommittedBeforeInvalidation`,
+    which hold discovery at that step through the `beforeMultipathCommit` seam.
+
+Observations that are not defects of the library:
+
+- `traceStream` yields hops in arrival order, so when the destination answers several TTLs a hop
+  past the destination can arrive, flagged `reachedDestination`, before the real destination's.
+  This is the documented contract ("the caller is responsible for sorting"); the battery asserts
+  that the lowest such TTL is the destination.
+- `TraceLifecycleTests.cancelActiveTracesCancelsClassifiedTrace` is not gated on
+  `SKIP_NETWORK_TESTS`, so the offline suite sends a real trace toward `192.0.2.1` and real STUN
+  queries. The seams added here would let it run offline.

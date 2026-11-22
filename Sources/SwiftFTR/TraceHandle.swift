@@ -183,3 +183,47 @@ internal func withTraceCancellation<T: Sendable>(
     throw error
   }
 }
+
+/// Returns once `handle` is cancelled or the calling task is, whichever comes first.
+///
+/// Occupies the handle's single cancellation-handler slot, so use it only on a handle that no other
+/// phase installs a handler on.
+internal func waitForCancellation(of handle: TraceHandle) async {
+  let signal = OneShotSignal()
+  let registrationID = await handle.installCancellationHandler { signal.fire() }
+  await withTaskCancellationHandler {
+    await signal.wait()
+  } onCancel: {
+    signal.fire()
+  }
+  await handle.clearCancellationHandler(id: registrationID)
+}
+
+/// Resumes one waiter once `fire()` has been called, however the two are ordered.
+private final class OneShotSignal: @unchecked Sendable {
+  private let lock = NSLock()
+  private var fired = false
+  private var waiter: CheckedContinuation<Void, Never>?
+
+  func wait() async {
+    await withCheckedContinuation { continuation in
+      lock.lock()
+      if fired {
+        lock.unlock()
+        continuation.resume()
+      } else {
+        waiter = continuation
+        lock.unlock()
+      }
+    }
+  }
+
+  func fire() {
+    lock.lock()
+    fired = true
+    let pending = waiter
+    waiter = nil
+    lock.unlock()
+    pending?.resume()
+  }
+}
