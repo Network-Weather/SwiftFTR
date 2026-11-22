@@ -18,7 +18,7 @@ Four kinds of work are written as blocking calls instead:
 
 | Work | How it waits today | Where it runs |
 |---|---|---|
-| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket (`performDNSQueryInternal`, `DNS.swift`) | `BlockingIOExecutor` |
+| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket; since Event-Based DNS, a Dispatch read source (`UDPExchange.swift`), with the blocking query kept only for the whoami fallback | `BlockingIOExecutor`; since Event-Based DNS, no thread |
 | Public-IP discovery (STUN, with a DNS fallback for IPv4) | blocking `recv`, plus `getaddrinfo` per server name | the executor in a classified trace; plain `Task` closures and `DispatchQueue.concurrentPerform` in standalone `getPublicIPs` |
 | Reverse DNS | `getnameinfo` | the executor |
 | Forward resolution of a destination | `getaddrinfo` | inline in the caller |
@@ -157,7 +157,7 @@ battery's cancellation tests stop accepting either type, and the two follow-ups 
 of #100 are done here (the `cancelActiveTraces()` doc comment; one gated trace per cancellation
 source). This is a behavior change and gets an upgrade-guide entry.
 
-### Event-Based DNS
+### ~~Event-Based DNS~~ (landed in #NNN)
 
 Rewrite `performDNSQueryInternal` as a non-blocking connected UDP socket with a Dispatch read
 source and a timer. Encoding, parsing, peer checks and interface and source binding are reused
