@@ -173,13 +173,13 @@ struct EventBasedDNSTests {
     #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
   }
 
-  @Test("An empty datagram is a malformed reply: dnsProbe reports the server reachable")
+  @Test("An empty datagram carries no transaction ID: it is ignored, and the query times out")
   func emptyDatagram() async throws {
     let server = try LoopbackUDPResponder { _ in ([], 0) }
     defer { server.stop() }
-    let timeout: TimeInterval = 10
+    let timeout: TimeInterval = 0.3
 
-    let (outcome, _) = try await measure(within: timeout / 2) {
+    let (outcome, _) = try await measure(within: Self.watchdog) {
       try await TestSeams.$dnsServerPort.withValue(server.port) {
         let probe = try await dnsProbe(
           server: "127.0.0.1", query: "empty.example", timeout: timeout)
@@ -192,10 +192,11 @@ struct EventBasedDNSTests {
     }
 
     let (probe, thrown) = outcome
-    #expect(probe.isReachable)
-    #expect(probe.rtt != nil)
-    #expect(probe.error == "Malformed response")
-    #expect(Self.isMalformed(thrown), "\(String(describing: thrown))")
+    #expect(server.requests.value == 2)
+    #expect(probe.outcome == .timedOut)
+    #expect(!probe.isReachable)
+    #expect(probe.rtt == nil)
+    #expect(Self.isTimeout(thrown), "\(String(describing: thrown))")
   }
 
   // MARK: Send
@@ -430,7 +431,7 @@ struct EventBasedDNSTests {
           FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord),
           0
         )
-      case .malformed: return ([0xDE, 0xAD], 0)
+      case .malformed: return (Array(query.prefix(2)) + [0xDE, 0xAD], 0)
       default: return nil
       }
     }

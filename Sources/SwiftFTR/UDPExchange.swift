@@ -25,19 +25,21 @@ enum UDPExchangeFailure: Error, Equatable {
   case timedOut
 }
 
-/// The first datagram the peer sent back, and how long it took.
+/// The first datagram back that the caller accepted, and how long it took.
 struct UDPExchangeReply: Sendable {
   let bytes: [UInt8]
   /// Seconds from the moment the request was sent to the moment the read handler took the reply.
   let rtt: TimeInterval
 }
 
-/// One UDP request and the first datagram back, on a non-blocking connected socket.
+/// One UDP request and the first datagram back that answers it, on a non-blocking connected socket.
 ///
 /// The wait holds no thread: a Dispatch read source delivers the reply, a timer on the same
 /// monotonic clock ends the wait at the deadline, and cancelling the calling task ends it at
 /// once. This type knows nothing about the protocol: it sends bytes and returns the first
-/// datagram, or a ``UDPExchangeFailure``. The caller validates what comes back.
+/// datagram the caller's `accepts` check takes as addressed to this request, or a
+/// ``UDPExchangeFailure``. The check answers only that question (for DNS, whether the datagram
+/// carries the query's transaction ID); the caller validates the rest of what comes back.
 ///
 /// Descriptor ownership: ``perform(family:request:timeout:receiveCapacity:configure:)`` owns the
 /// socket until the read source exists and closes it itself if setup fails. From then on the
@@ -59,7 +61,10 @@ struct UDPExchangeReply: Sendable {
 ///     any unsent        a retry starts at or after   not sent; deadlinePassed: sendFailed
 ///                       the deadline
 ///     any unsent        deadline timer               sendFailed (nothing left, so no evidence)
-///     sent              read: datagram or empty      success with the bytes, if before deadline
+///     sent              read: datagram or empty,     success with the bytes, if before deadline
+///                       accepted (or no check)
+///     sent              read: datagram or empty,     consume and ignore; keep waiting, deadline
+///                       not accepted                 unchanged (a stale or foreign datagram)
 ///     sent              read: ECONNREFUSED           refused; EHOSTUNREACH, ENETUNREACH:
 ///                                                    unreachable (both with rtt); other errno:
 ///                                                    receiveFailed
@@ -72,9 +77,10 @@ struct UDPExchangeReply: Sendable {
 /// `finish` runs once (a second call returns): it cancels the timers and every source on the
 /// descriptor. The last cancel handler closes the descriptor and resumes the caller, once.
 final class UDPExchange: @unchecked Sendable {
-  /// `recv` calls one read event may make. `EINTR`, and anything read before the request has
-  /// left, repeat a call; after the send, the first datagram ends the exchange whatever it holds.
-  /// More queued datagrams wait for the next read event.
+  /// `recv` calls one read event may make. `EINTR`, anything read before the request has left,
+  /// and a datagram the caller does not accept repeat a call; after the send, the first accepted
+  /// datagram ends the exchange. More queued datagrams wait for the next read event, so a peer
+  /// that never stops sending cannot hold the queue the deadline timer and cancellation run on.
   private static let receiveAttemptsPerEvent = 4
 
   /// Longest wait before retrying a send that failed with `ENOBUFS`. The socket reports writable
@@ -82,7 +88,7 @@ final class UDPExchange: @unchecked Sendable {
   private static let noBufferSpaceBackoff: DispatchTimeInterval = .milliseconds(1)
 
   /// Sends `request` to the peer `configure` connects the socket to and returns the first
-  /// datagram back.
+  /// datagram back that `accepts` takes.
   ///
   /// - Parameters:
   ///   - family: `AF_INET` or `AF_INET6`.
@@ -90,6 +96,9 @@ final class UDPExchange: @unchecked Sendable {
   ///   - timeout: Seconds from the start of the exchange until it gives up. Validated by the
   ///     caller: finite and greater than zero.
   ///   - receiveCapacity: Bytes read from the reply; a longer datagram is truncated to this.
+  ///   - accepts: Whether a datagram read after the send is addressed to this request. One it
+  ///     rejects is consumed and ignored, and the wait goes on to the same deadline. `nil` accepts
+  ///     every datagram. Runs on the exchange's queue; it must not block.
   ///   - configure: Binds and connects the new non-blocking socket. Runs before any source
   ///     exists; an error it throws closes the socket and is rethrown unchanged.
   /// - Throws: ``UDPExchangeFailure``, whatever `configure` throws, or `CancellationError` when
@@ -99,6 +108,7 @@ final class UDPExchange: @unchecked Sendable {
     request: [UInt8],
     timeout: TimeInterval,
     receiveCapacity: Int,
+    accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)? = nil,
     configure: (Int32) throws -> Void
   ) async throws -> UDPExchangeReply {
     try Task.checkCancellation()
@@ -132,7 +142,7 @@ final class UDPExchange: @unchecked Sendable {
 
     let exchange = UDPExchange(
       fd: fd, request: request, timeout: timeout, receiveCapacity: receiveCapacity,
-      sendDatagram: sendDatagram, receiveDatagram: receiveDatagram,
+      accepts: accepts, sendDatagram: sendDatagram, receiveDatagram: receiveDatagram,
       closeDescriptor: closeDescriptor)
     return try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { continuation in
@@ -146,6 +156,7 @@ final class UDPExchange: @unchecked Sendable {
   private let fd: Int32
   private let request: [UInt8]
   private let deadline: DispatchTime
+  private let accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)?
   private let sendDatagram: TestSeams.SendDatagram
   private let receiveDatagram: TestSeams.ReceiveDatagram
   private let closeDescriptor: TestSeams.CloseDescriptor
@@ -176,12 +187,14 @@ final class UDPExchange: @unchecked Sendable {
     request: [UInt8],
     timeout: TimeInterval,
     receiveCapacity: Int,
+    accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)?,
     sendDatagram: @escaping TestSeams.SendDatagram,
     receiveDatagram: @escaping TestSeams.ReceiveDatagram,
     closeDescriptor: @escaping TestSeams.CloseDescriptor
   ) {
     self.fd = fd
     self.request = request
+    self.accepts = accepts
     self.receiveBuffer = [UInt8](repeating: 0, count: max(1, receiveCapacity))
     self.sendDatagram = sendDatagram
     self.receiveDatagram = receiveDatagram
@@ -353,8 +366,11 @@ final class UDPExchange: @unchecked Sendable {
         return
       }
 
-      // Zero bytes is an empty datagram, and the first datagram decides.
-      finish(.success(UDPExchangeReply(bytes: Array(receiveBuffer.prefix(received)), rtt: rtt)))
+      // Zero bytes is an empty datagram, judged like any other. One the caller does not accept is
+      // not addressed to this request: it uses up one of this event's reads and nothing else.
+      let datagram = receiveBuffer.prefix(received)
+      if let accepts, !accepts(datagram) { continue }
+      finish(.success(UDPExchangeReply(bytes: Array(datagram), rtt: rtt)))
       return
     }
   }

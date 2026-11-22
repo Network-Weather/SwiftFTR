@@ -87,9 +87,9 @@ struct DNSProbeOutcomeTests {
     #expect(result.error == "Timeout - no response")
   }
 
-  @Test("An empty datagram is malformedReply, reachable, with rtt and elapsed equal")
+  @Test("A short datagram with the query's ID is malformedReply, reachable, rtt equals elapsed")
   func malformedReply() async throws {
-    let server = try LoopbackUDPResponder { _ in ([], 0) }
+    let server = try LoopbackUDPResponder { query in (Array(query.prefix(2)) + [0x81, 0x80], 0) }
     defer { server.stop() }
 
     let result = try await Self.probe(port: server.port)
