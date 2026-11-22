@@ -457,7 +457,7 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 
 ### Reference and examples
 - [Examples](docs/guides/EXAMPLES.md): worked Swift examples for each feature area, including trace, hop outcomes, configuration, network-change lifecycle, streaming, DNS, ping, multipath, bufferbloat, SwiftUI, concurrency, errors and ASN strategies. (updated 2026-11-21; update when: a public API used in a sample changes shape, or a release adds a feature area with no example)
-- [Condensed API reference](docs/reference/AI_REFERENCE.md): public types, method signatures, defaults, enum and error cases and CLI flags with short snippets, sized to load whole into an agent's context. (updated 2026-11-21; update when: a release changes a public signature, default, enum case or CLI flag)
+- [Condensed API reference](docs/reference/AI_REFERENCE.md): public types, method signatures, defaults, enum and error cases and CLI flags with short snippets, sized to load whole into an agent's context. (updated 2026-11-22; update when: a release changes a public signature, default, enum case or CLI flag)
 
 ### Tools and fixtures
 - [hop-monitor](Sources/hop-monitor/README.md): the demo CLI that traces a path and then pings every hop continuously, with its output, statistics and limits. (updated 2026-11-21; update when: `Sources/hop-monitor/main.swift` changes its arguments, limits or statistics)

@@ -71,12 +71,12 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
-| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, discoverPaths | `Enrichment`, `Cancellation` |
+| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
 | DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count | the `__dnsQuery` SPI | `Wire` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot | traceClassified, queryA | `Enrichment` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
-| Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase, with the error checked per source; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
+| Cancellation | task cancellation, `networkChanged()`, `cancelActiveTraces()`, and the caller and the tracer together, across each operation and in each stalled phase, with the exact error checked per source; a stream consumer that cancels sees a normal end and the producer closes its socket; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails | trace, traceClassified, traceStream, ping | `ReceiveLoop` |
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
@@ -222,6 +222,18 @@ numbers are as of the commit that added this section.
     it.** Fixed from reading the code; the race is not observable from a test. The descriptor is
     now closed from the source's cancellation handler, before the call returns, as in ping and the
     TCP and UDP probes. The tests check that every socket is closed when the call returns.
+17. **Cancellation did not say who cancelled.** Confirmed and fixed. `ping` threw
+    `TracerouteError.cancelled` when its own task was cancelled, in all 16 steps of the ping
+    sweep. A trace's task-cancellation handler set the same flag `cancelActiveTraces()` sets, so a
+    caller's cancellation was reported as the tracer's in every probe-window step (24 of 24), in
+    the reverse-DNS wave and in three of four `traceClassified` phases. In the fourth, public-IP
+    discovery, a `Task.checkCancellation()` noticed first and threw `CancellationError`, even when
+    the tracer had cancelled too. The handle now records the reason in a lock-protected state
+    that the task-cancellation handler sets synchronously, the tracer's reason outranking the
+    caller's, and `trace` and `traceClassified` report it on the tracer's actor. Tests: the
+    `FaultInjectionCancellationTests` sweeps, each asserting the exact type for each source and for
+    both together (`Canceller.both`, which cancels the task and the tracer's traces in one step on
+    the actor), and `streamConsumerCancellationCleansUp`.
 
 Observations that are not defects of the library:
 
@@ -232,5 +244,12 @@ Observations that are not defects of the library:
 - `TraceLifecycleTests.cancelActiveTracesCancelsClassifiedTrace` is not gated on
   `SKIP_NETWORK_TESTS`, so the offline suite sends a real trace toward `192.0.2.1` and real STUN
   queries. The seams added here would let it run offline.
+- An `AsyncThrowingStream` producer that finishes with an error inside its own `onTermination`
+  handler delivers that error to a consumer that cancelled; one that finishes after the handler
+  returns does not. `traceStream` therefore finishes normally when its consumer cancels, rather
+  than relying on its producer losing that race.
+- A wait for a test fixture to start that is a bare continuation or semaphore cannot be ended by
+  `.timeLimit`, whose task group still joins the stuck child. Such waits go through
+  `waitBounded`, which fails the test after ten seconds instead.
 - `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
   identifies a socket by its bound local address when checking that the library closed it.

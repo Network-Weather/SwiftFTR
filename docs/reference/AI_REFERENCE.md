@@ -832,7 +832,8 @@ let traceTask = Task { () -> TraceResult? in
     do {
         return try await tracer.trace(to: "example.com")
     } catch {
-        // Cancellation surfaces as TracerouteError.cancelled or CancellationError.
+        // Cancelling this task throws CancellationError; networkChanged() or
+        // cancelActiveTraces() throws TracerouteError.cancelled (also when both happened).
         print("Trace ended: \(error)")
         return nil
     }
