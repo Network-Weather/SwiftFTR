@@ -178,13 +178,13 @@ The transport contract (it is shared with STUN later, so it is one small type):
   no blocking `poll` or `usleep`.
 - **Receive.** Read `errno` on a negative `recv`. `EAGAIN` waits. `ECONNREFUSED`,
   `EHOSTUNREACH` and `ENETUNREACH` end the exchange at once (the ICMP error arrives as a read
-  event with no data). Zero bytes is an empty datagram, not a timeout; this
-  is a change, listed below. The drain is bounded and
-  the absolute deadline is checked before a reply is accepted.
-- **Foreign and malformed replies keep today's meaning**, with the one exception of the empty
-  datagram. The first datagram decides: a wrong transaction ID or garbage fails with
-  `malformedResponse`, as now. Ignoring them until the
-  deadline would change a probe's verdict and is not part of this stage.
+  event with no data). Zero bytes is an empty datagram, not a receive failure; DNS ignores it, as
+  it carries no transaction ID. The drain is bounded, the caller's acceptance check runs on each
+  datagram, and the absolute deadline is checked before a reply is accepted.
+- **Foreign replies are ignored; malformed ones keep today's meaning.** A datagram without the
+  query's transaction ID, or too short to carry one, is ignored until the deadline (decision 8,
+  done in #NNN). A datagram with the right ID that is otherwise invalid fails with
+  `malformedResponse`, as now.
 - **Truncation stays an error.** There is no TCP fallback today and none is added here.
 - **Timing.** RTT is stamped at `send` and in the read handler.
 
@@ -207,9 +207,10 @@ Behavior changes for the upgrade guide, each with a test of the public verdict:
   refusal. The new transport distinguishes a delivered refusal from silence. Which existing
   error it reports is chosen in this stage; no `DNSError` case is added. This is a change of
   reported outcome, not of speed.
-- An empty datagram. Today it is reported as `DNSError.timeout`, so `dnsProbe` says unreachable.
-  As a malformed reply, `dnsProbe` reports the server reachable, like any other malformed
-  reply.
+- A datagram without the query's transaction ID, an empty one included (decision 8). Today a
+  wrong ID is `malformedResponse`, which `dnsProbe` reports as reachable, and an empty datagram
+  is `DNSError.timeout` at once. Both are ignored, so a server that sends only such datagrams is
+  `DNSError.timeout` at the deadline, and `dnsProbe` reports it timed out and unreachable.
 
 Tests: the existing DNS fault battery against the new transport; refused port; `EAGAIN` on send
 (injected); cancellation returns while the fixture is still silent, and the descriptor is closed
@@ -441,7 +442,8 @@ otherwise. Decided ones say so.
    before 0.18.0 (David, 2026-11-22). It closes a gap review found in the event-based
    transport: a stale datagram queued before the query left but read after it is taken as the
    reply. It changes one verdict: a server that sends only wrong-ID datagrams is reported as
-   timed out, not as reachable with a malformed response.
+   timed out, not as reachable with a malformed response. Done in #NNN, for DNS on both the
+   event-based and the blocking path; a datagram too short to carry an ID is ignored too.
 9. **Structured DNS probe outcome.** Decided: add an additive `outcome` field to
    `DNSProbeResult`; `isReachable` stays false for a refused port; the throwing query methods keep
    `DNSError.sendFailed` for a refusal (David, 2026-11-22).
@@ -512,8 +514,9 @@ Declined, with the reason:
   matters, and it is the larger risk for the smaller gain.
 - A shared connection to the daemon for reverse lookups (Gemini, Fable as one option). A cap on
   concurrent lookups is simpler and bounds descriptors as well; revisit if the cap costs time.
-- Changing foreign-transaction-ID handling now (raised by all three as a choice to make). Kept
-  as today so a probe's verdict does not change in the same release as its transport.
+- Changing foreign-transaction-ID handling in the Event-Based DNS stage itself (raised by all
+  three as a choice to make). Kept out of that stage; decision 8 then made it its own change
+  before 0.18.0.
 
 No third review round: this version adopts the reviewers' recommendations and does not introduce
 a new approach.

@@ -292,28 +292,65 @@ do {
 }
 ```
 
-## An empty DNS reply is a malformed response
+## A DNS datagram for another query is ignored
 
-**What changed.** A zero-byte datagram from the server is a malformed reply: the query methods
-throw `DNSError.malformedResponse`, and `dnsProbe` returns `outcome == .malformedReply`,
-`isReachable == true`, `responseCode == nil`, a round-trip time and `error == "Malformed
-response"`, as for any other malformed reply. 0.17 reported it as `DNSError.timeout`, and `dnsProbe` as unreachable with
-"Timeout - no response".
+**What changed.** A DNS query takes as its reply only a datagram that carries its own
+transaction ID. A datagram with another ID, or too short to carry one (an empty datagram
+included), is ignored, and the query keeps waiting to the same timeout. 0.17 took the first
+datagram whatever it was: a wrong ID threw `DNSError.malformedResponse`, and `dnsProbe` reported
+the server reachable with "Malformed response"; an empty datagram threw `DNSError.timeout` at
+once. A datagram with the right ID that is otherwise invalid (not a response, truncated, cut
+short, unparseable) still ends the query at once as `malformedResponse`, and `dnsProbe` as
+`outcome == .malformedReply`, `isReachable == true`.
 
-**What a caller sees.** For a server that answers with an empty datagram, `malformedResponse`
-where it saw `timeout`, and a reachable `dnsProbe` result with no response code.
+**What a caller sees.** For a server, or a stale reply on a reused port, that sends only
+datagrams for other queries: `DNSError.timeout` at the timeout where 0.17 threw
+`malformedResponse` at once, and a `dnsProbe` result with `outcome == .timedOut`,
+`isReachable == false` and "Timeout - no response", where 0.17 said reachable. A real reply that
+follows such datagrams within the timeout is now returned. `malformedResponse` and
+`malformedReply` now always mean the server answered this query, badly.
 
-**What to change.** Nothing, if the consumer already handles `malformedResponse`, and already
-treats a reachable `dnsProbe` result with no `responseCode` as a malformed reply rather than a DNS
-answer. Otherwise add both; for `dnsProbe`, check `outcome == .malformedReply`.
+**What to change.** Nothing, unless the consumer treats `malformedResponse` or a reachable
+`dnsProbe` result with no `responseCode` as proof that something is answering on the port. Such
+datagrams now end as a timeout, which says nothing about the port. Report `malformedReply` as a
+DNS server that answered badly, and a timeout as no answer to this query; to ask whether anything
+at all sends back on the port, use ``udpProbe(host:port:timeout:payload:interface:sourceIP:)``.
 
 Before:
 
 ```swift
+let result = try await dnsProbe(server: resolver)
+if result.isReachable && result.responseCode == nil {
+  // 0.17: any datagram, a stray one included.
+  showSomethingListening(on: resolver)
+}
+```
+
+After:
+
+```swift
+let result = try await dnsProbe(server: resolver)
+switch result.outcome {
+case .malformedReply:
+  // A datagram for this query that was not valid DNS.
+  showDNSServerMisbehaving(resolver, reason: result.error)
+case .timedOut:
+  // Silence, or only datagrams for other queries.
+  showNoAnswer(from: resolver)
+default:
+  handle(result)
+}
+```
+
+The query methods, before:
+
+```swift
 do {
   _ = try await tracer.dns.a(hostname: name, server: resolver)
+} catch DNSError.malformedResponse {
+  showSomethingListening(on: resolver)
 } catch DNSError.timeout {
-  reportNoAnswer(from: resolver)
+  showNoAnswer(from: resolver)
 }
 ```
 
@@ -322,10 +359,10 @@ After:
 ```swift
 do {
   _ = try await tracer.dns.a(hostname: name, server: resolver)
-} catch DNSError.timeout {
-  reportNoAnswer(from: resolver)
 } catch DNSError.malformedResponse {
-  reportBadAnswer(from: resolver)
+  showDNSServerMisbehaving(resolver)
+} catch DNSError.timeout {
+  showNoAnswer(from: resolver)  // stray datagrams included
 }
 ```
 

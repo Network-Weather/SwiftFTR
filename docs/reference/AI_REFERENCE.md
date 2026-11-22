@@ -477,6 +477,8 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult
 //   elapsed, responseCode, error, timestamp
 //   isReachable: any DNS answer (responseCode set, NXDOMAIN included), or responseCode nil with
 //   error for a malformed reply; false for silence, a refused port and local errors
+//   Only a datagram carrying the query's transaction ID is a reply; others (wrong ID, under
+//   2 bytes, empty) are ignored until the timeout, so only such datagrams -> .timedOut
 //   outcome: DNSProbeOutcome, a struct with static members (switch needs `default`):
 //     .answered, .refused, .timedOut, .malformedReply, .unreachable, .failed; JSON: raw string
 //   elapsed: send to whatever came back from the network; nil when nothing did (timedOut,
@@ -525,6 +527,8 @@ public enum DNSError: Error, Sendable {
     case socketCreationFailed, setsockoptFailed(option: String, errno: Int32), bindFailed(String)
     case sendFailed, timeout, malformedResponse, noRecords, serverError(rcode: Int)
 }
+// malformedResponse: a datagram with the query's transaction ID that is not valid DNS. One with
+// another ID, or too short to carry one, is ignored; only such datagrams end as timeout.
 
 // Standalone functions with an explicit server:
 public func reverseDNS(ip: String, server: String, timeout: TimeInterval = 2.0,
