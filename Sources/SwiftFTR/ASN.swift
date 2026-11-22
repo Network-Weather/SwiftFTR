@@ -348,56 +348,30 @@ public struct CachingASNResolver: ASNResolver {
   }
 }
 
-/// Limits how many Team Cymru queries one resolve call has in flight, and so how many sockets it
-/// holds at once.
-actor _ConcurrencySemaphore {
+// Actor-based semaphore for limiting concurrent DNS queries.
+private actor _ConcurrencySemaphore {
   private var available: Int
-  private struct Waiter {
-    let id: UInt64
-    let continuation: CheckedContinuation<Void, Error>
-  }
-
-  private var waiters: [Waiter] = []
-  private var nextWaiterID: UInt64 = 0
+  private var waiters: [CheckedContinuation<Void, Never>] = []
 
   init(maxConcurrent: Int) { self.available = maxConcurrent }
 
-  /// Takes a permit, waiting without a thread until one is free.
-  ///
-  /// - Throws: `CancellationError` if the calling task is cancelled before a permit is free. A
-  ///   cancelled waiter takes no permit, so it must not call ``signal()``.
-  func wait() async throws {
+  func wait() async {
     if available > 0 {
       available -= 1
-      return
-    }
-    let id = nextWaiterID
-    nextWaiterID &+= 1
-    try await withTaskCancellationHandler {
-      try await withCheckedThrowingContinuation {
-        (continuation: CheckedContinuation<Void, Error>) in
-        waiters.append(Waiter(id: id, continuation: continuation))
+    } else {
+      await withCheckedContinuation { continuation in
+        waiters.append(continuation)
       }
-    } onCancel: {
-      // The actor is busy until this wait suspends, so `cancelWaiter` always runs after the
-      // waiter is listed, even when the task was cancelled before it called `wait()`.
-      Task { await self.cancelWaiter(id) }
     }
   }
 
   func signal() {
     if !waiters.isEmpty {
       let waiter = waiters.removeFirst()
-      waiter.continuation.resume()
+      waiter.resume()
     } else {
       available += 1
     }
-  }
-
-  private func cancelWaiter(_ id: UInt64) {
-    // A waiter that `signal()` already resumed holds a permit and is no longer listed.
-    guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
-    waiters.remove(at: index).continuation.resume(throwing: CancellationError())
   }
 }
 
@@ -409,20 +383,27 @@ private struct _OriginASNResult: Sendable {
   let registry: String?
 }
 
+/// Seconds a caller waits for one Team Cymru query, counted from submission rather than from the
+/// moment the query starts.
+///
+/// `timeout` bounds each server attempt once it is running, and `DNSClient.queryTXT` tries two
+/// servers, so a healthy query can take two timeouts. The third covers time spent queued for a
+/// slot on the shared blocking-I/O executor. Without a deadline that wait has no limit: sibling
+/// work holding every slot would hold ASN enrichment for as long as it stalled.
+func cymruQueryDeadline(timeout: TimeInterval) -> TimeInterval {
+  timeout * 3
+}
+
 // Team Cymru DNS-based resolver using TXT queries.
 /// Team Cymru DNS-based resolver using TXT queries for origin ASN and AS names.
 public struct CymruDNSResolver: ASNResolver {
-  /// Queries in flight at once for one ``resolve(ipv4Addrs:timeout:)`` call. Each holds one UDP
-  /// socket and no thread.
-  private static let maxConcurrentQueries = 8
+  /// Where the synchronous DNS queries run. Tests substitute a private executor so they can fill
+  /// it without starving the rest of the process.
+  private let executor: BlockingIOExecutor
 
-  /// DNS servers each query tries, in order.
-  private let servers: [String]
+  public init() { self.executor = blockingIOExecutor }
 
-  public init() { self.servers = DNSClient.defaultTXTServers }
-
-  /// A resolver that sends its queries to `servers`. Tests point it at a loopback responder.
-  init(servers: [String]) { self.servers = servers }
+  init(executor: BlockingIOExecutor) { self.executor = executor }
 
   /// Resolves origin ASN metadata through Team Cymru's DNS service.
   ///
@@ -448,7 +429,7 @@ public struct CymruDNSResolver: ASNResolver {
     let lookupIPs = Array(Set(ips.compactMap(asnLookupAddress)))
     if lookupIPs.isEmpty { return [:] }
 
-    let semaphore = _ConcurrencySemaphore(maxConcurrent: Self.maxConcurrentQueries)
+    let semaphore = _ConcurrencySemaphore(maxConcurrent: 8)
 
     // Phase 1: Parallel origin ASN lookups
     let originResults: [String: _OriginASNResult] = await withTaskGroup(
@@ -456,7 +437,7 @@ public struct CymruDNSResolver: ASNResolver {
     ) { group in
       for ip in lookupIPs {
         group.addTask {
-          guard (try? await semaphore.wait()) != nil else { return (ip, nil) }
+          await semaphore.wait()
           defer { Task { await semaphore.signal() } }
           return (ip, await self.lookupOriginASN(ip: ip, timeout: timeout))
         }
@@ -476,7 +457,7 @@ public struct CymruDNSResolver: ASNResolver {
     let asnNames: [Int: String] = await withTaskGroup(of: (Int, String?).self) { group in
       for asn in uniqueASNs {
         group.addTask {
-          guard (try? await semaphore.wait()) != nil else { return (asn, nil) }
+          await semaphore.wait()
           defer { Task { await semaphore.signal() } }
           return (asn, await self.lookupASName(asn: asn, timeout: timeout))
         }
@@ -527,7 +508,12 @@ public struct CymruDNSResolver: ASNResolver {
       q = "\(rev).origin.asn.cymru.com"
     }
 
-    let txts = await DNSClient.queryTXT(name: q, timeout: timeout, servers: servers)
+    // Keep the synchronous resolver off Swift's cooperative executor.
+    let txts = try? await executor.run(
+      priority: .userInitiated, deadline: cymruQueryDeadline(timeout: timeout)
+    ) {
+      DNSClient.queryTXTBlocking(name: q, timeout: timeout)
+    }
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Format: "AS | BGP Prefix | CC | Registry | Allocated"
@@ -551,7 +537,12 @@ public struct CymruDNSResolver: ASNResolver {
   private func lookupASName(asn: Int, timeout: TimeInterval) async -> String? {
     let qn = "AS\(asn).asn.cymru.com"
 
-    let txts = await DNSClient.queryTXT(name: qn, timeout: timeout, servers: servers)
+    // Keep the synchronous resolver off Swift's cooperative executor.
+    let txts = try? await executor.run(
+      priority: .userInitiated, deadline: cymruQueryDeadline(timeout: timeout)
+    ) {
+      DNSClient.queryTXTBlocking(name: qn, timeout: timeout)
+    }
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Typical format: "AS | AS Name | CC | Registry | Allocated"
