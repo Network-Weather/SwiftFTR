@@ -674,6 +674,33 @@ final class RefusingTCPPort: @unchecked Sendable {
   deinit { for descriptor in descriptors { close(descriptor) } }
 }
 
+/// A loopback UDP port that answers every datagram with ICMP port-unreachable, reserved for the
+/// fixture's lifetime.
+///
+/// The port belongs to a socket connected to another loopback address, so the kernel delivers it
+/// only datagrams from that peer and answers everyone else as it would for an unbound port, while
+/// no other socket can be handed the number.
+final class RefusingUDPPort: @unchecked Sendable {
+  let port: UInt16
+  private let fd: Int32
+
+  init(family: Int32 = AF_INET) throws {
+    (fd, port) = try bindLoopback(family: family, type: SOCK_DGRAM)
+    // Port 9 (discard): connecting a datagram socket sends nothing; it only fixes the peer.
+    var (peer, length) = loopbackAddress(family: family, port: 9)
+    let connected = withUnsafePointer(to: &peer) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
+    }
+    guard connected == 0 else {
+      let code = errno
+      close(fd)
+      throw FixtureError.socket("connect", code)
+    }
+  }
+
+  deinit { close(fd) }
+}
+
 // MARK: - Loopback UDP responder
 
 /// A loopback UDP server that answers each datagram as a test scripts: not at all, late, or with
