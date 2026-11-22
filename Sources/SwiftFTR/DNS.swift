@@ -924,10 +924,11 @@ public struct DNSProbeOutcome: RawRepresentable, Hashable, Sendable, Codable,
   /// The server's host replied that nothing is listening on the port (ICMP port unreachable).
   /// The host is up, but no DNS server answered, so ``DNSProbeResult/isReachable`` is `false`.
   public static let refused = DNSProbeOutcome(rawValue: "refused")
-  /// Nothing came back before the timeout.
+  /// No datagram carrying the query's transaction ID arrived before the timeout. Datagrams for
+  /// another query, and ones too short to carry an ID, are ignored and do not end the wait.
   public static let timedOut = DNSProbeOutcome(rawValue: "timedOut")
-  /// Something came back that is not a valid DNS response, such as an empty or truncated datagram.
-  /// The server is reachable: ``DNSProbeResult/isReachable`` is `true`.
+  /// A datagram carried the query's transaction ID but was not a valid DNS response, such as a
+  /// truncated one. The server is reachable: ``DNSProbeResult/isReachable`` is `true`.
   public static let malformedReply = DNSProbeOutcome(rawValue: "malformedReply")
   /// The server's host or network cannot be reached: the network reported it after the query was
   /// sent (ICMP host or network unreachable), or this machine refused to send toward it at all
