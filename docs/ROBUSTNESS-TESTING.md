@@ -99,6 +99,13 @@ Not covered, and why:
   a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which is shared
   with every other user of SwiftIP2ASN on the machine, and the cache location cannot be redirected
   from SwiftFTR. A test would have to delete that cache.
+- **A stale datagram that reached the socket before the query left but is read after it.** The
+  transport ignores whatever it reads before its request has been sent, but it cannot tell when
+  a datagram arrived, so one that was queued during a send retry and read just after the send
+  succeeded is taken as the first reply. On a reused port toward the same server, a late reply
+  to an earlier query would then be reported as a malformed response from a server that had not
+  answered. Not staged, and not fixed here: ignoring replies whose transaction ID does not match,
+  which closes this before and after the send, is the next change in `docs/BLOCKING-IO.md`.
 - **A DNS reply that arrives after the deadline but before the deadline timer runs.** The
   transport checks the deadline before it accepts a reply, but the two events race on one queue
   and no fixture can order them deterministically, so no test shows the check is needed.

@@ -280,6 +280,158 @@ struct DNSProbeOutcomeTests {
     #expect(result.elapsed == rtt)
   }
 
+  // MARK: Transport reads
+
+  @Test("An unreachable error read before the request has left is ignored, through the seam")
+  func unreachableBeforeTheSendIsIgnored() async throws {
+    let server = try Self.answering()
+    defer { server.stop() }
+    let attempts = FaultCounter()
+    let staged = FaultCounter()
+    let reads = FaultCounter()
+    let preSendReads = FaultCounter()
+    // The first send puts a request on the wire, waits for its reply, then reports ENOBUFS, so the
+    // reply is readable before the exchange has sent anything.
+    let send = EventBasedDNSTests.sendThatLiesFirst(attempts: attempts, staged: staged)
+    // The first read consumes that reply and reports EHOSTUNREACH instead.
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      reads.increment()
+      let received = Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
+      guard reads.value == 1 else { return received }
+      if attempts.value == 1 { preSendReads.increment() }
+      Darwin.errno = EHOSTUNREACH
+      return -1
+    }
+
+    let result = try await TestSeams.$sendDatagram.withValue(send) {
+      try await TestSeams.$receiveDatagram.withValue(receive) {
+        try await Self.probe(port: server.port)
+      }
+    }
+    try #require(staged.value == 1, "the first reply never arrived before the retry")
+    try #require(preSendReads.value == 1, "the seam did not see the read before the send")
+    #expect(result.outcome == .answered, "\(result.error ?? "nil")")
+    #expect(attempts.value == 2)
+    #expect(reads.value >= 2)
+  }
+
+  /// Datagrams waiting on `fd`, from `SO_NUMRCVPKT`.
+  static func queuedDatagrams(_ fd: Int32) -> Int32 {
+    var count: Int32 = 0
+    var length = socklen_t(MemoryLayout<Int32>.size)
+    guard getsockopt(fd, SOL_SOCKET, SO_NUMRCVPKT, &count, &length) == 0 else { return -1 }
+    return count
+  }
+
+  static func waitForQueued(_ fd: Int32, _ count: Int32, limit: TimeInterval = 5) -> Bool {
+    let giveUp = monotonicNow() + limit
+    while monotonicNow() < giveUp {
+      if queuedDatagrams(fd) >= count { return true }
+      _ = EventBasedDNSTests.waitUntilReadable(fd, limit: 0.01)
+    }
+    return queuedDatagrams(fd) >= count
+  }
+
+  enum Exit: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case answered, timedOut, cancelled
+    var testDescription: String { rawValue }
+  }
+
+  final class TaskBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Error?, Never>?
+    func set(_ task: Task<Error?, Never>) {
+      lock.lock()
+      self.task = task
+      lock.unlock()
+    }
+    /// Cancels the task, waiting for it to be set if the seam runs before `set`.
+    func cancel(limit: TimeInterval = 5) {
+      let giveUp = monotonicNow() + limit
+      while monotonicNow() < giveUp {
+        lock.lock()
+        let task = self.task
+        lock.unlock()
+        if let task { return task.cancel() }
+        usleep(1000)
+      }
+    }
+  }
+
+  @Test(
+    "Once the exchange has finished and closed its socket, nothing reads it again",
+    arguments: Exit.allCases)
+  func noReadAfterFinish(exit: Exit) async throws {
+    let server = try Self.answering()
+    defer { server.stop() }
+    let reads = FaultCounter()
+    let queuedAtSend = FaultCounter()
+    let closes = FaultCounter()
+    let readsAtClose = FaultCounter()
+    let box = TaskBox()
+    let timeout: TimeInterval = exit == .timedOut ? 0.3 : Self.longTimeout
+
+    // Sends the request twice, so two replies are queued, and waits until both are.
+    let send: TestSeams.SendDatagram = { fd, bytes in
+      let first = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+      _ = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+      if Self.waitForQueued(fd, 2) { queuedAtSend.increment() }
+      switch exit {
+      case .answered:
+        return first
+      case .timedOut:
+        // Both replies stay queued past the deadline: whichever of the read event and the
+        // deadline timer runs first, the exchange times out with them unread.
+        usleep(UInt32((timeout + 0.2) * 1_000_000))
+        return first
+      case .cancelled:
+        box.cancel()
+        Darwin.errno = ENOBUFS
+        return -1
+      }
+    }
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      reads.increment()
+      return Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
+    }
+    let close: TestSeams.CloseDescriptor = { fd in
+      // Taken while the descriptor is still open: every read the exchange made happened by now.
+      for _ in 0..<reads.value { readsAtClose.increment() }
+      closes.increment()
+      return Darwin.close(fd)
+    }
+
+    let task = Task {
+      await TestSeams.$sendDatagram.withValue(send) {
+        await TestSeams.$receiveDatagram.withValue(receive) {
+          await TestSeams.$closeDescriptor.withValue(close) {
+            await EventBasedDNSTests.error {
+              try await __dnsQuery(
+                server: "127.0.0.1", port: server.port, name: "finish.example", type: 1,
+                timeout: timeout)
+            }
+          }
+        }
+      }
+    }
+    box.set(task)
+    let (thrown, _) = try await measure(within: Self.watchdog) { await task.value }
+
+    try #require(queuedAtSend.value == 1, "two replies were never queued at once")
+    switch exit {
+    case .answered: #expect(thrown == nil, "\(String(describing: thrown))")
+    case .timedOut: #expect(EventBasedDNSTests.isTimeout(thrown), "\(String(describing: thrown))")
+    case .cancelled: #expect(thrown is CancellationError, "\(String(describing: thrown))")
+    }
+    #expect(closes.value == 1)
+    // The answered exit read the first reply and stopped, leaving the second queued.
+    if exit == .answered { #expect(readsAtClose.value == 1) }
+
+    // Absence over a window: any read source event or handler left over would run by now.
+    try await Task.sleep(nanoseconds: 200_000_000)
+    #expect(reads.value == readsAtClose.value, "read \(reads.value - readsAtClose.value) more")
+  }
+
   // MARK: Consumer use
 
   @Test("A switch over the outcome with a default arm matches the static members")
