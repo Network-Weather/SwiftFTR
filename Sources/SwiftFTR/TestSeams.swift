@@ -30,8 +30,9 @@ enum TestSeams {
   /// with. Returns what `send` would and sets `errno` the same way.
   typealias SendDatagram = @Sendable (_ fd: Int32, _ bytes: UnsafeRawBufferPointer) -> Int
 
-  /// `recv(2)` of one datagram into `buffer`, in place of the system call a ``UDPExchange`` reads
-  /// its reply with. Returns what `recv` would and sets `errno` the same way.
+  /// `recv(2)` of one datagram into `buffer`, in place of the system call a ``UDPExchange``, and
+  /// the blocking DNS query behind the whoami fallback, read their reply with. Returns what `recv`
+  /// would and sets `errno` the same way.
   typealias ReceiveDatagram =
     @Sendable (_ fd: Int32, _ buffer: UnsafeMutableRawBufferPointer) -> Int
 

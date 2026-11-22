@@ -74,9 +74,10 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
-| DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
-| DNS transport | refused port (IPv4 and IPv6); empty datagram; `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
-| DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; an empty datagram; `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` from `connect` (connect seam) and `send`; other connect and send errors, an unclassified receive error and an invalid server; a stall inside the read excluded from the round trip; an unreachable error read before the send ignored; no read once the exchange has finished and closed its socket, with a second reply still queued (answered, timed out, cancelled); cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
+| DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage without the query's transaction ID (ignored, so a timeout), oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
+| DNS transport | refused port (IPv4 and IPv6); empty datagram (ignored, so a timeout); `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
+| DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; a short datagram with the query's transaction ID (`malformedReply`); `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` from `connect` (connect seam) and `send`; other connect and send errors, an unclassified receive error and an invalid server; a stall inside the read excluded from the round trip; an unreachable error read before the send ignored; no read once the exchange has finished and closed its socket, with a second reply still queued (answered, timed out, cancelled); cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
+| DNS foreign replies | a reply with another transaction ID, then the real one, which answers with its own round trip (IPv4 and IPv6); empty and one-byte datagrams, then the real reply; only foreign replies, read while the query still waits, then a timeout and `timedOut`; a datagram with the query's ID but no valid header, still `malformedResponse` at once; a stale reply queued before the send and read after it; after a foreign datagram, a reply or refusal that comes only after the deadline, which is a timeout because each read event judges at most one datagram (query and dnsProbe); foreign replies that never stop, on a socket that never runs dry, with the deadline (IPv4 and IPv6) and cancellation still ending the query; a Team Cymru lookup answered foreign first; the blocking TXT path: a foreign and an empty datagram before the reply, a wait bounded by the time left after a foreign reply, a reply returned after the deadline (as the first read, or after a foreign one) taken as a timeout and the next server tried, and an endless feed | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, CymruDNSResolver, `DNSClient.queryTXTBlocking` | `DNSForeignReplyTests` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()`, `cancelActiveTraces()`, and the caller and the tracer together, across each operation and in each stalled phase, with the exact error checked per source; a stream consumer that cancels sees a normal end and the producer closes its socket; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
@@ -86,8 +87,8 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`
-and `CymruEventBasedTests` for the event-based DNS transport. Every timed operation runs under a
-watchdog
+and `DNSForeignReplyTests` for the event-based DNS transport, and `CymruEventBasedTests` for the
+Team Cymru lookups on it. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
 Not covered, and why:
@@ -110,13 +111,15 @@ Not covered, and why:
   so no test can enter the handler after `finish`: removing the check fails nothing.
   `DNSProbeOutcomeTests.noReadAfterFinish` shows that no read follows the close, and fails when
   the check is removed together with the `return` after a reply.
-- **A stale datagram that reached the socket before the query left but is read after it.** The
-  transport ignores whatever it reads before its request has been sent, but it cannot tell when
-  a datagram arrived, so one that was queued during a send retry and read just after the send
-  succeeded is taken as the first reply. On a reused port toward the same server, a late reply
-  to an earlier query would then be reported as a malformed response from a server that had not
-  answered. Not staged, and not fixed here: ignoring replies whose transaction ID does not match,
-  which closes this before and after the send, is the next change in `docs/BLOCKING-IO.md`.
+- **A stale datagram that carries the query's own transaction ID.** A DNS query ignores every
+  datagram without its transaction ID, before or after the send
+  (`DNSForeignReplyTests.staleReplyReadAfterTheSend`), but it cannot tell when a datagram
+  arrived, so a stale reply to an earlier query on the same port toward the same server that
+  happens to carry the same ID is taken as the reply. Each query draws its ID from
+  `UInt16.random(in:)`, the system's cryptographically secure generator, so a given stale reply
+  matches with probability 1 in 65,536, and only after the kernel has handed the same ephemeral
+  port to a new socket while that reply was still in flight. Not staged: no fixture can make the
+  two IDs collide without a seam on ID generation.
 - **A DNS reply that arrives after the deadline but before the deadline timer runs.** The
   transport checks the deadline before it accepts a reply, but the two events race on one queue
   and no fixture can order them deterministically, so no test shows the check is needed.
@@ -261,7 +264,8 @@ numbers are as of the commit that added this section.
     Tests: `EventBasedDNSTests.refusedPort` and `DNSProbeOutcomeTests.refused`, IPv4 and IPv6.
 18. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
     was treated like a failed one, `DNSError.timeout` after 1 ms on `main`. It is now
-    `malformedResponse`, which `dnsProbe` reports as reachable. Test:
+    `malformedResponse`, which `dnsProbe` reported as reachable; finding 25 then made it a
+    datagram that cannot answer the query, ignored like one with another transaction ID. Test:
     `EventBasedDNSTests.emptyDatagram`.
 19. **Host and network unreachable on a DNS query were reported as silence.** Confirmed through
     the receive seam and fixed for `dnsProbe`. The transport ends the exchange at once on
@@ -302,6 +306,16 @@ numbers are as of the commit that added this section.
 24. **An unclassified receive error was reported as a timeout.** Fixed: `dnsProbe` said "Timeout -
     no response" for a socket error that came at once. It now says a receive error occurred, with
     the errno. Test: `DNSProbeOutcomeTests.failed`.
+25. **A stale or stray DNS datagram decided the query.** Confirmed and fixed. The first datagram
+    after the send was the reply whatever it was, so one with another query's transaction ID
+    ended the query as `malformedResponse` and `dnsProbe` reported a silent server reachable;
+    staged with a reply queued before the send and read after it. A DNS query now ignores any
+    datagram without its transaction ID, or too short to carry one, and keeps waiting to its
+    deadline; one with the right ID still decides, valid or not. After the send the transport judges at most one datagram per read
+    event, so an ignored one costs its own event: a datagram read later in the same event could
+    have arrived after the stamp taken for it, even after the deadline. An endless stream of
+    ignored datagrams therefore cannot hold off the deadline or cancellation. The blocking TXT path waits only for the time it has left, and treats a reply `recv` returns after the deadline, which its receive timeout alone allows by about 2 ms, as a timeout.
+    Tests: `DNSForeignReplyTests`.
 
 Observations that are not defects of the library:
 
