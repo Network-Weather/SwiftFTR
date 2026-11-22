@@ -271,6 +271,63 @@ struct EventBasedDNSTests {
     if fault != .shortCount { #expect(server.requests.value == 0) }
   }
 
+  /// A send seam whose first call puts the datagram on the wire, waits for whatever it provokes
+  /// to arrive, and then reports `ENOBUFS`. So something is readable before the exchange has
+  /// sent, as a late reply to an earlier socket on the same port would be, and the retry then
+  /// really sends.
+  static func sendThatLiesFirst(attempts: FaultCounter) -> TestSeams.SendDatagram {
+    { fd, bytes in
+      attempts.increment()
+      let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+      guard attempts.value == 1 else { return sent }
+      usleep(50_000)
+      Darwin.errno = ENOBUFS
+      return -1
+    }
+  }
+
+  @Test("A datagram that arrives before the request has left does not complete the exchange")
+  func datagramBeforeTheSendIsIgnored() async throws {
+    let replies = FaultCounter()
+    let server = try LoopbackUDPResponder { query in
+      replies.increment()
+      // The stale reply carries 192.0.2.1, the one to the request that left carries 192.0.2.2.
+      let last: UInt8 = replies.value == 1 ? 1 : 2
+      let record: [UInt8] = [0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, last]
+      return (FaultInjectionWireTests.dnsResponse(to: query, answers: record), 0)
+    }
+    defer { server.stop() }
+    let attempts = FaultCounter()
+
+    let (answers, _) = try await measure(within: Self.watchdog) {
+      try await TestSeams.$sendDatagram.withValue(Self.sendThatLiesFirst(attempts: attempts)) {
+        try await __dnsQuery(
+          server: "127.0.0.1", port: server.port, name: "stale.example", type: 1, timeout: 5)
+      }
+    }
+    #expect(answers.first?.rdata == Data([192, 0, 2, 2]))
+    #expect(attempts.value == 2)
+  }
+
+  @Test("A refusal that arrives before the request has left does not end the exchange")
+  func refusalBeforeTheSendIsIgnored() async throws {
+    let refusing = try RefusingUDPPort()
+    defer { withExtendedLifetime(refusing) {} }
+    let attempts = FaultCounter()
+
+    let (thrown, _) = try await measure(within: Self.watchdog) {
+      await TestSeams.$sendDatagram.withValue(Self.sendThatLiesFirst(attempts: attempts)) {
+        await Self.error {
+          try await __dnsQuery(
+            server: "127.0.0.1", port: refusing.port, name: "stale.example", type: 1, timeout: 5)
+        }
+      }
+    }
+    // Refused, but by the request that left: the stale refusal was read and ignored first.
+    #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
+    #expect(attempts.value == 2)
+  }
+
   // MARK: Setup
 
   @Test("A failure to make the socket non-blocking is reported, and nothing is sent")
@@ -322,6 +379,20 @@ struct EventBasedDNSTests {
 
   enum Exit: String, CaseIterable, CustomTestStringConvertible, Sendable {
     case answered, timedOut, refused, malformed, cancelled, setupFailed
+    /// Every send fails with this errno, so the exchange is waiting to write or backing off.
+    case cancelledWhileWaitingToWrite, cancelledWhileBackingOff
+    case deadlineWhileWaitingToWrite, deadlineWhileBackingOff
+
+    var sendErrno: Int32? {
+      switch self {
+      case .cancelledWhileWaitingToWrite, .deadlineWhileWaitingToWrite: EAGAIN
+      case .cancelledWhileBackingOff, .deadlineWhileBackingOff: ENOBUFS
+      default: nil
+      }
+    }
+    var cancels: Bool {
+      [.cancelled, .cancelledWhileWaitingToWrite, .cancelledWhileBackingOff].contains(self)
+    }
     var testDescription: String { rawValue }
   }
 
@@ -342,8 +413,9 @@ struct EventBasedDNSTests {
     let refusing = exit == .refused ? try RefusingUDPPort() : nil
     defer { withExtendedLifetime(refusing) {} }
     let port = refusing?.port ?? server.port
-    let ledger = DescriptorLedger(failSetup: exit == .setupFailed)
-    let timeout: TimeInterval = exit == .timedOut ? 0.2 : 30
+    let ledger = DescriptorLedger(failSetup: exit == .setupFailed, sendErrno: exit.sendErrno)
+    let timeout: TimeInterval =
+      [.timedOut, .deadlineWhileWaitingToWrite, .deadlineWhileBackingOff].contains(exit) ? 0.2 : 30
 
     let query = Task {
       await ledger.install {
@@ -355,8 +427,11 @@ struct EventBasedDNSTests {
     }
     if exit == .cancelled {
       #expect(await eventually(within: Self.watchdog) { server.requests.value > 0 })
-      query.cancel()
     }
+    if exit.sendErrno != nil, exit.cancels {
+      #expect(await eventually(within: Self.watchdog) { ledger.snapshot.sendAttempts > 1 })
+    }
+    if exit.cancels { query.cancel() }
     let (thrown, _) = try await measure(within: Self.watchdog) { await query.value }
 
     switch exit {
@@ -364,15 +439,19 @@ struct EventBasedDNSTests {
     case .timedOut: #expect(Self.isTimeout(thrown), "\(String(describing: thrown))")
     case .refused: #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
     case .malformed: #expect(Self.isMalformed(thrown), "\(String(describing: thrown))")
-    case .cancelled: #expect(thrown is CancellationError, "\(String(describing: thrown))")
+    case .cancelled, .cancelledWhileWaitingToWrite, .cancelledWhileBackingOff:
+      #expect(thrown is CancellationError, "\(String(describing: thrown))")
     case .setupFailed: #expect(thrown != nil)
+    case .deadlineWhileWaitingToWrite, .deadlineWhileBackingOff:
+      #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
     }
 
     // Read as soon as the query returned: the close happens before the caller is resumed.
     let record = ledger.snapshot
     #expect(record.closedDescriptors.count == 1, "closes: \(record.closedDescriptors)")
-    if exit == .setupFailed {
-      // Setup still owned the socket, so it closed it: the one it configured, and nothing else.
+    if exit == .setupFailed || exit.sendErrno != nil {
+      // The socket that was configured, and nothing else; with every send failing, it was closed
+      // once although write sources or backoff timers were created and cancelled along the way.
       #expect(record.closedDescriptors == record.configuredDescriptors)
       #expect(record.sentFromPorts.isEmpty)
     } else {
@@ -448,13 +527,18 @@ final class DescriptorLedger: @unchecked Sendable {
     var sentFromPorts: [UInt16] = []
     var closedDescriptors: [Int32] = []
     var closedPorts: [UInt16] = []
+    var sendAttempts = 0
   }
 
   private let lock = NSLock()
   private var record = Record()
   private let failSetup: Bool
+  private let sendErrno: Int32?
 
-  init(failSetup: Bool = false) { self.failSetup = failSetup }
+  init(failSetup: Bool = false, sendErrno: Int32? = nil) {
+    self.failSetup = failSetup
+    self.sendErrno = sendErrno
+  }
 
   var snapshot: Record {
     lock.lock()
@@ -474,6 +558,11 @@ final class DescriptorLedger: @unchecked Sendable {
       return fcntl(fd, command, argument)
     }
     let send: TestSeams.SendDatagram = { [self] fd, bytes in
+      update { $0.sendAttempts += 1 }
+      if let sendErrno {
+        Darwin.errno = sendErrno
+        return -1
+      }
       let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
       let code = Darwin.errno
       if sent == bytes.count, let port = Self.localPort(fd) {
