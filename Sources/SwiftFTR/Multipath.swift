@@ -527,8 +527,9 @@ extension SwiftFTR {
   ///   - target: Hostname or IP to trace
   ///   - config: Multipath discovery configuration
   /// - Returns: Network topology with all discovered paths
-  /// - Throws: `CancellationError` when the calling task is cancelled, or
-  ///   `TracerouteError` when discovery cannot complete.
+  /// - Throws: `CancellationError` when the calling task is cancelled,
+  ///   `TracerouteError.cancelled` when ``networkChanged()`` or ``cancelActiveTraces()`` ends it,
+  ///   or `TracerouteError` when discovery cannot complete.
   ///
   /// - Important: This implementation uses **ICMP Echo Request** packets with varying
   ///   ICMP ID fields. Many ECMP routers do not hash ICMP fields, so this may find
@@ -568,7 +569,28 @@ extension SwiftFTR {
     )
     let discovery = MultipathDiscovery(worker: worker, config: swiftConfig)
 
-    return try await discovery.discoverPaths(to: target, multipathConfig: config)
+    // The flow workers are separate tracers, so this tracer's network change cannot reach them
+    // through their own handles. Register one here and race discovery against it. Both run as
+    // children of one group, so every flow worker is joined before this returns either way.
+    let handle = TraceHandle()
+    activeTraces.insert(handle)
+    defer { activeTraces.remove(handle) }
+
+    return try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
+      group.addTask {
+        try await discovery.discoverPaths(to: target, multipathConfig: config)
+      }
+      group.addTask {
+        await waitForCancellation(of: handle)
+        if await handle.isCancelled { throw TracerouteError.cancelled }
+        return nil
+      }
+      defer { group.cancelAll() }
+      while let next = try await group.next() {
+        if let topology = next { return topology }
+      }
+      throw CancellationError()
+    }
   }
 
   /// Runs flow workers that reuse caches without escaping the caller's task group.
