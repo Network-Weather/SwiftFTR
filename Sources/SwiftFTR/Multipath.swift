@@ -615,6 +615,7 @@ extension SwiftFTR {
         publicIP: baseConfig.publicIP,
         enableLogging: baseConfig.enableLogging,
         noReverseDNS: baseConfig.noReverseDNS,
+        publicIPDiscoveryTimeout: baseConfig.publicIPDiscoveryTimeout,
         interface: baseConfig.interface,
         sourceIP: baseConfig.sourceIP,
         preferredFamily: .v4
@@ -657,6 +658,7 @@ extension SwiftFTR {
       publicIP: self.config.publicIP,
       enableLogging: self.config.enableLogging,
       noReverseDNS: self.config.noReverseDNS,
+      publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeout,
       interface: self.config.interface,
       sourceIP: self.config.sourceIP,
       preferredFamily: .v4
@@ -746,7 +748,8 @@ extension SwiftFTR {
       publicIP: effectivePublicIP,
       interface: config.interface,
       sourceIP: config.sourceIP,
-      enableLogging: config.enableLogging
+      enableLogging: config.enableLogging,
+      publicIPDiscoveryTimeout: config.publicIPDiscoveryTimeoutForOperation
     )
 
     // Enhance classified result with hostnames
