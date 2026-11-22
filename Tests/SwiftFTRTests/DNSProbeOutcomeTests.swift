@@ -1,4 +1,5 @@
 import Foundation
+@_spi(Test) import SwiftFTR
 import Testing
 
 @testable import SwiftFTR
@@ -132,7 +133,7 @@ struct DNSProbeOutcomeTests {
   }
 
   enum Failure: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    case send, unclassifiedReceive, invalidServer
+    case send, connect, unclassifiedReceive, invalidServer
     var testDescription: String { rawValue }
   }
 
@@ -152,6 +153,11 @@ struct DNSProbeOutcomeTests {
       result = try await TestSeams.$sendDatagram.withValue(send) {
         try await Self.probe(port: server.port)
       }
+    case .connect:
+      result = try await TestSeams.$connectSocket.withValue(Self.connectFails(with: EADDRNOTAVAIL))
+      {
+        try await Self.probe(port: server.port)
+      }
     case .unclassifiedReceive:
       result = try await TestSeams.$receiveDatagram.withValue(Self.receiveFails(with: ECONNRESET)) {
         try await Self.probe(port: server.port)
@@ -166,9 +172,12 @@ struct DNSProbeOutcomeTests {
     #expect(result.responseCode == nil)
     let expected =
       switch failure {
-      case .send: "Failed to send query"
-      // An unclassified receive error keeps the message it has always had.
-      case .unclassifiedReceive: "Timeout - no response"
+      case .send: "Failed to send query - send failed (errno=1: Operation not permitted)"
+      case .connect:
+        "Failed to send query - connect failed (errno=49: Can't assign requested address)"
+      case .unclassifiedReceive:
+        "Receive failed - the socket reported an error while waiting for the reply"
+          + " (errno=54: Connection reset by peer)"
       case .invalidServer: "Invalid server IP: not-an-address"
       }
     #expect(result.error == expected)
@@ -193,6 +202,82 @@ struct DNSProbeOutcomeTests {
     case .success(let probe): Issue.record("returned a result: \(probe.error ?? "nil")")
     case .failure(let error): #expect(error is CancellationError, "\(error)")
     }
+  }
+
+  /// A `connect` that fails with `code`, as the kernel does when it has no route to the server.
+  static func connectFails(with code: Int32) -> TestSeams.ConnectSocket {
+    { _, _, _ in
+      Darwin.errno = code
+      return -1
+    }
+  }
+
+  enum Stage: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case connect, send
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "No route at connect or send is unreachable, with no timing, and the query methods still throw sendFailed",
+    arguments: Stage.allCases, [EHOSTUNREACH, EHOSTDOWN, ENETUNREACH, ENETDOWN])
+  func locallyUnreachable(stage: Stage, code: Int32) async throws {
+    let server = try Self.answering()
+    defer { server.stop() }
+    let send: TestSeams.SendDatagram = { _, _ in
+      Darwin.errno = code
+      return -1
+    }
+
+    let (result, thrown) = try await TestSeams.$connectSocket.withValue(
+      stage == .connect ? Self.connectFails(with: code) : nil
+    ) {
+      try await TestSeams.$sendDatagram.withValue(stage == .send ? send : nil) {
+        let result = try await Self.probe(port: server.port)
+        let thrown = await EventBasedDNSTests.error {
+          try await __dnsQuery(
+            server: "127.0.0.1", port: server.port, name: "route.example", type: 1, timeout: 5)
+        }
+        return (result, thrown)
+      }
+    }
+    #expect(result.outcome == .unreachable)
+    #expect(!result.isReachable)
+    #expect(result.rtt == nil)
+    // Nothing came back from the network.
+    #expect(result.elapsed == nil)
+    #expect(result.responseCode == nil)
+    let error = try #require(result.error)
+    let network = code == ENETUNREACH || code == ENETDOWN
+    #expect(error.hasPrefix(network ? "Network unreachable" : "Host unreachable"), "\(error)")
+    #expect(error.contains("(errno=\(code): \(String(cString: strerror(code))))"), "\(error)")
+    #expect(EventBasedDNSTests.isSendFailed(thrown), "\(String(describing: thrown))")
+    #expect(server.requests.value == 0)
+  }
+
+  @Test("The reported round trip excludes time spent inside the read call")
+  func receiveStampPrecedesRead() async throws {
+    let server = try Self.answering()
+    defer { server.stop() }
+    // The reply is already queued when the read event runs; a stall inside the read must not
+    // count. Large enough that no real loopback round trip on a loaded machine reaches it.
+    let stall: TimeInterval = 2
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      usleep(UInt32(stall * 1_000_000))
+      return Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
+    }
+
+    let (result, duration) = try await measure(within: Self.watchdog) {
+      try await TestSeams.$receiveDatagram.withValue(receive) {
+        try await TestSeams.$dnsServerPort.withValue(server.port) {
+          try await dnsProbe(server: "127.0.0.1", query: "stamp.example", timeout: Self.longTimeout)
+        }
+      }
+    }
+    #expect(duration >= stall, "the stall did not run")
+    #expect(result.outcome == .answered)
+    let rtt = try #require(result.rtt)
+    #expect(rtt < stall, "rtt \(rtt) s includes the \(stall) s stall inside the read")
+    #expect(result.elapsed == rtt)
   }
 
   // MARK: Consumer use

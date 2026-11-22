@@ -35,6 +35,11 @@ enum TestSeams {
   typealias ReceiveDatagram =
     @Sendable (_ fd: Int32, _ buffer: UnsafeMutableRawBufferPointer) -> Int
 
+  /// `connect(2)`, in place of the system call a DNS query connects its UDP socket to the server
+  /// with. Returns what `connect` would and sets `errno` the same way.
+  typealias ConnectSocket =
+    @Sendable (_ fd: Int32, _ address: UnsafePointer<sockaddr>, _ length: socklen_t) -> Int32
+
   /// `close(2)`, in place of the system call a ``UDPExchange`` closes its socket with. A substitute
   /// must close `fd` (or the test leaks it) and return what `close` would.
   typealias CloseDescriptor = @Sendable (_ fd: Int32) -> Int32
@@ -49,6 +54,8 @@ enum TestSeams {
   @TaskLocal static var receiveDatagram: ReceiveDatagram?
 
   @TaskLocal static var closeDescriptor: CloseDescriptor?
+
+  @TaskLocal static var connectSocket: ConnectSocket?
 
   /// UDP port every event-based DNS query sends to, in place of 53, so a query to a loopback
   /// literal reaches a test responder on an ephemeral port.
