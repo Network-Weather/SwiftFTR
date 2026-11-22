@@ -1012,6 +1012,11 @@ public struct DNSProbeResult: Sendable, Codable {
   ///   "Host unreachable…" or "Network unreachable…", ``DNSProbeOutcome/timedOut`` for
   ///   "Timeout…" or no error, and ``DNSProbeOutcome/failed`` for any other message. ``elapsed``
   ///   is `nil`, since these fields do not record it.
+  ///
+  /// The derived outcome is a best effort. SwiftFTR 0.17 wrote "Timeout - no response" for a
+  /// refused port, an unreachable report and a receive error as well as for silence, so a result
+  /// recorded by 0.17 derives ``DNSProbeOutcome/timedOut`` for all of them: it cannot tell a
+  /// refusal from silence. Only a result measured by 0.18 or later carries a measured outcome.
   public init(
     server: String,
     query: String,
@@ -1033,7 +1038,9 @@ public struct DNSProbeResult: Sendable, Codable {
   }
 
   /// Decodes a result. JSON without an `outcome` key, as written before it existed, derives
-  /// ``outcome`` and ``elapsed`` as the initializer without them does.
+  /// ``outcome`` and ``elapsed`` as the initializer without them does, with the same limit: a
+  /// result written by 0.17 cannot tell a refusal from silence, and derives
+  /// ``DNSProbeOutcome/timedOut`` for both.
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
     server = try container.decode(String.self, forKey: .server)

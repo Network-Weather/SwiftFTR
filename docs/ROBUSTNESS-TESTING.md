@@ -100,6 +100,11 @@ Not covered, and why:
   a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which is shared
   with every other user of SwiftIP2ASN on the machine, and the cache location cannot be redirected
   from SwiftFTR. A test would have to delete that cache.
+- **An incomplete reply with a non-zero response code** (#119). The response code is checked
+  before the answer section is parsed, so a truncated or malformed reply whose header carries
+  NXDOMAIN or SERVFAIL throws `serverError`, and `dnsProbe` reports it as
+  `outcome == .answered` with that `responseCode`, not as `.malformedReply`. This predates the
+  outcome field and is a known limitation of it; no test pins it either way.
 - **The `finished` check at the top of the read handler.** Every path that finishes the exchange
   returns from the handler, and Dispatch invokes no event handler once the source is cancelled,
   so no test can enter the handler after `finish`: removing the check fails nothing.

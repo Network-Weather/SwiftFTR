@@ -473,6 +473,13 @@ let noRoute = result.outcome == .unreachable && result.elapsed == nil
 let localFailure = result.outcome == .failed
 ```
 
+Apply the `silent` check only to results measured by 0.18 or later. For a result decoded from
+JSON that 0.17 wrote, or built with the initializer that takes no `outcome`, the outcome is a
+best-effort derivation from the old fields. In particular it cannot tell a refusal from silence:
+0.17 wrote "Timeout - no response" for a refused port too, so such a result derives
+`outcome == .timedOut` even when the host replied at once. Old data cannot recover the
+distinction.
+
 ## dnsProbe throws CancellationError when its task is cancelled
 
 **What changed.** Cancelling the task that awaits `dnsProbe` makes it throw `CancellationError`.

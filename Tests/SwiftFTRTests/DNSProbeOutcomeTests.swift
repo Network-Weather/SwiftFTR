@@ -254,6 +254,33 @@ struct DNSProbeOutcomeTests {
     #expect(server.requests.value == 0)
   }
 
+  @Test("A TXT lookup whose connect has no route moves on to the next server")
+  func txtConnectFailureFallsThrough() async throws {
+    let server = try LoopbackUDPResponder { query in CymruFixture.answer(query) }
+    defer { server.stop() }
+    let connects = FaultCounter()
+    let connect: TestSeams.ConnectSocket = { fd, address, length in
+      connects.increment()
+      guard connects.value > 1 else {
+        Darwin.errno = ENETUNREACH
+        return -1
+      }
+      return Darwin.connect(fd, address, length)
+    }
+
+    let (txts, _) = try await measure(within: Self.watchdog) {
+      await TestSeams.$connectSocket.withValue(connect) {
+        await TestSeams.$dnsServerPort.withValue(server.port) {
+          await DNSClient.queryTXT(
+            name: "8.8.8.8.origin.asn.cymru.com", timeout: 5, servers: ["127.0.0.1", "127.0.0.1"])
+        }
+      }
+    }
+    #expect(txts == [CymruFixture.origin])
+    #expect(connects.value == 2)
+    #expect(server.requests.value == 1)
+  }
+
   @Test("The reported round trip excludes time spent inside the read call")
   func receiveStampPrecedesRead() async throws {
     let server = try Self.answering()
