@@ -465,8 +465,7 @@ Still unbounded after this plan, or deliberately deferred. Roadmap, not this pla
   operation's queue for up to the 250 ms burst budget.
 - `discoverPublicIPWithHostname()` not being ended by a network change.
 - Using real PTR time-to-live values in `RDNSCache` instead of one cache-wide value.
-- Collapsing the multipath per-flow pipeline onto the shared classified-trace implementation,
-  which would also fix the configuration it drops (#91).
+- Collapsing the multipath per-flow pipeline onto the shared classified-trace implementation.
 - Coalescing identical in-flight forward lookups.
 - The UDP probe's setup. Its receive handler reads once per callback and does not have the
   receive-loop defect; its `fcntl` that sets `O_NONBLOCK` is still unchecked.

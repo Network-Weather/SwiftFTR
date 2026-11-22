@@ -993,14 +993,15 @@ struct TraceView: View {
   does not grow with hop count. The burst itself can take up to 250 ms more when sends hit
   transient buffer pressure, and that time is not counted against `maxWaitMs`.
 - **rDNS phase**: lookups run concurrently, each bounded by `rdnsLookupTimeout` (default 5 s).
-  Results are cached per instance (TTL 86400 s, 1000 entries by default).
+  Results are cached per instance (TTL 86400 s, 1000 entries by default). Multipath flows use
+  the instance's rDNS cache and ASN resolver, so they follow the same settings.
 - **Public IP** (classified trace and multipath only): each discovery attempt is bounded by
   `publicIPDiscoveryTimeout` (default 6 s), and a classified trace makes up to two attempts (before
   the trace, then again during classification if the first found nothing). An address found by
   the first attempt is cached per instance until invalidated; one found only by the second is
   returned in that result and not cached, so the next trace discovers again. Multipath reuses an existing cached value but does not
-  write its own discoveries back; with no cached value, each flow discovers on its own, and those
-  attempts use the 6 s default regardless of the instance's `publicIPDiscoveryTimeout`.
+  write its own discoveries back; with no cached value, each flow discovers on its own, each
+  attempt bounded by the instance's `publicIPDiscoveryTimeout`.
 - **ASN**: the embedded database answers locally (microseconds per lookup once loaded; it reloads
   if every resolver holding it has been released). DNS-based results are cached process-wide with
   a soft cap of 2048 entries. ASN caches

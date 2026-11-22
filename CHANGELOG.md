@@ -3,6 +3,20 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Bug fixes
+
+- **Multipath flow workers carry every `SwiftFTRConfig` field of the tracer that started them**
+  (#91). The per-flow configuration was rebuilt field by field and left `rdnsCacheTTL`,
+  `rdnsCacheSize`, `rdnsLookupTimeout` and `asnResolverStrategy` at their defaults. Flows did not
+  act on those defaults: they share the caller's reverse-DNS cache and ASN resolver, which are
+  built from those settings, and tests now pin that a flow's reverse DNS stops at the caller's
+  deadline and that it classifies with the caller's resolver. One helper now copies the whole
+  configuration except a flow's hop limit, per-probe wait and forced IPv4 family, and a test fails
+  if a field added later is not carried over. No caller-visible change.
+
 0.18.0 — 2026-11-22
 -------------------
 
