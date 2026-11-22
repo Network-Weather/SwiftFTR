@@ -65,6 +65,12 @@ Before adding a second transport, freeze the behavior callers already receive fr
   system-defined and are not byte-stable across OS releases or locales.
 - Existing cancellation behavior remains stable: the legacy API returns a failed result whose
   error is `"Cancelled"` instead of throwing `CancellationError`.
+- A response the timeout ends after its first byte is reachable, with an error that begins
+  `"Timeout: "` and the status if URLSession had parsed it. URLSession delivers a response only
+  once body bytes follow the headers (#122), so the URLSession path reports a server that stalls
+  after its headers only at the timeout. A transport that reads the status line itself should
+  report it as soon as the headers arrive; `FaultInjectionWireTests.httpHeadersThenStall` records
+  that as a known issue today.
 
 Do not grow the existing Codable result and public initializer into the new diagnostic model. Add
 an enduring request/report API without `V2`, `Advanced`, `Spike`, or `InterfaceBound` in its names:

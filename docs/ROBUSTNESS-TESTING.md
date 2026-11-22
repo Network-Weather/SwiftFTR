@@ -80,6 +80,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | DNS foreign replies | a reply with another transaction ID, then the real one, which answers with its own round trip (IPv4 and IPv6); empty and one-byte datagrams, then the real reply; only foreign replies, read while the query still waits, then a timeout and `timedOut`; a datagram with the query's ID but no valid header, still `malformedResponse` at once; a stale reply queued before the send and read after it; after a foreign datagram, a reply or refusal that comes only after the deadline, which is a timeout because each read event judges at most one datagram (query and dnsProbe); foreign replies that never stop, on a socket that never runs dry, with the deadline (IPv4 and IPv6) and cancellation still ending the query; a Team Cymru lookup answered foreign first; the blocking TXT path: a foreign and an empty datagram before the reply, a wait bounded by the time left after a foreign reply, a reply returned after the deadline (as the first read, or after a foreign one) taken as a timeout and the next server tried, and an endless feed | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, CymruDNSResolver, `DNSClient.queryTXTBlocking` | `DNSForeignReplyTests` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
+| HTTP headers then a stalled body | `Content-Length` or chunked, with and without `Content-Type`; `Connection: close`; a small first body chunk, with and without `Content-Type`; no body on a kept-alive connection; a partial status line | httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()`, `cancelActiveTraces()`, and the caller and the tracer together, across each operation and in each stalled phase, with the exact error checked per source; a stream consumer that cancels sees a normal end and the producer closes its socket; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails | trace, traceClassified, traceStream, ping | `ReceiveLoop` |
@@ -316,6 +317,21 @@ numbers are as of the commit that added this section.
     have arrived after the stamp taken for it, even after the deadline. An endless stream of
     ignored datagrams therefore cannot hold off the deadline or cancellation. The blocking TXT path waits only for the time it has left, and treats a reply `recv` returns after the deadline, which its receive timeout alone allows by about 2 ms, as a timeout.
     Tests: `DNSForeignReplyTests`.
+
+26. **A server that sent its headers and stalled its body was reported unreachable** (#122).
+    Confirmed, partly fixed. URLSession calls the delegate's `didReceive response` only once body
+    bytes follow the headers: one byte when the response declares `Content-Type:
+    application/octet-stream`, otherwise enough to sniff a type from (600 bytes was enough, 10
+    was not). `X-Content-Type-Options: nosniff`, chunked encoding, `Connection: close`,
+    `prefersIncrementalDelivery` and the `bytes(from:)` API made no difference. So the probe ran to
+    its timeout and said `isReachable == false`, `statusCode == nil`, `"Timeout"`. Now, when the
+    task's metrics record a response start, the probe reports the server as reachable with an
+    error beginning `"Timeout: "`, and with the status when the metrics carry the parsed response
+    (they do once body bytes have arrived). With no body bytes the metrics hold only
+    `responseStartDate`, the same as for a partial status line, so the status stays `nil`.
+    Reporting the status as soon as the headers arrive needs a transport that reads the status
+    line itself. Test: `FaultInjectionWireTests.httpHeadersThenStall`, whose prompt-status
+    expectations are recorded with `withKnownIssue`.
 
 Observations that are not defects of the library:
 

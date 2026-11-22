@@ -470,6 +470,9 @@ public func httpProbe(url: String, timeout: TimeInterval = 2.0) async throws -> 
 public func httpProbe(config: HTTPProbeConfig) async throws -> HTTPProbeResult
 // HTTPProbeConfig(url:timeout:followRedirects:)  (no interface binding; uses URLSession)
 // HTTPProbeResult: url, isReachable, statusCode, rtt, networkRTT, tcpHandshakeRTT, error, timestamp
+// Headers then a stalled body: reported at the timeout as isReachable == true, error starting
+//   "Timeout: ", rtt to the first response byte, statusCode only if body bytes followed the
+//   headers (URLSession withholds the response until then). No response byte: "Timeout", unreachable.
 
 public func dnsProbe(server: String, query: String = "example.com", timeout: TimeInterval = 2.0) async throws -> DNSProbeResult
 public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult

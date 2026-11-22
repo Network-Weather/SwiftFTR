@@ -33,6 +33,12 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
 - **Strengthen `cancelledLookupNotCached` to cover the stall breaker**: it cancels one lookup at
   once, so it would not notice the cancellation guard moving below the breaker update. Use two
   slow lookups that each pass the stall threshold before being cancelled.
+- **Report an HTTP status as soon as the headers arrive** (#122, finding 26): URLSession withholds
+  the response until body bytes follow it, so a server that stalls after its headers is reported
+  only at the timeout, and without its status if no body byte came. Fixing it means reading the
+  status line from the connection, for example with the Network.framework transport in
+  [docs/development/HTTPProbe-Production-Roadmap.md](docs/development/HTTPProbe-Production-Roadmap.md),
+  while keeping URLSession's system routing for the existing API.
 - **Move the live probe tests onto the loopback fixtures**: they still assert success against a
   third-party test site, so when that site is slow they fail although the probe reported the
   truth. `FaultInjectionSupport.swift` now has the TCP and HTTP fixtures they need.
