@@ -30,6 +30,11 @@ struct FaultInjectionProbeWindowTests {
   /// returns at all did not wait it out.
   static let windowPastWatchdogMs = 60_000
 
+  /// A stream whose probe timeout outlasts ``watchdog`` and which never retries, for the same
+  /// purpose: the default config's 10 s timeout would end a stream inside the watchdog.
+  static let streamPastWatchdog = StreamingTraceConfig(
+    probeTimeout: TimeInterval(windowPastWatchdogMs) / 1000, retryAfter: nil)
+
   // MARK: Positive control
 
   @Test("A staged path is traced hop by hop and completes early", arguments: families)
@@ -269,7 +274,7 @@ struct FaultInjectionProbeWindowTests {
         _ = try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
       }
       await expectSendFailure("traceStream") {
-        for try await _ in tracer.traceStream(to: "fake.test") {}
+        for try await _ in tracer.traceStream(to: "fake.test", config: Self.streamPastWatchdog) {}
       }
     }
     #expect(await tracer.activeTraces.isEmpty)
@@ -346,7 +351,7 @@ struct FaultInjectionProbeWindowTests {
         _ = try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
       }
       await expectSocketFailure("traceStream") {
-        for try await _ in tracer.traceStream(to: "fake.test") {}
+        for try await _ in tracer.traceStream(to: "fake.test", config: Self.streamPastWatchdog) {}
       }
       await expectSocketFailure("ping") {
         _ = try await tracer.ping(
@@ -391,7 +396,7 @@ struct FaultInjectionProbeWindowTests {
         _ = try await tracer.traceClassified(to: "127.0.0.1", resolver: EmptyASNResolver())
       }
       await expectResolutionFailure("traceStream") {
-        for try await _ in tracer.traceStream(to: "127.0.0.1") {}
+        for try await _ in tracer.traceStream(to: "127.0.0.1", config: Self.streamPastWatchdog) {}
       }
       await expectResolutionFailure("ping") {
         _ = try await tracer.ping(
