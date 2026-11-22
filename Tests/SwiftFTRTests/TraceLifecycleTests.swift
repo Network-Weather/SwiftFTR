@@ -25,31 +25,37 @@ struct TraceLifecycleTests {
       maxHops: 1
     )
 
-    let consumer = Task {
-      var iterator = tracer.traceStream(
-        to: "192.0.2.1", config: streamConfig
-      ).makeAsyncIterator()
-      return try await iterator.next()
+    // A loopback peer that never answers, so the stream stays in its receive window until it is
+    // cancelled. A real first hop can answer within a millisecond and end the stream first.
+    let network = try FakeICMPNetwork { _ in [] }
+    defer { network.stop() }
+    try await network.install {
+      let consumer = Task {
+        var iterator = tracer.traceStream(
+          to: "fake.test", config: streamConfig
+        ).makeAsyncIterator()
+        return try await iterator.next()
+      }
+
+      let receiving = await waitUntil {
+        guard let handle = await tracer.activeTraces.first else { return false }
+        return await handle.hasCancellationHandler
+      }
+      #expect(receiving, "The streaming trace should start before cancellation")
+
+      let started = ContinuousClock.now
+      await tracer.cancelActiveTraces()
+
+      do {
+        _ = try await consumer.value
+      } catch is CancellationError {
+      } catch TracerouteError.cancelled {
+      }
+
+      let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
+      #expect(unregistered)
+      #expect(started.duration(to: .now) < .seconds(1))
     }
-
-    let receiving = await waitUntil {
-      guard let handle = await tracer.activeTraces.first else { return false }
-      return await handle.hasCancellationHandler
-    }
-    #expect(receiving, "The streaming trace should start before cancellation")
-
-    let started = ContinuousClock.now
-    await tracer.cancelActiveTraces()
-
-    do {
-      _ = try await consumer.value
-    } catch is CancellationError {
-    } catch TracerouteError.cancelled {
-    }
-
-    let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
-    #expect(unregistered)
-    #expect(started.duration(to: .now) < .seconds(1))
 
     // Verify caches are still intact!
     #expect(await tracer.publicIP == "198.51.100.1")
@@ -148,8 +154,9 @@ struct TraceLifecycleTests {
   final class HangingASNResolver: ASNResolver, @unchecked Sendable {
     private let started = DispatchSemaphore(value: 0)
 
-    func waitUntilStarted() {
-      started.wait()
+    /// Whether the resolver was invoked within `limit` seconds.
+    func waitUntilStarted(within limit: TimeInterval) -> Bool {
+      started.wait(timeout: .now() + limit) == .success
     }
 
     func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
@@ -168,6 +175,8 @@ struct TraceLifecycleTests {
       config: SwiftFTRConfig(
         maxHops: 1,
         maxWaitMs: 100,
+        // Configured, so classification reaches the resolver without public-IP discovery.
+        publicIP: "198.51.100.1",
         enableLogging: false,
         noReverseDNS: true
       )
@@ -177,13 +186,20 @@ struct TraceLifecycleTests {
       try await tracer.traceClassified(to: "127.0.0.1", resolver: resolver)
     }
 
-    // Wait until the resolver is actively invoked during the enrichment phase
-    await withCheckedContinuation { continuation in
+    // Wait until the resolver is actively invoked during the enrichment phase. Bounded: a trace
+    // that fails before classification never invokes it, and must fail this test, not hang it.
+    let started = await withCheckedContinuation { continuation in
       DispatchQueue.global().async {
-        resolver.waitUntilStarted()
-        continuation.resume()
+        continuation.resume(returning: resolver.waitUntilStarted(within: 10))
       }
     }
+    guard started else {
+      // Not joined: a trace stuck before the resolver may not end even when cancelled.
+      task.cancel()
+      Issue.record("the resolver was not invoked within 10 seconds")
+      return
+    }
+    #expect(await !tracer.activeTraces.isEmpty, "the trace was no longer running in enrichment")
 
     // Cancel while classifier.classify() is actively awaiting the suspended resolver
     await tracer.cancelActiveTraces()

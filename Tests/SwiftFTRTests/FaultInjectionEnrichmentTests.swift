@@ -95,8 +95,8 @@ struct FaultInjectionEnrichmentTests {
       return STUNPublicIP(ip: "198.51.100.99")
     }
 
-    try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+    await TestSeams.$blockingIOExecutor.withValue(executor) {
+      await TestSeams.$discoverPublicIPv4.withValue(discovery) {
         let lookup = Task {
           await tracer.effectivePublicIPForClassification {
             try? await tracer.discoverPublicIP()
@@ -187,11 +187,19 @@ struct FaultInjectionEnrichmentTests {
     #expect(topology.paths.count == 1)
   }
 
+  /// Who ends a trace stalled in forward resolution.
+  enum ResolutionCanceller: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case taskCancel, cancelActiveTraces
+    var testDescription: String { rawValue }
+  }
+
   @Test(
     "A stalled forward resolution does not hold the tracer or its cancellation",
     .disabled(
-      "finding 5 in docs/ROBUSTNESS-TESTING.md: getaddrinfo runs synchronously on the actor"))
-  func forwardResolutionStall() async throws {
+      "finding 5 in docs/ROBUSTNESS-TESTING.md: getaddrinfo runs synchronously on the actor"),
+    arguments: ResolutionCanceller.allCases)
+  func forwardResolutionStall(canceller: ResolutionCanceller) async throws {
+    // One gated trace per cancellation source, so each source is the only thing that can end it.
     let gate = StallGate()
     defer { gate.open() }
     let entered = FaultCounter()
@@ -202,19 +210,32 @@ struct FaultInjectionEnrichmentTests {
     }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 1000, noReverseDNS: true))
 
-    try await TestSeams.$resolveHost.withValue(stall) {
+    await TestSeams.$resolveHost.withValue(stall) {
       let task = Task { try await tracer.trace(to: "slow-resolver.test") }
       #expect(await eventually(within: 2) { entered.value > 0 })
 
-      // Any other call on the tracer must not wait for the resolver.
-      let (_, actorLag) = await measure { await tracer.cancelActiveTraces() }
-      #expect(actorLag < 0.5, "the tracer was unavailable for \(actorLag)s behind a resolver stall")
+      // The cancellation call itself must not wait for the resolver: the tracer's, because it is
+      // a call on the actor the resolver holds; the caller's, because it is synchronous.
+      let (_, callLag) = await measure {
+        switch canceller {
+        case .taskCancel: task.cancel()
+        case .cancelActiveTraces: await tracer.cancelActiveTraces()
+        }
+      }
+      #expect(callLag < 0.5, "cancelling took \(callLag)s behind a resolver stall")
 
       let cancelledAt = monotonicNow()
-      task.cancel()
-      _ = try? await task.value
+      let outcome = await task.result
       let lag = monotonicNow() - cancelledAt
       #expect(lag < 0.5, "a trace stalled in resolution returned \(lag)s after cancellation")
+      switch (canceller, outcome) {
+      case (.taskCancel, .failure(let error)):
+        #expect(error is CancellationError, "\(error)")
+      case (.cancelActiveTraces, .failure(TracerouteError.cancelled)):
+        break
+      default:
+        Issue.record("\(canceller): \(outcome)")
+      }
     }
   }
 
@@ -289,7 +310,7 @@ struct FaultInjectionEnrichmentTests {
         { if case DNSError.bindFailed = $0 { true } else { false } }
       ),
     ]
-    try await TestSeams.$blockingIOExecutor.withValue(executor) {
+    await TestSeams.$blockingIOExecutor.withValue(executor) {
       for (name, server, sourceIP, matches) in cases {
         do {
           _ = try await measure(within: Self.watchdog) {
