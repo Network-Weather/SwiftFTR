@@ -23,8 +23,10 @@ struct FlowIdentifierTests {
     let id1 = FlowIdentifier.generate(variation: 1)
 
     // Variations should differ by roughly 173 (prime spacing)
-    // Allow some tolerance for timestamp changes
-    let diff = Int(id1.icmpID) - Int(id0.icmpID)
+    // Allow some tolerance for timestamp changes. The identifier is a 16-bit value that wraps,
+    // so take the difference modulo 2^16: a plain subtraction is off by 65536 whenever the
+    // second identifier wraps past the first.
+    let diff = Int(id1.icmpID &- id0.icmpID)
     let expectedDiff = 173
 
     // Should be within 200 of expected (allowing for timestamp progression)
