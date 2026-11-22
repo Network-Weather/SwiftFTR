@@ -91,7 +91,7 @@ if let rcode = result.responseCode {
 }
 ```
 
-Any DNS response (even NXDOMAIN) means the server is reachable, and so does a malformed reply or a refused port (the host answered that nothing is listening): those two carry no `responseCode` and say what happened in `error`. Only silence until the timeout and local or network errors indicate unreachability. The round-trip time runs from sending the query to reading the reply, and the wait for it holds no thread.
+Any DNS response (even NXDOMAIN) means the server is reachable, and so does a malformed reply, which carries no `responseCode` and says so in `error`. Silence until the timeout, a refused port (the host is up but nothing listens on the DNS port), and local or network errors indicate unreachability; `error` says which. The round-trip time runs from sending the query to reading the reply, and the wait for it holds no thread.
 
 ## Interface Binding
 

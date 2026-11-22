@@ -216,46 +216,22 @@ record(dnsCallDuration: clock.now - start)
 **What changed.** When the server's host answers a query with ICMP port unreachable, meaning the
 host is up but nothing is listening on the DNS port, the query methods (`tracer.dns`,
 `reverseDNS`, `reverseIPv6`, `queryA`, `queryAAAA`) throw `DNSError.sendFailed`, and `dnsProbe`
-returns `isReachable == true` with `responseCode == nil`, a round-trip time, and `error` set to
-"Connection refused - the host is reachable but no DNS server is listening". 0.17 reported the
-refusal as `DNSError.timeout`, and `dnsProbe` as `isReachable == false` with "Timeout - no
-response", although the refusal arrived at once. A server that stays silent is still
-`DNSError.timeout`, and in `dnsProbe` still unreachable with "Timeout - no response".
+sets `error` to "Connection refused - the host is up but no DNS server is listening on this
+port". 0.17 reported the refusal as `DNSError.timeout`, and `dnsProbe` said "Timeout - no
+response", although the refusal arrived at once. `dnsProbe` still reports a refused port with
+`isReachable == false`, `rtt == nil` and `responseCode == nil`: the probe answers "does DNS work
+at this server", and it does not. A server that stays silent is still `DNSError.timeout`, and in
+`dnsProbe` still "Timeout - no response".
 
-**What a caller sees.** For a host with no DNS service on the port, `dnsProbe` changes from
-unreachable to reachable with an error, and the query methods throw `sendFailed` where they threw
-`timeout`. `isReachable` now means what it means for `udpProbe`: the host answered. As in 0.17, a
-reachable result with `responseCode == nil` is not a DNS answer; a malformed reply looks the same.
+**What a caller sees.** For a host with no DNS service on the port, the query methods throw
+`sendFailed` where they threw `timeout`, and `dnsProbe` returns the same unreachable result as
+0.17 with a different `error` message.
 
-**What to change.** Where `isReachable` is read as "a DNS server answered", test `responseCode`
-as well, which is set for every DNS answer, NXDOMAIN and SERVFAIL included. Where the query
-methods' errors are handled, treat `sendFailed` as "the query was not delivered to a DNS server",
-distinct from `timeout`.
-
-Before:
-
-```swift
-let result = try await dnsProbe(server: resolver)
-if result.isReachable {
-  showDNSServerUp(resolver)
-} else {
-  showDNSServerDown(resolver, reason: result.error)
-}
-```
-
-After:
-
-```swift
-let result = try await dnsProbe(server: resolver)
-if result.isReachable, result.responseCode != nil {
-  showDNSServerUp(resolver)  // a DNS server answered, NXDOMAIN and SERVFAIL included
-} else if result.isReachable {
-  // The host answered, but not with a DNS answer: a refused port or a malformed reply.
-  showDNSServerMisbehaving(resolver, reason: result.error)
-} else {
-  showDNSServerDown(resolver, reason: result.error)
-}
-```
+**What to change.** Nothing for `dnsProbe`: `isReachable` keeps its meaning. Its `error` is a
+message for people, not an API, so do not parse it to tell a refusal from silence; a structured
+outcome for that is planned for a later release. Where the query methods' errors are handled and
+the distinction matters, catch `sendFailed` separately from `timeout`: it means the query was not
+delivered to a DNS server.
 
 Before:
 
@@ -289,10 +265,11 @@ malformed reply. 0.17 reported it as `DNSError.timeout`, and `dnsProbe` as unrea
 "Timeout - no response".
 
 **What a caller sees.** For a server that answers with an empty datagram, `malformedResponse`
-where it saw `timeout`, and a reachable `dnsProbe` result.
+where it saw `timeout`, and a reachable `dnsProbe` result with no response code.
 
-**What to change.** Nothing, if the consumer already handles `malformedResponse` and the reachable
-`dnsProbe` result with no response code, as the previous section shows. Otherwise add the case.
+**What to change.** Nothing, if the consumer already handles `malformedResponse`, and already
+treats a reachable `dnsProbe` result with no `responseCode` as a malformed reply rather than a DNS
+answer. Otherwise add both.
 
 Before:
 
@@ -313,6 +290,30 @@ do {
   reportNoAnswer(from: resolver)
 } catch DNSError.malformedResponse {
   reportBadAnswer(from: resolver)
+}
+```
+
+Before:
+
+```swift
+let result = try await dnsProbe(server: resolver)
+if result.isReachable {
+  showDNSServerUp(resolver)
+} else {
+  showDNSServerDown(resolver, reason: result.error)
+}
+```
+
+After:
+
+```swift
+let result = try await dnsProbe(server: resolver)
+if result.isReachable, result.responseCode != nil {
+  showDNSServerUp(resolver)  // a DNS answer, NXDOMAIN and SERVFAIL included
+} else if result.isReachable {
+  showDNSServerMisbehaving(resolver, reason: result.error)  // a malformed reply
+} else {
+  showDNSServerDown(resolver, reason: result.error)
 }
 ```
 

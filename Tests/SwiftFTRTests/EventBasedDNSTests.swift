@@ -97,11 +97,15 @@ struct EventBasedDNSTests {
     withExtendedLifetime(refusing) {}
 
     let (probe, thrown) = outcome
-    // The host answered that nothing listens on the port: reachable host, no DNS server.
-    #expect(probe.isReachable)
-    #expect(probe.rtt != nil)
+    // No DNS server answered, so the probe is unreachable; the message, and for the query
+    // methods the error, tell the refusal apart from silence ("Timeout - no response", `timeout`).
+    #expect(!probe.isReachable)
+    #expect(probe.rtt == nil)
     #expect(probe.responseCode == nil)
-    #expect(probe.error?.contains("refused") == true, "\(probe.error ?? "nil")")
+    #expect(
+      probe.error
+        == "Connection refused - the host is up but no DNS server is listening on this port",
+      "\(probe.error ?? "nil")")
     #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
   }
 

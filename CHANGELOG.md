@@ -26,10 +26,11 @@ What an unmodified caller will see differently:
   blocking-I/O workers, which stalled reverse-DNS lookups can hold for seconds, and socket setup.
 - **A refused DNS port is reported as a refusal, not as silence.** When the server's host answers
   that nothing is listening on the port (ICMP port unreachable), the query methods throw
-  `DNSError.sendFailed` and `dnsProbe` returns `isReachable == true` with `responseCode == nil`, a
-  round-trip time and an `error` that says the connection was refused. Both reported
-  `DNSError.timeout`, and `dnsProbe` said "Timeout - no response" with `isReachable == false`,
-  although the refusal arrived at once. Silence is still `DNSError.timeout`.
+  `DNSError.sendFailed`, and `dnsProbe`'s `error` says "Connection refused - the host is up but no
+  DNS server is listening on this port". Both reported `DNSError.timeout` and "Timeout - no
+  response", although the refusal arrived at once. `dnsProbe` still reports the server
+  unreachable (`isReachable == false`, `rtt == nil`): it answers whether DNS works there. Silence
+  is still `DNSError.timeout`.
 - **An empty DNS reply is a malformed response.** A zero-byte datagram from the server throws
   `DNSError.malformedResponse`, and `dnsProbe` reports the server reachable with "Malformed
   response", as for any other malformed reply. It was reported as `DNSError.timeout`.

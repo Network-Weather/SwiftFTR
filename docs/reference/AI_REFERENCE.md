@@ -475,7 +475,7 @@ public func dnsProbe(server: String, query: String = "example.com", timeout: Tim
 public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult
 // DNSProbeResult: server, query, isReachable, rtt (send to reply; set when reachable), responseCode, error, timestamp
 //   isReachable: any DNS answer (responseCode set, NXDOMAIN included), or responseCode nil with
-//   error for a malformed reply or a refused port; false for silence and local errors
+//   error for a malformed reply; false for silence, a refused port and local errors
 ```
 
 ### 15. DNS

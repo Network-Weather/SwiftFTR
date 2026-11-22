@@ -236,7 +236,8 @@ numbers are as of the commit that added this section.
     socket failed at once with `ECONNREFUSED` and the client called it `DNSError.timeout`, so
     `dnsProbe` said "Timeout - no response" about a host that had answered. Measured on `main`:
     `timeout` after 1 ms, for a fixture port and for port 53 on loopback. Now the query methods
-    throw `sendFailed` and `dnsProbe` reports the host reachable with the refusal as its error.
+    throw `sendFailed`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
+    that names the refusal.
     Test: `EventBasedDNSTests.refusedPort`, IPv4 and IPv6.
 18. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
     was treated like a failed one, `DNSError.timeout` after 1 ms on `main`. It is now

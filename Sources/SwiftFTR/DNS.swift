@@ -1566,7 +1566,8 @@ private func performDNSQueryBlocking(
 /// Runs the query behind ``dnsProbe(config:)`` and reports it as a probe outcome.
 ///
 /// Any DNS response, including an error code or a malformed reply, means the server is reachable.
-/// So does a refusal: the host answered, though nothing listens on the port.
+/// A refusal does not: the host is up, but no DNS server answers on the port, so it is reported as
+/// unreachable, with a message that tells it apart from silence.
 private func performDNSProbe(
   server: String,
   query: String,
@@ -1582,12 +1583,12 @@ private func performDNSProbe(
       reply = try await exchangeDNSQuery(
         server: server, query: query, queryType: queryType, timeout: timeout,
         interface: interface, sourceIP: sourceIP)
-    } catch UDPExchangeFailure.refused(let rtt) {
+    } catch UDPExchangeFailure.refused {
       return DNSProbeResultInternal(
-        isReachable: true,
-        rtt: rtt,
+        isReachable: false,
+        rtt: nil,
         responseCode: nil,
-        error: "Connection refused - the host is reachable but no DNS server is listening"
+        error: "Connection refused - the host is up but no DNS server is listening on this port"
       )
     } catch let failure as UDPExchangeFailure {
       throw dnsError(for: failure)
