@@ -209,7 +209,9 @@ struct PingReplyMatchingTests {
   func firstReplyWins(family: Int32) async throws {
     // Probe 1 is answered, then answered again at once and once more when probe 3 arrives, just
     // ahead of probe 3's own reply.
+    let arrivals = ProbeArrivals()
     let network = try FakeICMPNetwork(family: family) { probe in
+      arrivals.record(probe.sequence)
       let id = probe.identifier
       switch probe.sequence {
       case 1:
@@ -227,7 +229,7 @@ struct PingReplyMatchingTests {
     }
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig())
-    let config = PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
+    let config = PingConfig(count: 3, interval: 0.5, timeout: Self.windowPastWatchdog)
 
     let (result, _) = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
@@ -237,6 +239,12 @@ struct PingReplyMatchingTests {
     #expect(
       result.responses.allSatisfy { $0.ttl == Int(Self.kept) },
       "a duplicate replaced the first reply: \(Self.summary(result))")
+    // The last duplicate is sent only after the network has seen probe 3, so an RTT measured to it
+    // is longer than the time between the network seeing probes 1 and 3 (about 1 s). Probe 1's
+    // first reply leaves at once.
+    let gap = try #require(arrivals.gap(from: 1, to: 3))
+    let rtt = try #require(result.responses.first?.rtt)
+    #expect(rtt < gap, "probe 1's RTT \(rtt)s is a duplicate's (probes 1 to 3: \(gap)s)")
   }
 
   // MARK: Late replies
@@ -265,5 +273,25 @@ struct PingReplyMatchingTests {
     let s = result.statistics
     #expect(s.sent == 3 && s.received == 3, "\(Self.summary(result))")
     #expect((result.responses.first?.rtt ?? 0) >= delay, "\(Self.summary(result))")
+  }
+}
+
+/// When the fake network saw each probe, on its own thread.
+private final class ProbeArrivals: @unchecked Sendable {
+  private let lock = NSLock()
+  private var times: [UInt16: TimeInterval] = [:]
+
+  func record(_ sequence: UInt16) {
+    let now = monotonicNow()
+    lock.lock()
+    defer { lock.unlock() }
+    if times[sequence] == nil { times[sequence] = now }
+  }
+
+  func gap(from first: UInt16, to last: UInt16) -> TimeInterval? {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let start = times[first], let end = times[last] else { return nil }
+    return end - start
   }
 }
