@@ -305,8 +305,9 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
   }
 
   /// Sends the headers of a response whose body never arrives: nothing more is sent until
-  /// loading stops. The response declares its type, so URLSession hands it to the delegate at
-  /// once instead of waiting for body bytes to sniff one from.
+  /// loading stops. A protocol class hands the response to URLSession directly, and one that
+  /// declares its type reaches the delegate at once. A real server's response does not: see
+  /// `FaultInjectionWireTests.httpHeadersThenStall`.
   private func holdBody(for url: URL) async {
     guard
       let response = HTTPURLResponse(

@@ -537,6 +537,9 @@ final class LoopbackTCPServer: @unchecked Sendable {
     case respond(response: [UInt8], after: TimeInterval)
     /// Accept and close at once, without writing.
     case closeImmediately
+    /// Accept, read the request, write `response`, then hold the connection open, sending
+    /// nothing more, until `stop()`.
+    case respondThenHold(response: [UInt8])
   }
 
   let port: UInt16
@@ -631,6 +634,10 @@ final class LoopbackTCPServer: @unchecked Sendable {
       readRequest(client)
       waitForStop(limit: delay)
       write(response, to: client)
+    case .respondThenHold(let response):
+      readRequest(client)
+      write(response, to: client)
+      waitForStop(limit: .infinity)
     }
     // A test can hold the handler here to prove stop() waits for it.
     exitGate?.wait(limit: 30)
