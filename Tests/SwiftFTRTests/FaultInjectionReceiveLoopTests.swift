@@ -336,28 +336,64 @@ struct FaultInjectionReceiveLoopTests {
 
   @Test("A backlog longer than one read callback is read to the end without new arrivals")
   func traceReadsWholeBacklog() async throws {
-    // Each probe is answered with a long run of foreign replies and then the valid one, all sent
-    // back to back, and then nothing more arrives. The socket is the library's own non-blocking
-    // one. Reaching the valid replies needs the read source to fire again for data left over
-    // from an earlier callback.
-    let network = try FakeICMPNetwork { probe in
-      let ttl = probe.hopLimit ?? Int(probe.sequence)
-      let foreign = ICMPWire.echoReply(family: AF_INET, id: probe.identifier &+ 1, seq: 1)
-      let valid =
-        ttl < 3
-        ? ICMPWire.timeExceeded(family: AF_INET, id: probe.identifier, seq: probe.sequence)
-        : ICMPWire.echoReply(family: AF_INET, id: probe.identifier, seq: probe.sequence)
-      return Array(repeating: FakeICMPNetwork.Reply(foreign), count: 300) + [.init(valid)]
-    }
+    // The probe socket is handed to the trace already holding more foreign replies than one read
+    // callback handles, then the reply that completes the trace, and the network stays silent.
+    // Nothing new ever arrives, so the trace completes only if the read source fires again for
+    // data an earlier callback left unread.
+    let identifier: UInt16 = 0x5A5A
+    let backlog = 2 * receiveBatchLimit
+    let network = try FakeICMPNetwork { _ in [] }
     defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 5, maxWaitMs: 5000, noReverseDNS: true))
+    let preloaded: TestSeams.MakeICMPSocket = { family in
+      let fd = try network.makeSocket(family)
+      var (address, length) = loopbackAddress(family: family, port: 0)
+      let bound = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, length) }
+      }
+      guard bound == 0 else { throw FixtureError.socket("bind probe socket", errno) }
+      var actual = sockaddr_storage()
+      var actualLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      _ = withUnsafeMutablePointer(to: &actual) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &actualLength) }
+      }
+      let foreign = ICMPWire.echoReply(family: family, id: identifier &+ 1, seq: 1)
+      let valid = ICMPWire.echoReply(family: family, id: identifier, seq: 1)
+      let datagrams = Array(repeating: foreign, count: backlog) + [valid]
+      let sender = socket(family, SOCK_DGRAM, IPPROTO_UDP)
+      guard sender >= 0 else { throw FixtureError.socket("socket", errno) }
+      defer { close(sender) }
+      for datagram in datagrams {
+        _ = datagram.withUnsafeBytes { raw in
+          withUnsafePointer(to: &actual) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+              sendto(sender, raw.baseAddress, raw.count, 0, $0, actualLength)
+            }
+          }
+        }
+      }
+      // Loopback delivers on its own thread, so wait until every datagram is queued.
+      let expected = Int32(datagrams.reduce(0) { $0 + $1.count })
+      let giveUp = monotonicNow() + 5
+      var queued: Int32 = 0
+      while monotonicNow() < giveUp {
+        _ = ioctl(fd, fionread, &queued)
+        if queued >= expected { break }
+        usleep(1000)
+      }
+      guard queued >= expected else { throw FixtureError.socket("backlog not queued", 0) }
+      return fd
+    }
+    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 5000, noReverseDNS: true))
 
     let (result, _) = try await measure(within: Self.watchdog) {
-      try await network.install { try await tracer.trace(to: "fake.test") }
+      try await network.install(socketFactory: preloaded) {
+        try await tracer.performTrace(
+          to: "fake.test", handle: TraceHandle(), flowIdentifier: identifier)
+      }
     }
-    #expect(result.reached)
-    #expect(result.hops.count == 3)
-    #expect(result.hops.allSatisfy { $0.ipAddress != nil })
+    #expect(result.reached, "the reply behind the backlog was never read")
+    #expect(result.hops.count == 1)
+    #expect(result.hops.first?.reachedDestination == true)
   }
 
   // MARK: Streaming
@@ -487,8 +523,13 @@ struct FaultInjectionReceiveLoopTests {
     let descriptors = DescriptorLog()
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.05, timeout: 0.3)
+    // Ping also arms a safety timer, at twice its whole schedule plus 5 s (5.8 s here). A ping
+    // that never moved its deadline to the last probe's reply window would end on that timer, so
+    // the watchdog sits a second below it.
+    let schedule = Double(config.count - 1) * config.interval + config.timeout
+    let safetyBudget = 2 * schedule + 5
 
-    let (result, elapsed) = try await measure(within: Self.watchdog) {
+    let (result, elapsed) = try await measure(within: safetyBudget - 1) {
       try await replies.install(network, descriptors: descriptors) {
         try await tracer.ping(to: "fake.test", config: config)
       }
@@ -621,3 +662,6 @@ extension Result {
     return true
   }
 }
+
+/// `FIONREAD`, which the Swift overlay does not export: `_IOR('f', 127, int)`.
+private let fionread: UInt = 0x4004_667F
