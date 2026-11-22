@@ -74,6 +74,68 @@ struct EventBasedDNSTests {
     #expect(try #require(probe.rtt) >= delay)
   }
 
+  @Test("Round-trip time includes a sending thread descheduled after the datagram left")
+  func roundTripTimeStartsBeforeTheSend() async throws {
+    let delay: TimeInterval = 0.2
+    let server = try LoopbackUDPResponder { query in
+      (
+        FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord),
+        delay
+      )
+    }
+    defer { server.stop() }
+    // The datagram leaves, then the sender stalls past the moment the reply is sent.
+    let send: TestSeams.SendDatagram = { fd, bytes in
+      let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+      let code = Darwin.errno
+      usleep(useconds_t((delay * 1.5) * 1_000_000))
+      Darwin.errno = code
+      return sent
+    }
+    let query = try await TestSeams.$sendDatagram.withValue(send) {
+      try await TestSeams.$dnsServerPort.withValue(server.port) {
+        try await SwiftFTR().dns.a(hostname: "stall.example", server: "127.0.0.1", timeout: 5)
+      }
+    }
+    #expect(query.rttMs >= delay * 1000, "rttMs \(query.rttMs)")
+  }
+
+  @Test("A deadline that passes before the first send is a send failure, and nothing is sent")
+  func deadlineBeforeTheFirstSend() async throws {
+    let server = try LoopbackUDPResponder { _ in nil }
+    defer { server.stop() }
+    let attempts = FaultCounter()
+    let send: TestSeams.SendDatagram = { fd, bytes in
+      attempts.increment()
+      return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+    }
+    // 1 ns: the deadline is fixed when the exchange is created, and the first attempt runs only
+    // after a hop to the exchange's queue, so it always starts after the deadline.
+    let timeout: TimeInterval = 1e-9
+    let (outcome, _) = try await measure(within: Self.watchdog) {
+      try await TestSeams.$sendDatagram.withValue(send) {
+        try await TestSeams.$dnsServerPort.withValue(server.port) {
+          let thrown = await Self.error {
+            try await __dnsQuery(
+              server: "127.0.0.1", port: server.port, name: "late.example", type: 1,
+              timeout: timeout)
+          }
+          let probe = try await dnsProbe(
+            server: "127.0.0.1", query: "late.example", timeout: timeout)
+          return (thrown, probe)
+        }
+      }
+    }
+    let (thrown, probe) = outcome
+    #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
+    #expect(!probe.isReachable)
+    #expect(probe.error == "Failed to send query")
+    #expect(attempts.value == 0)
+    // Give a datagram that did leave time to arrive before concluding none did.
+    try await Task.sleep(nanoseconds: 100_000_000)
+    #expect(server.requests.value == 0)
+  }
+
   // MARK: Behavior changes
 
   @Test(

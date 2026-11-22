@@ -206,9 +206,19 @@ final class UDPExchange: @unchecked Sendable {
 
   private func attemptSend() {
     while !finished {
+      // Checked before every attempt, including one a writable or backoff callback makes after
+      // the deadline but before the deadline timer runs: a datagram sent then could only report a
+      // missing reply, which is not evidence about the peer.
+      let attemptStarted = DispatchTime.now()
+      guard attemptStarted < deadline else {
+        deadlinePassed()
+        return
+      }
       let sent = request.withUnsafeBytes { sendDatagram(fd, $0) }
       if sent == request.count {
-        sentAt = DispatchTime.now()
+        // Stamped before the call, so a thread descheduled once the datagram left cannot start
+        // the clock after the reply was already on its way.
+        sentAt = attemptStarted
         return
       }
       // A UDP send is all or nothing; a short count means the datagram did not leave whole.
@@ -275,11 +285,13 @@ final class UDPExchange: @unchecked Sendable {
   private func handleRead() {
     for _ in 0..<Self.receiveAttemptsPerEvent {
       guard !finished else { return }
+      // Stamped before the call: the datagram is already queued when the read event runs, and a
+      // thread descheduled inside `recv` must not add that delay to the round trip.
+      let receivedAt = DispatchTime.now()
       let received = receiveBuffer.withUnsafeMutableBytes { raw in
         recv(fd, raw.baseAddress, raw.count, 0)
       }
       let code = received < 0 ? errno : 0
-      let receivedAt = DispatchTime.now()
       if received < 0, code == EAGAIN || code == EWOULDBLOCK { return }
       if received < 0, code == EINTR { continue }
 
