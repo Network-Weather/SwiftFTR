@@ -421,6 +421,7 @@ Documentation
 - [`BENCHMARKS.md`](BENCHMARKS.md) — measured throughput, memory and ASN-database load cost per release,
   with the `ResourceBenchmark` and `asnloadprobe` commands that reproduce them (fresh as of 2026-09-01).
 - [`docs/IPV6.md`](docs/IPV6.md) — sequenced plan and architectural contracts for IPv6 feature parity (ping, traceroute, probes, STUN, ASN).
+- [Robustness testing: fault injection, phase by phase](docs/ROBUSTNESS-TESTING.md): why and how the offline fault-injection battery simulates failing networks, the conditions and operations it covers, what is out of scope, the gate commands, and the defects it found. (updated 2026-11-21; update when: a seam, fixture or covered phase is added or removed, or a listed finding changes disposition)
 - [`docs/BUG2-INVESTIGATION.md`](docs/BUG2-INVESTIGATION.md) — audit and measurements behind the bounded-and-cancellable-enrichment work: continuation exit paths, the shared blocking-IO executor, and what did and did not reproduce.
 
 Generate and view the docs:
