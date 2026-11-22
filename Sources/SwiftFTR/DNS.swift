@@ -85,6 +85,47 @@ private func _dnsSocketTimeout(_ timeout: TimeInterval) throws -> timeval {
   return timeval(tv_sec: seconds, tv_usec: __darwin_suseconds_t(microseconds))
 }
 
+/// Rejects a source address whose family cannot reach `serverFamily`, before any socket exists.
+private func _validateDNSSourceFamily(_ sourceIP: String?, serverFamily: Int32) throws {
+  guard let sourceIP else { return }
+  let sourceFamily = detectAddressFamily(sourceIP)
+  guard sourceFamily == serverFamily else {
+    throw DNSError.bindFailed(
+      "Source IP family (\(sourceFamily == AF_INET ? "IPv4" : "IPv6")) doesn't match server family")
+  }
+}
+
+/// Runs a blocking DNS query on the shared executor, waiting at most `timeout` for a free worker.
+///
+/// The wait in the queue is the only part this bounds. A query that has started is governed by
+/// its own send and receive timeouts (each `timeout`), so it is never cut off mid-flight and
+/// reports its own outcome. A query still queued after `timeout` is withdrawn and reported as
+/// ``DNSError/timeout``, the error a query that ran and went unanswered already raises. From
+/// submission, a query therefore finishes within about three times its timeout.
+///
+/// A query that is withdrawn never ran, so nothing it would have discovered is reported. The
+/// inputs `performDNSQueryInternal` rejects without I/O are therefore checked here first, so a
+/// query that can never succeed reports why (`invalidTimeout`, `invalidHostname`, `invalidIP`, or
+/// `bindFailed` for a source address of the wrong family) even when no worker is free.
+private func runDNSQuery<T: Sendable>(
+  server: String,
+  query name: String,
+  sourceIP: String?,
+  timeout: TimeInterval,
+  _ query: @Sendable @escaping () throws -> T
+) async throws -> T {
+  try _validateDNSTimeout(timeout)
+  _ = try _encodeQName(name)
+  let family = detectAddressFamily(server)
+  guard family == AF_INET || family == AF_INET6 else { throw DNSError.invalidIP(server) }
+  try _validateDNSSourceFamily(sourceIP, serverFamily: family)
+  do {
+    return try await runDetachedBlockingIO(queueDeadline: timeout, query)
+  } catch is BlockingIOTimeout {
+    throw DNSError.timeout
+  }
+}
+
 private func _applyDNSSocketTimeout(fd: Int32, timeout: TimeInterval) throws {
   var socketTimeout = try _dnsSocketTimeout(timeout)
   let optionSize = socklen_t(MemoryLayout<timeval>.size)
@@ -207,6 +248,9 @@ public struct DNSQueries: Sendable {
   /// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid;
   ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
   ///   response is malformed or contains a server error.
+  ///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+  ///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+  ///   for a worker, then at most `timeout` each to send and to receive.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -231,7 +275,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query A record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -282,6 +328,9 @@ public struct DNSQueries: Sendable {
   /// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid;
   ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
   ///   response is malformed or contains a server error.
+  ///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+  ///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+  ///   for a worker, then at most `timeout` each to send and to receive.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -306,7 +355,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query AAAA record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -357,6 +408,9 @@ public struct DNSQueries: Sendable {
   /// - Throws: ``DNSError`` if the IP address, server or source address, or timeout is invalid;
   ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
   ///   response is malformed or contains a server error.
+  ///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+  ///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+  ///   for a worker, then at most `timeout` each to send and to receive.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -382,7 +436,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: arpaQuery, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: arpaQuery,
@@ -437,6 +493,9 @@ public struct DNSQueries: Sendable {
   /// - Throws: ``DNSError`` if the IP address, server or source address, or timeout is invalid;
   ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
   ///   response is malformed or contains a server error.
+  ///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+  ///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+  ///   for a worker, then at most `timeout` each to send and to receive.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -462,7 +521,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: arpaQuery, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: arpaQuery,
@@ -517,6 +578,9 @@ public struct DNSQueries: Sendable {
   /// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid;
   ///   if socket creation, configuration, binding, sending, or receiving fails; or if the
   ///   response is malformed or contains a server error.
+  ///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+  ///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+  ///   for a worker, then at most `timeout` each to send and to receive.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -541,7 +605,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query TXT record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -593,6 +659,9 @@ public struct DNSQueries: Sendable {
   /// - Throws: ``DNSError`` if the name, server or source address, or timeout is invalid; if
   ///   socket creation, configuration, binding, sending, or receiving fails; or if the response
   ///   is malformed or contains a server error.
+  ///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+  ///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+  ///   for a worker, then at most `timeout` each to send and to receive.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -618,7 +687,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Perform query
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: name, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: name,
@@ -896,6 +967,9 @@ public struct DNSProbeResult: Sendable, Codable {
 /// Any DNS response, including NXDOMAIN, marks the server as reachable. Network and socket
 /// failures are reported in the returned result.
 ///
+/// A query waits at most `timeout` for one of the shared blocking-I/O workers; if none becomes
+/// free in that time the result reports a timeout, as for a server that does not answer.
+///
 /// - Parameters:
 ///   - server: The DNS server IP address.
 ///   - query: The domain name to query.
@@ -919,6 +993,9 @@ public func dnsProbe(
 ///
 /// Any DNS response, including NXDOMAIN, marks the server as reachable. Network and socket
 /// failures are reported in the returned result.
+///
+/// A query waits at most `timeout` for one of the shared blocking-I/O workers; if none becomes
+/// free in that time the result reports a timeout, as for a server that does not answer.
 ///
 /// - Parameter config: The probe configuration. Its timeout must be finite and greater than zero.
 /// - Returns: A result describing reachability and any network or socket failure.
@@ -1074,6 +1151,9 @@ public struct AQueryResult: Sendable, Codable {
 /// - Throws: ``DNSError`` if the IP address, server or source address, or timeout is invalid; if
 ///   socket creation, configuration, binding, sending, or receiving fails; or if the response is
 ///   malformed or contains a server error.
+///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+///   for a worker, then at most `timeout` each to send and to receive.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -1092,7 +1172,9 @@ public func reverseDNS(
   }
 
   // Query PTR record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(
+    server: server, query: reverseName, sourceIP: sourceIP, timeout: timeout
+  ) {
     try performDNSQueryInternal(
       server: server,
       query: reverseName,
@@ -1143,6 +1225,9 @@ public func reverseDNS(
 /// - Throws: ``DNSError`` if the IP address, server or source address, or timeout is invalid; if
 ///   socket creation, configuration, binding, sending, or receiving fails; or if the response is
 ///   malformed or contains a server error.
+///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+///   for a worker, then at most `timeout` each to send and to receive.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -1161,7 +1246,9 @@ public func reverseIPv6(
   }
 
   // Query PTR record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(
+    server: server, query: reverseName, sourceIP: sourceIP, timeout: timeout
+  ) {
     try performDNSQueryInternal(
       server: server,
       query: reverseName,
@@ -1226,6 +1313,9 @@ public func reverseIPv6(
 /// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid; if
 ///   socket creation, configuration, binding, sending, or receiving fails; or if the response is
 ///   malformed or contains a server error.
+///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+///   for a worker, then at most `timeout` each to send and to receive.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -1243,7 +1333,9 @@ public func queryAAAA(
   }
 
   // Query AAAA record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(
+    server: server, query: hostname, sourceIP: sourceIP, timeout: timeout
+  ) {
     try performDNSQueryInternal(
       server: server,
       query: hostname,
@@ -1299,6 +1391,9 @@ public func queryAAAA(
 /// - Throws: ``DNSError`` if the hostname, server or source address, or timeout is invalid; if
 ///   socket creation, configuration, binding, sending, or receiving fails; or if the response is
 ///   malformed or contains a server error.
+///   Throws ``DNSError/timeout`` when no answer arrives in time, including when none of the
+///   shared blocking-I/O workers becomes free within `timeout`: a query waits at most `timeout`
+///   for a worker, then at most `timeout` each to send and to receive.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -1316,7 +1411,9 @@ public func queryA(
   }
 
   // Query A record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(
+    server: server, query: hostname, sourceIP: sourceIP, timeout: timeout
+  ) {
     try performDNSQueryInternal(
       server: server,
       query: hostname,
@@ -1459,11 +1556,7 @@ private func performDNSQueryInternal(
 
   // Bind to source IP if specified
   if let srcIP = sourceIP {
-    let srcFamily = detectAddressFamily(srcIP)
-    guard srcFamily == serverFamily else {
-      throw DNSError.bindFailed(
-        "Source IP family (\(srcFamily == AF_INET ? "IPv4" : "IPv6")) doesn't match server family")
-    }
+    try _validateDNSSourceFamily(srcIP, serverFamily: serverFamily)
 
     if serverFamily == AF_INET6 {
       let (bare6, scopeID) = parseIPv6Scoped(srcIP)
@@ -1567,7 +1660,9 @@ private func performDNSProbe(
 ) async -> DNSProbeResultInternal {
   do {
     // Try to perform query - success means RCODE=0
-    _ = try await runDetachedBlockingIO {
+    _ = try await runDNSQuery(
+      server: server, query: query, sourceIP: sourceIP, timeout: timeout
+    ) {
       try performDNSQueryInternal(
         server: server,
         query: query,
@@ -2240,6 +2335,24 @@ public struct __DNSAnswer: Sendable {
   public let klass: UInt16
   public let ttl: UInt32
   public let rdata: Data
+}
+
+/// The production asynchronous query path, executor submission included, against a chosen
+/// server port. Internal so tests can serve DNS from a loopback fixture; the public queries are
+/// fixed to port 53.
+func dnsQuery(
+  server: String,
+  port: UInt16,
+  name: String,
+  type: UInt16,
+  timeout: TimeInterval,
+  sourceIP: String? = nil
+) async throws -> [DNSClient.Answer] {
+  try await runDNSQuery(server: server, query: name, sourceIP: sourceIP, timeout: timeout) {
+    try performDNSQueryInternal(
+      server: server, query: name, queryType: type, timeout: timeout, interface: nil,
+      sourceIP: sourceIP, serverPort: port)
+  }
 }
 
 // swift-format-ignore: AlwaysUseLowerCamelCase

@@ -582,15 +582,25 @@ final class BlockingIOExecutor: Sendable {
     self.operationQueue = operationQueue
   }
 
-  /// - Parameter deadline: Seconds the caller will wait before abandoning the operation with
-  ///   ``BlockingIOTimeout``. `nil` waits for as long as the syscall takes.
+  /// - Parameters:
+  ///   - deadline: Seconds the caller will wait before abandoning the operation with
+  ///     ``BlockingIOTimeout``, whether it is still queued or already running. `nil` waits for as
+  ///     long as the syscall takes.
+  ///   - queueDeadline: Seconds the operation may wait for a free worker. If none has picked it
+  ///     up by then it is withdrawn and the caller gets ``BlockingIOTimeout``; once it has
+  ///     started it is never abandoned, so it must bound itself. Use instead of `deadline` for
+  ///     operations that carry their own timeouts and whose own errors should reach the caller.
   func run<T: Sendable>(
     priority: TaskPriority,
     deadline: TimeInterval? = nil,
+    queueDeadline: TimeInterval? = nil,
     _ operation: @Sendable @escaping () throws -> T
   ) async throws -> T {
+    precondition(deadline == nil || queueDeadline == nil, "pass at most one deadline")
     let queuedOperation = BlockOperation()
     let deadlineTimer = DeadlineTimerBox()
+    // Decides, exactly once, whether the operation started before its queue deadline expired.
+    let startLatch = StartLatch()
 
     return try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
@@ -602,6 +612,12 @@ final class BlockingIOExecutor: Sendable {
           // Whichever way this block exits, drop the timer: it holds the handler, which holds
           // this operation, so leaving it armed would keep all three alive.
           defer { deadlineTimer.cancel() }
+          // A queue deadline that already expired has resumed the caller; the work is not wanted.
+          if queueDeadline != nil {
+            guard startLatch.start() else { return }
+            // Started in time: from here only the operation's own timeouts apply.
+            deadlineTimer.cancel()
+          }
           // A cancelled operation that already started still runs its block; skip the syscall
           // rather than paying for work whose result nobody can observe.
           guard queuedOperation?.isCancelled != true else {
@@ -628,6 +644,15 @@ final class BlockingIOExecutor: Sendable {
               queuedOperation.cancel()
             }
           }
+        } else if let queueDeadline {
+          deadlineTimer.arm(after: queueDeadline) {
+            defer { deadlineTimer.cancel() }
+            // Only an operation that has not started may be withdrawn.
+            guard startLatch.expire() else { return }
+            if box.resume(with: .failure(BlockingIOTimeout())) {
+              queuedOperation.cancel()
+            }
+          }
         }
 
         cancellationBridge.register(queuedOperation, box: box)
@@ -650,6 +675,29 @@ final class BlockingIOExecutor: Sendable {
       queuedOperation.cancel()
       deadlineTimer.cancel()
     }
+  }
+}
+
+/// Settles the race between an operation starting and its queue deadline expiring: whichever
+/// calls first wins, and the other learns it lost.
+private final class StartLatch: @unchecked Sendable {
+  private enum State { case queued, started, expired }
+
+  private let lock = NSLock()
+  private var state = State.queued
+
+  /// Marks the operation started. Returns false if the queue deadline expired first.
+  func start() -> Bool { settle(as: .started) }
+
+  /// Marks the queue deadline expired. Returns false if the operation started first.
+  func expire() -> Bool { settle(as: .expired) }
+
+  private func settle(as outcome: State) -> Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    guard state == .queued else { return false }
+    state = outcome
+    return true
   }
 }
 
@@ -739,12 +787,17 @@ let blockingIOExecutor = BlockingIOExecutor(
 ///
 /// Callers should pass lightweight closures that capture only the values required by the syscall.
 ///
-/// - Parameter deadline: Seconds to wait before abandoning the operation with ``BlockingIOTimeout``.
+/// - Parameters:
+///   - deadline: Seconds to wait before abandoning the operation with ``BlockingIOTimeout``.
+///   - queueDeadline: Seconds the operation may wait for a free worker before it is withdrawn
+///     with ``BlockingIOTimeout``; once started it runs to completion under its own timeouts.
 func runDetachedBlockingIO<T: Sendable>(
   priority: TaskPriority = .userInitiated,
   deadline: TimeInterval? = nil,
+  queueDeadline: TimeInterval? = nil,
   _ operation: @Sendable @escaping () throws -> T
 ) async throws -> T {
   let executor = TestSeams.blockingIOExecutor ?? blockingIOExecutor
-  return try await executor.run(priority: priority, deadline: deadline, operation)
+  return try await executor.run(
+    priority: priority, deadline: deadline, queueDeadline: queueDeadline, operation)
 }
