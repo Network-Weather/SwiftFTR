@@ -22,8 +22,8 @@ that fail when any phase can wait without a bound or strand its caller.
 - **Seams, not mocks of the whole tracer.** `Sources/SwiftFTR/TestSeams.swift` holds task-local
   overrides, all `nil` in production: the blocking-I/O executor, forward resolution, the ICMP
   socket factory used by trace and ping, IPv4 public-address discovery, a hook that holds
-  `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping
-  or UDP exchange socket non-blocking, and for the event-based UDP transport (`UDPExchange`) its
+  `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping,
+  UDP exchange, TCP probe or UDP probe socket non-blocking, and for the event-based UDP transport (`UDPExchange`) its
   `send` and `close` calls and the DNS server port. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
@@ -82,13 +82,14 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()`, `cancelActiveTraces()`, and the caller and the tracer together, across each operation and in each stalled phase, with the exact error checked per source; a stream consumer that cancels sees a normal end and the producer closes its socket; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
-| Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails | trace, traceClassified, traceStream, ping | `ReceiveLoop` |
+| Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails; for the probes, the result, nothing sent or connected, and the socket closed, against a pass-through control | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ReceiveLoop`, `ProbeNonBlockingSetupTests` |
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`
-and `DNSForeignReplyTests` for the event-based DNS transport, and `CymruEventBasedTests` for the
-Team Cymru lookups on it. Every timed operation runs under a watchdog
+and `DNSForeignReplyTests` for the event-based DNS transport, `CymruEventBasedTests` for the
+Team Cymru lookups on it, and `ProbeNonBlockingSetupTests` for the TCP and UDP probes' socket
+setup. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
 Not covered, and why:
@@ -316,6 +317,16 @@ numbers are as of the commit that added this section.
     have arrived after the stamp taken for it, even after the deadline. An endless stream of
     ignored datagrams therefore cannot hold off the deadline or cancellation. The blocking TXT path waits only for the time it has left, and treats a reply `recv` returns after the deadline, which its receive timeout alone allows by about 2 ms, as a timeout.
     Tests: `DNSForeignReplyTests`.
+26. **The TCP and UDP probes ran on a blocking socket when `fcntl` failed** (#107). Confirmed and
+    fixed. Both ignored the two `fcntl` results, and neither read the `fileControl` seam, so an
+    injected failure changed nothing: the TCP probe connected and reported `open`, the UDP probe
+    sent its datagram. On a blocking socket, the TCP probe's `connect` waits for the kernel: with
+    the check removed, a failed `F_SETFL` and a loopback listener whose backlog was full, a probe
+    with a 1 s timeout returned after 7.8 s with `connectionState == .error` and "Operation timed
+    out", not `.filtered`. Both probes now check the calls through `setProbeSocketNonBlocking` and
+    report a failure as their other socket-setup failures are reported: not reachable, no round
+    trip, `.error` for TCP and no response type for UDP, with a message naming the failed step
+    and errno, before anything is sent, with the socket closed. Tests: `ProbeNonBlockingSetupTests`.
 
 Observations that are not defects of the library:
 

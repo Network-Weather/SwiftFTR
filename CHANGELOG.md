@@ -3,6 +3,20 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Bug fixes
+
+- **`tcpProbe` and `udpProbe` no longer probe on a blocking socket when `fcntl` fails** (#107).
+  Both ignored the results of the two `fcntl` calls that set `O_NONBLOCK`. A blocking TCP
+  `connect` waits for the kernel's own connect timeout, past the probe's timeout and its
+  cancellation, and then reports `.error` instead of `.filtered`. Either probe now returns at once
+  with the result its other socket-setup failures give (`isReachable == false`, `rtt == nil`,
+  `connectionState == .error` for TCP, `responseType == nil` for UDP) and an `error` such as
+  `Failed to make socket non-blocking: fcntl F_SETFL failed (errno=22): Invalid argument`, before
+  sending anything, with the socket closed.
+
 0.18.0 — 2026-11-22
 -------------------
 

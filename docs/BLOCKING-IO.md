@@ -468,8 +468,6 @@ Still unbounded after this plan, or deliberately deferred. Roadmap, not this pla
 - Collapsing the multipath per-flow pipeline onto the shared classified-trace implementation,
   which would also fix the configuration it drops (#91).
 - Coalescing identical in-flight forward lookups.
-- The UDP probe's setup. Its receive handler reads once per callback and does not have the
-  receive-loop defect; its `fcntl` that sets `O_NONBLOCK` is still unchecked.
 - Thread Sanitizer and Address Sanitizer jobs, scheduled soak runs, DNS and STUN parser fuzzing.
 - Adding `connectionRefused` and `unreachable` cases to `DNSError`, which would break exhaustive
   switches; for the next release where a source break is acceptable.
