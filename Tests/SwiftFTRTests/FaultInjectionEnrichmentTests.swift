@@ -96,7 +96,8 @@ struct FaultInjectionEnrichmentTests {
           }
         }
         #expect(await eventually(within: 2) { entered.value > 0 })
-        await tracer.invalidatePublicIP()
+        // The network-change path, not the direct invalidation one (CacheGenerationTests covers that).
+        await tracer.networkChanged()
         gate.open()
         let observed = await lookup.value
         #expect(observed == nil, "stale address \(observed ?? "") escaped")
@@ -301,6 +302,45 @@ struct FaultInjectionEnrichmentTests {
     gate.open()
     try await Task.sleep(nanoseconds: UInt64(2 * limit * 1_000_000_000))
     #expect(ran.value == 0, "withdrawn work ran anyway")
+  }
+
+  @Test("Work a worker reaches just after its queue deadline is withdrawn, not run")
+  func queueDeadlinePassedAtStart() async throws {
+    let limit: TimeInterval = 0.03
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.queue-edge")
+    let ran = FaultCounter()
+    var timedOut = 0
+    let rounds = 40
+    for _ in 0..<rounds {
+      // The occupant frees the worker 1 ms after the queued work's deadline: before the
+      // deadline timer's handler can be relied on to have run.
+      let target = ResultBox<TimeInterval>()
+      let occupied = FaultCounter()
+      let released = DispatchSemaphore(value: 0)
+      let holder = Task {
+        try? await executor.run(priority: .userInitiated) {
+          occupied.increment()
+          released.wait()
+          if case .success(let until)? = target.value {
+            let remaining = until - monotonicNow()
+            if remaining > 0 { Thread.sleep(forTimeInterval: remaining) }
+          }
+        }
+      }
+      _ = await eventually(within: 2) { occupied.value > 0 }
+      target.set(.success(monotonicNow() + limit + 0.001))
+      released.signal()
+      do {
+        _ = try await executor.run(priority: .userInitiated, queueDeadline: limit) {
+          ran.increment()
+        }
+      } catch is BlockingIOTimeout {
+        timedOut += 1
+      }
+      await holder.value
+    }
+    #expect(ran.value == 0, "\(ran.value) of \(rounds) withdrawn operations ran")
+    #expect(timedOut == rounds)
   }
 
   @Test("A DNS query that starts late is governed by its own timeouts, not cut off")

@@ -236,7 +236,9 @@ struct FaultInjectionWireTests {
     let refused = try await udpProbe(
       config: UDPProbeConfig(host: "127.0.0.1", port: Int(closedPort), timeout: 1, payload: payload)
     )
-    #expect(refused.responseType != "udp_reply")
+    // The host answered that the port is closed: reachable host, unreachable port.
+    #expect(refused.responseType == "icmp_port_unreachable", "\(refused.responseType ?? "nil")")
+    #expect(refused.isReachable)
 
     let timeout: TimeInterval = 0.3
     let (quiet, elapsed) = try await measure {

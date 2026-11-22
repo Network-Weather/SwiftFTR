@@ -66,6 +66,10 @@ struct FaultInjectionCancellationTests {
         if step < 8 {
           for _ in 0..<step { await Task.yield() }
         } else {
+          if canceller != .taskCancel {
+            // From here on the sweep is of a registered trace, which the tracer can reach.
+            #expect(await eventually(within: 2) { await !tracer.activeTraces.isEmpty })
+          }
           try await Task.sleep(nanoseconds: UInt64(step - 8) * 15_000_000)
         }
         let cancelledAt = monotonicNow()
@@ -102,8 +106,15 @@ struct FaultInjectionCancellationTests {
         let cancelledAt = monotonicNow()
         await Self.cancel(task, on: tracer, by: canceller)
         if canceller == .taskCancel {
-          // Cancelling the consuming task ends iteration normally, as for any AsyncSequence.
-          _ = try? await task.value
+          // Cancelling the consuming task ends iteration normally, as for any AsyncSequence, or
+          // with a cancellation error. Anything else is a failure, not a cancellation.
+          do {
+            _ = try await task.value
+          } catch is CancellationError {
+          } catch TracerouteError.cancelled {
+          } catch {
+            Issue.record("step \(step): stream threw \(error)")
+          }
           let lag = monotonicNow() - cancelledAt
           #expect(lag < Self.promptly, "step \(step): stream ended \(lag)s after cancellation")
         } else {
@@ -126,11 +137,23 @@ struct FaultInjectionCancellationTests {
           try await tracer.ping(
             to: "fake.test", config: PingConfig(count: 20, interval: 0.5, timeout: 5))
         }
+        if step > 0 {
+          // Mid-flight: the ping has really started sending before it is cancelled.
+          let before = network.probes.value
+          #expect(await eventually(within: 2) { network.probes.value > before })
+        }
         try await Task.sleep(nanoseconds: UInt64(step) * 20_000_000)
         let cancelledAt = monotonicNow()
         task.cancel()
-        // A cancelled ping may also return the partial result it has; either way it must return.
-        _ = try? await task.value
+        // A cancelled ping may return the partial result it has or throw a cancellation error;
+        // any other error means it failed rather than being cancelled.
+        do {
+          _ = try await task.value
+        } catch is CancellationError {
+        } catch TracerouteError.cancelled {
+        } catch {
+          Issue.record("step \(step): ping threw \(error)")
+        }
         let lag = monotonicNow() - cancelledAt
         #expect(lag < Self.promptly, "step \(step): ping returned \(lag)s after cancellation")
       }
