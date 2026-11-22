@@ -1354,107 +1354,6 @@ private struct DNSProbeResultInternal {
   let error: String?
 }
 
-/// Builds a DNS query for `encodedQuery` with a random transaction ID.
-private func makeDNSQueryMessage(encodedQuery: [UInt8], queryType: UInt16) -> (
-  bytes: [UInt8], id: UInt16
-) {
-  let id = UInt16.random(in: 0...UInt16.max)
-  var message: [UInt8] = []
-  func append16(_ value: UInt16) {
-    message.append(UInt8(value >> 8))
-    message.append(UInt8(value & 0xFF))
-  }
-
-  // Header
-  append16(id)  // ID
-  append16(0x0100)  // RD (recursion desired)
-  append16(1)  // QDCOUNT
-  append16(0)  // ANCOUNT
-  append16(0)  // NSCOUNT
-  append16(0)  // ARCOUNT
-
-  // Question
-  message.append(contentsOf: encodedQuery)
-  append16(queryType)  // QTYPE
-  append16(1)  // QCLASS IN
-  return (message, id)
-}
-
-/// Binds a DNS socket to `interface` and to `sourceIP`, when given.
-private func bindDNSSocket(
-  _ fd: Int32,
-  family serverFamily: Int32,
-  interface: String?,
-  sourceIP: String?
-) throws {
-  // Bind to interface if specified
-  if let iface = interface {
-    #if canImport(Darwin)
-      let ifaceIndex = if_nametoindex(iface)
-      guard ifaceIndex != 0 else {
-        throw DNSError.bindFailed("Interface '\(iface)' not found")
-      }
-
-      var index = ifaceIndex
-      let (proto, opt) =
-        serverFamily == AF_INET6
-        ? (IPPROTO_IPV6, IPV6_BOUND_IF) : (IPPROTO_IP, IP_BOUND_IF)
-      let result = setsockopt(
-        fd, proto, opt,
-        &index, socklen_t(MemoryLayout<UInt32>.size))
-
-      guard result >= 0 else {
-        throw DNSError.bindFailed("Failed to bind to interface '\(iface)'")
-      }
-    #else
-      throw DNSError.bindFailed("Interface binding not supported on this platform")
-    #endif
-  }
-
-  // Bind to source IP if specified
-  guard let srcIP = sourceIP else { return }
-  try _validateDNSSourceFamily(srcIP, serverFamily: serverFamily)
-
-  if serverFamily == AF_INET6 {
-    let (bare6, scopeID) = parseIPv6Scoped(srcIP)
-    var sourceAddr6 = sockaddr_in6()
-    sourceAddr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-    sourceAddr6.sin6_family = sa_family_t(AF_INET6)
-    sourceAddr6.sin6_port = 0
-    sourceAddr6.sin6_scope_id = scopeID
-    guard inet_pton(AF_INET6, bare6, &sourceAddr6.sin6_addr) == 1 else {
-      throw DNSError.bindFailed("Invalid source IPv6 address '\(srcIP)'")
-    }
-    let bindResult = withUnsafePointer(to: &sourceAddr6) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-        bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in6>.size))
-      }
-    }
-    guard bindResult >= 0 else {
-      throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
-    }
-  } else {
-    var sourceAddr = sockaddr_in()
-    sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    sourceAddr.sin_family = sa_family_t(AF_INET)
-    sourceAddr.sin_port = 0
-
-    guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
-      throw DNSError.bindFailed("Invalid source IP address '\(srcIP)'")
-    }
-
-    let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
-      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-        bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-
-    guard bindResult >= 0 else {
-      throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
-    }
-  }
-}
-
 /// Connect a UDP socket to a DNS server so the kernel only accepts datagrams
 /// from the queried address and port.
 private func connectDNSSocket(
@@ -1498,6 +1397,110 @@ private func connectDNSSocket(
   guard result == 0 else {
     throw DNSError.sendFailed
   }
+}
+
+/// Binds a DNS socket to `interface` and to `sourceIP`, when given.
+private func bindDNSSocket(
+  _ fd: Int32,
+  family serverFamily: Int32,
+  interface: String?,
+  sourceIP: String?
+) throws {
+  // Bind to interface if specified
+  if let iface = interface {
+    #if canImport(Darwin)
+      let ifaceIndex = if_nametoindex(iface)
+      guard ifaceIndex != 0 else {
+        throw DNSError.bindFailed("Interface '\(iface)' not found")
+      }
+
+      var index = ifaceIndex
+      let (proto, opt) =
+        serverFamily == AF_INET6
+        ? (IPPROTO_IPV6, IPV6_BOUND_IF) : (IPPROTO_IP, IP_BOUND_IF)
+      let result = setsockopt(
+        fd, proto, opt,
+        &index, socklen_t(MemoryLayout<UInt32>.size))
+
+      guard result >= 0 else {
+        throw DNSError.bindFailed("Failed to bind to interface '\(iface)'")
+      }
+    #else
+      throw DNSError.bindFailed("Interface binding not supported on this platform")
+    #endif
+  }
+
+  // Bind to source IP if specified
+  if let srcIP = sourceIP {
+    try _validateDNSSourceFamily(srcIP, serverFamily: serverFamily)
+
+    if serverFamily == AF_INET6 {
+      let (bare6, scopeID) = parseIPv6Scoped(srcIP)
+      var sourceAddr6 = sockaddr_in6()
+      sourceAddr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      sourceAddr6.sin6_family = sa_family_t(AF_INET6)
+      sourceAddr6.sin6_port = 0
+      sourceAddr6.sin6_scope_id = scopeID
+      guard inet_pton(AF_INET6, bare6, &sourceAddr6.sin6_addr) == 1 else {
+        throw DNSError.bindFailed("Invalid source IPv6 address '\(srcIP)'")
+      }
+      let bindResult = withUnsafePointer(to: &sourceAddr6) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+          bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+      }
+      guard bindResult >= 0 else {
+        throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
+      }
+    } else {
+      var sourceAddr = sockaddr_in()
+      sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+      sourceAddr.sin_family = sa_family_t(AF_INET)
+      sourceAddr.sin_port = 0
+
+      guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
+        throw DNSError.bindFailed("Invalid source IP address '\(srcIP)'")
+      }
+
+      let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+          bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+      }
+
+      guard bindResult >= 0 else {
+        throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
+      }
+    }
+  }
+}
+
+/// Builds a DNS query for `encodedQuery` with a random transaction ID.
+private func makeDNSQueryMessage(encodedQuery: [UInt8], queryType: UInt16) -> (
+  bytes: [UInt8], id: UInt16
+) {
+  // Build DNS query message
+  var msg = Data()
+  let id = UInt16.random(in: 0...UInt16.max)
+
+  func append16(_ v: UInt16) {
+    var b = v.bigEndian
+    withUnsafeBytes(of: &b) { msg.append(contentsOf: $0) }
+  }
+
+  // Header
+  append16(id)  // ID
+  append16(0x0100)  // RD (recursion desired)
+  append16(1)  // QDCOUNT
+  append16(0)  // ANCOUNT
+  append16(0)  // NSCOUNT
+  append16(0)  // ARCOUNT
+
+  // Question
+  msg.append(contentsOf: encodedQuery)
+  append16(queryType)  // QTYPE
+  append16(1)  // QCLASS IN
+  return ([UInt8](msg), id)
 }
 
 /// A DNS query that waits for its reply in a blocking `recv` on the calling thread.
@@ -1554,7 +1557,10 @@ private func performDNSQueryBlocking(
     throw DNSError.timeout
   }
 
-  return try DNSClient.validateResponse(message: Data(buf.prefix(n)), expectedID: id)
+  // Parse response
+  let responseData = Data(buf.prefix(n))
+
+  return try DNSClient.validateResponse(message: responseData, expectedID: id)
 }
 
 /// Runs the query behind ``dnsProbe(config:)`` and reports it as a probe outcome.
@@ -1569,62 +1575,98 @@ private func performDNSProbe(
   interface: String?,
   sourceIP: String?
 ) async -> DNSProbeResultInternal {
-  let reply: DNSReply
+  var replyRTT: TimeInterval?
   do {
-    reply = try await exchangeDNSQuery(
-      server: server, query: query, queryType: queryType, timeout: timeout,
-      interface: interface, sourceIP: sourceIP)
-  } catch UDPExchangeFailure.refused(let rtt) {
+    let reply: DNSReply
+    do {
+      reply = try await exchangeDNSQuery(
+        server: server, query: query, queryType: queryType, timeout: timeout,
+        interface: interface, sourceIP: sourceIP)
+    } catch UDPExchangeFailure.refused(let rtt) {
+      return DNSProbeResultInternal(
+        isReachable: true,
+        rtt: rtt,
+        responseCode: nil,
+        error: "Connection refused - the host is reachable but no DNS server is listening"
+      )
+    } catch let failure as UDPExchangeFailure {
+      throw dnsError(for: failure)
+    }
+    replyRTT = reply.rtt
+    // Success means RCODE=0
+    _ = try reply.answers()
     return DNSProbeResultInternal(
       isReachable: true,
-      rtt: rtt,
-      responseCode: nil,
-      error: "Connection refused - the host is reachable but no DNS server is listening"
+      rtt: replyRTT,
+      responseCode: 0,
+      error: nil
     )
-  } catch let failure as UDPExchangeFailure {
-    return dnsProbeOutcome(for: dnsError(for: failure), rtt: nil)
-  } catch {
-    return dnsProbeOutcome(for: error, rtt: nil)
-  }
-
-  do {
-    _ = try reply.answers()
-    return DNSProbeResultInternal(isReachable: true, rtt: reply.rtt, responseCode: 0, error: nil)
-  } catch {
-    return dnsProbeOutcome(for: error, rtt: reply.rtt)
-  }
-}
-
-/// The probe outcome for a failed query. `rtt` is the time to the reply, when one arrived.
-private func dnsProbeOutcome(for error: Error, rtt: TimeInterval?) -> DNSProbeResultInternal {
-  switch error {
-  case DNSError.serverError(let rcode):
+  } catch DNSError.serverError(let rcode) {
     // DNS server responded with non-zero RCODE (NXDOMAIN, etc.)
     // This is still "reachable" for probe purposes
-    return DNSProbeResultInternal(isReachable: true, rtt: rtt, responseCode: rcode, error: nil)
-  case DNSError.malformedResponse:
-    // Got response, even if malformed
     return DNSProbeResultInternal(
-      isReachable: true, rtt: rtt, responseCode: nil, error: "Malformed response")
-  case DNSError.timeout:
-    return unreachable("Timeout - no response")
-  case DNSError.socketCreationFailed:
-    return unreachable("Failed to create socket")
-  case DNSError.setsockoptFailed(let option, let errorCode):
-    return unreachable(
-      "Failed to configure \(option) (errno=\(errorCode)): \(String(cString: strerror(errorCode)))")
-  case DNSError.bindFailed(let msg):
-    return unreachable(msg)
-  case DNSError.invalidIP(let ip):
-    return unreachable("Invalid server IP: \(ip)")
-  case DNSError.sendFailed:
-    return unreachable("Failed to send query")
-  default:
-    return unreachable("Unexpected error: \(error)")
-  }
-
-  func unreachable(_ message: String) -> DNSProbeResultInternal {
-    DNSProbeResultInternal(isReachable: false, rtt: nil, responseCode: nil, error: message)
+      isReachable: true,
+      rtt: replyRTT,
+      responseCode: rcode,
+      error: nil
+    )
+  } catch DNSError.timeout {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseCode: nil,
+      error: "Timeout - no response"
+    )
+  } catch DNSError.socketCreationFailed {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseCode: nil,
+      error: "Failed to create socket"
+    )
+  } catch DNSError.setsockoptFailed(let option, let errorCode) {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseCode: nil,
+      error:
+        "Failed to configure \(option) (errno=\(errorCode)): \(String(cString: strerror(errorCode)))"
+    )
+  } catch DNSError.bindFailed(let msg) {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseCode: nil,
+      error: msg
+    )
+  } catch DNSError.invalidIP(let ip) {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseCode: nil,
+      error: "Invalid server IP: \(ip)"
+    )
+  } catch DNSError.sendFailed {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseCode: nil,
+      error: "Failed to send query"
+    )
+  } catch DNSError.malformedResponse {
+    return DNSProbeResultInternal(
+      isReachable: true,  // Got response, even if malformed
+      rtt: replyRTT,
+      responseCode: nil,
+      error: "Malformed response"
+    )
+  } catch {
+    return DNSProbeResultInternal(
+      isReachable: false,
+      rtt: nil,
+      responseCode: nil,
+      error: "Unexpected error: \(error)"
+    )
   }
 }
 
