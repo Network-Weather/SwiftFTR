@@ -454,6 +454,34 @@ struct DNSForeignReplyTests {
     #expect(thrown is CancellationError, "\(String(describing: thrown))")
   }
 
+  // MARK: Team Cymru
+
+  @Test("A Cymru lookup ignores a reply for another query and resolves from its own")
+  func cymruForeignThenValid() async throws {
+    let delay: TimeInterval = 0.2
+    // Each TXT query gets a foreign copy of its answer at once and the real one after `delay`,
+    // so a lookup that moved on at the foreign one would not resolve.
+    let peer = try ScriptedDNSPeer { query in
+      guard let (reply, _) = CymruFixture.answer(query) else { return [] }
+      return [(Self.foreign(reply), 0), (reply, delay)]
+    }
+    defer { peer.stop() }
+
+    let (result, elapsed) = try await measure(within: Self.watchdog) {
+      try await TestSeams.$dnsServerPort.withValue(peer.port) {
+        try await CymruDNSResolver(servers: ["127.0.0.1"])
+          .resolve(ipv4Addrs: ["8.8.8.8"], timeout: 5)
+      }
+    }
+    let info = try #require(result["8.8.8.8"])
+    #expect(info.asn == 15169)
+    #expect(info.name == "GOOGLE, US")
+    // One origin query and one AS-name query, each answered foreign first.
+    #expect(peer.requests.value == 2)
+    #expect(peer.sent.value == 4)
+    #expect(elapsed >= 2 * delay, "resolved after \(elapsed)s")
+  }
+
   // MARK: Blocking path
 
   static let txtRecord: [UInt8] =
