@@ -289,19 +289,23 @@ How the classifier assigns categories (`Sources/SwiftFTR/Segmentation.swift`), c
 order for each hop with an address:
 
 1. **Exact matches**: a hop whose address equals the destination IP is DESTINATION; one that is
-   among the host's VPN local addresses is VPN. These win over every rule below.
+   among the effective VPN context's `vpnLocalIPs` is VPN. These win over every rule below.
 2. **Non-VPN trace**:
-   - non-global, non-CGNAT addresses (LAN, link-local, loopback) are LOCAL before the first public
-     hop and ISP after it;
+   - private, link-local, loopback, multicast and unspecified addresses are LOCAL before the
+     first public hop and ISP after it. Reserved documentation ranges such as 203.0.113.0/24
+     count as public here, although public-IP validation rejects them;
    - CGNAT (100.64.0.0/10) is ISP;
    - a public address whose ASN equals the client's ASN (from the public IP) is ISP; this is
      checked before the destination ASN, so when client and destination share an ASN, an
      intermediate public hop in it is ISP;
    - otherwise a public address whose ASN equals the destination's ASN is DESTINATION;
    - any other public address, or one with no ASN data, is TRANSIT.
-3. **VPN trace** (an explicit `VPNContext` says so, or the configured `interface` name starts
-   with `utun`, `ipsec`, `ppp`, `tun`, `tap`, `wg`, `gpd` or `ztun`):
-   - non-global addresses, CGNAT included, are VPN;
+3. **VPN trace**: the effective context is the `VPNContext` passed to the call, or, when none is
+   passed, one derived from the configured `interface` (a VPN trace when its name starts with
+   `utun`, `ipsec`, `ppp`, `tun`, `tap`, `wg`, `gpd` or `ztun`). An explicit context is used as
+   given, so `VPNContext(isVPNTrace: false)` on a `utun` interface is a non-VPN trace. When the
+   effective context says VPN:
+   - private, link-local, loopback, multicast, unspecified and CGNAT addresses are VPN;
    - a public address whose ASN equals the destination's ASN is DESTINATION;
    - every other public address is TRANSIT, including one in the client's ASN: the client ASN
      does not produce ISP on a VPN trace.
@@ -849,6 +853,7 @@ state changed, compose the finer controls instead of replacing the actor:
 
 ```swift
 import Network
+import SwiftFTR
 
 let tracer = SwiftFTR()
 let monitor = NWPathMonitor()
@@ -975,8 +980,9 @@ struct TraceView: View {
   Results are cached per instance (TTL 86400 s, 1000 entries by default).
 - **Public IP** (classified trace and multipath only): each discovery attempt is bounded by
   `publicIPDiscoveryTimeout` (default 6 s), and a classified trace makes up to two attempts (before
-  the trace, then again during classification if the first found nothing). A discovered address is
-  cached per instance until invalidated. Multipath reuses an existing cached value but does not
+  the trace, then again during classification if the first found nothing). An address found by
+  the first attempt is cached per instance until invalidated; one found only by the second is
+  returned in that result and not cached, so the next trace discovers again. Multipath reuses an existing cached value but does not
   write its own discoveries back; with no cached value, each flow discovers on its own, and those
   attempts use the 6 s default regardless of the instance's `publicIPDiscoveryTimeout`.
 - **ASN**: the embedded database answers locally (microseconds per lookup once loaded; it reloads

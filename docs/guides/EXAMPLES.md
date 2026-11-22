@@ -190,8 +190,7 @@ await tracer.networkChanged()
 // Cancel in-flight traces but keep every cache
 await tracer.cancelActiveTraces()
 
-// Evict only private, CGNAT, link-local, loopback and unique-local rDNS entries;
-// globally routable hostnames survive
+// Keep only rDNS entries whose address scope is global; evict every other entry
 await tracer.invalidateNetworkScopedRDNS()
 
 // Force fresh public-IP discovery on the next classified trace or multipath run
