@@ -250,15 +250,25 @@ final class FakeICMPNetwork: @unchecked Sendable {
 
   /// Runs `body` with forward resolution and the ICMP socket factory pointed at this network, or
   /// at `socketFactory` when one is given.
+  ///
+  /// Public-IP discovery is substituted too: by the test's own substitute when one is bound, and
+  /// otherwise by one that fails at once, so a classified trace inside `body` can never fall
+  /// through to real STUN traffic.
   func install<T>(
     socketFactory: TestSeams.MakeICMPSocket? = nil, _ body: () async throws -> T
   ) async rethrows -> T {
     let resolved = self.resolved
     let resolve: TestSeams.ResolveHost = { _, _ in resolved }
     let makeSocket: TestSeams.MakeICMPSocket = socketFactory ?? { try self.makeSocket($0) }
+    let discover: TestSeams.DiscoverPublicIPv4 =
+      TestSeams.discoverPublicIPv4 ?? {
+        throw PublicIPError.allMethodsFailed(stunError: "offline test", dnsError: "offline test")
+      }
     return try await TestSeams.$resolveHost.withValue(resolve) {
       try await TestSeams.$makeICMPSocket.withValue(makeSocket) {
-        try await body()
+        try await TestSeams.$discoverPublicIPv4.withValue(discover) {
+          try await body()
+        }
       }
     }
   }
