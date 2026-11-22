@@ -84,11 +84,12 @@ struct EventBasedDNSTests {
       )
     }
     defer { server.stop() }
-    // The datagram leaves, then the sender stalls past the moment the reply is sent.
+    // The datagram leaves, then the sender stalls until the reply is already waiting.
+    let staged = FaultCounter()
     let send: TestSeams.SendDatagram = { fd, bytes in
       let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
       let code = Darwin.errno
-      usleep(useconds_t((delay * 1.5) * 1_000_000))
+      if Self.waitUntilReadable(fd, limit: 4) { staged.increment() }
       Darwin.errno = code
       return sent
     }
@@ -97,6 +98,7 @@ struct EventBasedDNSTests {
         try await SwiftFTR().dns.a(hostname: "stall.example", server: "127.0.0.1", timeout: 5)
       }
     }
+    try #require(staged.value == 1, "the reply never arrived while the sender was stalled")
     #expect(query.rttMs >= delay * 1000, "rttMs \(query.rttMs)")
   }
 
@@ -271,16 +273,31 @@ struct EventBasedDNSTests {
     if fault != .shortCount { #expect(server.requests.value == 0) }
   }
 
-  /// A send seam whose first call puts the datagram on the wire, waits for whatever it provokes
-  /// to arrive, and then reports `ENOBUFS`. So something is readable before the exchange has
-  /// sent, as a late reply to an earlier socket on the same port would be, and the retry then
-  /// really sends.
-  static func sendThatLiesFirst(attempts: FaultCounter) -> TestSeams.SendDatagram {
+  /// Whether `fd` becomes readable, or has an error pending, within `limit` seconds. `poll` does
+  /// not consume the datagram or clear the error, so the exchange still reads it afterwards.
+  static func waitUntilReadable(_ fd: Int32, limit: TimeInterval) -> Bool {
+    let giveUp = monotonicNow() + limit
+    while true {
+      var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+      let remaining = Int32(max(0, (giveUp - monotonicNow()) * 1000))
+      let ready = poll(&descriptor, 1, remaining)
+      if ready > 0 { return descriptor.revents & Int16(POLLIN | POLLERR) != 0 }
+      if ready == 0 || (ready < 0 && errno != EINTR) { return false }
+    }
+  }
+
+  /// A send seam whose first call puts the datagram on the wire, waits until whatever it provokes
+  /// is waiting on the socket, and then reports `ENOBUFS`. So something is readable before the
+  /// exchange has sent, as a late reply to an earlier socket on the same port would be, and the
+  /// retry then really sends. `staged` counts first calls that reached that state.
+  static func sendThatLiesFirst(attempts: FaultCounter, staged: FaultCounter)
+    -> TestSeams.SendDatagram
+  {
     { fd, bytes in
       attempts.increment()
       let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
       guard attempts.value == 1 else { return sent }
-      usleep(50_000)
+      if Self.waitUntilReadable(fd, limit: 5) { staged.increment() }
       Darwin.errno = ENOBUFS
       return -1
     }
@@ -298,13 +315,16 @@ struct EventBasedDNSTests {
     }
     defer { server.stop() }
     let attempts = FaultCounter()
+    let staged = FaultCounter()
+    let send = Self.sendThatLiesFirst(attempts: attempts, staged: staged)
 
     let (answers, _) = try await measure(within: Self.watchdog) {
-      try await TestSeams.$sendDatagram.withValue(Self.sendThatLiesFirst(attempts: attempts)) {
+      try await TestSeams.$sendDatagram.withValue(send) {
         try await __dnsQuery(
           server: "127.0.0.1", port: server.port, name: "stale.example", type: 1, timeout: 5)
       }
     }
+    try #require(staged.value == 1, "the first reply never arrived before the retry")
     #expect(answers.first?.rdata == Data([192, 0, 2, 2]))
     #expect(attempts.value == 2)
   }
@@ -314,18 +334,23 @@ struct EventBasedDNSTests {
     let refusing = try RefusingUDPPort()
     defer { withExtendedLifetime(refusing) {} }
     let attempts = FaultCounter()
+    let staged = FaultCounter()
+    let send = Self.sendThatLiesFirst(attempts: attempts, staged: staged)
 
     let (thrown, _) = try await measure(within: Self.watchdog) {
-      await TestSeams.$sendDatagram.withValue(Self.sendThatLiesFirst(attempts: attempts)) {
+      await TestSeams.$sendDatagram.withValue(send) {
         await Self.error {
           try await __dnsQuery(
-            server: "127.0.0.1", port: refusing.port, name: "stale.example", type: 1, timeout: 5)
+            server: "127.0.0.1", port: refusing.port, name: "stale.example", type: 1, timeout: 1)
         }
       }
     }
-    // Refused, but by the request that left: the stale refusal was read and ignored first.
-    #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
+    try #require(staged.value == 1, "the first refusal never arrived before the retry")
+    // The stale refusal did not end the exchange: the request was sent again. Whether that send
+    // is refused too is the kernel's choice, since Darwin suppresses a second port-unreachable to
+    // the same peer within about 50 ms, so either a refusal or a timeout is right here.
     #expect(attempts.value == 2)
+    #expect(Self.isSendFailed(thrown) || Self.isTimeout(thrown), "\(String(describing: thrown))")
   }
 
   // MARK: Setup
