@@ -69,28 +69,23 @@ final class LocalASNResolverTests: XCTestCase {
       "1000 lookups should complete in <1s (took \(String(format: "%.3f", elapsed))s)")
   }
 
-  /// Verify preload works and eliminates first-lookup latency.
+  /// Verify preload loads the database, so the first lookup does not. Load time itself is
+  /// measured by ResourceBenchmark, not here.
   func testPreload() async throws {
-    let resolver = LocalASNResolver(source: .embedded)
+    let store = LocalASNDatabaseStore()
+    let resolver = LocalASNResolver(source: .embedded, store: store)
 
-    // Preload
-    let preloadStart = Date()
     await resolver.preload()
-    let preloadTime = Date().timeIntervalSince(preloadStart)
+    let loadsAfterPreload = await store.loadCount
+    let residentAfterPreload = await store.isResident(.embedded)
+    XCTAssertEqual(loadsAfterPreload, 1, "preload should load the database")
+    XCTAssertTrue(residentAfterPreload, "the preloaded database should stay resident")
 
-    // Preload typically takes ~35-50ms on a developer machine, but GitHub-hosted
-    // macOS runners are routinely slower (observed 0.9s under load). Use a
-    // generous ceiling that catches outright regressions without flaking on
-    // shared CI runners; the actual perf budget is enforced by ResourceBenchmark.
-    XCTAssertLessThan(preloadTime, 2.0, "Preload should complete in <2s")
-
-    // Subsequent lookup should be fast (no load delay)
-    let lookupStart = Date()
-    _ = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
-    let lookupTime = Date().timeIntervalSince(lookupStart)
-
-    // Lookup should be < 50ms under CI load (microseconds for actual lookup + scheduling overhead).
-    XCTAssertLessThan(lookupTime, 0.05, "Post-preload lookup should be <50ms")
+    // The first lookup is served by the preloaded database rather than loading its own.
+    let results = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
+    let loadsAfterLookup = await store.loadCount
+    XCTAssertEqual(results["8.8.8.8"]?.asn, 15169)
+    XCTAssertEqual(loadsAfterLookup, 1, "the first lookup after preload loaded the database again")
   }
 
   // MARK: - IP Filtering Tests

@@ -50,14 +50,13 @@ struct RDNSSuppressionTests {
     _ = await cache.lookup("192.0.2.2")
     #expect(await cache.isSuppressingLookups, "two stalled lookups should open the breaker")
 
+    // The cache bounds a lookup only by its resolver, so a lookup that does not reach the
+    // resolver cannot pay the deadline.
     let callsBefore = probe.calls
-    let start = monotonicNow()
     let hostname = await cache.lookup("192.0.2.3")
-    let elapsed = monotonicNow() - start
 
     #expect(hostname == nil)
     #expect(probe.calls == callsBefore, "a suppressed lookup must not reach the resolver")
-    #expect(elapsed < 0.05, "a suppressed lookup returned in \(elapsed)s; expected immediately")
   }
 
   @Test("A fast resolver never trips the breaker")
@@ -111,19 +110,27 @@ struct RDNSSuppressionTests {
     #expect(probe.calls == callsBefore + 1, "clear() should let lookups reach the resolver again")
   }
 
-  @Test("A whole batch stays bounded when every lookup stalls")
-  func batchLookupStaysBounded() async {
-    let probe = CountingResolver(stall: 0.12)
-    let cache = RDNSCache(lookupDeadline: 0.1, resolver: { _ in await probe.resolve() })
+  @Test("A batch runs its stalled lookups concurrently, not one after another")
+  func batchLookupStaysBounded() async throws {
+    // Every lookup stalls until all forty are in flight at once, so a batch that ran them one
+    // after another never releases the first, and trips the watchdog. Each then stalls past the
+    // deadline as well.
     let ips = (1...40).map { "192.0.2.\($0)" }
+    let allInFlight = StallGate()
+    defer { allInFlight.open() }
+    let inFlight = FaultCounter()
+    let cache = RDNSCache(lookupDeadline: 0.1) { _ in
+      inFlight.increment()
+      if inFlight.value >= ips.count { allInFlight.open() }
+      await allInFlight.waitAsync(limit: 60)
+      try? await Task.sleep(nanoseconds: 120_000_000)
+      return nil
+    }
 
-    let start = monotonicNow()
-    let results = await cache.batchLookup(ips)
-    let elapsed = monotonicNow() - start
+    let (results, _) = try await measure(within: 20) { await cache.batchLookup(ips) }
 
     #expect(results.isEmpty)
-    // 40 concurrent stalls, not 40 sequential ones. Well under the serialized 4.8s worst case.
-    #expect(elapsed < 1.0, "batch of 40 stalled lookups took \(elapsed)s")
+    #expect(inFlight.value == ips.count)
   }
 }
 
