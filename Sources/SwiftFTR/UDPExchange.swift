@@ -50,6 +50,14 @@ struct UDPExchangeReply: Sendable {
 /// States and events. Everything after `start` runs on `queue`, so events never interleave. A
 /// read is one `receiveDatagram` call (`recv(2)`, or the test seam), whatever the state.
 ///
+/// A read is stamped before the call, and the stamp stands for the datagram's arrival. That holds
+/// only for a datagram that was already queued when the read event fired: the first read of an
+/// event, or a read retried after `EINTR`, which took nothing. So after the send, at most one
+/// datagram or error is judged per read event. A read that consumed one and did not end the
+/// exchange returns, and the next datagram gets its own event and its own stamp. Before the send,
+/// the handler may read again within one event: everything it reads then is ignored, because
+/// nothing in the handler can send.
+///
 ///     State             Event                        Rule
 ///     setup             any setup step fails          close in setup, throw; no source exists
 ///     created           cancel before start          start sees the flag; finish, close, resume
@@ -63,9 +71,10 @@ struct UDPExchangeReply: Sendable {
 ///     any unsent        deadline timer               sendFailed (nothing left, so no evidence)
 ///     sent              read: datagram or empty,     success with the bytes, if before deadline
 ///                       accepted (or no check)
-///     sent              read: datagram or empty,     consume and ignore; keep waiting, deadline
-///                       not accepted                 unchanged (a stale or foreign datagram).
-///                                                    A read error is never put to the check
+///     sent              read: datagram or empty,     consume and ignore; return and wait for the
+///                       not accepted                 next read event, deadline unchanged (a stale
+///                                                    or foreign datagram). A read error is never
+///                                                    put to the check
 ///     sent              read: ECONNREFUSED           refused; EHOSTUNREACH, ENETUNREACH:
 ///                                                    unreachable (both with rtt); other errno:
 ///                                                    receiveFailed
@@ -78,10 +87,10 @@ struct UDPExchangeReply: Sendable {
 /// `finish` runs once (a second call returns): it cancels the timers and every source on the
 /// descriptor. The last cancel handler closes the descriptor and resumes the caller, once.
 final class UDPExchange: @unchecked Sendable {
-  /// `recv` calls one read event may make. `EINTR`, anything read before the request has left,
-  /// and a datagram the caller does not accept repeat a call; after the send, the first accepted
-  /// datagram ends the exchange. More queued datagrams wait for the next read event, so a peer
-  /// that never stops sending cannot hold the queue the deadline timer and cancellation run on.
+  /// `recv` calls one read event may make. Only `EINTR`, which took nothing, and anything read
+  /// before the request has left, which is ignored, repeat a call. After the send, one datagram or
+  /// error is judged per event, so a peer that never stops sending costs one event per datagram
+  /// and cannot hold the queue the deadline timer and cancellation run on.
   private static let receiveAttemptsPerEvent = 4
 
   /// Longest wait before retrying a send that failed with `ENOBUFS`. The socket reports writable
@@ -336,8 +345,9 @@ final class UDPExchange: @unchecked Sendable {
   private func handleRead() {
     for _ in 0..<Self.receiveAttemptsPerEvent {
       guard !finished else { return }
-      // Stamped before the call: the datagram is already queued when the read event runs, and a
-      // thread descheduled inside `recv` must not add that delay to the round trip.
+      // Stamped before the call: the datagram is already queued when the read event runs (after
+      // the send, this is the event's first read or a retry after EINTR, which took nothing), and
+      // a thread descheduled inside `recv` must not add that delay to the round trip.
       let receivedAt = DispatchTime.now()
       let received = receiveBuffer.withUnsafeMutableBytes { receiveDatagram(fd, $0) }
       let code = received < 0 ? errno : 0
@@ -352,7 +362,8 @@ final class UDPExchange: @unchecked Sendable {
       }
 
       // Before the request has left, nothing read can answer it: a datagram or error from an
-      // earlier socket on the same port. It is consumed and ignored, and the send goes on.
+      // earlier socket on the same port. It is consumed and ignored, and the send goes on. Reading
+      // again is safe: nothing in this handler sends, so every later read in it is ignored too.
       guard let sentAt else { continue }
       let rtt = Self.seconds(from: sentAt, to: receivedAt)
       guard received >= 0 else {
@@ -368,9 +379,10 @@ final class UDPExchange: @unchecked Sendable {
       }
 
       // Zero bytes is an empty datagram, judged like any other. One the caller does not accept is
-      // not addressed to this request: it uses up one of this event's reads and nothing else.
+      // not addressed to this request. Return rather than read again: a datagram the next read
+      // returns may have arrived after this event's stamp, even after the deadline.
       let datagram = receiveBuffer.prefix(received)
-      if let accepts, !accepts(datagram) { continue }
+      if let accepts, !accepts(datagram) { return }
       finish(.success(UDPExchangeReply(bytes: Array(datagram), rtt: rtt)))
       return
     }

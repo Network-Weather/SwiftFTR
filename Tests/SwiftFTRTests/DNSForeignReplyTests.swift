@@ -36,6 +36,7 @@ final class ScriptedDNSPeer: @unchecked Sendable {
   private var lastFeed: TimeInterval?
   private var longestGap: TimeInterval = 0
   private var scriptedSendStarts: [TimeInterval] = []
+  private var lastQuery: (query: [UInt8], source: sockaddr_storage, length: socklen_t)?
   private let threadsExited = DispatchSemaphore(value: 0)
   private var threads = 1
 
@@ -66,6 +67,15 @@ final class ScriptedDNSPeer: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return scriptedSendStarts
+  }
+
+  /// Sends `make(query)` now, to whoever sent the last query. Returns whether it left whole.
+  func sendToLastQuerier(_ make: ([UInt8]) -> [UInt8]) -> Bool {
+    lock.lock()
+    let last = lastQuery
+    lock.unlock()
+    guard let last else { return false }
+    return send(make(last.query), to: last.source, last.length)
   }
 
   /// How much the feed had sent at one moment.
@@ -127,8 +137,11 @@ final class ScriptedDNSPeer: @unchecked Sendable {
         }
       }
       guard n >= 0 else { continue }
-      requests.increment()
       let query = Array(buffer.prefix(n))
+      lock.lock()
+      lastQuery = (query, source, length)
+      lock.unlock()
+      requests.increment()
       for (datagram, after) in script(query) {
         if after > 0 { usleep(useconds_t(after * 1_000_000)) }
         guard !isStopped else { return }
@@ -265,18 +278,25 @@ struct DNSForeignReplyTests {
     count: Int, timeout: TimeInterval, _ body: @escaping @Sendable () async throws -> T
   ) async throws -> (T, TimeInterval) {
     let reads = FaultCounter()
-    let done = FaultCounter()
-    let task = Task {
-      defer { done.increment() }
-      return try await TestSeams.$receiveDatagram.withValue(Self.countingReceive(reads)) {
-        try await measure(within: Self.watchdog, body)
+    let lastRead = TimeStamp()
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      let received = Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
+      let code = Darwin.errno
+      if received >= 0 {
+        reads.increment()
+        lastRead.set(monotonicNow())
       }
+      Darwin.errno = code
+      return received
     }
-    #expect(
-      await eventually(within: Self.watchdog) { reads.value >= count },
-      "only \(reads.value) of \(count) foreign datagrams were read")
-    #expect(done.value == 0, "the query ended before its deadline, after \(reads.value) reads")
-    let (value, elapsed) = try await task.value
+    // Both ends are stamped on the query's side, so a slow resume of the test cannot move them.
+    let ((value, end), elapsed) = try await TestSeams.$receiveDatagram.withValue(receive) {
+      try await measure(within: Self.watchdog) { (try await body(), monotonicNow()) }
+    }
+    #expect(reads.value == count, "read \(reads.value) of \(count) foreign datagrams")
+    // It went on waiting after the last foreign datagram, and ended at its deadline.
+    let read = try #require(lastRead.value)
+    #expect(end > read)
     #expect(elapsed >= timeout * 0.95, "ended after \(elapsed)s against a \(timeout)s timeout")
     return (value, elapsed)
   }
@@ -469,6 +489,97 @@ struct DNSForeignReplyTests {
     #expect(thrown is CancellationError, "\(String(describing: thrown))")
   }
 
+  // MARK: Nothing late is judged with an early stamp
+
+  enum LateEvent: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    /// The query's reply, delivered after the deadline.
+    case reply
+    /// A refusal, reported after the deadline.
+    case refusal
+    var testDescription: String { rawValue }
+  }
+
+  enum Caller: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case query, probe
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "After a foreign datagram, a reply or refusal that comes after the deadline is a timeout",
+    arguments: LateEvent.allCases, Caller.allCases)
+  func lateEventAfterForeign(event: LateEvent, caller: Caller) async throws {
+    let peer = try ScriptedDNSPeer { query in [(Self.foreign(Self.answer(query, last: 1)), 0)] }
+    defer { peer.stop() }
+    let timeout: TimeInterval = 0.3
+    let calls = FaultCounter()
+    let firstRead = TimeStamp()
+    let lateSent = FaultCounter()
+    let heldRead = FaultCounter()
+    // The first read takes the foreign datagram. A second read in the same read event, which the
+    // exchange must not make, behaves as a thread descheduled between its stamp and `recv` would:
+    // it returns only what came after the deadline (the late reply, or a refusal).
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      calls.increment()
+      if calls.value == 1 {
+        firstRead.set(monotonicNow())
+        return Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
+      }
+      heldRead.increment()
+      let giveUp = monotonicNow() + 5
+      switch event {
+      case .reply:
+        while lateSent.value == 0, monotonicNow() < giveUp { usleep(1000) }
+        _ = EventBasedDNSTests.waitUntilReadable(fd, limit: 5)
+        return Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
+      case .refusal:
+        let first = firstRead.value ?? 0
+        while monotonicNow() <= first + timeout + 0.05, monotonicNow() < giveUp { usleep(1000) }
+        Darwin.errno = ECONNREFUSED
+        return -1
+      }
+    }
+    let task = Task {
+      await TestSeams.$receiveDatagram.withValue(receive) {
+        await TestSeams.$dnsServerPort.withValue(peer.port) {
+          switch caller {
+          case .query:
+            let thrown = await EventBasedDNSTests.error {
+              try await __dnsQuery(
+                server: "127.0.0.1", port: peer.port, name: "late.example", type: 1,
+                timeout: timeout)
+            }
+            return (thrown, DNSProbeResult?.none)
+          case .probe:
+            let probe = try? await dnsProbe(
+              server: "127.0.0.1", query: "late.example", timeout: timeout)
+            return (Error?.none, probe)
+          }
+        }
+      }
+    }
+    if event == .reply {
+      // Once the first read is done, wait until well past the deadline, which was fixed before
+      // that read, and only then deliver the query's own reply.
+      #expect(await eventually(within: Self.watchdog) { firstRead.value != nil })
+      let first = try #require(firstRead.value)
+      #expect(
+        await eventually(within: Self.watchdog) { monotonicNow() > first + timeout + 0.05 })
+      #expect(peer.sendToLastQuerier { Self.answer($0, last: 2) })
+      lateSent.increment()
+    }
+    let ((thrown, probe), _) = try await measure(within: Self.watchdog) { await task.value }
+
+    #expect(heldRead.value == 0, "a second read was made within one read event")
+    switch caller {
+    case .query:
+      #expect(EventBasedDNSTests.isTimeout(thrown), "\(String(describing: thrown))")
+    case .probe:
+      let result = try #require(probe)
+      #expect(result.outcome == .timedOut, "\(result)")
+      #expect(result.rtt == nil)
+    }
+  }
+
   // MARK: Team Cymru
 
   @Test("A Cymru lookup ignores a reply for another query and resolves from its own")
@@ -532,13 +643,16 @@ struct DNSForeignReplyTests {
     }
     defer { peer.stop() }
 
-    let (strings, _) = try await measure(within: Self.watchdog) {
+    // Stamped as the blocking call returns, inside the measured task.
+    let ((strings, returnedAt), _) = try await measure(within: Self.watchdog) {
       TestSeams.$dnsServerPort.withValue(peer.port) {
-        DNSClient.queryTXTBlocking(
-          name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
+        (
+          DNSClient.queryTXTBlocking(
+            name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"]),
+          monotonicNow()
+        )
       }
     }
-    let returnedAt = monotonicNow()
     #expect(await eventually(within: Self.watchdog) { peer.sent.value == 2 })
     #expect(strings == nil, "the query took a reply sent after its deadline")
     // It gave up before the real reply left, so it waited only for the time it had left; a wait
@@ -638,5 +752,23 @@ struct DNSForeignReplyTests {
     #expect(flow.ok, "the socket was not kept fed while the query waited: \(flow.detail)")
     #expect(strings == nil)
     #expect(elapsed >= timeout * 0.95, "ended after \(elapsed)s against a \(timeout)s timeout")
+  }
+}
+
+/// One time stamp that several threads write and read.
+final class TimeStamp: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stamp: TimeInterval?
+
+  var value: TimeInterval? {
+    lock.lock()
+    defer { lock.unlock() }
+    return stamp
+  }
+
+  func set(_ time: TimeInterval) {
+    lock.lock()
+    stamp = time
+    lock.unlock()
   }
 }
