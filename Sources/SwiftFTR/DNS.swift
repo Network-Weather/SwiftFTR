@@ -160,6 +160,8 @@ private func runDNSQuery(
       interface: interface, sourceIP: sourceIP, serverPort: serverPort)
   } catch let failure as UDPExchangeFailure {
     throw dnsError(for: failure)
+  } catch is DNSConnectFailure {
+    throw DNSError.sendFailed
   }
   return (try reply.answers(), reply.rtt)
 }
@@ -885,6 +887,55 @@ public struct DNSProbeConfig: Sendable {
   }
 }
 
+/// How a ``dnsProbe(config:)`` ended.
+///
+/// Read it to tell a refused port from silence, or a reply from a malformed one, without parsing
+/// ``DNSProbeResult/error``.
+///
+/// This is a struct with one static member per outcome rather than an enum, so a later release can
+/// add an outcome without breaking a consumer's `switch`. Match the members you handle and end the
+/// `switch` with `default`:
+///
+/// ```swift
+/// switch result.outcome {
+/// case .answered: showHealthy(rtt: result.rtt)
+/// case .refused: showNoDNSServer()
+/// case .timedOut: showSilent()
+/// default: showFailed(result.error)
+/// }
+/// ```
+///
+/// It encodes as its raw string, such as `"refused"`, and decodes any string, so a result written
+/// by a later release with an outcome this one does not know still decodes.
+public struct DNSProbeOutcome: RawRepresentable, Hashable, Sendable, Codable,
+  CustomStringConvertible
+{
+  /// The outcome's stable name, used in JSON.
+  public let rawValue: String
+
+  public init(rawValue: String) { self.rawValue = rawValue }
+
+  /// A DNS response arrived, whatever its response code. ``DNSProbeResult/isReachable`` is `true`.
+  public static let answered = DNSProbeOutcome(rawValue: "answered")
+  /// The server's host replied that nothing is listening on the port (ICMP port unreachable).
+  /// The host is up, but no DNS server answered, so ``DNSProbeResult/isReachable`` is `false`.
+  public static let refused = DNSProbeOutcome(rawValue: "refused")
+  /// Nothing came back before the timeout.
+  public static let timedOut = DNSProbeOutcome(rawValue: "timedOut")
+  /// Something came back that is not a valid DNS response, such as an empty or truncated datagram.
+  /// The server is reachable: ``DNSProbeResult/isReachable`` is `true`.
+  public static let malformedReply = DNSProbeOutcome(rawValue: "malformedReply")
+  /// The server's host or network cannot be reached: the network reported it after the query was
+  /// sent (ICMP host or network unreachable), or this machine refused to send toward it at all
+  /// (no route, or the interface is down). ``DNSProbeResult/error`` names the errno.
+  public static let unreachable = DNSProbeOutcome(rawValue: "unreachable")
+  /// The probe could not run to an answer: invalid input, a socket, bind, connect or send error
+  /// other than no route, or a receive error the probe does not classify. ``DNSProbeResult/error`` says which.
+  public static let failed = DNSProbeOutcome(rawValue: "failed")
+
+  public var description: String { rawValue }
+}
+
 /// Result from DNS probe
 public struct DNSProbeResult: Sendable, Codable {
   /// DNS server queried
@@ -893,11 +944,30 @@ public struct DNSProbeResult: Sendable, Codable {
   /// Query name
   public let query: String
 
+  /// How the probe ended. See ``DNSProbeOutcome``.
+  public let outcome: DNSProbeOutcome
+
   /// Whether server responded (success even if NXDOMAIN)
+  ///
+  /// `true` exactly when ``outcome`` is ``DNSProbeOutcome/answered`` or
+  /// ``DNSProbeOutcome/malformedReply``.
   public let isReachable: Bool
 
   /// Round-trip time (nil if timeout)
+  ///
+  /// Seconds from sending the query to reading the reply; set exactly when ``isReachable`` is.
   public let rtt: TimeInterval?
+
+  /// Seconds from sending the query until something came back from the network, and `nil` when
+  /// nothing did.
+  ///
+  /// Set only when something came back: ``DNSProbeOutcome/answered``,
+  /// ``DNSProbeOutcome/malformedReply``, ``DNSProbeOutcome/refused``, and
+  /// ``DNSProbeOutcome/unreachable`` when the network reported it. An ``DNSProbeOutcome/unreachable``
+  /// from this machine itself (no route at `connect` or `send`) has no `elapsed`, nor do
+  /// ``DNSProbeOutcome/timedOut`` and ``DNSProbeOutcome/failed``. Equal to ``rtt`` when the server
+  /// is reachable; the only timing for a refusal, where ``rtt`` is `nil`.
+  public let elapsed: TimeInterval?
 
   /// Response code (0 = NOERROR, 3 = NXDOMAIN, etc.)
   public let responseCode: Int?
@@ -908,6 +978,45 @@ public struct DNSProbeResult: Sendable, Codable {
   /// Timestamp
   public let timestamp: Date
 
+  /// Creates a result with an explicit ``outcome`` and ``elapsed`` time.
+  public init(
+    server: String,
+    query: String,
+    outcome: DNSProbeOutcome,
+    isReachable: Bool,
+    rtt: TimeInterval?,
+    elapsed: TimeInterval?,
+    responseCode: Int?,
+    error: String?,
+    timestamp: Date = Date()
+  ) {
+    self.server = server
+    self.query = query
+    self.outcome = outcome
+    self.isReachable = isReachable
+    self.rtt = rtt
+    self.elapsed = elapsed
+    self.responseCode = responseCode
+    self.error = error
+    self.timestamp = timestamp
+  }
+
+  /// Creates a result from the fields that predate ``outcome``, deriving ``outcome`` and
+  /// ``elapsed`` from them.
+  ///
+  /// - A reachable result is ``DNSProbeOutcome/answered`` when it has a response code or no
+  ///   error, and ``DNSProbeOutcome/malformedReply`` when it has an error and no response code.
+  ///   ``elapsed`` is `rtt`.
+  /// - An unreachable result is read from the messages ``dnsProbe(config:)`` writes:
+  ///   ``DNSProbeOutcome/refused`` for "Connection refused…", ``DNSProbeOutcome/unreachable`` for
+  ///   "Host unreachable…" or "Network unreachable…", ``DNSProbeOutcome/timedOut`` for
+  ///   "Timeout…" or no error, and ``DNSProbeOutcome/failed`` for any other message. ``elapsed``
+  ///   is `nil`, since these fields do not record it.
+  ///
+  /// The derived outcome is a best effort. SwiftFTR 0.17 wrote "Timeout - no response" for a
+  /// refused port, an unreachable report and a receive error as well as for silence, so a result
+  /// recorded by 0.17 derives ``DNSProbeOutcome/timedOut`` for all of them: it cannot tell a
+  /// refusal from silence. Only a result measured by 0.18 or later carries a measured outcome.
   public init(
     server: String,
     query: String,
@@ -917,13 +1026,54 @@ public struct DNSProbeResult: Sendable, Codable {
     error: String?,
     timestamp: Date = Date()
   ) {
-    self.server = server
-    self.query = query
-    self.isReachable = isReachable
-    self.rtt = rtt
-    self.responseCode = responseCode
-    self.error = error
-    self.timestamp = timestamp
+    let (outcome, elapsed) = Self.legacyOutcome(
+      isReachable: isReachable, rtt: rtt, responseCode: responseCode, error: error)
+    self.init(
+      server: server, query: query, outcome: outcome, isReachable: isReachable, rtt: rtt,
+      elapsed: elapsed, responseCode: responseCode, error: error, timestamp: timestamp)
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case server, query, outcome, isReachable, rtt, elapsed, responseCode, error, timestamp
+  }
+
+  /// Decodes a result. JSON without an `outcome` key, as written before it existed, derives
+  /// ``outcome`` and ``elapsed`` as the initializer without them does, with the same limit: a
+  /// result written by 0.17 cannot tell a refusal from silence, and derives
+  /// ``DNSProbeOutcome/timedOut`` for both.
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    server = try container.decode(String.self, forKey: .server)
+    query = try container.decode(String.self, forKey: .query)
+    isReachable = try container.decode(Bool.self, forKey: .isReachable)
+    rtt = try container.decodeIfPresent(TimeInterval.self, forKey: .rtt)
+    responseCode = try container.decodeIfPresent(Int.self, forKey: .responseCode)
+    error = try container.decodeIfPresent(String.self, forKey: .error)
+    timestamp = try container.decode(Date.self, forKey: .timestamp)
+    if let outcome = try container.decodeIfPresent(DNSProbeOutcome.self, forKey: .outcome) {
+      self.outcome = outcome
+      elapsed = try container.decodeIfPresent(TimeInterval.self, forKey: .elapsed)
+    } else {
+      (outcome, elapsed) = Self.legacyOutcome(
+        isReachable: isReachable, rtt: rtt, responseCode: responseCode, error: error)
+    }
+  }
+
+  private static func legacyOutcome(
+    isReachable: Bool, rtt: TimeInterval?, responseCode: Int?, error: String?
+  ) -> (DNSProbeOutcome, TimeInterval?) {
+    if isReachable {
+      return (responseCode == nil && error != nil ? .malformedReply : .answered, rtt)
+    }
+    guard let error else { return (.timedOut, nil) }
+    if error.hasPrefix(DNSProbeMessage.refusedPrefix) { return (.refused, nil) }
+    if error.hasPrefix(DNSProbeMessage.hostUnreachablePrefix)
+      || error.hasPrefix(DNSProbeMessage.networkUnreachablePrefix)
+    {
+      return (.unreachable, nil)
+    }
+    if error.hasPrefix(DNSProbeMessage.timeoutPrefix) { return (.timedOut, nil) }
+    return (.failed, nil)
   }
 }
 
@@ -938,7 +1088,8 @@ public struct DNSProbeResult: Sendable, Codable {
 ///   - timeout: The query timeout in seconds. It must be finite and greater than zero.
 /// - Returns: A result describing reachability and any network or socket failure.
 /// - Throws: ``DNSError/invalidTimeout(_:)`` if `timeout` is not finite and greater than zero,
-///   or ``DNSError/invalidHostname(_:)`` if `query` cannot be encoded as a DNS name.
+///   ``DNSError/invalidHostname(_:)`` if `query` cannot be encoded as a DNS name, or
+///   `CancellationError` if the calling task is cancelled.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -959,7 +1110,8 @@ public func dnsProbe(
 /// - Parameter config: The probe configuration. Its timeout must be finite and greater than zero.
 /// - Returns: A result describing reachability and any network or socket failure.
 /// - Throws: ``DNSError/invalidTimeout(_:)`` if `config.timeout` is not finite and greater than
-///   zero, or ``DNSError/invalidHostname(_:)`` if `config.query` cannot be encoded as a DNS name.
+///   zero, ``DNSError/invalidHostname(_:)`` if `config.query` cannot be encoded as a DNS name, or
+///   `CancellationError` if the calling task is cancelled.
 #if compiler(>=6.2)
   @concurrent
 #endif
@@ -970,7 +1122,7 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult {
   let startTime = Date()
 
   // Perform DNS query
-  let result = await performDNSProbe(
+  let result = try await performDNSProbe(
     server: config.server,
     query: config.query,
     queryType: config.queryType,
@@ -982,8 +1134,10 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult {
   return DNSProbeResult(
     server: config.server,
     query: config.query,
+    outcome: result.outcome,
     isReachable: result.isReachable,
     rtt: result.rtt,
+    elapsed: result.elapsed,
     responseCode: result.responseCode,
     error: result.error,
     timestamp: startTime
@@ -1347,21 +1501,169 @@ public func queryA(
 // MARK: - Private Helpers
 
 private struct DNSProbeResultInternal {
+  let outcome: DNSProbeOutcome
   let isReachable: Bool
   /// Seconds from sending the query to reading the answer; set exactly when `isReachable` is.
   let rtt: TimeInterval?
+  /// Seconds from sending the query to whatever came back from the network, if anything did.
+  let elapsed: TimeInterval?
   let responseCode: Int?
   let error: String?
 }
 
+/// The messages ``dnsProbe(config:)`` writes that the legacy ``DNSProbeResult`` initializer reads
+/// back to derive an outcome.
+private enum DNSProbeMessage {
+  static let refusedPrefix = "Connection refused"
+  static let refused =
+    "Connection refused - the host is up but no DNS server is listening on this port"
+  static let hostUnreachablePrefix = "Host unreachable"
+  static let networkUnreachablePrefix = "Network unreachable"
+  static let timeoutPrefix = "Timeout"
+  static let timeout = "Timeout - no response"
+
+  static func detail(_ code: Int32) -> String {
+    "(errno=\(code): \(String(cString: strerror(code))))"
+  }
+
+  /// The network's report, after the query was sent, that the server cannot be reached.
+  static func unreachable(errno code: Int32) -> String {
+    code == ENETUNREACH
+      ? "\(networkUnreachablePrefix) - the network reported no route to the server \(detail(code))"
+      : "\(hostUnreachablePrefix) - the network reported the server's host unreachable \(detail(code))"
+  }
+
+  /// This machine's refusal, at `connect` or `send`, to send toward the server.
+  static func locallyUnreachable(errno code: Int32) -> String {
+    switch code {
+    case ENETUNREACH:
+      "\(networkUnreachablePrefix) - this machine has no route to the server \(detail(code))"
+    case ENETDOWN:
+      "\(networkUnreachablePrefix) - the interface toward the server is down \(detail(code))"
+    default:
+      "\(hostUnreachablePrefix) - this machine cannot reach the server's host \(detail(code))"
+    }
+  }
+
+  static let sendFailed = "Failed to send query"
+
+  static func receiveFailed(errno code: Int32) -> String {
+    "Receive failed - the socket reported an error while waiting for the reply \(detail(code))"
+  }
+}
+
+/// The `connect(2)` and `send(2)` errnos that mean this machine cannot reach the server. Darwin's
+/// manual pages list `EHOSTUNREACH`, `ENETDOWN` and `ENETUNREACH` for both calls. `EHOSTDOWN` is not
+/// listed there; XNU's address resolution returns it from `send` when an on-link host does not
+/// answer, so it is included as the same condition.
+private let locallyUnreachableErrnos: Set<Int32> = [EHOSTUNREACH, EHOSTDOWN, ENETUNREACH, ENETDOWN]
+
+/// Why a probe ended without a valid answer: the transport's failure, or the error a query step
+/// threw.
+private enum DNSProbeFailure {
+  case transport(UDPExchangeFailure)
+  /// `replyRTT` is set when the error came from validating a reply that arrived.
+  case query(DNSError, replyRTT: TimeInterval?)
+  /// `connect(2)` failed with `errno`.
+  case connect(errno: Int32)
+  /// Any other error but cancellation. None is known to reach here.
+  case unexpected(any Error)
+}
+
+/// The probe result for every way a probe can end without a valid answer. Every outcome other
+/// than a clean answer is decided here.
+private func probeResult(for failure: DNSProbeFailure) -> DNSProbeResultInternal {
+  func notReachable(
+    _ outcome: DNSProbeOutcome, _ error: String, elapsed: TimeInterval? = nil
+  ) -> DNSProbeResultInternal {
+    DNSProbeResultInternal(
+      outcome: outcome, isReachable: false, rtt: nil, elapsed: elapsed, responseCode: nil,
+      error: error)
+  }
+  // Nothing came back from the network, so `elapsed` stays nil.
+  func sendStageFailure(_ code: Int32, stage: String) -> DNSProbeResultInternal {
+    locallyUnreachableErrnos.contains(code)
+      ? notReachable(.unreachable, DNSProbeMessage.locallyUnreachable(errno: code))
+      : notReachable(
+        .failed, "\(DNSProbeMessage.sendFailed) - \(stage) failed \(DNSProbeMessage.detail(code))")
+  }
+  func optionFailure(_ option: String, _ code: Int32) -> String {
+    "Failed to configure \(option) (errno=\(code)): \(String(cString: strerror(code)))"
+  }
+
+  switch failure {
+  case .transport(.refused(let rtt)):
+    return notReachable(.refused, DNSProbeMessage.refused, elapsed: rtt)
+  case .transport(.unreachable(let code, let rtt)):
+    return notReachable(.unreachable, DNSProbeMessage.unreachable(errno: code), elapsed: rtt)
+  case .transport(.timedOut):
+    return notReachable(.timedOut, DNSProbeMessage.timeout)
+  case .transport(.receiveFailed(let code)):
+    return notReachable(.failed, DNSProbeMessage.receiveFailed(errno: code))
+  case .transport(.sendFailed(let code?)):
+    return sendStageFailure(code, stage: "send")
+  case .transport(.sendFailed(nil)):
+    // A short send, or a deadline that passed before the datagram left.
+    return notReachable(.failed, DNSProbeMessage.sendFailed)
+  case .connect(let code):
+    return sendStageFailure(code, stage: "connect")
+  case .transport(.socketCreationFailed):
+    return notReachable(.failed, "Failed to create socket")
+  case .transport(.nonBlockingFailed(let code)):
+    return notReachable(.failed, optionFailure("O_NONBLOCK", code))
+
+  case .query(.serverError(let rcode), let replyRTT):
+    // Any response code means a DNS server answered.
+    return DNSProbeResultInternal(
+      outcome: .answered, isReachable: true, rtt: replyRTT, elapsed: replyRTT,
+      responseCode: rcode, error: nil)
+  case .query(.noRecords, let replyRTT):
+    return DNSProbeResultInternal(
+      outcome: .answered, isReachable: true, rtt: replyRTT, elapsed: replyRTT, responseCode: 0,
+      error: nil)
+  case .query(.malformedResponse, let replyRTT):
+    return DNSProbeResultInternal(
+      outcome: .malformedReply, isReachable: true, rtt: replyRTT, elapsed: replyRTT,
+      responseCode: nil, error: "Malformed response")
+  case .query(.timeout, _):
+    return notReachable(.timedOut, DNSProbeMessage.timeout)
+  case .query(.socketCreationFailed, _):
+    return notReachable(.failed, "Failed to create socket")
+  case .query(.setsockoptFailed(let option, let code), _):
+    return notReachable(.failed, optionFailure(option, code))
+  case .query(.bindFailed(let message), _):
+    return notReachable(.failed, message)
+  case .query(.invalidIP(let ip), _):
+    return notReachable(.failed, "Invalid server IP: \(ip)")
+  case .query(.sendFailed, _):
+    return notReachable(.failed, DNSProbeMessage.sendFailed)
+  case .query(.invalidHostname(let name), _):
+    return notReachable(.failed, "Invalid hostname: \(name)")
+  case .query(.invalidTimeout(let timeout), _):
+    return notReachable(.failed, "Invalid timeout: \(timeout)")
+  case .unexpected(let error):
+    return notReachable(.failed, "Unexpected error: \(error)")
+  }
+}
+
+/// `connect(2)` on a DNS socket failed. The query methods report it as `DNSError.sendFailed`;
+/// ``dnsProbe(config:)`` reports the errno.
+private struct DNSConnectFailure: Error {
+  let errno: Int32
+}
+
 /// Connect a UDP socket to a DNS server so the kernel only accepts datagrams
 /// from the queried address and port.
+///
+/// - Throws: ``DNSError/invalidIP(_:)``, or ``DNSConnectFailure`` when `connect` fails.
 private func connectDNSSocket(
   _ fd: Int32,
   server: String,
   port: UInt16,
   family: Int32
 ) throws {
+  // The event-based path runs this on the async side, where the task-local is visible.
+  let connectSocket = TestSeams.connectSocket ?? { connect($0, $1, $2) }
   let result: Int32
 
   if family == AF_INET6 {
@@ -1376,7 +1678,7 @@ private func connectDNSSocket(
     }
     result = withUnsafePointer(to: &address) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-        connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        connectSocket(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in6>.size))
       }
     }
   } else {
@@ -1389,13 +1691,13 @@ private func connectDNSSocket(
     }
     result = withUnsafePointer(to: &address) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-        connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+        connectSocket(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
       }
     }
   }
 
   guard result == 0 else {
-    throw DNSError.sendFailed
+    throw DNSConnectFailure(errno: errno)
   }
 }
 
@@ -1536,7 +1838,11 @@ private func performDNSQueryBlocking(
   try _applyDNSSocketTimeout(fd: fd, timeout: timeout)
 
   // A connected UDP socket only receives responses from this DNS server and port.
-  try connectDNSSocket(fd, server: server, port: 53, family: serverFamily)
+  do {
+    try connectDNSSocket(fd, server: server, port: 53, family: serverFamily)
+  } catch is DNSConnectFailure {
+    throw DNSError.sendFailed
+  }
 
   let (msg, id) = makeDNSQueryMessage(encodedQuery: encodedQuery, queryType: queryType)
   let sent = msg.withUnsafeBytes { raw in
@@ -1566,8 +1872,10 @@ private func performDNSQueryBlocking(
 /// Runs the query behind ``dnsProbe(config:)`` and reports it as a probe outcome.
 ///
 /// Any DNS response, including an error code or a malformed reply, means the server is reachable.
-/// A refusal does not: the host is up, but no DNS server answers on the port, so it is reported as
-/// unreachable, with a message that tells it apart from silence.
+/// A refusal does not: the host is up, but no DNS server answers on the port. ``probeResult(for:)``
+/// decides every outcome other than a clean answer.
+///
+/// - Throws: `CancellationError` when the calling task is cancelled, and nothing else.
 private func performDNSProbe(
   server: String,
   query: String,
@@ -1575,100 +1883,30 @@ private func performDNSProbe(
   timeout: TimeInterval,
   interface: String?,
   sourceIP: String?
-) async -> DNSProbeResultInternal {
-  var replyRTT: TimeInterval?
+) async throws -> DNSProbeResultInternal {
+  let reply: DNSReply
   do {
-    let reply: DNSReply
-    do {
-      reply = try await exchangeDNSQuery(
-        server: server, query: query, queryType: queryType, timeout: timeout,
-        interface: interface, sourceIP: sourceIP)
-    } catch UDPExchangeFailure.refused {
-      return DNSProbeResultInternal(
-        isReachable: false,
-        rtt: nil,
-        responseCode: nil,
-        error: "Connection refused - the host is up but no DNS server is listening on this port"
-      )
-    } catch let failure as UDPExchangeFailure {
-      throw dnsError(for: failure)
-    }
-    replyRTT = reply.rtt
-    // Success means RCODE=0
-    _ = try reply.answers()
-    return DNSProbeResultInternal(
-      isReachable: true,
-      rtt: replyRTT,
-      responseCode: 0,
-      error: nil
-    )
-  } catch DNSError.serverError(let rcode) {
-    // DNS server responded with non-zero RCODE (NXDOMAIN, etc.)
-    // This is still "reachable" for probe purposes
-    return DNSProbeResultInternal(
-      isReachable: true,
-      rtt: replyRTT,
-      responseCode: rcode,
-      error: nil
-    )
-  } catch DNSError.timeout {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseCode: nil,
-      error: "Timeout - no response"
-    )
-  } catch DNSError.socketCreationFailed {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseCode: nil,
-      error: "Failed to create socket"
-    )
-  } catch DNSError.setsockoptFailed(let option, let errorCode) {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseCode: nil,
-      error:
-        "Failed to configure \(option) (errno=\(errorCode)): \(String(cString: strerror(errorCode)))"
-    )
-  } catch DNSError.bindFailed(let msg) {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseCode: nil,
-      error: msg
-    )
-  } catch DNSError.invalidIP(let ip) {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseCode: nil,
-      error: "Invalid server IP: \(ip)"
-    )
-  } catch DNSError.sendFailed {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseCode: nil,
-      error: "Failed to send query"
-    )
-  } catch DNSError.malformedResponse {
-    return DNSProbeResultInternal(
-      isReachable: true,  // Got response, even if malformed
-      rtt: replyRTT,
-      responseCode: nil,
-      error: "Malformed response"
-    )
-  } catch {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      rtt: nil,
-      responseCode: nil,
-      error: "Unexpected error: \(error)"
-    )
+    reply = try await exchangeDNSQuery(
+      server: server, query: query, queryType: queryType, timeout: timeout,
+      interface: interface, sourceIP: sourceIP)
+  } catch let failure as UDPExchangeFailure {
+    return probeResult(for: .transport(failure))
+  } catch let error as DNSError {
+    return probeResult(for: .query(error, replyRTT: nil))
+  } catch let failure as DNSConnectFailure {
+    return probeResult(for: .connect(errno: failure.errno))
+  } catch let error where !(error is CancellationError) {
+    return probeResult(for: .unexpected(error))
   }
+
+  do {
+    _ = try reply.answers()
+  } catch let error as DNSError {
+    return probeResult(for: .query(error, replyRTT: reply.rtt))
+  }
+  return DNSProbeResultInternal(
+    outcome: .answered, isReachable: true, rtt: reply.rtt, elapsed: reply.rtt, responseCode: 0,
+    error: nil)
 }
 
 // MARK: - Existing DNS Client

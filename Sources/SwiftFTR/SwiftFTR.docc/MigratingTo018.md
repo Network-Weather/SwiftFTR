@@ -1,10 +1,12 @@
 # Migrating to SwiftFTR 0.18
 
-Handle the cancellation, discovery-budget, DNS and trace socket-setup changes introduced in SwiftFTR 0.18.
+Handle the cancellation, discovery-budget, DNS and trace socket-setup changes introduced in SwiftFTR 0.18, and adopt the structured DNS probe outcome.
 
 ## Overview
 
-SwiftFTR 0.18 is source-compatible with 0.17: no public declaration is added, removed or changed.
+SwiftFTR 0.18 is source-compatible with 0.17: no public declaration is removed or changed. One is
+added: ``DNSProbeOutcome``, with ``DNSProbeResult/outcome``, ``DNSProbeResult/elapsed`` and an
+initializer that takes both; the initializer and JSON without them still work and derive them.
 What changes is behavior an unmodified caller can observe. Each section below has the same shape,
 so a person or a coding agent can work through a consumer one change at a time:
 
@@ -14,7 +16,8 @@ so a person or a coding agent can work through a consumer one change at a time:
 
 To find the call sites to review, search the consumer for `discoverPaths(`, `networkChanged(`,
 `cancelActiveTraces(`, `TracerouteError.cancelled`, `.cancelled`, `publicIPDiscoveryTimeout`,
-`DNSError`, `socketCreateFailed`, `dnsProbe(`, `rttMs` and the `rtt` of the DNS result types.
+`DNSError`, `socketCreateFailed`, `dnsProbe(`, `rttMs` and the `rtt` and `error` of the DNS result
+types.
 
 ## Update the package
 
@@ -300,11 +303,45 @@ at this server", and it does not. A server that stays silent is still `DNSError.
 `sendFailed` where they threw `timeout`, and `dnsProbe` returns the same unreachable result as
 0.17 with a different `error` message.
 
-**What to change.** Nothing for `dnsProbe`: `isReachable` keeps its meaning. Its `error` is a
-message for people, not an API, so do not parse it to tell a refusal from silence; a structured
-outcome for that is planned for a later release. Where the query methods' errors are handled and
-the distinction matters, catch `sendFailed` separately from `timeout`: it means the query was not
-delivered to a DNS server.
+**What to change.** For `dnsProbe`, `isReachable` keeps its meaning. To tell a refusal from
+silence, read ``DNSProbeResult/outcome``, not the `error` string, which is a message for people.
+Replace any match on `error` text, and any code that treats every unreachable result alike, with a
+`switch` over `outcome`. ``DNSProbeOutcome`` is a struct with static members, not an enum, so a
+later release can add an outcome: match the members you handle and keep the `default` arm. A
+refusal has no `rtt`; ``DNSProbeResult/elapsed`` is how long it took.
+
+Before:
+
+```swift
+let result = try await dnsProbe(server: resolver)
+if !result.isReachable {
+  if result.error?.hasPrefix("Connection refused") == true {
+    showNoDNSServer(at: resolver)
+  } else {
+    showDNSServerDown(resolver, reason: result.error)
+  }
+}
+```
+
+After:
+
+```swift
+let result = try await dnsProbe(server: resolver)
+switch result.outcome {
+case .answered, .malformedReply:
+  break  // isReachable is true
+case .refused:
+  showNoDNSServer(at: resolver)  // the host is up; result.elapsed is when it said so
+case .timedOut:
+  showDNSServerDown(resolver, reason: result.error)
+default:
+  // .unreachable, .failed, and any outcome a later release adds.
+  showDNSServerDown(resolver, reason: result.error)
+}
+```
+
+Where the query methods' errors are handled and the distinction matters, catch `sendFailed`
+separately from `timeout`: it means the query was not delivered to a DNS server.
 
 Before:
 
@@ -332,9 +369,9 @@ do {
 ## An empty DNS reply is a malformed response
 
 **What changed.** A zero-byte datagram from the server is a malformed reply: the query methods
-throw `DNSError.malformedResponse`, and `dnsProbe` returns `isReachable == true` with
-`responseCode == nil`, a round-trip time and `error == "Malformed response"`, as for any other
-malformed reply. 0.17 reported it as `DNSError.timeout`, and `dnsProbe` as unreachable with
+throw `DNSError.malformedResponse`, and `dnsProbe` returns `outcome == .malformedReply`,
+`isReachable == true`, `responseCode == nil`, a round-trip time and `error == "Malformed
+response"`, as for any other malformed reply. 0.17 reported it as `DNSError.timeout`, and `dnsProbe` as unreachable with
 "Timeout - no response".
 
 **What a caller sees.** For a server that answers with an empty datagram, `malformedResponse`
@@ -342,7 +379,7 @@ where it saw `timeout`, and a reachable `dnsProbe` result with no response code.
 
 **What to change.** Nothing, if the consumer already handles `malformedResponse`, and already
 treats a reachable `dnsProbe` result with no `responseCode` as a malformed reply rather than a DNS
-answer. Otherwise add both.
+answer. Otherwise add both; for `dnsProbe`, check `outcome == .malformedReply`.
 
 Before:
 
@@ -381,12 +418,101 @@ After:
 
 ```swift
 let result = try await dnsProbe(server: resolver)
-if result.isReachable, result.responseCode != nil {
+switch result.outcome {
+case .answered:
   showDNSServerUp(resolver)  // a DNS answer, NXDOMAIN and SERVFAIL included
-} else if result.isReachable {
-  showDNSServerMisbehaving(resolver, reason: result.error)  // a malformed reply
-} else {
+case .malformedReply:
+  showDNSServerMisbehaving(resolver, reason: result.error)
+default:
   showDNSServerDown(resolver, reason: result.error)
+}
+```
+
+## dnsProbe reports unreachable servers and receive errors as such
+
+**What changed.** Three `dnsProbe` messages that hid what happened now say it:
+
+- When the network reports the server's host or network unreachable after the query is sent
+  (`EHOSTUNREACH` or `ENETUNREACH` on the socket), `outcome == .unreachable` and `error` says so
+  with the errno, such as "Host unreachable - the network reported the server's host unreachable
+  (errno=65: No route to host)". 0.17 said "Timeout - no response", although the report arrived
+  before the timeout. ``DNSProbeResult/elapsed`` is when the report arrived.
+- When this machine cannot send toward the server at all (`connect` or `send` fails with
+  `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or `ENETDOWN`), `outcome == .unreachable` and `error`
+  is "Network unreachable - this machine has no route to the server (errno=51: Network is
+  unreachable)" or a similar "Host unreachable - …"/"Network unreachable - …" message.
+  ``DNSProbeResult/elapsed`` is `nil`, because nothing came back. 0.17 said "Failed to send query".
+  Any other `connect` or `send` failure still starts "Failed to send query", now followed by the
+  errno.
+- A socket error while waiting for the reply that is neither a refusal nor an unreachable report
+  is `outcome == .failed` with "Receive failed - the socket reported an error while waiting for
+  the reply (errno=…)". 0.17 said "Timeout - no response".
+
+`isReachable` stays `false` and `rtt` stays `nil` in every case. The query methods are unchanged:
+`DNSError.timeout` for the first and third, `DNSError.sendFailed` for the second.
+
+**What a caller sees.** Different `error` messages for these cases, the first one sooner than the
+timeout.
+
+**What to change.** Nothing, unless the consumer matched "Timeout - no response" to detect silence
+or "Failed to send query" to detect a local failure. Replace both with `outcome`; an exact match
+on "Failed to send query" no longer matches when an errno follows it.
+
+Before:
+
+```swift
+let silent = !result.isReachable && result.error == "Timeout - no response"
+let localFailure = result.error == "Failed to send query"
+```
+
+After:
+
+```swift
+let silent = result.outcome == .timedOut
+let noRoute = result.outcome == .unreachable && result.elapsed == nil
+let localFailure = result.outcome == .failed
+```
+
+Apply the `silent` check only to results measured by 0.18 or later. For a result decoded from
+JSON that 0.17 wrote, or built with the initializer that takes no `outcome`, the outcome is a
+best-effort derivation from the old fields. In particular it cannot tell a refusal from silence:
+0.17 wrote "Timeout - no response" for a refused port too, so such a result derives
+`outcome == .timedOut` even when the host replied at once. Old data cannot recover the
+distinction.
+
+## dnsProbe throws CancellationError when its task is cancelled
+
+**What changed.** Cancelling the task that awaits `dnsProbe` makes it throw `CancellationError`.
+0.17 returned a result with `isReachable == false` and `error == "Unexpected error:
+CancellationError()"`, which reads as a failed server.
+
+**What a caller sees.** A thrown `CancellationError` where it got that result. `dnsProbe` was
+already `throws`, so the call site compiles unchanged.
+
+**What to change.** Make sure the code around the call treats `CancellationError` as "stopped",
+not as a failure of the server, and does not record a result for it.
+
+Before:
+
+```swift
+do {
+  let result = try await dnsProbe(server: resolver)
+  record(result)  // also recorded the fake result of a cancelled probe
+} catch {
+  reportFailure(error)
+}
+```
+
+After:
+
+```swift
+do {
+  let result = try await dnsProbe(server: resolver)
+  record(result)
+} catch is CancellationError {
+  return
+} catch {
+  reportFailure(error)
 }
 ```
 

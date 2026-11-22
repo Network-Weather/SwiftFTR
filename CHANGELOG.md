@@ -12,8 +12,21 @@ each kind of failure phase by phase. A network change now ends every `trace`, `t
 network changes), and several waits are now bounded by the caller's own configuration. DNS
 queries, `dnsProbe` and Team Cymru ASN lookups wait for their reply without holding a thread, so
 they no longer queue behind stalled reverse-DNS lookups for a blocking-I/O worker.
-No public API is added or removed: `swift package diagnose-api-breaking-changes v0.17.1` reports
-none. Upgrading from 0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
+One public API is added, a structured outcome on `dnsProbe` results; none is removed or changed:
+`swift package diagnose-api-breaking-changes v0.17.1` reports no breaking change. Upgrading from
+0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
+
+### New public API
+
+- **`DNSProbeResult.outcome` and `DNSProbeResult.elapsed`.** `outcome` is a `DNSProbeOutcome`:
+  `answered`, `refused`, `timedOut`, `malformedReply`, `unreachable` or `failed`, so a caller can
+  tell a refused port from silence without parsing `error`. It is a struct with static members,
+  not an enum, so a later release can add an outcome without breaking a `switch`; keep a
+  `default` arm. `elapsed` is the time from sending the query until something came back from the
+  network, and `nil` when nothing did; it is the only timing for a refusal, whose `rtt` stays
+  `nil`. A new initializer takes both. The existing initializer, and JSON written by
+  0.17 without an `outcome` key, still work and derive both from the other fields. Encoding adds
+  the `outcome` and `elapsed` keys, which also appear in `swift-ftr probe dns --json` output.
 
 ### Behavior changes
 
@@ -34,6 +47,23 @@ What an unmodified caller will see differently:
 - **An empty DNS reply is a malformed response.** A zero-byte datagram from the server throws
   `DNSError.malformedResponse`, and `dnsProbe` reports the server reachable with "Malformed
   response", as for any other malformed reply. It was reported as `DNSError.timeout`.
+- **`dnsProbe` reports host and network unreachable as such.** When the network reports the
+  server's host or network unreachable after the query is sent, `dnsProbe` returns
+  `outcome == .unreachable` with an `error` naming it and its errno ("Host unreachable - …" or
+  "Network unreachable - …"). It said "Timeout - no response", although the report arrived before
+  the timeout. `isReachable` stays `false`; the query methods still throw `DNSError.timeout`.
+- **`dnsProbe` reports no route to the server as unreachable.** When `connect` or `send` fails
+  with `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or `ENETDOWN` (no route, or the interface is
+  down), `dnsProbe` returns `outcome == .unreachable` with "Network unreachable - this machine has
+  no route to the server (errno=…)" or a similar message, and `elapsed == nil`. It said "Failed to
+  send query". Other `connect` and `send` failures still say "Failed to send query", now followed
+  by the errno. The query methods still throw `DNSError.sendFailed` for all of them.
+- **`dnsProbe` names a receive error instead of calling it a timeout.** A socket error while
+  waiting for the reply that is not a refusal or an unreachable report says "Receive failed - the
+  socket reported an error while waiting for the reply (errno=…)", with `outcome == .failed`. It
+  said "Timeout - no response". The query methods still throw `DNSError.timeout` for it.
+- **`dnsProbe` throws `CancellationError` when its task is cancelled.** It returned a result with
+  `isReachable == false` and `error == "Unexpected error: CancellationError()"`.
 - **`discoverPaths` throws `TracerouteError.cancelled` on `networkChanged()` and
   `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
   measured on the old network. A topology or flow error that arrives after the invalidation began

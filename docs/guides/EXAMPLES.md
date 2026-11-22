@@ -713,6 +713,32 @@ do {
 }
 ```
 
+### DNS Server Reachability
+
+`dnsProbe` reports a result instead of throwing for network failures. Read `outcome` to tell them
+apart. `DNSProbeOutcome` is a struct with static members, so a later release can add one: keep a
+`default` arm.
+
+```swift
+import SwiftFTR
+
+let result = try await dnsProbe(server: "192.168.1.1", query: "example.com", timeout: 2)
+switch result.outcome {
+case .answered:
+  print("DNS answered (rcode \(result.responseCode ?? 0)) in \(result.rtt ?? 0) s")
+case .refused:
+  // The router is up but nothing listens on port 53.
+  print("Refused after \(result.elapsed ?? 0) s")
+case .timedOut:
+  print("No reply within the timeout")
+case .unreachable:
+  print("Network reported the server unreachable: \(result.error ?? "")")
+default:
+  // .malformedReply, .failed, and outcomes added later.
+  print("\(result.outcome): \(result.error ?? "")")
+}
+```
+
 ## Ping (v0.5.0+)
 
 ### Basic Ping

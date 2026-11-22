@@ -442,6 +442,9 @@ otherwise. Decided ones say so.
    transport: a stale datagram queued before the query left but read after it is taken as the
    reply. It changes one verdict: a server that sends only wrong-ID datagrams is reported as
    timed out, not as reachable with a malformed response.
+9. **Structured DNS probe outcome.** Decided: add an additive `outcome` field to
+   `DNSProbeResult`; `isReachable` stays false for a refused port; the throwing query methods keep
+   `DNSError.sendFailed` for a refusal (David, 2026-11-22).
 
 ## Out of scope
 
@@ -465,6 +468,8 @@ Still unbounded after this plan, or deliberately deferred. Roadmap, not this pla
 - The UDP probe's setup. Its receive handler reads once per callback and does not have the
   receive-loop defect; its `fcntl` that sets `O_NONBLOCK` is still unchecked.
 - Thread Sanitizer and Address Sanitizer jobs, scheduled soak runs, DNS and STUN parser fuzzing.
+- Adding `connectionRefused` and `unreachable` cases to `DNSError`, which would break exhaustive
+  switches; for the next release where a source break is acceptable.
 - Root cause of the production timeouts in #84. This plan gives the means to find it; 56 of 59
   reported calls returned within five seconds of cancellation, so a blocked resolver is not
   established as the cause.
