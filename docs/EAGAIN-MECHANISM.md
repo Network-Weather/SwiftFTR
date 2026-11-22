@@ -8,9 +8,11 @@ record, not a plan.
 > hypothesis is still untested. Two things this page discusses have changed since it was
 > written: `SendRetry.swift` no longer justifies the 250 ms budget with buffer
 > pressure (its comment now cites this page and calls the budget a guess against `EAGAIN`), and
-> a probe whose send budget runs out no longer aborts the trace — it is reported as
-> `HopOutcome.notSent(errno:)` and the trace continues. Source line numbers in SwiftFTR files
-> are as of that writing.
+> a probe whose send budget runs out no longer aborts the trace, provided another probe in the
+> burst was sent — it is reported as `HopOutcome.notSent(errno:)` and the trace continues. When
+> no probe was sent (for example a `maxHops: 1` trace whose only send exhausts the budget), the
+> trace throws `TracerouteError.sendFailed(errno:)`. Source line numbers in SwiftFTR files are as
+> of that writing.
 
 **Bottom line:** on `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` the send buffer is pure
 accounting and never holds a byte, so it cannot fill and cannot produce `EAGAIN`.

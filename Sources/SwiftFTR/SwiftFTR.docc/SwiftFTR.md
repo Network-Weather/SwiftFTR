@@ -93,11 +93,12 @@ let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
 
 ## Reacting to Network Changes
 
-``SwiftFTR/SwiftFTR/networkChanged()`` cancels active traces and clears the cached public IP and
-the reverse-DNS cache. ASN results are not network-scoped and are kept. When only part of the
+``SwiftFTR/SwiftFTR/networkChanged()`` ends every `trace`, `traceClassified`, `traceStream` and
+`discoverPaths` in flight with ``SwiftFTR/TracerouteError/cancelled`` and clears the cached public
+IP and the reverse-DNS cache. `ping` and the probes are not tied to the tracer and keep running. ASN results are not network-scoped and are kept. When only part of the
 network state changed, call the individual controls instead:
 
-- ``SwiftFTR/SwiftFTR/cancelActiveTraces()`` cancels in-flight traces and keeps all caches.
+- ``SwiftFTR/SwiftFTR/cancelActiveTraces()`` ends the same operations and keeps all caches.
 - ``SwiftFTR/SwiftFTR/invalidateNetworkScopedRDNS()`` evicts only reverse-DNS entries for
   non-global addresses and resets the reverse-DNS stall breaker.
 - ``SwiftFTR/SwiftFTR/invalidatePublicIP()`` clears the cached public IP without changing a

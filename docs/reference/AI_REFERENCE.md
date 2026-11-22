@@ -74,7 +74,7 @@ public actor SwiftFTR {
     public func preloadASNDatabase() async
 
     // Network-transition lifecycle and caches
-    public func networkChanged() async            // cancel traces + clear public IP + clear rDNS
+    public func networkChanged() async            // cancel operations + clear public IP + clear rDNS
     public func cancelActiveTraces() async        // cancel only; caches preserved
     public func invalidateNetworkScopedRDNS() async  // evict non-global rDNS entries only
     @discardableResult
@@ -88,6 +88,9 @@ public actor SwiftFTR {
 Notes:
 - `ping(to:config:)` is `nonisolated` (and `@concurrent` on Swift 6.2+ compilers), so concurrent
   pings from one instance run in parallel, each on its own socket.
+- `networkChanged()` and `cancelActiveTraces()` end every `trace`, `traceClassified`,
+  `traceStream` and `discoverPaths` in flight with `TracerouteError.cancelled`, even if its caller
+  cancelled too. `ping` and the probe functions are not tied to the tracer and keep running.
 - `networkChanged()` does not clear the ASN cache; ASN data is not network-scoped.
 - `seedPublicIP` accepts only syntactically valid, globally routable IPv4/IPv6 addresses and
   returns `false` otherwise (private, CGNAT, link-local, loopback, multicast, documentation and
@@ -999,8 +1002,8 @@ struct TraceView: View {
   the trace, then again during classification if the first found nothing). An address found by
   the first attempt is cached per instance until invalidated; one found only by the second is
   returned in that result and not cached, so the next trace discovers again. Multipath reuses an existing cached value but does not
-  write its own discoveries back; with no cached value, each flow discovers on its own, and those
-  attempts use the 6 s default regardless of the instance's `publicIPDiscoveryTimeout`.
+  write its own discoveries back; with no cached value, each flow discovers on its own, each
+  attempt bounded by the instance's `publicIPDiscoveryTimeout`.
 - **ASN**: the embedded database answers locally (microseconds per lookup once loaded; it reloads
   if every resolver holding it has been released). DNS-based results are cached process-wide with
   a soft cap of 2048 entries. ASN caches
