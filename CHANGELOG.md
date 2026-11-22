@@ -3,8 +3,17 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-Unreleased
-----------
+0.17.1 — 2026-11-21
+-------------------
+
+A robustness release for the bridge that every blocking system call crosses: reverse DNS,
+public-IP discovery, ASN and DNS queries. A cancellation at the wrong instant could crash the
+process or leave the caller suspended forever, and callers that gave up on queued work leaked it.
+All three are fixed, one more unbounded wait is bounded, and the embedded ASN database is
+refreshed.
+
+No public API changes: `swift package diagnose-api-breaking-changes v0.17.0` reports none.
+Upgrading is a version bump, and it raises the SwiftIP2ASN floor to 0.5.2.
 
 ### Bug fixes
 
