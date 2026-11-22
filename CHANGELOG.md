@@ -165,7 +165,6 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   has run, now fail after ten seconds instead of hanging the run when that never happens (#105).
   Waits that cannot fail to end (a fixture's own stop path, a stall the test itself releases, a
   call with its own timeout) are left as they are.
-
 - The offline tests no longer assert wall-clock upper bounds, which failed on slow CI runners
   while the library behaved correctly (#118). A test that an operation ends early gives it a
   window longer than a watchdog; a test that a caller was released asserts it returned while the
