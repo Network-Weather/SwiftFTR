@@ -279,10 +279,11 @@ private func performTCPProbe(
     }
   }
 
-  // Non-blocking.
-  var flags = fcntl(sockfd, F_GETFL, 0)
-  flags |= O_NONBLOCK
-  _ = fcntl(sockfd, F_SETFL, flags)
+  // A blocking connect would outlive the probe's timeout and its cancellation.
+  if let error = makeProbeSocketNonBlocking(sockfd: sockfd) {
+    close(sockfd)
+    return ProbeResult(isReachable: false, connectionState: .error, rtt: nil, error: error)
+  }
 
   // Build the destination sockaddr from the resolved family + port.
   var destAddr = resolved.address

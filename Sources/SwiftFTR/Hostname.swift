@@ -107,6 +107,26 @@ internal func bindInterface(sockfd: Int32, family: Int32, ifIndex: UInt32) -> St
   return nil
 }
 
+/// Makes a TCP or UDP probe socket non-blocking, as ``setProbeSocketNonBlocking(_:)`` does for
+/// trace and ping. Returns nil on success; on failure, the message the probe reports in its
+/// result, naming the failed `fcntl` step and its errno.
+///
+/// The probes report setup failures in their result rather than throwing. Neither may run on a
+/// blocking socket: the TCP probe's `connect` would wait for the kernel's connect timeout, past the
+/// probe's timeout and cancellation, and the UDP probe's `recv` would park its queue on a readable
+/// event with no datagram.
+internal func makeProbeSocketNonBlocking(sockfd: Int32) -> String? {
+  do {
+    try setProbeSocketNonBlocking(sockfd)
+    return nil
+  } catch TracerouteError.socketCreateFailed(let code, let step) {
+    return
+      "Failed to make socket non-blocking: \(step) (errno=\(code)): \(String(cString: strerror(code)))"
+  } catch {
+    return "Failed to make socket non-blocking: \(error)"
+  }
+}
+
 /// Dual-stack host resolver shared across `ping()`, `trace()`, and friends.
 ///
 /// Honors `PreferredFamily`:
