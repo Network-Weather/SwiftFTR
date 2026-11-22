@@ -25,31 +25,37 @@ struct TraceLifecycleTests {
       maxHops: 1
     )
 
-    let consumer = Task {
-      var iterator = tracer.traceStream(
-        to: "192.0.2.1", config: streamConfig
-      ).makeAsyncIterator()
-      return try await iterator.next()
+    // A loopback peer that never answers, so the stream stays in its receive window until it is
+    // cancelled. A real first hop can answer within a millisecond and end the stream first.
+    let network = try FakeICMPNetwork { _ in [] }
+    defer { network.stop() }
+    try await network.install {
+      let consumer = Task {
+        var iterator = tracer.traceStream(
+          to: "fake.test", config: streamConfig
+        ).makeAsyncIterator()
+        return try await iterator.next()
+      }
+
+      let receiving = await waitUntil {
+        guard let handle = await tracer.activeTraces.first else { return false }
+        return await handle.hasCancellationHandler
+      }
+      #expect(receiving, "The streaming trace should start before cancellation")
+
+      let started = ContinuousClock.now
+      await tracer.cancelActiveTraces()
+
+      do {
+        _ = try await consumer.value
+      } catch is CancellationError {
+      } catch TracerouteError.cancelled {
+      }
+
+      let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
+      #expect(unregistered)
+      #expect(started.duration(to: .now) < .seconds(1))
     }
-
-    let receiving = await waitUntil {
-      guard let handle = await tracer.activeTraces.first else { return false }
-      return await handle.hasCancellationHandler
-    }
-    #expect(receiving, "The streaming trace should start before cancellation")
-
-    let started = ContinuousClock.now
-    await tracer.cancelActiveTraces()
-
-    do {
-      _ = try await consumer.value
-    } catch is CancellationError {
-    } catch TracerouteError.cancelled {
-    }
-
-    let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
-    #expect(unregistered)
-    #expect(started.duration(to: .now) < .seconds(1))
 
     // Verify caches are still intact!
     #expect(await tracer.publicIP == "198.51.100.1")
