@@ -45,9 +45,9 @@ What an unmodified caller will see differently:
   `TracerouteError.cancelled`, also when the caller cancelled too. A caller's own cancellation
   used to be reported as `TracerouteError.cancelled` in most phases and as `CancellationError` in
   one, so a caller that retried on `TracerouteError.cancelled` retried after cancelling itself.
-- **A `traceStream` consumer that cancels sees a normal end of iteration**, never an error; the
-  stream then stops probing and closes its socket. A live stream ended by the tracer still throws
-  `TracerouteError.cancelled`.
+- **A `traceStream` consumer that cancels its task sees a normal end of iteration**, unless the
+  tracer had already ended the stream; the trace then stops probing and closes its socket. A
+  stream the tracer ends before it finishes still throws `TracerouteError.cancelled`.
 
 ### Bug fixes
 
@@ -80,8 +80,10 @@ What an unmodified caller will see differently:
   phase through task-local test seams and loopback fixtures, and asserts that every operation
   returns while its stall is still in force, under a watchdog derived from its configuration. See
   `docs/ROBUSTNESS-TESTING.md`.
-- Every test that waits for a fixture to start fails after ten seconds instead of hanging the
-  run when the start never comes (#105).
+- Tests that wait for a fixture to start, become ready or be cancelled, or poll until a fixture
+  has run, now fail after ten seconds instead of hanging the run when that never happens (#105).
+  Waits that cannot fail to end (a fixture's own stop path, a stall the test itself releases, a
+  call with its own timeout) are left as they are.
 
 ### Dependencies
 

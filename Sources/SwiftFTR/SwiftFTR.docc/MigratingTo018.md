@@ -117,8 +117,11 @@ caller cancelled its own task. `TracerouteError.cancelled`: the tracer ended the
 `TracerouteError.cancelled` for its own task's cancellation, and `trace` and `traceClassified`
 threw it in most phases and `CancellationError` in one. `ping` is still not ended by
 `networkChanged()` or `cancelActiveTraces()`, so it now only ever throws `CancellationError` for a
-cancellation. `discoverPaths` already followed the rule. A `traceStream` consumer that cancels
-sees iteration end normally; a live stream the tracer ends throws `TracerouteError.cancelled`.
+cancellation. `discoverPaths` already followed the rule. A `traceStream` consumer that cancels its
+task sees iteration end normally, unless the tracer had already ended the stream; a stream the
+tracer ends before it finishes throws `TracerouteError.cancelled`. Breaking out of a loop over a
+stream held in a variable cancels nothing: the trace runs until it finishes or the stream is
+released.
 
 **What a caller sees.** A ping or trace that the consumer itself cancels, for example by
 cancelling the task that runs it when a view goes away or a newer measurement replaces it, throws

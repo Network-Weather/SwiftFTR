@@ -248,8 +248,11 @@ Observations that are not defects of the library:
   handler delivers that error to a consumer that cancelled; one that finishes after the handler
   returns does not. `traceStream` therefore finishes normally when its consumer cancels, rather
   than relying on its producer losing that race.
-- A wait for a test fixture to start that is a bare continuation or semaphore cannot be ended by
-  `.timeLimit`, whose task group still joins the stuck child. Such waits go through
-  `waitBounded`, which fails the test after ten seconds instead.
+- A wait on a test-owned signal that is a bare continuation, semaphore or stream cannot be ended
+  by `.timeLimit`, whose task group still joins the stuck child. Waits for a fixture to start,
+  become ready or be cancelled go through `waitBounded`, and polls for one to run through
+  `eventually`, each failing the test after ten seconds. A test that gives up does not join the
+  operation it was waiting on. Waits that cannot fail to end are left unbounded: a fixture's stop
+  path, a stall the test itself releases, a call with its own timeout.
 - `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
   identifies a socket by its bound local address when checking that the library closed it.

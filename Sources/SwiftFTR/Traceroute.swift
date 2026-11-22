@@ -555,10 +555,15 @@ public actor SwiftFTR {
   /// }
   /// ```
   ///
-  /// ``networkChanged()`` and ``cancelActiveTraces()`` end a live stream with
-  /// `TracerouteError.cancelled`. A consumer that cancels its own task, or stops iterating, sees
-  /// iteration end normally, as with any `AsyncSequence`: `next()` returns `nil` rather than
-  /// throwing. The stream then stops probing and closes its socket.
+  /// ``networkChanged()`` and ``cancelActiveTraces()`` end a stream that has not finished with
+  /// `TracerouteError.cancelled`. A consumer that cancels its own task sees iteration end
+  /// normally, as with any `AsyncSequence`: `next()` returns `nil` rather than throwing.
+  ///
+  /// The trace stops probing and closes its socket when the stream terminates: when the task
+  /// iterating it is cancelled, or when the stream and its iterator are released. Breaking out of
+  /// a `for try await` loop written inline over `traceStream(...)` releases the stream and so stops
+  /// the trace. Breaking out of a loop over a stream held in a variable does not: the trace keeps
+  /// its socket open and keeps re-probing until it finishes or the stream is released.
   ///
   /// - Parameters:
   ///   - host: Destination hostname or IPv4/IPv6 address.
@@ -1344,10 +1349,11 @@ public actor SwiftFTR {
   /// Cancel all active traceroute operations without clearing caches.
   ///
   /// Signals every operation registered when the call is made: `trace`, `traceClassified`,
-  /// `traceStream` and `discoverPaths`. One that is still running stops and throws
+  /// `traceStream` and `discoverPaths`. One that has not finished stops and throws
   /// `TracerouteError.cancelled`, even if its caller cancelled it too. One that has already
-  /// produced its result may still return it: a `traceStream` that has delivered its last hop ends
-  /// normally. `discoverPaths` alone guarantees more: a topology not yet returned is discarded.
+  /// finished keeps its outcome. For a `traceStream`, delivering its last hop is not finishing:
+  /// until the producer has ended the stream, the consumer's next call can still throw.
+  /// `discoverPaths` alone guarantees more: a topology not yet returned is discarded.
   /// Operations registered after this call remain tracked for subsequent cancellation.
   /// This method does not invalidate rDNS, public IP, or ASN caches.
   public func cancelActiveTraces() async {
