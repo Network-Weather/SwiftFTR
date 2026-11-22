@@ -52,7 +52,7 @@ overall deadline (#84).
 ## What stays
 
 - Every public signature. New options are added as separate initializer overloads so existing
-  calls keep their exact function type. The one proposed exception is in Decisions.
+  calls keep their exact function type. No case is added to an existing public error enum.
 - The fault-injection approach from #94: task-local seams, loopback fixtures, negative controls.
   The seam closure types for resolution and public-IP discovery are synchronous today and become
   async with the code they replace, so the tests that bind them change.
@@ -360,8 +360,7 @@ swift package --allow-writing-to-directory docc generate-documentation --target 
 
 - The release-mode run is there because optimized builds shorten object lifetimes, which is how
   an object kept alive only by a callback context is freed early.
-- After 0.18.0 the API check also runs against `v0.18.0`. If the new error case is accepted, it
-  goes in a breakage allowlist file passed to the check, and nothing else does.
+- After 0.18.0 the API check also runs against `v0.18.0`. No breakage is allowlisted.
 - Each event-based stage adds one more: with every executor slot held by a gated blocker, the
   operation it converts still completes against a healthy loopback fixture reached by a literal
   address.
@@ -383,12 +382,10 @@ written for both people and coding agents updating a consumer from 0.17.
 
 ## Decisions for David
 
-Each has a recommended default. Work proceeds on the default until he says otherwise.
+Each open one has a recommended default, and work proceeds on the default until he says
+otherwise. Decided ones say so.
 
-1. **Is Event-Based DNS in 0.18.0?** Recommended: yes. Without it the release ships a DNS probe
-   that can wait without limit for a worker, and all three reviewers found the cheap interim
-   bound wrong: it can report a healthy server as unreachable. The cost is one more stage before
-   the release.
+1. **Is Event-Based DNS in 0.18.0?** Decided: yes (David, 2026-11-22).
 2. **Cancellation errors (Consistent Cancellation).** Recommended: fix before 0.18.0. Ping's
    error type changes for a caller that cancels its own task.
 3. **Forward resolution keeps `getaddrinfo`.** Recommended, as described in Resolution Off The
@@ -402,16 +399,11 @@ Each has a recommended default. Work proceeds on the default until he says other
    return the result with enrichment missing and a field naming the phase that ran out, and
    throw only when the deadline passes before the probe window completes. The alternative is to
    throw and carry the partial result in the error.
-6. **Shape of the deadline error**, for the case that does throw. The reviewers split, and the
-   split did not close in the second round.
-   - A separate type such as `TraceDeadlineExceeded` (Codex, both rounds): adding a case to
-     `TracerouteError` breaks exhaustive switches in consumers, which the source-compatibility
-     rule forbids as stated.
-   - A new `TracerouteError` case (Fable and Gemini in the first round): callers route on
-     `TracerouteError`, so a separate type falls into a generic catch at run time with no
-     warning, and 0.14 added `DNSError` cases in a minor release.
-   The author leans to the separate type now, because decision 5's default makes this error rare
-   and the compatibility rule is the owner's.
+6. **Shape of the deadline error**, for the case that does throw. Decided: a separate error
+   type, not a new `TracerouteError` case (David, 2026-11-22). A new case would break exhaustive
+   switches in consumers; decision 5's default makes this error rare. The compatibility gate
+   compiles an exhaustive switch over `TracerouteError` to hold that line, and the documentation
+   says a caller catching only `TracerouteError` will not see the deadline error.
 7. **Forward-resolution budget.** There is no configuration to derive one from today.
    Recommended: a new `SwiftFTRConfig` option for traces, defaulting to 10 seconds, with probes
    spending from their existing `timeout`. The 10 seconds is a proposal, not a measurement.
