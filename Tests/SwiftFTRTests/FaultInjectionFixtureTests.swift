@@ -37,7 +37,10 @@ struct FaultInjectionFixtureTests {
     let start = monotonicNow()
     await #expect(throws: WatchdogExpired.self) {
       _ = try await measure(within: 0.2) {
-        await withCheckedContinuation { (_: CheckedContinuation<Void, Never>) in }
+        // Outlives the watchdog and ignores cancellation, but does end, so no task is stranded.
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          DispatchQueue.global().asyncAfter(deadline: .now() + 2) { continuation.resume() }
+        }
       }
     }
     #expect(monotonicNow() - start < 1.0)
@@ -92,7 +95,9 @@ struct FaultInjectionFixtureTests {
       .respond(response: Array("late".utf8), after: 30),
     ])
   func tcpServerStopJoinsHandlers(behavior: LoopbackTCPServer.Behavior) async throws {
-    let server = try LoopbackTCPServer(behavior: behavior)
+    let exitGate = StallGate()
+    defer { exitGate.open() }
+    let server = try LoopbackTCPServer(behavior: behavior, exitGate: exitGate)
     let client = socket(AF_INET, SOCK_STREAM, 0)
     defer { close(client) }
     var (address, length) = loopbackAddress(family: AF_INET, port: server.port)
@@ -103,14 +108,25 @@ struct FaultInjectionFixtureTests {
     _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
     #expect(await eventually(within: 2) { server.accepted.value == 1 })
 
-    // Run on its own thread under a watchdog, so a stop() that never returns fails the test
-    // instead of hanging the run.
-    let stoppedPromptly = await returnsWithin(1.0) { server.stop() }
-    #expect(stoppedPromptly, "stop() waited for a handler's own timeout")
+    // stop() runs on its own thread. The handler is held at the exit gate, so stop() must not
+    // return until the gate opens: returning earlier means it did not wait for the handler.
+    let stopped = FaultCounter()
+    Thread.detachNewThread {
+      server.stop()
+      stopped.increment()
+    }
+    try await Task.sleep(nanoseconds: 300_000_000)
+    #expect(stopped.value == 0, "stop() returned while a handler was still running")
 
-    // The handler closed its end, so the client sees end-of-file rather than a live peer.
+    // Released, the handler finishes and stop() returns, without waiting for the handler's own
+    // 30 s behavior.
+    exitGate.open()
+    #expect(await eventually(within: 1) { stopped.value == 1 }, "stop() did not return")
+
+    // The connection was shut down, so the client sees end-of-file: 0, not a receive timeout.
     setReceiveTimeout(client, seconds: 1)
     var buffer = [UInt8](repeating: 0, count: 16)
-    #expect(recv(client, &buffer, buffer.count, 0) <= 0)
+    let received = recv(client, &buffer, buffer.count, 0)
+    #expect(received == 0, "recv returned \(received), errno \(errno)")
   }
 }

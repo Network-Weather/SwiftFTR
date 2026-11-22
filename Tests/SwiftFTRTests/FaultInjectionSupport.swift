@@ -518,6 +518,7 @@ final class LoopbackTCPServer: @unchecked Sendable {
 
   private let fd: Int32
   private let behavior: Behavior
+  private let exitGate: StallGate?
   private let lock = NSLock()
   private var stopped = false
   /// Connections whose handler has not closed them yet.
@@ -527,7 +528,10 @@ final class LoopbackTCPServer: @unchecked Sendable {
   private let stopping = DispatchSemaphore(value: 0)
   private let loopExited = DispatchSemaphore(value: 0)
 
-  init(family: Int32 = AF_INET, behavior: Behavior) throws {
+  /// - Parameter exitGate: When given, every handler waits on it just before closing its
+  ///   connection, so a test can observe whether `stop()` waits for handlers.
+  init(family: Int32 = AF_INET, behavior: Behavior, exitGate: StallGate? = nil) throws {
+    self.exitGate = exitGate
     self.behavior = behavior
     (fd, port) = try bindLoopback(family: family, type: SOCK_STREAM)
     guard listen(fd, 64) == 0 else { throw FixtureError.socket("listen", errno) }
@@ -594,6 +598,8 @@ final class LoopbackTCPServer: @unchecked Sendable {
       waitForStop(limit: delay)
       write(response, to: client)
     }
+    // A test can hold the handler here to prove stop() waits for it.
+    exitGate?.wait(limit: 30)
     lock.lock()
     live.remove(client)
     lock.unlock()

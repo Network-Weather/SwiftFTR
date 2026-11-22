@@ -76,7 +76,9 @@ struct FaultInjectionProbeWindowTests {
     // The late replies land after the socket is closed. Give them time to arrive, then prove the
     // tracer is still usable.
     try await Task.sleep(nanoseconds: 500_000_000)
-    let again = try await network.install { try await tracer.trace(to: "fake.test") }
+    let again = try await measure(within: 10) {
+      try await network.install { try await tracer.trace(to: "fake.test") }
+    }.0
     #expect(again.hops.count == 4)
   }
 
@@ -173,7 +175,9 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 300, noReverseDNS: true))
 
-    let result = try await network.install { try await tracer.trace(to: "fake.test") }
+    let result = try await measure(within: 10) {
+      try await network.install { try await tracer.trace(to: "fake.test") }
+    }.0
     #expect(!result.reached)
     #expect(result.hops.allSatisfy { $0.ipAddress == nil && $0.outcome == .timedOut })
   }
@@ -189,7 +193,9 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 3, maxWaitMs: 300, noReverseDNS: true))
 
-    let result = try await network.install { try await tracer.trace(to: "fake.test") }
+    let result = try await measure(within: 10) {
+      try await network.install { try await tracer.trace(to: "fake.test") }
+    }.0
     #expect(!result.reached)
     #expect(result.hops.allSatisfy { $0.outcome == .unreachable(code: 1) })
   }
@@ -214,10 +220,12 @@ struct FaultInjectionProbeWindowTests {
       return fd
     }
 
-    func expectSendFailure(_ name: String, _ body: () async throws -> Void) async {
+    func expectSendFailure(_ name: String, _ body: @escaping @Sendable () async throws -> Void)
+      async
+    {
       let start = monotonicNow()
       do {
-        try await body()
+        _ = try await measure(within: 5) { try await body() }
         Issue.record("\(name) succeeded though no probe could be sent")
       } catch TracerouteError.sendFailed(let code) {
         #expect(code == EISCONN, "\(name) reported errno \(code)")
@@ -253,10 +261,12 @@ struct FaultInjectionProbeWindowTests {
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, publicIP: "198.51.100.7", noReverseDNS: true))
 
-    func expectSocketFailure(_ name: String, _ body: () async throws -> Void) async {
+    func expectSocketFailure(_ name: String, _ body: @escaping @Sendable () async throws -> Void)
+      async
+    {
       let start = monotonicNow()
       do {
-        try await body()
+        _ = try await measure(within: 5) { try await body() }
         Issue.record("\(name) succeeded without a socket")
       } catch TracerouteError.socketCreateFailed(let code, _) {
         #expect(code == EMFILE, "\(name)")
@@ -289,10 +299,12 @@ struct FaultInjectionProbeWindowTests {
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, publicIP: "198.51.100.7", noReverseDNS: true))
 
-    func expectResolutionFailure(_ name: String, _ body: () async throws -> Void) async {
+    func expectResolutionFailure(
+      _ name: String, _ body: @escaping @Sendable () async throws -> Void
+    ) async {
       let start = monotonicNow()
       do {
-        try await body()
+        _ = try await measure(within: 5) { try await body() }
         Issue.record("\(name) succeeded without resolving")
       } catch TracerouteError.resolutionFailed(_, let details) {
         // Only the substitute says this, so a call that went around it cannot pass.
@@ -416,8 +428,13 @@ struct FaultInjectionProbeWindowTests {
           to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: 0.3))
       }
     }
+    #expect(result.statistics.sent == 3)
     #expect(result.statistics.received == 0)
-    #expect(elapsed < 1.5, "silent ping took \(elapsed)s")
+    #expect(result.statistics.packetLoss == 1)
+    #expect(network.probes.value == 3, "the network saw \(network.probes.value) probes")
+    // The last probe leaves at about 0.1 s and is owed its 0.3 s reply window, so a ping that
+    // gives up after its last send returns too early.
+    #expect(elapsed >= 0.35 && elapsed < 1.5, "silent ping took \(elapsed)s")
   }
 }
 
