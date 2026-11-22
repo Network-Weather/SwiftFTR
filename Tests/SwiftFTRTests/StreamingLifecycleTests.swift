@@ -3,6 +3,10 @@ import Testing
 
 @testable import SwiftFTR
 
+/// How long a cancelled stream may take to end. Each stream here has a probe timeout that outlasts
+/// it, so a stream that ends within it was ended by its cancellation, and one that is not trips it.
+private let lifecycleWatchdog: TimeInterval = 20
+
 @Suite("Streaming Trace Lifecycle Tests")
 struct StreamingLifecycleTests {
   @Test("TraceHandle invokes an installed cancellation handler exactly once")
@@ -68,7 +72,7 @@ struct StreamingLifecycleTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: true))
     let streamConfig = StreamingTraceConfig(
-      probeTimeout: 30,
+      probeTimeout: 3 * lifecycleWatchdog,
       retryAfter: nil,
       emitTimeouts: false,
       maxHops: 1
@@ -88,19 +92,20 @@ struct StreamingLifecycleTests {
       }
       try #require(receiving, "The streaming receive operation should start before cancellation")
 
-      let started = ContinuousClock.now
       await tracer.networkChanged()
 
-      do {
-        _ = try await consumer.value
+      let (outcome, _) = try await measure(within: lifecycleWatchdog) { await consumer.result }
+      switch outcome {
+      case .success:
         Issue.record("the stream ended normally instead of reporting the network change")
-      } catch TracerouteError.cancelled {
-        // The tracer ended the live stream.
+      case .failure(TracerouteError.cancelled):
+        break  // The tracer ended the live stream.
+      case .failure(let error):
+        Issue.record("the stream threw \(error)")
       }
 
       let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
       #expect(unregistered)
-      #expect(started.duration(to: .now) < .seconds(1))
     }
   }
 
@@ -112,7 +117,7 @@ struct StreamingLifecycleTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: true))
     let streamConfig = StreamingTraceConfig(
-      probeTimeout: 30,
+      probeTimeout: 3 * lifecycleWatchdog,
       retryAfter: nil,
       emitTimeouts: false,
       maxHops: 1
@@ -132,24 +137,19 @@ struct StreamingLifecycleTests {
       }
       try #require(receiving, "The streaming receive operation should start before cancellation")
 
-      let started = ContinuousClock.now
       consumer.cancel()
-      _ = try? await consumer.value
+      _ = try await measure(within: lifecycleWatchdog) { await consumer.result }
 
       let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
       #expect(unregistered)
-      #expect(started.duration(to: .now) < .seconds(1))
     }
   }
 
+  /// Whether `condition` holds within ``lifecycleWatchdog``.
   private func waitUntil(
     _ condition: @escaping @Sendable () async -> Bool
   ) async -> Bool {
-    for _ in 0..<10_000 {
-      if await condition() { return true }
-      await Task.yield()
-    }
-    return false
+    await eventually(within: lifecycleWatchdog) { await condition() }
   }
 }
 

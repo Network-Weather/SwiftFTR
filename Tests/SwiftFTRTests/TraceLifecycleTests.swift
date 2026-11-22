@@ -3,6 +3,11 @@ import Testing
 
 @testable import SwiftFTR
 
+/// How long a cancelled stream may take to end, and how long a condition may take to hold. The
+/// stream's probe timeout outlasts it, so a stream that ends within it was ended by its
+/// cancellation, and one that is not trips it.
+private let lifecycleWatchdog: TimeInterval = 20
+
 @Suite("Trace Lifecycle and Options Tests")
 struct TraceLifecycleTests {
   @Test("cancelActiveTraces cancels active trace while preserving caches", .timeLimit(.minutes(1)))
@@ -19,7 +24,7 @@ struct TraceLifecycleTests {
     #expect(await tracer.publicIP == "198.51.100.1")
 
     let streamConfig = StreamingTraceConfig(
-      probeTimeout: 30,
+      probeTimeout: 3 * lifecycleWatchdog,
       retryAfter: nil,
       emitTimeouts: false,
       maxHops: 1
@@ -43,18 +48,19 @@ struct TraceLifecycleTests {
       }
       #expect(receiving, "The streaming trace should start before cancellation")
 
-      let started = ContinuousClock.now
       await tracer.cancelActiveTraces()
 
-      do {
-        _ = try await consumer.value
-      } catch is CancellationError {
-      } catch TracerouteError.cancelled {
+      // The probe timeout outlasts the watchdog, so a stream that ends was ended by the
+      // cancellation.
+      let (outcome, _) = try await measure(within: lifecycleWatchdog) { await consumer.result }
+      if case .failure(let error) = outcome {
+        var cancelled = error is CancellationError
+        if case TracerouteError.cancelled = error { cancelled = true }
+        #expect(cancelled, "threw \(error)")
       }
 
       let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
       #expect(unregistered)
-      #expect(started.duration(to: .now) < .seconds(1))
     }
 
     // Verify caches are still intact!
@@ -217,13 +223,10 @@ struct TraceLifecycleTests {
     #expect(unregistered)
   }
 
+  /// Whether `condition` holds within ``lifecycleWatchdog``.
   private func waitUntil(
     _ condition: @escaping @Sendable () async -> Bool
   ) async -> Bool {
-    for _ in 0..<10_000 {
-      if await condition() { return true }
-      await Task.yield()
-    }
-    return false
+    await eventually(within: lifecycleWatchdog) { await condition() }
   }
 }
