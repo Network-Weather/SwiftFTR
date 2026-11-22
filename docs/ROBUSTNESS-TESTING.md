@@ -19,9 +19,10 @@ that fail when any phase can wait without a bound or strand its caller.
 
 ## Method
 
-- **Seams, not mocks of the whole tracer.** `Sources/SwiftFTR/TestSeams.swift` holds four
+- **Seams, not mocks of the whole tracer.** `Sources/SwiftFTR/TestSeams.swift` holds five
   task-local overrides, all `nil` in production: the blocking-I/O executor, forward resolution,
-  the ICMP socket factory used by trace and ping, and IPv4 public-address discovery. Task-locals
+  the ICMP socket factory used by trace and ping, IPv4 public-address discovery, and the `fcntl`
+  that makes a trace or ping socket non-blocking. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
   unset, and the public API is unchanged
@@ -56,6 +57,8 @@ below runs only the first slice's tests, so a green gate means exactly the "Land
 | Forward resolution | fails (the injected error is checked, so a call that went around the seam fails) | trace, traceClassified, traceStream, ping | `FaultInjectionProbeWindowTests` |
 | Probe socket | creation fails the way `socket(2)` does (`-1` with `errno`); every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `FaultInjectionProbeWindowTests` |
 | Probe window | no replies; replies after the deadline; truncated, garbage and seeded-random ICMPv4/ICMPv6 queued ahead of valid replies; replies for another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `FaultInjectionProbeWindowTests` |
+| Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails | trace, traceClassified, traceStream, ping | `FaultInjectionReceiveLoopTests` |
+| Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `FaultInjectionReceiveLoopTests` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP requests; a refusing TCP port that stays reserved; TCP server teardown that joins its handlers | fixtures | `FaultInjectionFixtureTests` |
 
 Every timed operation in these tests runs under a watchdog (`measure(within:)`), so an operation
@@ -100,3 +103,34 @@ swift package diagnose-api-breaking-changes v0.17.1 --products SwiftFTR
 
 This slice changes no library behavior. The defects the full battery found, and their fixes, are
 recorded here by the next slice, which lands them together.
+
+### Receive loop bounds
+
+- **An endless supply of irrelevant replies held trace, stream and ping past their deadlines.**
+  Each receive loop read until its socket was empty, on the serial queue that also delivers its
+  deadline timer, its cancellation, ping's sends and a stream's retry timer. Reproduced on the
+  unfixed code with real non-blocking sockets: a loopback flood of echo replies for another
+  identifier held the trace, the stream and the ping past a 10 s watchdog with a 0.3 s window,
+  held trace and stream cancellation the same way, and kept a stream's retry and ping's second
+  and third probes from being sent. Ping cancellation was already prompt, because ping's loop
+  re-checked its state on every read. Fixed by reading at most 64 datagrams per callback and
+  checking for cancellation and the deadline before every read. For the trace either half alone
+  keeps the deadline and cancellation; ping's sends and the stream's retry need the bound.
+- **A trace ran on a blocking socket when `fcntl` failed.** With the result ignored, a failed
+  `F_SETFL` left the socket blocking, and every trace path, and ping once its own check was
+  removed, waited in its last read past the watchdog. The trace paths now throw
+  `socketCreateFailed`, as ping did.
+- **The trace paths closed their descriptor while the cancelled read source could still hold
+  it.** Not observable from a test; the descriptor is now closed from the source's cancellation
+  handler, before the call returns, as in ping and the TCP and UDP probes.
+- **How the condition is staged.** A loopback flood cannot hold a receive loop reliably. Loopback
+  delivers at about the rate a loop drains, so a flood paced to stay ahead held the unfixed loop in
+  most runs but let it find the socket empty within seconds in the rest; a flood sent flat out
+  overflows loopback's input queue (`net.link.generic.system.rcvq_maxlen`, 256) and drops
+  datagrams for every socket on the host, which failed unrelated tests running in parallel. An
+  IPv6 loopback flood kept the socket readable only about three quarters of the time. The tests
+  instead leave the socket blocking with a 1 s receive timeout, through the `fcntl` seam, and send
+  one foreign reply every 2 ms, so every read gets a datagram. Each test was shown to fail with
+  the part of the fix it covers removed.
+- **`fstat` cannot tell sockets apart on Darwin.** It reports inode 0 for every socket, so the
+  battery identifies a socket by its bound local address when checking that the library closed it.
