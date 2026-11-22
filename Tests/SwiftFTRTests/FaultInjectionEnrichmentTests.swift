@@ -202,6 +202,75 @@ struct FaultInjectionEnrichmentTests {
     }
   }
 
+  // MARK: A full blocking-I/O executor
+
+  /// Fills a private single-slot executor with a call that holds it for `seconds`, and returns
+  /// the gate that releases it early.
+  private static func occupy(_ executor: BlockingIOExecutor, for seconds: TimeInterval) async
+    -> StallGate
+  {
+    let gate = StallGate()
+    let occupied = FaultCounter()
+    Task {
+      try? await executor.run(priority: .userInitiated) {
+        occupied.increment()
+        gate.wait(limit: seconds)
+      }
+    }
+    _ = await eventually(within: 2) { occupied.value > 0 }
+    return gate
+  }
+
+  @Test("A classified trace stays within its budgets when every executor slot is held")
+  func classifiedTraceWithFullExecutor() async throws {
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.full-classified")
+    let gate = await Self.occupy(executor, for: 10)
+    defer { gate.open() }
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
+    defer { network.stop() }
+    // Discovery and reverse DNS both queue behind the occupant; only their deadlines end them.
+    let rdns = RDNSCache(lookupDeadline: 0.3) { _ in
+      try? await runDetachedBlockingIO(priority: .background, deadline: 0.3) { String?.none }
+    }
+    let tracer = offlineTracer(
+      SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, publicIPDiscoveryTimeout: 0.3), rdns: rdns)
+    let discovery: TestSeams.DiscoverPublicIPv4 = { STUNPublicIP(ip: "198.51.100.7") }
+
+    let (trace, elapsed) = try await measure {
+      try await TestSeams.$blockingIOExecutor.withValue(executor) {
+        try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+          try await network.install {
+            try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
+          }
+        }
+      }
+    }
+    #expect(trace.publicIP == nil, "discovery cannot have run with no free slot")
+    #expect(trace.hops.count == 2)
+    // Two discovery budgets (finding 6) and two reverse-DNS waves, each 0.3 s.
+    #expect(elapsed < 4 * 0.3 + 1.0, "classified trace took \(elapsed)s with the executor full")
+  }
+
+  @Test(
+    "A DNS query queued behind a full executor gives up at its deadline")
+  func dnsQueryWithFullExecutor() async throws {
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.full-dns")
+    let gate = await Self.occupy(executor, for: 3)
+    defer { gate.open() }
+
+    // Nothing listens on loopback port 53, so once the query runs it fails at once.
+    let timeout: TimeInterval = 0.3
+    let (result, elapsed) = try await measure {
+      try await TestSeams.$blockingIOExecutor.withValue(executor) {
+        try await dnsProbe(server: "127.0.0.1", query: "example.com", timeout: timeout)
+      }
+    }
+    #expect(!result.isReachable)
+    #expect(
+      elapsed < dnsQueryDeadline(timeout: timeout) + 0.5,
+      "DNS probe waited \(elapsed)s for a slot, timeout \(timeout)s")
+  }
+
   // MARK: Concurrency under faults
 
   @Test("Many concurrent traces on one tracer and across tracers all finish under faults")
