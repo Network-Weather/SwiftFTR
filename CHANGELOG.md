@@ -21,6 +21,9 @@ Unreleased
   `tracer.dns`, `reverseDNS`, `queryA`, `queryAAAA`) bounded its own send and receive but not the
   time it queued for one of the eight shared blocking-I/O slots. Each now gives up three timeouts
   after it is submitted and reports `DNSError.timeout`.
+- **A cancelled reverse-DNS lookup is no longer cached as "no hostname".** A lookup cut short by
+  cancellation was recorded as a negative answer for the full cache TTL (24 h by default), so the
+  hop showed no hostname until the cache was cleared.
 - **A STUN timeout under one microsecond no longer waits forever.** It truncated to a zero socket
   timeout, which means none.
 

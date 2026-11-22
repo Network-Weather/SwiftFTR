@@ -28,6 +28,9 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
 - **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code
   reading). Decide between failing classification fast and loading in the background, and make
   the SwiftIP2ASN cache directory injectable so a test can stage it without touching the user's.
+- **DNS queue deadline vs. input errors** (finding 12): a wrong-family `sourceIP` behind a full
+  executor reports `timeout`. Decide between pre-validating it and making the DNS deadline cancel
+  only still-queued work. Also strengthen `cancelledLookupNotCached` to cover the stall breaker.
 - **Move the live probe tests onto the loopback fixtures**: they still assert success against a
   third-party test site, so when that site is slow they fail although the probe reported the
   truth. `FaultInjectionSupport.swift` now has the TCP and HTTP fixtures they need.

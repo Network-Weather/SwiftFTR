@@ -148,6 +148,30 @@ numbers are as of the commit that added this section.
    30 s per server in the list, and the call cannot be cancelled. Not fixed: the right bound is a
    budget the public signature does not have.
 
+10. **A reverse-DNS lookup cut short by cancellation was cached as a miss for 24 hours.**
+    Confirmed and fixed; found by the Codex review of fix 1, which made it common. The resolver
+    reports a cancelled wait as `nil`, and `RDNSCache.lookup` cached that as a negative answer and
+    counted it toward the stall breaker. Test: `cancelledLookupNotCached`.
+11. **Follow-ups to fixes 2 and 8, from the same review.** Confirmed by test and fixed: a flow
+    cancelled during public-IP discovery went on to resolve its destination; a flow's
+    classification could wait on a shared ASN load after cancellation; caller cancellation could
+    surface from `discoverPaths` as `TracerouteError.cancelled`; and an invalid DNS query behind a
+    full executor reported `timeout` instead of its input error. Tests:
+    `discoverPathsCancellation` (every phase against every cancellation source) and
+    `invalidDNSQueryWithFullExecutor`.
+
+12. **The DNS queue deadline still masks one input error: a source address of the wrong family.**
+    Open; found by the second Codex pass. `queryA(hostname:server: "127.0.0.1", sourceIP: "::1")`
+    behind a full executor reports `DNSError.timeout` instead of `bindFailed`. This is the second
+    instance of one problem, so it is held for a decision rather than patched a third time (David's
+    review rule). Two ways out: keep pre-validating (pass `sourceIP` into `runDNSQuery` and check
+    its family), or change what the deadline means for DNS so it only ever cancels work still
+    queued, leaving a query that has started to its socket timeouts, which removes the masking
+    class entirely but changes `BlockingIOExecutor`'s deadline semantics for one caller.
+    Also from that pass, a test gap: `cancelledLookupNotCached` would not notice the cancellation
+    guard moving below the breaker update, because one immediately cancelled lookup never counts
+    as a stall.
+
 Observations that are not defects of the library:
 
 - `traceStream` yields hops in arrival order, so when the destination answers several TTLs a hop
