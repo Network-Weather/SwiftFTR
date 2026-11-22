@@ -745,5 +745,6 @@ func runDetachedBlockingIO<T: Sendable>(
   deadline: TimeInterval? = nil,
   _ operation: @Sendable @escaping () throws -> T
 ) async throws -> T {
-  try await blockingIOExecutor.run(priority: priority, deadline: deadline, operation)
+  let executor = TestSeams.blockingIOExecutor ?? blockingIOExecutor
+  return try await executor.run(priority: priority, deadline: deadline, operation)
 }

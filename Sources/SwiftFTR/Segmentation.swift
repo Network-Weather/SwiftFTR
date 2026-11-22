@@ -234,14 +234,10 @@ public struct TraceClassifier: Sendable {
       // not: `getaddrinfo` holds its worker for 30 seconds against an unresponsive resolver, and
       // the server list is walked serially. Classification degrades without a public IP, so a
       // timeout here costs enrichment detail rather than the trace.
-      if let pub = try? await runDetachedBlockingIO(
-        deadline: publicIPDiscoveryTimeout,
-        {
-          try getPublicIPv4(
-            stunTimeout: 0.8, dnsTimeout: 2.0,
-            interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
-        })
-      {
+      let discover = publicIPv4Discovery(
+        stunTimeout: 0.8, dnsTimeout: 2.0,
+        interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+      if let pub = try? await runDetachedBlockingIO(deadline: publicIPDiscoveryTimeout, discover) {
         resolvedPublicIP = pub.ip
         allIPs.insert(pub.ip)
       }
