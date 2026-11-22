@@ -28,11 +28,11 @@ discovery, bufferbloat testing, and network-interface discovery.
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.17.1")
+    .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.18.0")
 ]
 ```
 
-The library exposes `swiftFTRVersion` (a `String`, currently `"0.17.1"`).
+The library exposes `swiftFTRVersion` (a `String`, currently `"0.18.0"`).
 
 ## Primary Types
 

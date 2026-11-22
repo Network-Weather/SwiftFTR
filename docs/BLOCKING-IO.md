@@ -1,9 +1,11 @@
 # Event-based I/O: no thread held while waiting, one deadline per operation
 
 Sequenced plan for the ROADMAP item "Robustness under network and DNS failure, proven by tests".
-Stage: product. Status: Independent Fixes (#100), Receive Loop Bounds (#108) and Consistent
-Cancellation (#110) have landed; Event-Based DNS is next. The
-plan was reviewed twice (see Review record). Completed stages are struck through.
+Stage: product. Status: the four stages before the release have landed and shipped in 0.18.0:
+Independent Fixes (#100), Receive Loop Bounds (#108), Consistent Cancellation (#110) and
+Event-Based DNS (#111, #112), with the structured DNS probe outcome (#114) and foreign-reply
+handling (#116). Async Public-IP Discovery is next. The plan was reviewed twice (see Review
+record). Completed stages are struck through.
 
 ## Why
 
@@ -216,11 +218,10 @@ Tests: the existing DNS fault battery against the new transport; refused port; `
 (injected); cancellation returns while the fixture is still silent, and the descriptor is closed
 once; with every executor slot held, a query to a healthy loopback server still answers.
 
-### Release 0.18.0
+### ~~Release 0.18.0~~ (released 2026-11-22)
 
-After the four stages above. Bump `Version.swift`, consolidate `Unreleased` into a section
-organized by user-visible value with "Behavior changes" first, finish the upgrade guide for what
-shipped, tag the release-prep merge commit. Tagging and publishing need David's explicit go.
+The four stages above, with the changelog's 0.18.0 section and the upgrade guide
+(`MigratingTo018.md`) covering every behavior change in it.
 
 ### Async Public-IP Discovery
 
