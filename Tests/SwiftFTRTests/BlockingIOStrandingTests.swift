@@ -30,8 +30,12 @@ struct BlockingIOStrandingTests {
     // cancellation lands at every point of the submission path.
     for index in 0..<callCount {
       let call = Task {
-        _ = try? await executor.run(priority: .userInitiated, deadline: 0.05) { 1 }
-        finished.increment()
+        // The deadline outlasts the test, so only cancellation can resume this caller.
+        do {
+          _ = try await executor.run(priority: .userInitiated, deadline: 60) { 1 }
+        } catch is CancellationError {
+          finished.increment()
+        } catch {}
       }
       Task.detached {
         for _ in 0..<(index % 16) { await Task.yield() }
@@ -39,7 +43,7 @@ struct BlockingIOStrandingTests {
       }
     }
 
-    // Each call is bounded by its 50 ms deadline; allow far longer before calling it stranded.
+    // Cancellation should resume each caller at once; allow far longer before calling it stranded.
     let giveUp = monotonicNow() + 5.0
     while finished.value < callCount, monotonicNow() < giveUp {
       try await Task.sleep(nanoseconds: 20_000_000)
@@ -50,7 +54,8 @@ struct BlockingIOStrandingTests {
 
     #expect(
       finishedWhileHeld == callCount,
-      "\(callCount - finishedWhileHeld) callers had not resumed while the worker was held")
+      "\(callCount - finishedWhileHeld) callers were not resumed by cancellation while the worker was held"
+    )
   }
 
   @Test("A deadline that fires while the operation is still queued releases its timer")
