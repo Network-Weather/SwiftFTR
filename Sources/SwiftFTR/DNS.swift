@@ -78,7 +78,8 @@ private func _validateDNSSourceFamily(_ sourceIP: String?, serverFamily: Int32) 
 /// which reports it as `DNSError.malformedResponse`.
 private let dnsReceiveCapacity = 2048
 
-/// The first datagram a DNS server sent back for one query, not yet validated.
+/// The first datagram a DNS server sent back carrying the query's transaction ID, not yet
+/// validated otherwise.
 private struct DNSReply {
   let message: Data
   let expectedID: UInt16
@@ -90,7 +91,9 @@ private struct DNSReply {
   }
 }
 
-/// Sends one DNS query over a ``UDPExchange`` and returns the first datagram back, unvalidated.
+/// Sends one DNS query over a ``UDPExchange`` and returns the first datagram back that carries
+/// the query's transaction ID, otherwise unvalidated. Any other datagram is ignored and the wait
+/// goes on to the same deadline (``DNSClient/carriesTransactionID(_:_:)``).
 ///
 /// The checks that need no I/O (`invalidTimeout`, `invalidHostname`, `invalidIP`, and
 /// `bindFailed` for a source address of the wrong family) run first, before any socket is
@@ -118,12 +121,13 @@ private func exchangeDNSQuery(
   let port = serverPort ?? TestSeams.dnsServerPort ?? 53
   let (request, id) = makeDNSQueryMessage(encodedQuery: encodedQuery, queryType: queryType)
   let reply = try await UDPExchange.perform(
-    family: family, request: request, timeout: timeout, receiveCapacity: dnsReceiveCapacity
-  ) { fd in
-    try bindDNSSocket(fd, family: family, interface: interface, sourceIP: sourceIP)
-    // A connected UDP socket only receives responses from this DNS server and port.
-    try connectDNSSocket(fd, server: server, port: port, family: family)
-  }
+    family: family, request: request, timeout: timeout, receiveCapacity: dnsReceiveCapacity,
+    accepts: { DNSClient.carriesTransactionID(id, $0) },
+    configure: { fd in
+      try bindDNSSocket(fd, family: family, interface: interface, sourceIP: sourceIP)
+      // A connected UDP socket only receives responses from this DNS server and port.
+      try connectDNSSocket(fd, server: server, port: port, family: family)
+    })
   return DNSReply(message: Data(reply.bytes), expectedID: id, rtt: reply.rtt)
 }
 
@@ -1809,8 +1813,10 @@ private func makeDNSQueryMessage(encodedQuery: [UInt8], queryType: UInt16) -> (
 ///
 /// Its only caller is ``DNSClient/queryTXTBlocking(name:timeout:servers:)``, for the whoami
 /// fallback in `getPublicIPv4ViaDNS`, which runs inside a blocking public-IP closure and cannot
-/// await. Every other DNS query uses the event-based ``exchangeDNSQuery``. Refusals, host and
-/// network unreachable and an empty datagram are all `DNSError.timeout` here.
+/// await. Every other DNS query uses the event-based ``exchangeDNSQuery``. Refusals and host and
+/// network unreachable are all `DNSError.timeout` here. As on the event-based path, a datagram
+/// without the query's transaction ID (an empty one included) is ignored, and the wait goes on
+/// with the time left.
 private func performDNSQueryBlocking(
   server: String,
   query: String,
@@ -1839,12 +1845,14 @@ private func performDNSQueryBlocking(
 
   // A connected UDP socket only receives responses from this DNS server and port.
   do {
-    try connectDNSSocket(fd, server: server, port: 53, family: serverFamily)
+    try connectDNSSocket(
+      fd, server: server, port: TestSeams.dnsServerPort ?? 53, family: serverFamily)
   } catch is DNSConnectFailure {
     throw DNSError.sendFailed
   }
 
   let (msg, id) = makeDNSQueryMessage(encodedQuery: encodedQuery, queryType: queryType)
+  let deadline = monotonicNow() + timeout
   let sent = msg.withUnsafeBytes { raw in
     send(fd, raw.baseAddress, raw.count, 0)
   }
@@ -1853,20 +1861,24 @@ private func performDNSQueryBlocking(
     throw DNSError.sendFailed
   }
 
-  // Receive from the connected peer.
+  // Receive from the connected peer until a datagram carries this query's transaction ID. Read on
+  // the calling thread, so a test's task-local seam is visible here; production has none.
+  let receiveDatagram =
+    TestSeams.receiveDatagram ?? { fd, buffer in recv(fd, buffer.baseAddress, buffer.count, 0) }
   var buf = [UInt8](repeating: 0, count: dnsReceiveCapacity)
-  let n = buf.withUnsafeMutableBytes { raw in
-    recv(fd, raw.baseAddress, raw.count, 0)
+  while true {
+    let n = buf.withUnsafeMutableBytes { receiveDatagram(fd, $0) }
+    // `SO_RCVTIMEO` bounds the wait only to the kernel's timer granularity (about 2 ms past it on
+    // loopback), so a datagram can still be returned after the deadline. A blocking `recv` returns
+    // once the datagram is there, so the stamp taken on return is the earliest one that bounds its
+    // arrival; one past the deadline is a timeout, on the first read as on any later one.
+    guard n >= 0, monotonicNow() <= deadline else { throw DNSError.timeout }
+    if DNSClient.carriesTransactionID(id, buf.prefix(n)) {
+      return try DNSClient.validateResponse(message: Data(buf.prefix(n)), expectedID: id)
+    }
+    // Not this query's reply: wait again, for the time left rather than a fresh timeout.
+    try _applyDNSSocketTimeout(fd: fd, timeout: max(deadline - monotonicNow(), 1e-6))
   }
-
-  guard n > 0 else {
-    throw DNSError.timeout
-  }
-
-  // Parse response
-  let responseData = Data(buf.prefix(n))
-
-  return try DNSClient.validateResponse(message: responseData, expectedID: id)
 }
 
 /// Runs the query behind ``dnsProbe(config:)`` and reports it as a probe outcome.
@@ -2057,6 +2069,16 @@ struct DNSClient {
       if !chunks.isEmpty { out.append(chunks.joined()) }
     }
     return out.isEmpty ? nil : out
+  }
+
+  /// Whether `datagram` is addressed to the query with transaction ID `id`: it is at least the two
+  /// bytes of an ID, and they are `id`. A datagram that fails this cannot be attributed to the
+  /// query (a stale reply to an earlier one on the same port, or noise), so it is ignored rather
+  /// than reported as a malformed reply. Every other check stays in ``validateResponse``.
+  static func carriesTransactionID(_ id: UInt16, _ datagram: ArraySlice<UInt8>) -> Bool {
+    guard datagram.count >= 2 else { return false }
+    let start = datagram.startIndex
+    return (UInt16(datagram[start]) << 8 | UInt16(datagram[start + 1])) == id
   }
 
   fileprivate static func validateResponse(message: Data, expectedID: UInt16) throws -> [Answer] {

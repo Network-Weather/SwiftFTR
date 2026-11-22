@@ -91,6 +91,28 @@ struct DNSWireHardeningTests {
     try await responder.value
   }
 
+  @Test("Production query ignores a response with another transaction ID and times out")
+  func productionQueryIgnoresMismatchedTransactionID() async throws {
+    let fixture = try DNSUDPFixture()
+    let responder = Task.detached {
+      try fixture.respond(with: .mismatchedTransactionID)
+    }
+
+    await #expect {
+      try await runDNSFixtureQuery(
+        port: fixture.port,
+        name: "header.example.com",
+        type: 1,
+        timeout: 0.5
+      )
+    } throws: { error in
+      guard let dnsError = error as? DNSError else { return false }
+      if case .timeout = dnsError { return true }
+      return false
+    }
+    try await responder.value
+  }
+
   @Test("Production query rejects datagrams from an unexpected source")
   func productionQueryRejectsUnexpectedSource() async throws {
     let fixture = try DNSUDPFixture()
@@ -127,15 +149,14 @@ private func runDNSFixtureQuery(
   try await __dnsQuery(server: "127.0.0.1", port: port, name: name, type: type, timeout: timeout)
 }
 
+/// Headers that carry the query's transaction ID but are otherwise invalid.
 enum InvalidDNSHeader: CaseIterable, CustomTestStringConvertible, Sendable {
-  case mismatchedTransactionID
   case queryInsteadOfResponse
   case unsupportedOpcode
   case truncated
 
   var scenario: DNSFixtureScenario {
     switch self {
-    case .mismatchedTransactionID: .mismatchedTransactionID
     case .queryInsteadOfResponse: .queryInsteadOfResponse
     case .unsupportedOpcode: .unsupportedOpcode
     case .truncated: .truncated
@@ -144,7 +165,6 @@ enum InvalidDNSHeader: CaseIterable, CustomTestStringConvertible, Sendable {
 
   var testDescription: String {
     switch self {
-    case .mismatchedTransactionID: "mismatched transaction ID"
     case .queryInsteadOfResponse: "QR bit not set"
     case .unsupportedOpcode: "non-query opcode"
     case .truncated: "truncated UDP response"

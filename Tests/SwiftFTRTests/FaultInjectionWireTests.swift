@@ -159,7 +159,8 @@ struct FaultInjectionWireTests {
       case .silent: return nil
       case .nxdomain: return (Self.dnsResponse(to: query, rcode: 3, answerCount: 0, answers: []), 0)
       case .servfail: return (Self.dnsResponse(to: query, rcode: 2, answerCount: 0, answers: []), 0)
-      case .garbage: return ([0x00, 0x01, 0x02], 0)
+      // Junk whose first two bytes are not the query's transaction ID.
+      case .garbage: return ([query[0] ^ 0x80, query[1], 0x02], 0)
       case .oversized:
         // Larger than the client's receive buffer, so it arrives truncated mid-record.
         let record = Self.aRecord
@@ -198,6 +199,14 @@ struct FaultInjectionWireTests {
         try unwrapped.get()
       } throws: { error in
         guard case DNSError.malformedResponse = error else { return false }
+        return true
+      }
+    case .silent, .garbage:
+      // A datagram without the query's transaction ID is ignored, so junk is silence.
+      #expect {
+        try unwrapped.get()
+      } throws: { error in
+        guard case DNSError.timeout = error else { return false }
         return true
       }
     default:

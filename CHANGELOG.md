@@ -44,9 +44,20 @@ What an unmodified caller will see differently:
   response", although the refusal arrived at once. `dnsProbe` still reports the server
   unreachable (`isReachable == false`, `rtt == nil`): it answers whether DNS works there. Silence
   is still `DNSError.timeout`.
-- **An empty DNS reply is a malformed response.** A zero-byte datagram from the server throws
-  `DNSError.malformedResponse`, and `dnsProbe` reports the server reachable with "Malformed
-  response", as for any other malformed reply. It was reported as `DNSError.timeout`.
+- **A DNS query ignores datagrams addressed to another query.** A datagram from the server whose
+  transaction ID is not the query's, or that is too short to carry one (an empty datagram
+  included), is consumed and ignored, and the query keeps waiting, to the same timeout, for its
+  own reply. 0.17 let the first datagram decide: a wrong transaction ID threw
+  `DNSError.malformedResponse` and `dnsProbe` reported the server reachable with "Malformed
+  response", and an empty datagram threw `DNSError.timeout` at once. So a stale reply to an
+  earlier query on a reused port no longer makes a silent server look like one that answered: a
+  server that sends only such datagrams is now `DNSError.timeout`, and `dnsProbe` reports
+  `outcome == .timedOut` with `isReachable == false`. A datagram that carries the query's ID but
+  is otherwise invalid is still `malformedResponse` and `malformedReply`. The Team Cymru TXT
+  lookups, which use the same event-based transport, and the IPv4 whoami fallback, which still
+  waits in a blocking `recv`, follow the same rule: after a wrong-ID datagram they keep waiting
+  for the rest of that server's timeout before trying the next server, instead of moving on at
+  once.
 - **`dnsProbe` reports host and network unreachable as such.** When the network reports the
   server's host or network unreachable after the query is sent, `dnsProbe` returns
   `outcome == .unreachable` with an `error` naming it and its errno ("Host unreachable - …" or
