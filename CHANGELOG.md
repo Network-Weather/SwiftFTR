@@ -3,6 +3,18 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Bug fixes
+
+- **`swift-ftr probe dns` says how an unreachable probe ended** (#113). The pretty output printed
+  only `✗ Unreachable` whatever happened; it now adds an `Outcome:` line in plain words (refused:
+  host is up, nothing listening on the port; timed out; unreachable; malformed reply; failed),
+  and an `Elapsed:` line when something came back without a round trip, such as a refusal. An
+  answer prints as before. `--json` output, the flags and the exit status are unchanged: exit 1
+  when the server is not reachable (refused, timed out, unreachable, failed), 0 otherwise.
+
 0.18.0 — 2026-11-22
 -------------------
 
