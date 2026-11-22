@@ -512,7 +512,7 @@ public struct CymruDNSResolver: ASNResolver {
     let txts = try? await executor.run(
       priority: .userInitiated, deadline: cymruQueryDeadline(timeout: timeout)
     ) {
-      DNSClient.queryTXT(name: q, timeout: timeout)
+      DNSClient.queryTXTBlocking(name: q, timeout: timeout)
     }
     guard let txts = txts, let first = txts.first else { return nil }
 
@@ -541,7 +541,7 @@ public struct CymruDNSResolver: ASNResolver {
     let txts = try? await executor.run(
       priority: .userInitiated, deadline: cymruQueryDeadline(timeout: timeout)
     ) {
-      DNSClient.queryTXT(name: qn, timeout: timeout)
+      DNSClient.queryTXTBlocking(name: qn, timeout: timeout)
     }
     guard let txts = txts, let first = txts.first else { return nil }
 

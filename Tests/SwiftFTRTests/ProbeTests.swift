@@ -210,17 +210,20 @@ struct DNSProbeTests {
     #expect(result.responseCode == 3)
   }
 
-  @Test("DNS probe to unreachable server")
+  @Test("DNS probe to a server that never answers")
   func testUnreachableServer() async throws {
-    // Use 0.0.0.0 ("this network" - not routable, will timeout)
-    // Other reserved ranges may be intercepted by DNS forwarders
-    let result = try await NetworkTestGate.shared.withPermit {
-      try await dnsProbe(server: "0.0.0.0", query: "example.com", timeout: 2.0)
+    // A loopback server that reads the query and stays silent. A host with nothing listening on
+    // the port answers with a refusal instead, which dnsProbe reports as reachable.
+    let server = try LoopbackUDPResponder { _ in nil }
+    defer { server.stop() }
+    let result = try await TestSeams.$dnsServerPort.withValue(server.port) {
+      try await dnsProbe(server: "127.0.0.1", query: "example.com", timeout: 0.3)
     }
 
     #expect(!result.isReachable)
     #expect(result.rtt == nil)
-    #expect(result.error != nil)
+    #expect(result.error == "Timeout - no response")
+    #expect(server.requests.value == 1)
   }
 
   @Test("DNS probe with invalid server IP")

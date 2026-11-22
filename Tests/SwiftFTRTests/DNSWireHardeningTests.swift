@@ -117,32 +117,14 @@ struct DNSWireHardeningTests {
   }
 }
 
-/// Runs the synchronous DNS SPI outside Swift's cooperative executor.
-///
-/// The fixture responder is a Swift task. Blocking a cooperative worker in `recv()` can starve
-/// that responder on constrained CI runners and turn a deterministic loopback test into a timeout.
+/// Runs one query through the DNS SPI, the event-based path the public query methods take.
 private func runDNSFixtureQuery(
   port: UInt16,
   name: String,
   type: UInt16,
   timeout: TimeInterval
 ) async throws -> [__DNSAnswer] {
-  try await withCheckedThrowingContinuation { continuation in
-    DispatchQueue.global(qos: .userInitiated).async {
-      do {
-        continuation.resume(
-          returning: try __dnsQuery(
-            server: "127.0.0.1",
-            port: port,
-            name: name,
-            type: type,
-            timeout: timeout
-          ))
-      } catch {
-        continuation.resume(throwing: error)
-      }
-    }
-  }
+  try await __dnsQuery(server: "127.0.0.1", port: port, name: name, type: type, timeout: timeout)
 }
 
 enum InvalidDNSHeader: CaseIterable, CustomTestStringConvertible, Sendable {

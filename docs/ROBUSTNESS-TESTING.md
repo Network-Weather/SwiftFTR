@@ -22,8 +22,9 @@ that fail when any phase can wait without a bound or strand its caller.
 - **Seams, not mocks of the whole tracer.** `Sources/SwiftFTR/TestSeams.swift` holds task-local
   overrides, all `nil` in production: the blocking-I/O executor, forward resolution, the ICMP
   socket factory used by trace and ping, IPv4 public-address discovery, a hook that holds
-  `discoverPaths` at the step where it commits its result, and the `fcntl` that makes a trace or
-  ping socket non-blocking. Task-locals
+  `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping
+  or UDP exchange socket non-blocking, and for the event-based UDP transport (`UDPExchange`) its
+  `send` and `close` calls and the DNS server port. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
   unset, and the public API is unchanged
@@ -73,8 +74,9 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, discoverPaths | `Enrichment`, `Cancellation` |
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
-| DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count | the `__dnsQuery` SPI | `Wire` |
-| Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot | traceClassified, queryA | `Enrichment` |
+| DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
+| DNS transport | refused port (IPv4 and IPv6); empty datagram; `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
+| Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries and dnsProbe answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe | `Enrichment`, `EventBasedDNSTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase, with the error checked per source; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
@@ -82,7 +84,8 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
-Test suites are `FaultInjection<Name>Tests`. Every timed operation runs under a watchdog
+Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests` for the event-based DNS
+transport. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
 Not covered, and why:
@@ -95,8 +98,18 @@ Not covered, and why:
   a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which is shared
   with every other user of SwiftIP2ASN on the machine, and the cache location cannot be redirected
   from SwiftFTR. A test would have to delete that cache.
-- **A DNS query queued behind a full executor.** Its wait for a worker is still unbounded
-  (finding 8); the tests for a bound arrive with the executor rewrite that provides one.
+- **A stale datagram that reached the socket before the query left but is read after it.** The
+  transport ignores whatever it reads before its request has been sent, but it cannot tell when
+  a datagram arrived, so one that was queued during a send retry and read just after the send
+  succeeded is taken as the first reply. On a reused port toward the same server, a late reply
+  to an earlier query would then be reported as a malformed response from a server that had not
+  answered. Not staged, and not fixed here: ignoring replies whose transaction ID does not match,
+  which closes this before and after the send, is the next change in `docs/BLOCKING-IO.md`.
+- **A DNS reply that arrives after the deadline but before the deadline timer runs.** The
+  transport checks the deadline before it accepts a reply, but the two events race on one queue
+  and no fixture can order them deterministically, so no test shows the check is needed.
+- **Host and network unreachable on a DNS query** (finding 19). Loopback cannot produce
+  `EHOSTUNREACH` or `ENETUNREACH`, and there is no receive seam.
 - **The `.dns` and `.hybrid` strategies end to end**: their fallback is Team Cymru over the real
   resolver. `CymruQueueDeadlineTests` covers their queueing bound; the battery passes a stub
   resolver to every classified trace so no test reaches it.
@@ -164,11 +177,15 @@ numbers are as of the commit that added this section.
    Unverified, from reading the code. With no bundled or cached database, the first resolve waits
    on `RemoteDatabase.load()` (`LocalASNResolver.swift:212`), which uses `URLSession.shared` with
    its 60 s default, and ignores the resolver `timeout`. Could not be staged (see "Not covered").
-8. **DNS queries wait without limit for an executor slot.** Confirmed, not fixed. Every DNS
-   query goes onto the shared executor with no deadline, so its socket timeouts bound the query but
-   not the queueing: with the executor full, `dnsProbe` with a 0.3 s timeout waited as long as the
-   occupant held it (3.0 s). Bounding the queue wait needs the executor to withdraw work that has
-   not started, which belongs to the executor's rewrite rather than to a patch on it.
+8. **DNS queries waited without limit for an executor slot.** Confirmed and fixed. Every DNS
+   query went onto the shared executor with no deadline, so its socket timeouts bounded the query
+   but not the queueing: with the executor full, `dnsProbe` with a 0.3 s timeout waited as long as
+   the occupant held it (3.0 s). A deadline counted from submission would have reported a healthy
+   server as unreachable when no packet was sent, so instead DNS queries now wait on Dispatch
+   sources (`UDPExchange.swift`) and need no worker. Team Cymru lookups still run on the executor,
+   behind the queue deadline `CymruQueueDeadlineTests` covers. Test:
+   `EventBasedDNSTests.answersWithEveryWorkerHeld`, which waited out its 5 s watchdog before and
+   answers while every slot is held after.
 9. **`getPublicIPs` runs blocking STUN on Swift's cooperative pool, without a deadline.**
    Unverified, from reading the code. `STUN.swift:725` wraps `stunGetPublicIPWithFallback`,
    which calls `getaddrinfo` for each server hostname and blocks in `recv`, in plain `Task`s rather
@@ -222,6 +239,22 @@ numbers are as of the commit that added this section.
     it.** Fixed from reading the code; the race is not observable from a test. The descriptor is
     now closed from the source's cancellation handler, before the call returns, as in ping and the
     TCP and UDP probes. The tests check that every socket is closed when the call returns.
+17. **A refused DNS port was reported as silence.** Confirmed and fixed. `recv` on the connected
+    socket failed at once with `ECONNREFUSED` and the client called it `DNSError.timeout`, so
+    `dnsProbe` said "Timeout - no response" about a host that had answered. Measured on `main`:
+    `timeout` after 1 ms, for a fixture port and for port 53 on loopback. Now the query methods
+    throw `sendFailed`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
+    that names the refusal.
+    Test: `EventBasedDNSTests.refusedPort`, IPv4 and IPv6.
+18. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
+    was treated like a failed one, `DNSError.timeout` after 1 ms on `main`. It is now
+    `malformedResponse`, which `dnsProbe` reports as reachable. Test:
+    `EventBasedDNSTests.emptyDatagram`.
+19. **Host and network unreachable on a DNS query are still reported as `timeout`.** From reading
+    the code, not staged. The transport ends the exchange at once on `EHOSTUNREACH` and
+    `ENETUNREACH`, but they map to `DNSError.timeout`, as the blocking client reported them, so
+    `dnsProbe` says "Timeout - no response" for an answer that came at once. Not fixed: telling
+    them apart needs a decision on which existing error describes them, and a way to stage them.
 
 Observations that are not defects of the library:
 
