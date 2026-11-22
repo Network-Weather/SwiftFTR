@@ -479,6 +479,8 @@ final class PingOperation: @unchecked Sendable {
   private var continuation: CheckedContinuation<PingResult, Error>?
   private var readSource: DispatchSourceRead?
   private var timerSource: DispatchSourceTimer?
+  /// When `timerSource` is due, on `monotonicTime`'s clock. Queue-owned; moved with the timer.
+  private var receiveDeadline: TimeInterval = .infinity
 
   // Queue-owned operation data.
   private var sentTimes: [Int: TimeInterval] = [:]
@@ -615,6 +617,7 @@ final class PingOperation: @unchecked Sendable {
     // but seq=2 isn't scheduled to send until t=2.0).
     let safetyBudget =
       2.0 * (Double(max(config.count - 1, 0)) * max(config.interval, 0) + config.timeout) + 5.0
+    receiveDeadline = monotonicTime() + safetyBudget
     let timer = DispatchSource.makeTimerSource(queue: queue)
     timer.schedule(deadline: .now() + .nanoseconds(Int(safetyBudget * 1_000_000_000)))
     timer.setEventHandler { self.finishNormally() }
@@ -701,15 +704,21 @@ final class PingOperation: @unchecked Sendable {
 
     let nowMono = monotonicTime()
     let deadlineDelta = max(0, lastSendTime + config.timeout - nowMono)
+    receiveDeadline = lastSendTime + config.timeout
     timerSource?.schedule(
       deadline: .now() + .nanoseconds(Int(deadlineDelta * 1_000_000_000)))
   }
 
+  /// Reads at most ``receiveBatchLimit`` datagrams, so the deadline timer, cancellation and the
+  /// sends queued behind this callback get their turn on a socket that stays readable. The read
+  /// source fires again while data remains.
   private func handleRead() {
-    guard isRunning, descriptorState == .open else { return }
-
-    while true {
+    for _ in 0..<receiveBatchLimit {
       guard isRunning, descriptorState == .open else { return }
+      if monotonicTime() >= receiveDeadline {
+        finishNormally()
+        return
+      }
       var fromAddr = sockaddr_storage()
       var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
       var hopLimit: Int? = nil
