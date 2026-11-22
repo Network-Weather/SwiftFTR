@@ -34,7 +34,8 @@ that fail when any phase can wait without a bound or strand its caller.
 - **Local fixtures for every other protocol.** TCP listeners that refuse, accept and stay silent,
   reset mid-response or answer slowly; an HTTP responder on the same listener; UDP responders for
   STUN and DNS that stay silent, answer late or answer garbage. All bind `127.0.0.1` or `::1` on an
-  ephemeral port. No new test sends a packet off the host.
+  ephemeral port. No new test sends a packet off the host. They land with the first slice, tested
+  on their own; the protocol tests that use them come with the next.
 - **Private executors.** Any test that stalls a blocking call does it on a private
   `BlockingIOExecutor`, installed through the seam, never on the process-wide one.
 - **Discrimination.** Each test states the failure it catches. Where practical it was shown to fail
@@ -43,27 +44,44 @@ that fail when any phase can wait without a bound or strand its caller.
 
 ## Conditions covered
 
+The battery lands in two pull requests. The first lands the seams, the fixtures and the tests of
+the probe window, and changes no library behavior. The second lands the remaining tests together
+with the library fixes they motivated. Until the second lands, the `--filter FaultInjection` gate
+below runs only the first slice's tests, so a green gate means exactly the "Landed" rows.
+
+### Landed
+
+| Phase | Conditions | Operations | Tests |
+|---|---|---|---|
+| Forward resolution | fails (the injected error is checked, so a call that went around the seam fails) | trace, traceClassified, traceStream, ping | `FaultInjectionProbeWindowTests` |
+| Probe socket | creation fails the way `socket(2)` does (`-1` with `errno`); every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `FaultInjectionProbeWindowTests` |
+| Probe window | no replies; replies after the deadline; truncated, garbage and seeded-random ICMPv4/ICMPv6 queued ahead of valid replies; replies for another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `FaultInjectionProbeWindowTests` |
+| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP requests; a refusing TCP port that stays reserved; TCP server teardown that joins its handlers | fixtures | `FaultInjectionFixtureTests` |
+
+Every timed operation in these tests runs under a watchdog (`measure(within:)`), so an operation
+that never returns fails its test instead of hanging the run.
+
+### Planned for the next slice
+
 | Phase | Conditions | Operations |
 |---|---|---|
-| Forward resolution | fails; stalls (synchronous, see Findings) | trace, traceClassified, traceStream, ping |
-| Probe socket | creation fails; reads report EOF continuously | trace, traceStream, ping |
-| Probe window | no replies; replies after the deadline; truncated and garbage ICMPv4/ICMPv6; replies for another identifier; mixed valid and invalid in one burst | trace, traceStream, traceClassified |
-| Public-IP discovery | stalls past its budget; fails; network change while in flight | traceClassified, discoverPaths |
-| STUN wire | silent, garbage, slow server; sub-microsecond timeout | stunGetPublicIP |
-| Reverse DNS | stalls; handle cancellation during the lookup wave | trace, traceClassified |
-| ASN | `.remote` database download that stalls | LocalASNResolver |
-| DNS wire | silence, NXDOMAIN, SERVFAIL, garbage, oversized datagram, compression loop | dnsProbe, dns queries |
-| TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, slow first byte, timeout | tcpProbe, udpProbe, httpProbe |
-| Cancellation | task cancellation and `networkChanged()` / `cancelActiveTraces()` at varying points | trace, traceClassified, traceStream, ping, discoverPaths |
-| Concurrency | many simultaneous traces on one tracer and across tracers with faults injected | trace, traceClassified |
+| Forward resolution | stalls (a disabled test; see #84) | trace |
+| Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths |
+| STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP |
+| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave | trace |
+| ASN | resolver that stalls and ignores its timeout | traceClassified, discoverPaths |
+| DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count | the `__dnsQuery` SPI |
+| Full executor | every blocking-I/O slot held while discovery, reverse DNS and DNS queue | traceClassified, dnsProbe |
+| TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe |
+| Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase | trace, traceClassified, traceStream, ping, discoverPaths |
+| Concurrency | many simultaneous operations on one tracer and across tracers under faults | trace, traceClassified |
 
 ## Out of scope
 
 - An overall deadline on `traceClassified` with an error naming the phase, and an executor-pressure
   reading (#84). Both are API additions for a minor release.
 - Moving forward resolution off the actor. It needs a resolution budget, which is a new
-  configuration field. The test that shows the defect is checked in disabled, pointing at the
-  finding below.
+  configuration field. The test that shows the defect comes with the next slice, disabled.
 - `testBufferbloat`, which needs real load traffic, and the interface-bound HTTPS spike.
 - Raw-socket or privileged fault injection, and any test that sends traffic off the host.
 
@@ -80,4 +98,5 @@ swift package diagnose-api-breaking-changes v0.17.1 --products SwiftFTR
 
 ## Findings
 
-Defects the battery exposes are recorded here with their disposition as they are confirmed.
+This slice changes no library behavior. The defects the full battery found, and their fixes, are
+recorded here by the next slice, which lands them together.
