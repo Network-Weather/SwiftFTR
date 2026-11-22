@@ -19,7 +19,7 @@ Four kinds of work are written as blocking calls instead:
 
 | Work | How it waits today | Where it runs |
 |---|---|---|
-| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket; since #111, a Dispatch read source (`UDPExchange.swift`) for DNS queries and probes, while Cymru lookups and the whoami fallback keep the blocking query | `BlockingIOExecutor`; since #111, no thread for DNS queries and probes |
+| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket; since Event-Based DNS, a Dispatch read source (`UDPExchange.swift`), with the blocking query kept only for the whoami fallback | `BlockingIOExecutor`; since Event-Based DNS, no thread |
 | Public-IP discovery (STUN, with a DNS fallback for IPv4) | blocking `recv`, plus `getaddrinfo` per server name | the executor in a classified trace; plain `Task` closures and `DispatchQueue.concurrentPerform` in standalone `getPublicIPs` |
 | Reverse DNS | `getnameinfo` | the executor |
 | Forward resolution of a destination | `getaddrinfo` | inline in the caller |
