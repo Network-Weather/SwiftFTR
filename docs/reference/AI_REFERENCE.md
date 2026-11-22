@@ -143,9 +143,9 @@ Arguments must be passed in declaration order. Values are validated when an oper
 non-finite `rdnsCacheTTL`, a negative `rdnsCacheSize`, or a non-positive hybrid `fallbackTimeout`
 throws `TracerouteError.invalidConfiguration(reason:)`. The two enrichment budgets never throw: a
 `rdnsLookupTimeout` or `publicIPDiscoveryTimeout` that is zero, negative, non-finite or out of
-range is replaced by its default (5 s and 6 s respectively). `interface`, `sourceIP`, `publicIP`
-and `maxHops` are fixed per instance, so a host that needs several binding contexts holds several
-`SwiftFTR` instances. Each instance owns its rDNS cache, cached public IP and active traces; the
+range is replaced by its default (5 s and 6 s respectively). `interface`, `sourceIP` and `publicIP`
+are fixed per instance, so a host that needs several binding contexts holds several
+`SwiftFTR` instances. `maxHops` is the instance default; `TraceOptions(maxHops:)` overrides it for one call. Each instance owns its rDNS cache, cached public IP and active traces; the
 DNS-based ASN cache is shared process-wide, and a loaded ASN database is shared by
 every live resolver for the same source.
 
