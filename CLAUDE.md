@@ -127,6 +127,18 @@ SwiftFTR has production consumers whose integrations depend on contracts that ar
 
 Never name, link, or path-reference specific downstream applications or their private repositories anywhere in this repository — docs, code comments, commit messages, telemetry excerpts. Refer to them as "downstream consumers" / "the host app", and strip consumer-internal details (source paths, line numbers, commit hashes, infrastructure identifiers) when recording field evidence here.
 
+## Size the pull request, not just the commits
+
+Plan PR boundaries before the work starts. One Codex review pass covers about 2,000 changed
+lines (the `codex-review` wrapper stops above that), so a larger PR cannot be reviewed as a
+whole however small its commits are, and its tests and seams go unreviewed. Name the slices up
+front (for example: seams and fixtures; tests of existing behavior; each group of fixes with its
+tests), open them as stacked PRs, and land each before the next builds on it. Check
+`git diff --shortstat` against the base before opening a PR. Put the cap and the slice plan in
+every subagent brief: an agent asked for "a branch and a draft PR" will deliver one of each.
+(David, 2026-11-21, after the documentation sweep and the fault-injection battery both arrived
+as single PRs of about 2,500 lines.)
+
 ## After every PR merges
 
 1. Fast-forward main, remove the worktree, delete the local + remote branch.
