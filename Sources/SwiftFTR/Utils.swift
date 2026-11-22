@@ -631,6 +631,16 @@ final class BlockingIOExecutor: Sendable {
         }
 
         cancellationBridge.register(queuedOperation, box: box)
+
+        // `onCancel` may have run since the check above, before there was anything registered
+        // for it to resume. Checking again now closes that window: a cancellation from here on
+        // finds the registration. Do not enqueue instead and rely on the operation finishing,
+        // because a cancelled operation still waits for a free worker before it finishes.
+        guard !Task.isCancelled else {
+          cancellationBridge.cancel(queuedOperation)
+          deadlineTimer.cancel()
+          return
+        }
         operationQueue.addOperation(queuedOperation)
       }
     } onCancel: {
@@ -648,11 +658,10 @@ final class BlockingIOExecutor: Sendable {
 /// `onCancel` cannot name the generic `ContinuationBox<T>` of the call it belongs to, so each
 /// in-flight operation registers a type-erased resume closure here for the duration of its run.
 ///
-/// The registration is also the backstop against a stranded caller. `onCancel` can run before
-/// the operation is registered, in which case it finds nothing to resume; the operation is then
-/// submitted already cancelled and finishes without running its block. So an operation that
-/// finishes while still registered resumes its caller, which is a no-op whenever the block, the
-/// deadline or `onCancel` got there first.
+/// The registration is also a backstop against a stranded caller: an operation that finishes
+/// while still registered resumes its caller, which is a no-op whenever the block, the deadline
+/// or `onCancel` got there first. It is only a backstop, because a cancelled operation does not
+/// finish until a worker is free to dequeue it.
 private final class BlockingIOCancellationBridge: @unchecked Sendable {
   private let lock = NSLock()
   private var pending: [ObjectIdentifier: @Sendable () -> Void] = [:]

@@ -8,11 +8,23 @@ import Testing
 @Suite(.serialized)
 struct BlockingIOStrandingTests {
 
-  @Test("Cancelling during submission never strands the caller")
+  @Test("Cancelling during submission never strands the caller, even with every worker busy")
   func cancellationDuringSubmissionResumes() async throws {
-    let executor = BlockingIOExecutor(maximumConcurrentOperations: 8, name: "test.stranding")
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.stranding")
     let callCount = 10_000
     let finished = Counter()
+    let occupied = Counter()
+    let release = DispatchSemaphore(value: 0)
+
+    // Hold the only worker throughout, so a caller that depends on its operation being dequeued
+    // cannot return.
+    let holder = Task {
+      try? await executor.run(priority: .userInitiated) {
+        occupied.increment()
+        release.wait()
+      }
+    }
+    while occupied.value == 0 { try await Task.sleep(nanoseconds: 5_000_000) }
 
     // Cancel from another task after a varying number of yields, so across the run the
     // cancellation lands at every point of the submission path.
@@ -32,7 +44,13 @@ struct BlockingIOStrandingTests {
     while finished.value < callCount, monotonicNow() < giveUp {
       try await Task.sleep(nanoseconds: 20_000_000)
     }
-    #expect(finished.value == callCount, "\(callCount - finished.value) callers never resumed")
+    let finishedWhileHeld = finished.value
+    release.signal()
+    await holder.value
+
+    #expect(
+      finishedWhileHeld == callCount,
+      "\(callCount - finishedWhileHeld) callers had not resumed while the worker was held")
   }
 
   @Test("A deadline that fires while the operation is still queued releases its timer")
