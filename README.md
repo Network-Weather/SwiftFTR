@@ -413,7 +413,7 @@ Design Details
 
 Testing
 -------
-- Unit tests: `swift test`. Some suites use the live network; for an offline, deterministic run set both gates: `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug`. See [TESTING.md](docs/development/TESTING.md).
+- Unit tests: `swift test`. Some suites use the live network; to skip the tests designated as live-network, as CI does, set both gates: `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug`. The gates skip tests; they do not disable networking. See [TESTING.md](docs/development/TESTING.md).
 - Lightweight runner: `.build/debug/ptrtests`
 
 Fuzzing

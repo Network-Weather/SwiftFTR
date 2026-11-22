@@ -46,9 +46,9 @@ As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
 - Public-IP discovery is generation-guarded: a result that arrives after an
   invalidation is neither returned nor cached
   (`effectivePublicIPForClassification`).
-- `RDNSCache` holds entries for 86400 s with LRU eviction at 1000 entries
+- `RDNSCache` holds entries for 86400 s, evicting the oldest-inserted entry at 1000 entries
   (both configurable through `SwiftFTRConfig`), caches negative results, and
-  has a stall breaker: after two consecutive lookups that consume their full
+  has a stall breaker: after two consecutive lookups that take at least 90% of their
   deadline, further lookups are suppressed until `clear()` or
   `invalidateNetworkScoped()` runs. `clear()` also generation-guards against
   in-flight lookups repopulating the cache.
@@ -70,9 +70,11 @@ As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
 
 ## Why the controls are separate
 
-Before 0.17.0, `networkChanged()` was the only transition control, and it
-couples three actions — trace cancellation, public-IP invalidation, and full
-rDNS eviction — that callers legitimately need under different conditions. A
+Before 0.17.0 the transition controls were `networkChanged()`, `clearCaches()`
+and `invalidatePublicIP()`. There was no way to cancel traces without
+invalidating, and no way to evict only part of the rDNS cache: `networkChanged()`
+couples trace cancellation, public-IP invalidation and full rDNS eviction, which
+callers legitimately need under different conditions. A
 caller that can tell a local roam from a WAN change had only two options, both
 bad:
 
@@ -172,10 +174,11 @@ A dynamic, actor-isolated way to provide a known-valid public IP so the next
 classified trace can skip discovery — distinct from the `publicIP` config
 override, which suppresses discovery permanently. The method:
 
-- accepts only syntactically valid, globally routable addresses, using the
-  library's scope classifier ("not RFC 1918" is insufficient — CGNAT space is
-  neither private nor publicly routable, and the check rejects every
-  non-global range for the address family, plus multicast);
+- accepts only syntactically valid addresses outside the special-purpose
+  ranges the library's scope classifier recognizes ("not RFC 1918" is
+  insufficient — CGNAT space is neither private nor publicly routable).
+  Acceptance does not prove global routability: ranges the classifier does not
+  know, such as deprecated IPv6 site-local `fec0::/10`, are accepted;
 - rejects placeholder strings by construction — there is no way to seed
   `"unknown"`;
 - stores the canonical (`inet_ntop`) form, bumps the cache generation so an
