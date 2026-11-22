@@ -1861,20 +1861,23 @@ private func performDNSQueryBlocking(
     throw DNSError.sendFailed
   }
 
-  // Receive from the connected peer until a datagram carries this query's transaction ID.
+  // Receive from the connected peer until a datagram carries this query's transaction ID. Read on
+  // the calling thread, so a test's task-local seam is visible here; production has none.
+  let receiveDatagram =
+    TestSeams.receiveDatagram ?? { fd, buffer in recv(fd, buffer.baseAddress, buffer.count, 0) }
   var buf = [UInt8](repeating: 0, count: dnsReceiveCapacity)
   while true {
-    let n = buf.withUnsafeMutableBytes { raw in
-      recv(fd, raw.baseAddress, raw.count, 0)
-    }
-    guard n >= 0 else { throw DNSError.timeout }
+    let n = buf.withUnsafeMutableBytes { receiveDatagram(fd, $0) }
+    // `SO_RCVTIMEO` bounds the wait only to the kernel's timer granularity (about 2 ms past it on
+    // loopback), so a datagram can still be returned after the deadline. A blocking `recv` returns
+    // once the datagram is there, so the stamp taken on return is the earliest one that bounds its
+    // arrival; one past the deadline is a timeout, on the first read as on any later one.
+    guard n >= 0, monotonicNow() <= deadline else { throw DNSError.timeout }
     if DNSClient.carriesTransactionID(id, buf.prefix(n)) {
       return try DNSClient.validateResponse(message: Data(buf.prefix(n)), expectedID: id)
     }
     // Not this query's reply: wait again, for the time left rather than a fresh timeout.
-    let remaining = deadline - monotonicNow()
-    guard remaining > 0 else { throw DNSError.timeout }
-    try _applyDNSSocketTimeout(fd: fd, timeout: remaining)
+    try _applyDNSSocketTimeout(fd: fd, timeout: max(deadline - monotonicNow(), 1e-6))
   }
 }
 

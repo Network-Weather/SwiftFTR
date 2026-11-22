@@ -192,7 +192,7 @@ struct EventBasedDNSTests {
     }
 
     let (probe, thrown) = outcome
-    #expect(server.requests.value == 2)
+    #expect(await eventually(within: Self.watchdog) { server.requests.value == 2 })
     #expect(probe.outcome == .timedOut)
     #expect(!probe.isReachable)
     #expect(probe.rtt == nil)
