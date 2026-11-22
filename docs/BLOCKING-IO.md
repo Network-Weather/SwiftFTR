@@ -1,7 +1,7 @@
 # Event-based I/O: no thread held while waiting, one deadline per operation
 
 Sequenced plan for the ROADMAP item "Robustness under network and DNS failure, proven by tests".
-Stage: product. Status: Independent Fixes (#100) and Receive Loop Bounds (#NNN) have landed; Consistent
+Stage: product. Status: Independent Fixes (#100) and Receive Loop Bounds (#108) have landed; Consistent
 Cancellation is next. The
 plan was reviewed twice (see Review record). Completed stages are struck through.
 
@@ -109,7 +109,7 @@ Not ported: #95's DNS queue deadline. Event-Based DNS removes the wait it was bo
 
 This stage starts the upgrade guide (see Upgrade guide).
 
-### ~~Receive Loop Bounds~~ (landed in #NNN)
+### ~~Receive Loop Bounds~~ (landed in #108)
 
 `TraceReceiveOperation.handleRead`, `StreamingTraceReceiveOperation.handleRead` and
 `PingOperation.handleRead` each drain in `while true` on the serial queue that delivers their
