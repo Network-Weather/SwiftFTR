@@ -43,7 +43,10 @@ public struct PingConfig: Sendable {
   /// Interval between pings in seconds (default: 1.0)
   public let interval: TimeInterval
 
-  /// Timeout for each ping in seconds (default: 2.0)
+  /// How long to wait for replies after the last echo request is sent, in seconds (default: 2.0).
+  ///
+  /// A reply to an earlier request still counts if it arrives within that window, so its RTT can
+  /// exceed `timeout`. Only the first reply to each request sent is counted.
   public let timeout: TimeInterval
 
   /// ICMP payload size in bytes (default: 56)
@@ -779,8 +782,16 @@ final class PingOperation: @unchecked Sendable {
 
         switch parsed {
         case .echoReply(let sequence, let ttl):
-          receiveTimes[Int(sequence)] = receiveTime
-          if let ttl = ttl { ttls[Int(sequence)] = ttl }
+          // Only the first reply to a request this ping has sent counts. The identifier is not
+          // secret, and a path can duplicate or reflect ICMP: a reply to a sequence never sent, or
+          // not sent yet, has no send time to measure from, and a second reply would overwrite
+          // the first one's RTT. Either would also count toward ending the ping early. Such
+          // replies are dropped like ones for another identifier. Sends are recorded on this
+          // queue, so a reply to a request already sent always finds its send time here.
+          let seq = Int(sequence)
+          guard sentTimes[seq] != nil, receiveTimes[seq] == nil else { break }
+          receiveTimes[seq] = receiveTime
+          if let ttl = ttl { ttls[seq] = ttl }
         case .timeExceeded(let originalSequence, let ttl, _):
           // A Time Exceeded message implies the packet was lost at an intermediate hop.
           // We record a timeout for the original sequence for statistical purposes,
@@ -801,9 +812,9 @@ final class PingOperation: @unchecked Sendable {
           }
         // Do not record a receive time for Destination Unreachable.
         }
-        let count = receiveTimes.count
-
-        if count >= config.count {
+        // Every entry in receiveTimes is a sent sequence answered once, so this is the number of
+        // distinct probes answered.
+        if receiveTimes.count >= config.count {
           finishNormally()
           return
         }

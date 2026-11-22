@@ -750,7 +750,7 @@ let tracer = SwiftFTR()
 let config = PingConfig(
     count: 5,           // Number of pings (default: 5)
     interval: 1.0,      // Interval between pings in seconds (default: 1.0)
-    timeout: 2.0,       // Timeout per ping in seconds (default: 2.0)
+    timeout: 2.0,       // Reply window after the last ping, in seconds (default: 2.0)
     payloadSize: 56     // ICMP payload size (default: 56)
 )
 

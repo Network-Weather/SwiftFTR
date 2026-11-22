@@ -3,6 +3,21 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Bug fixes
+
+- **`ping` counts only the first reply to each request it sent** (#106). Any echo reply carrying
+  the ping's identifier was recorded under its sequence number, and the ping ended once it held
+  as many as it sends. A reply to a sequence never sent could end a ping after its first probe
+  with no loss reported, or before a later probe's reply with loss reported on a clean path; a
+  reply to a sequence not yet sent was taken as that probe's reply, with a negative RTT; a
+  duplicate replaced the first reply's RTT and TTL. Such replies are now ignored. On a network
+  that sends them, `received`, `packetLoss` and the RTTs can differ from 0.18.0, which
+  misreported them. `PingConfig.timeout` is now documented as what it always was: the reply
+  window after the last request, within which a reply to any earlier request still counts.
+
 0.18.0 — 2026-11-22
 -------------------
 
