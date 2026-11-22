@@ -576,20 +576,29 @@ extension SwiftFTR {
     activeTraces.insert(handle)
     defer { activeTraces.remove(handle) }
 
-    return try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
-      group.addTask {
-        try await discovery.discoverPaths(to: target, multipathConfig: config)
+    do {
+      return try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
+        group.addTask {
+          try await discovery.discoverPaths(to: target, multipathConfig: config)
+        }
+        group.addTask {
+          await waitForCancellation(of: handle)
+          if await handle.isCancelled { throw TracerouteError.cancelled }
+          return nil
+        }
+        defer { group.cancelAll() }
+        while let next = try await group.next() {
+          if let topology = next { return topology }
+        }
+        throw CancellationError()
       }
-      group.addTask {
-        await waitForCancellation(of: handle)
-        if await handle.isCancelled { throw TracerouteError.cancelled }
-        return nil
-      }
-      defer { group.cancelAll() }
-      while let next = try await group.next() {
-        if let topology = next { return topology }
-      }
-      throw CancellationError()
+    } catch {
+      // A flow interrupted by cancellation may report it either way, depending on the phase it
+      // was in. Report the source instead: the handle means a network change, the task means the
+      // caller.
+      if await handle.isCancelled { throw TracerouteError.cancelled }
+      if Task.isCancelled { throw CancellationError() }
+      throw error
     }
   }
 
@@ -697,6 +706,9 @@ extension SwiftFTR {
     let effectivePublicIP = await effectivePublicIPForClassification {
       try? await self.discoverPublicIP()
     }
+    // Discovery swallows its own cancellation; do not start resolving a destination for a flow
+    // whose discovery has already been cancelled.
+    try Task.checkCancellation()
 
     // Perform base trace with flow ID
     let tr = try await withTaskCancellationHandler {
@@ -739,18 +751,23 @@ extension SwiftFTR {
     let effectiveResolver = asnResolver
 
     // Classify
+    // Raced against cancellation like traceClassified's classification, so a cancelled flow does
+    // not wait on an ASN load it shares with other resolvers.
+    try Task.checkCancellation()
     let classifier = TraceClassifier()
-    let baseClassified = try await classifier.classify(
-      trace: tr,
-      destinationIP: destIP,
-      resolver: effectiveResolver,
-      timeout: 1.5,
-      publicIP: effectivePublicIP,
-      interface: config.interface,
-      sourceIP: config.sourceIP,
-      enableLogging: config.enableLogging,
-      publicIPDiscoveryTimeout: config.publicIPDiscoveryTimeoutForOperation
-    )
+    let baseClassified = try await withTraceCancellation(handle: handle) {
+      try await classifier.classify(
+        trace: tr,
+        destinationIP: destIP,
+        resolver: effectiveResolver,
+        timeout: 1.5,
+        publicIP: effectivePublicIP,
+        interface: self.config.interface,
+        sourceIP: self.config.sourceIP,
+        enableLogging: self.config.enableLogging,
+        publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeoutForOperation
+      )
+    }
 
     // Enhance classified result with hostnames
     let enhancedHops = baseClassified.hops.map { hop -> ClassifiedHop in
