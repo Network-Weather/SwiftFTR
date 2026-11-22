@@ -91,7 +91,8 @@ Notes:
 - `networkChanged()` does not clear the ASN cache; ASN data is not network-scoped.
 - `seedPublicIP` accepts only syntactically valid, globally routable IPv4/IPv6 addresses and
   returns `false` otherwise (private, CGNAT, link-local, loopback, multicast, documentation and
-  benchmark ranges, and zone-suffixed strings are rejected). A seed is discarded by the next `invalidatePublicIP()`,
+  benchmark ranges, IPv6 outside `2000::/3` other than `64:ff9b::/96` (including site-local
+  `fec0::/10`), and zone-suffixed strings are rejected). A seed is discarded by the next `invalidatePublicIP()`,
   `clearCaches()` or `networkChanged()`. `PublicIPSource` has cases `.validatedCallerCache` and
   `.gatewayReported`; the library does not retain the source.
 - `discoverPublicIPWithHostname()` discovers IPv4 via STUN through the configured interface, with

@@ -182,7 +182,8 @@ struct ParsedIPAddress: Hashable, Sendable {
   /// Returns whether this address is eligible to be a globally routable public address.
   /// Rejects non-globally-reachable entries from the IANA IPv4 and IPv6 Special-Purpose Address
   /// Registries (RFC 6890, RFC 5737, RFC 2544, RFC 1112, RFC 8215, RFC 6666, RFC 9780, RFC 3849,
-  /// RFC 9637, RFC 9602, etc.).
+  /// RFC 9637, RFC 9602, etc.), and IPv6 outside 2000::/3 other than 64:ff9b::/96, which the IANA
+  /// IPv6 Address Space registry reserves (including site-local fec0::/10, RFC 3879).
   var isGloballyRoutablePublicAddress: Bool {
     guard scope == .global else { return false }
     switch family {
@@ -227,6 +228,20 @@ struct ParsedIPAddress: Hashable, Sendable {
       {
         return false
       }
+      // 64:ff9b::/96 (Well-Known Prefix, RFC 6052) is globally reachable although it lies
+      // outside 2000::/3.
+      if bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xff && bytes[3] == 0x9b
+        && bytes[4..<12].allSatisfy({ $0 == 0 })
+      {
+        return true
+      }
+      // fec0::/10 (deprecated site-local, RFC 3879). Also covered by the 2000::/3 rule below;
+      // named here because it was once a valid unicast scope.
+      if bytes[0] == 0xfe && bytes[1] & 0xc0 == 0xc0 { return false }
+      // IANA assigns IPv6 unicast only from 2000::/3 (RFC 4291 section 2.4, IANA IPv6 Address
+      // Space registry); everything else is reserved by the IETF, including the deprecated
+      // IPv4-compatible ::/96 and the former OSI NSAP 200::/7 (RFC 4048).
+      if bytes[0] & 0xe0 != 0x20 { return false }
       // 2001::/23 (IETF Protocol Assignments, RFC 2928):
       // By default, addresses within 2001::/23 are not globally reachable unless permitted
       // by a more specific allocation in the IANA IPv6 Special-Purpose Address Registry.
@@ -356,7 +371,8 @@ func isGloballyRoutableIPAddress(_ presentation: String) -> Bool {
 /// Rejects private networks (RFC 1918, ULA), CGNAT (RFC 6598), link-local, loopback,
 /// multicast, unspecified, documentation / test networks (RFC 5737, RFC 3849),
 /// benchmark ranges (RFC 2544, RFC 5180), Class E reserved (240.0.0.0/4), limited broadcast,
-/// and any address with a scope/zone index (%zone).
+/// IPv6 outside the 2000::/3 unicast space other than 64:ff9b::/96 (so deprecated site-local
+/// fec0::/10 and IPv4-compatible ::/96 too), and any address with a scope/zone index (%zone).
 @inline(__always)
 func isGloballyRoutablePublicIP(_ presentation: String) -> Bool {
   guard !presentation.contains("%") else { return false }
