@@ -601,6 +601,8 @@ final class BlockingIOExecutor: Sendable {
     let deadlineTimer = DeadlineTimerBox()
     // Decides, exactly once, whether the operation started before its queue deadline expired.
     let startLatch = StartLatch()
+    // Fixed at submission, so the wait in the queue is measured from when the caller asked.
+    let queueExpiry = queueDeadline.map { monotonicNow() + $0 }
 
     return try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
@@ -612,8 +614,14 @@ final class BlockingIOExecutor: Sendable {
           // Whichever way this block exits, drop the timer: it holds the handler, which holds
           // this operation, so leaving it armed would keep all three alive.
           defer { deadlineTimer.cancel() }
-          // A queue deadline that already expired has resumed the caller; the work is not wanted.
-          if queueDeadline != nil {
+          if let queueExpiry {
+            // The deadline is an instant, not the timer's handler, which can run late: a worker
+            // that picks the operation up after the instant withdraws it itself.
+            if monotonicNow() >= queueExpiry {
+              if startLatch.expire() { box.resume(with: .failure(BlockingIOTimeout())) }
+              return
+            }
+            // A deadline whose handler already ran has resumed the caller; the work is not wanted.
             guard startLatch.start() else { return }
             // Started in time: from here only the operation's own timeouts apply.
             deadlineTimer.cancel()
