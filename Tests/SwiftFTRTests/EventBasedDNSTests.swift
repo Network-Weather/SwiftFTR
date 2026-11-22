@@ -84,11 +84,12 @@ struct EventBasedDNSTests {
       )
     }
     defer { server.stop() }
-    // The datagram leaves, then the sender stalls past the moment the reply is sent.
+    // The datagram leaves, then the sender stalls until the reply is already waiting.
+    let staged = FaultCounter()
     let send: TestSeams.SendDatagram = { fd, bytes in
       let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
       let code = Darwin.errno
-      usleep(useconds_t((delay * 1.5) * 1_000_000))
+      if Self.waitUntilReadable(fd, limit: 4) { staged.increment() }
       Darwin.errno = code
       return sent
     }
@@ -97,6 +98,7 @@ struct EventBasedDNSTests {
         try await SwiftFTR().dns.a(hostname: "stall.example", server: "127.0.0.1", timeout: 5)
       }
     }
+    try #require(staged.value == 1, "the reply never arrived while the sender was stalled")
     #expect(query.rttMs >= delay * 1000, "rttMs \(query.rttMs)")
   }
 
@@ -271,6 +273,147 @@ struct EventBasedDNSTests {
     if fault != .shortCount { #expect(server.requests.value == 0) }
   }
 
+  /// Whether `fd` becomes readable, or has an error pending, within `limit` seconds. `poll` does
+  /// not consume the datagram or clear the error, so the exchange still reads it afterwards.
+  static func waitUntilReadable(_ fd: Int32, limit: TimeInterval) -> Bool {
+    let giveUp = monotonicNow() + limit
+    while true {
+      var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+      let remaining = Int32(max(0, (giveUp - monotonicNow()) * 1000))
+      let ready = poll(&descriptor, 1, remaining)
+      if ready > 0 { return descriptor.revents & Int16(POLLIN | POLLERR) != 0 }
+      if ready == 0 || (ready < 0 && errno != EINTR) { return false }
+    }
+  }
+
+  /// What a ``staleEventSend(_:beforeRealSend:)`` seam observed.
+  final class StaleEventStaging: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state = (attempts: 0, staged: false, deferrals: 0, consumed: false, sent: false)
+    /// Retries held back while the staged event is still unread; past this, the seam stops
+    /// waiting and the test fails on `consumedBeforeRealSend`.
+    static let maxDeferrals = 3000
+
+    var staged: Bool { read { $0.staged } }
+    var consumedBeforeRealSend: Bool { read { $0.consumed } }
+    var realSendSucceeded: Bool { read { $0.sent } }
+    var deferrals: Int { read { $0.deferrals } }
+
+    func update<T>(
+      _ change: (inout (attempts: Int, staged: Bool, deferrals: Int, consumed: Bool, sent: Bool)) ->
+        T
+    ) -> T {
+      lock.lock()
+      defer { lock.unlock() }
+      return change(&state)
+    }
+
+    private func read<T>(
+      _ get: ((attempts: Int, staged: Bool, deferrals: Int, consumed: Bool, sent: Bool)) -> T
+    ) -> T {
+      lock.lock()
+      defer { lock.unlock() }
+      return get(state)
+    }
+  }
+
+  /// A send seam that makes something readable before the exchange has sent, as a late reply to
+  /// an earlier socket on the same port would be. Its first call puts the datagram on the wire,
+  /// waits until what that provokes is waiting on the socket, and reports `ENOBUFS`. Retries
+  /// keep reporting `ENOBUFS` while that event is still unread; once the read handler has
+  /// consumed it, `beforeRealSend` runs and the request really leaves.
+  static func staleEventSend(
+    _ staging: StaleEventStaging, beforeRealSend: @escaping @Sendable () -> Void = {}
+  ) -> TestSeams.SendDatagram {
+    { fd, bytes in
+      let attempt = staging.update { state -> Int in
+        state.attempts += 1
+        return state.attempts
+      }
+      if attempt == 1 {
+        _ = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+        let staged = Self.waitUntilReadable(fd, limit: 5)
+        staging.update { $0.staged = staged }
+        Darwin.errno = ENOBUFS
+        return -1
+      }
+      let pending = Self.waitUntilReadable(fd, limit: 0)
+      let deferred = staging.update { state -> Bool in
+        guard pending, !state.sent, state.deferrals < StaleEventStaging.maxDeferrals else {
+          return false
+        }
+        state.deferrals += 1
+        return true
+      }
+      if deferred {
+        Darwin.errno = ENOBUFS
+        return -1
+      }
+      beforeRealSend()
+      let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+      let code = Darwin.errno
+      staging.update {
+        $0.consumed = !pending
+        $0.sent = sent == bytes.count
+      }
+      Darwin.errno = code
+      return sent
+    }
+  }
+
+  @Test("A datagram that arrives before the request has left does not complete the exchange")
+  func datagramBeforeTheSendIsIgnored() async throws {
+    let replies = FaultCounter()
+    let server = try LoopbackUDPResponder { query in
+      replies.increment()
+      // The stale reply carries 192.0.2.1, the one to the request that left carries 192.0.2.2.
+      let last: UInt8 = replies.value == 1 ? 1 : 2
+      let record: [UInt8] = [0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, last]
+      return (FaultInjectionWireTests.dnsResponse(to: query, answers: record), 0)
+    }
+    defer { server.stop() }
+    let staging = StaleEventStaging()
+
+    let (answers, _) = try await measure(within: Self.watchdog) {
+      try await TestSeams.$sendDatagram.withValue(Self.staleEventSend(staging)) {
+        try await __dnsQuery(
+          server: "127.0.0.1", port: server.port, name: "stale.example", type: 1, timeout: 5)
+      }
+    }
+    try #require(staging.staged, "the first reply never arrived before the retry")
+    // The stale reply was read and dropped before the request really left, and the answer is the
+    // one to that request.
+    #expect(staging.consumedBeforeRealSend, "still unread after \(staging.deferrals) retries")
+    #expect(staging.realSendSucceeded)
+    #expect(answers.first?.rdata == Data([192, 0, 2, 2]))
+    #expect(server.requests.value == 2)
+  }
+
+  @Test("A refusal that arrives before the request has left does not end the exchange")
+  func refusalBeforeTheSendIsIgnored() async throws {
+    // Refuses the first datagram, then answers: the real send goes to a server that replies, so
+    // its outcome does not depend on Darwin suppressing a second port-unreachable to one peer.
+    let port = try RefusingThenAnsweringUDPPort { query in
+      FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord)
+    }
+    defer { port.stop() }
+    let staging = StaleEventStaging()
+    let send = Self.staleEventSend(staging) { port.startAnswering() }
+
+    let (answers, _) = try await measure(within: Self.watchdog) {
+      try await TestSeams.$sendDatagram.withValue(send) {
+        try await __dnsQuery(
+          server: "127.0.0.1", port: port.port, name: "stale.example", type: 1, timeout: 5)
+      }
+    }
+    try #require(staging.staged, "the first refusal never arrived before the retry")
+    // The pending refusal was read and dropped before the request really left, and the outcome is
+    // the real send's: an answer, not the refusal.
+    #expect(staging.consumedBeforeRealSend, "still pending after \(staging.deferrals) retries")
+    #expect(staging.realSendSucceeded)
+    #expect(answers.first?.rdata == Data([192, 0, 2, 9]))
+  }
+
   // MARK: Setup
 
   @Test("A failure to make the socket non-blocking is reported, and nothing is sent")
@@ -322,6 +465,20 @@ struct EventBasedDNSTests {
 
   enum Exit: String, CaseIterable, CustomTestStringConvertible, Sendable {
     case answered, timedOut, refused, malformed, cancelled, setupFailed
+    /// Every send fails with this errno, so the exchange is waiting to write or backing off.
+    case cancelledWhileWaitingToWrite, cancelledWhileBackingOff
+    case deadlineWhileWaitingToWrite, deadlineWhileBackingOff
+
+    var sendErrno: Int32? {
+      switch self {
+      case .cancelledWhileWaitingToWrite, .deadlineWhileWaitingToWrite: EAGAIN
+      case .cancelledWhileBackingOff, .deadlineWhileBackingOff: ENOBUFS
+      default: nil
+      }
+    }
+    var cancels: Bool {
+      [.cancelled, .cancelledWhileWaitingToWrite, .cancelledWhileBackingOff].contains(self)
+    }
     var testDescription: String { rawValue }
   }
 
@@ -342,8 +499,9 @@ struct EventBasedDNSTests {
     let refusing = exit == .refused ? try RefusingUDPPort() : nil
     defer { withExtendedLifetime(refusing) {} }
     let port = refusing?.port ?? server.port
-    let ledger = DescriptorLedger(failSetup: exit == .setupFailed)
-    let timeout: TimeInterval = exit == .timedOut ? 0.2 : 30
+    let ledger = DescriptorLedger(failSetup: exit == .setupFailed, sendErrno: exit.sendErrno)
+    let timeout: TimeInterval =
+      [.timedOut, .deadlineWhileWaitingToWrite, .deadlineWhileBackingOff].contains(exit) ? 0.2 : 30
 
     let query = Task {
       await ledger.install {
@@ -355,8 +513,11 @@ struct EventBasedDNSTests {
     }
     if exit == .cancelled {
       #expect(await eventually(within: Self.watchdog) { server.requests.value > 0 })
-      query.cancel()
     }
+    if exit.sendErrno != nil, exit.cancels {
+      #expect(await eventually(within: Self.watchdog) { ledger.snapshot.sendAttempts > 1 })
+    }
+    if exit.cancels { query.cancel() }
     let (thrown, _) = try await measure(within: Self.watchdog) { await query.value }
 
     switch exit {
@@ -364,15 +525,19 @@ struct EventBasedDNSTests {
     case .timedOut: #expect(Self.isTimeout(thrown), "\(String(describing: thrown))")
     case .refused: #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
     case .malformed: #expect(Self.isMalformed(thrown), "\(String(describing: thrown))")
-    case .cancelled: #expect(thrown is CancellationError, "\(String(describing: thrown))")
+    case .cancelled, .cancelledWhileWaitingToWrite, .cancelledWhileBackingOff:
+      #expect(thrown is CancellationError, "\(String(describing: thrown))")
     case .setupFailed: #expect(thrown != nil)
+    case .deadlineWhileWaitingToWrite, .deadlineWhileBackingOff:
+      #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
     }
 
     // Read as soon as the query returned: the close happens before the caller is resumed.
     let record = ledger.snapshot
     #expect(record.closedDescriptors.count == 1, "closes: \(record.closedDescriptors)")
-    if exit == .setupFailed {
-      // Setup still owned the socket, so it closed it: the one it configured, and nothing else.
+    if exit == .setupFailed || exit.sendErrno != nil {
+      // The socket that was configured, and nothing else; with every send failing, it was closed
+      // once although write sources or backoff timers were created and cancelled along the way.
       #expect(record.closedDescriptors == record.configuredDescriptors)
       #expect(record.sentFromPorts.isEmpty)
     } else {
@@ -448,13 +613,18 @@ final class DescriptorLedger: @unchecked Sendable {
     var sentFromPorts: [UInt16] = []
     var closedDescriptors: [Int32] = []
     var closedPorts: [UInt16] = []
+    var sendAttempts = 0
   }
 
   private let lock = NSLock()
   private var record = Record()
   private let failSetup: Bool
+  private let sendErrno: Int32?
 
-  init(failSetup: Bool = false) { self.failSetup = failSetup }
+  init(failSetup: Bool = false, sendErrno: Int32? = nil) {
+    self.failSetup = failSetup
+    self.sendErrno = sendErrno
+  }
 
   var snapshot: Record {
     lock.lock()
@@ -474,6 +644,11 @@ final class DescriptorLedger: @unchecked Sendable {
       return fcntl(fd, command, argument)
     }
     let send: TestSeams.SendDatagram = { [self] fd, bytes in
+      update { $0.sendAttempts += 1 }
+      if let sendErrno {
+        Darwin.errno = sendErrno
+        return -1
+      }
       let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
       let code = Darwin.errno
       if sent == bytes.count, let port = Self.localPort(fd) {
@@ -514,5 +689,82 @@ final class DescriptorLedger: @unchecked Sendable {
       UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
     }
     return port == 0 ? nil : port
+  }
+}
+
+/// A loopback UDP port that refuses datagrams until ``startAnswering()``, then answers one.
+///
+/// Until then its socket is connected to another loopback port, so the kernel answers anyone else
+/// with ICMP port-unreachable. `startAnswering()` dissolves that association, so the next
+/// datagram reaches the socket and is answered with `reply`.
+final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
+  let port: UInt16
+  private let fd: Int32
+  private let reply: @Sendable ([UInt8]) -> [UInt8]
+  private let lock = NSLock()
+  private var answering = false
+  private let served = DispatchSemaphore(value: 0)
+
+  init(reply: @escaping @Sendable ([UInt8]) -> [UInt8]) throws {
+    let (bound, boundPort) = try bindLoopback(family: AF_INET, type: SOCK_DGRAM)
+    var (peer, length) = loopbackAddress(family: AF_INET, port: 9)
+    let connected = withUnsafePointer(to: &peer) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(bound, $0, length) }
+    }
+    guard connected == 0 else {
+      let code = errno
+      close(bound)
+      throw FixtureError.socket("connect", code)
+    }
+    setReceiveTimeout(bound, seconds: 5)
+    fd = bound
+    port = boundPort
+    self.reply = reply
+  }
+
+  /// Disconnects the socket and answers the next datagram on a thread of its own.
+  func startAnswering() {
+    lock.lock()
+    guard !answering else {
+      lock.unlock()
+      return
+    }
+    answering = true
+    lock.unlock()
+    var unspecified = sockaddr()
+    unspecified.sa_len = UInt8(MemoryLayout<sockaddr>.size)
+    unspecified.sa_family = sa_family_t(AF_UNSPEC)
+    _ = connect(fd, &unspecified, socklen_t(MemoryLayout<sockaddr>.size))
+    Thread.detachNewThread { [self] in
+      defer { served.signal() }
+      var buffer = [UInt8](repeating: 0, count: 2048)
+      var source = sockaddr_storage()
+      var sourceLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      let received = buffer.withUnsafeMutableBytes { raw in
+        withUnsafeMutablePointer(to: &source) {
+          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            recvfrom(fd, raw.baseAddress, raw.count, 0, $0, &sourceLength)
+          }
+        }
+      }
+      guard received > 0 else { return }
+      let answer = reply(Array(buffer.prefix(received)))
+      _ = answer.withUnsafeBytes { raw in
+        withUnsafePointer(to: &source) {
+          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            sendto(fd, raw.baseAddress, raw.count, 0, $0, sourceLength)
+          }
+        }
+      }
+    }
+  }
+
+  /// Waits for the answering thread, if one started, then closes the socket.
+  func stop() {
+    lock.lock()
+    let started = answering
+    lock.unlock()
+    if started { served.wait() }
+    close(fd)
   }
 }

@@ -43,9 +43,35 @@ struct UDPExchangeReply: Sendable {
 /// descriptor is closed exactly once, by the cancel handler of the last source watching it, and
 /// the caller is resumed only after that close. Every source is activated as soon as it is
 /// created, because libdispatch traps when a source that was never activated is released.
+///
+/// States and events. Everything after `start` runs on `queue`, so events never interleave.
+///
+///     State             Event                        Rule
+///     setup             any setup step fails          close in setup, throw; no source exists
+///     created           cancel before start          start sees the flag; finish, close, resume
+///     unsent            read: datagram, empty, error  consume and ignore; it cannot answer this
+///                                                    request (a stale datagram on a reused port)
+///     unsent            send EINTR                   retry at once, inside the deadline
+///     waiting to write  writable                     cancel the write source, retry the send
+///     backing off       backoff timer                retry the send
+///     any unsent        a retry starts at or after   not sent; deadlinePassed: sendFailed
+///                       the deadline
+///     any unsent        deadline timer               sendFailed (nothing left, so no evidence)
+///     sent              read: datagram or empty      success with the bytes, if before deadline
+///     sent              read: ECONNREFUSED           refused; EHOSTUNREACH, ENETUNREACH:
+///                                                    unreachable; other errno: receiveFailed
+///     sent              read after the deadline      deadlinePassed, before the timer runs
+///     sent              deadline timer               timedOut
+///     any but finished  task cancellation            CancellationError
+///     finished          any event                    ignored: every handler checks `finished`
+///                                                    before touching the descriptor
+///
+/// `finish` runs once (a second call returns): it cancels the timers and every source on the
+/// descriptor. The last cancel handler closes the descriptor and resumes the caller, once.
 final class UDPExchange: @unchecked Sendable {
-  /// `recv` calls one read event may make. Only `EINTR` repeats a call; the first datagram ends
-  /// the exchange whatever it holds.
+  /// `recv` calls one read event may make. `EINTR`, and anything read before the request has
+  /// left, repeat a call; after the send, the first datagram ends the exchange whatever it holds.
+  /// More queued datagrams wait for the next read event.
   private static let receiveAttemptsPerEvent = 4
 
   /// Longest wait before retrying a send that failed with `ENOBUFS`. The socket reports writable
@@ -302,7 +328,10 @@ final class UDPExchange: @unchecked Sendable {
         return
       }
 
-      let rtt = sentAt.map { Self.seconds(from: $0, to: receivedAt) } ?? 0
+      // Before the request has left, nothing read can answer it: a datagram or error from an
+      // earlier socket on the same port. It is consumed and ignored, and the send goes on.
+      guard let sentAt else { continue }
+      let rtt = Self.seconds(from: sentAt, to: receivedAt)
       guard received >= 0 else {
         switch code {
         case ECONNREFUSED:
