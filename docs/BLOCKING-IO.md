@@ -1,8 +1,8 @@
 # Event-based I/O: no thread held while waiting, one deadline per operation
 
 Sequenced plan for the ROADMAP item "Robustness under network and DNS failure, proven by tests".
-Stage: product. Status: plan; see Review record for what has been reviewed. Completed stages get
-struck through as they land.
+Stage: product. Status: plan, reviewed twice (see Review record). Completed stages get struck
+through as they land.
 
 ## Why
 
@@ -16,33 +16,34 @@ discovery. What it leaves unbounded is listed under Out of scope.
 Dispatch sources: no thread is held, a timer ends the wait, and cancellation closes the socket.
 Four kinds of work are written as blocking calls instead:
 
-| Work | How it waits today |
-|---|---|
-| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket with a receive timeout (`performDNSQueryInternal`, `DNS.swift`) |
-| STUN public-IP discovery | the same, plus `getaddrinfo` for each server name |
-| Reverse DNS | `getnameinfo` |
-| Forward resolution of a destination | `getaddrinfo` |
+| Work | How it waits today | Where it runs |
+|---|---|---|
+| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket (`performDNSQueryInternal`, `DNS.swift`) | `BlockingIOExecutor` |
+| Public-IP discovery (STUN, with a DNS fallback for IPv4) | blocking `recv`, plus `getaddrinfo` per server name | the executor in a classified trace; plain `Task` closures and `DispatchQueue.concurrentPerform` in standalone `getPublicIPs` |
+| Reverse DNS | `getnameinfo` | the executor |
+| Forward resolution of a destination | `getaddrinfo` | inline in the caller |
 
-A thread parked in one of those calls cannot be a cooperative-pool thread, so the first three
-run on `BlockingIOExecutor` (`Utils.swift`), eight worker slots behind an `OperationQueue`, and
-the fourth runs inline. Everything hard about this area follows from that:
+`BlockingIOExecutor` (`Utils.swift`) is eight worker slots behind an `OperationQueue`.
+Everything hard about this area follows from threads being held:
 
 - **Work queues for a thread it does not need.** A DNS probe sends one UDP packet, yet it waits
-  for a free slot, and stalled `getnameinfo` calls can hold all eight. That wait has no bound.
+  for a free slot, and stalled `getnameinfo` calls can hold all eight. That wait has no bound,
+  and bounding it with a deadline would report a healthy server as unreachable when no packet
+  was ever sent.
 - **A released caller still occupies a slot.** A blocking call cannot be interrupted, so
   cancellation and deadlines free the caller while the syscall runs on.
-- **The bridge keeps producing races.** Four objects can each end a request on the executor (the
-  operation's block, the deadline timer, the cancellation handler, a completion-block backstop).
-  0.17.1 fixed three defects in it; review of #95 found a fourth of the same kind.
+- **The bridge is easy to get wrong.** Four objects can each end a request on the executor.
+  0.17.1 fixed three defects in it. The queue deadline that #95 added on top had a fourth; that
+  code never merged, so the fourth is not on `main`.
 - **Inline `getaddrinfo` blocks the tracer actor** in `performTrace` and
   `performStreamingTrace`, so `cancelActiveTraces()` and `networkChanged()` wait behind it. For
   `ping` (`nonisolated`) and the TCP and UDP probes (free functions) it blocks a cooperative-pool
   thread.
 
-The first version of this plan kept the blocking calls and rewrote the bridge as a per-request
-state machine. That would have made the bridge correct and left every other item above in place.
-Making the four kinds of work event-based removes the bridge, the slots and the queue, so there
-is nothing to starve and nothing to race, and cancellation actually stops the work.
+The plan: make DNS, STUN and reverse DNS event-based, so they hold no thread and leave the
+executor. Keep `getaddrinfo` for forward resolution, because it is the only thing that chooses
+the address the system itself would connect to (see Resolution Off The Actor), and move it onto
+the executor, which by then carries nothing else. The executor's internals do not change.
 
 Two further defects are independent of this and are fixed first: the receive handlers for trace,
 streaming trace and ping can starve their own deadline timer, and `traceClassified` has no
@@ -51,19 +52,18 @@ overall deadline (#84).
 ## What stays
 
 - Every public signature. New options are added as separate initializer overloads so existing
-  calls keep their exact function type. The one proposed exception is a new error case; see
-  Decisions.
-- The task-local test seams (`TestSeams.swift`), the loopback fixtures and the offline
-  fault-injection battery from #94.
+  calls keep their exact function type. The one proposed exception is in Decisions.
+- The fault-injection approach from #94: task-local seams, loopback fixtures, negative controls.
+  The seam closure types for resolution and public-IP discovery are synchronous today and become
+  async with the code they replace, so the tests that bind them change.
 - The downstream contracts in `CLAUDE.md`: single destination-string entry points, canonical
   address form, zone-suffix preservation, family-agnostic errors, concurrent-ping safety,
   unprivileged sockets.
 - Graceful degradation, the 0.15.0 contract: a trace whose probes succeeded returns its hops even
   when enrichment does not finish.
-- The system resolver for names. Forward and reverse lookups keep going through macOS's
-  resolver (via its event-based API), not a DNS client of the library's own, because split DNS,
-  VPN resolvers, search domains and `.local` are part of what the host network is.
-- `BlockingIOExecutor`, unchanged, until the last stage removes it.
+- The system resolver for names, forward and reverse, so split DNS, VPN resolvers, search
+  domains and `.local` behave as they do for the rest of the host.
+- `BlockingIOExecutor` and its bridge, unchanged. Its last remaining use is `getaddrinfo`.
 
 ## Stages
 
@@ -71,8 +71,10 @@ Each stage is one pull request under about 2,000 changed lines, reviewed by Code
 with tests shown to fail without the change. A stage that outgrows the cap is split, not
 overridden.
 
-The order puts the fixes that do not depend on the executor first, so a second-pass blocker on
-the executor rewrite cannot strand them or the release.
+The order puts the fixes that are independent of each other first and the release after the
+four that close known defects. The event-based conversions follow in order of risk: the UDP
+transports the library fully owns, then reverse DNS, where a difference costs only a hostname,
+then forward resolution, where it would change what is measured.
 
 ### Independent Fixes
 
@@ -100,8 +102,7 @@ Carried in from review:
 - The two follow-ups recorded on #95: ping under a non-transient send fault, and a valid reply
   behind random datagrams still being processed.
 
-Not ported: #95's DNS queue deadline. DNS Wait Bound covers the wait until Event-Based DNS
-removes it.
+Not ported: #95's DNS queue deadline. Event-Based DNS removes the wait it was bounding.
 
 This stage starts the upgrade guide (see Upgrade guide).
 
@@ -129,23 +130,63 @@ Two error types mean two things: `CancellationError` when the caller cancelled i
 `TracerouteError.cancelled` when the library ended the operation (`networkChanged()`,
 `cancelActiveTraces()`). Today the mapping is not consistent. `PingExecutor.ping` throws
 `TracerouteError.cancelled` for task cancellation, and a trace throws either type for the same
-cause depending on which check notices first (`Task.checkCancellation()` beside
-`throw TracerouteError.cancelled` in `Traceroute.swift`). A caller that retries on
+cause depending on which check notices first. A caller that retries on
 `TracerouteError.cancelled` therefore sometimes retries after its own cancellation.
 
-Apply the rule `discoverPaths` gets in Independent Fixes to trace, streaming trace and ping:
-task cancellation always throws `CancellationError`; a library-side cancel always throws
-`TracerouteError.cancelled`; when both have happened, the library-side cancel is reported, since
-it carries more information. The fault battery's cancellation tests stop accepting either type.
-This is a behavior change and gets an upgrade-guide entry.
+The cause is structural. In `trace`, `traceClassified` and the multipath flow, the task's
+`onCancel` runs `Task { await handle.cancel() }`, which sets the same flag a library-side cancel
+sets, and `withTraceCancellation` then turns everything into `TracerouteError.cancelled`. So the
+fix is not a change of `throw` statements: `TraceHandle` gets a lock-protected, synchronous
+cancel state that records the reason (caller task, or library), and `withTraceCancellation`
+reports from it. Overall Deadline later adds a third reason to the same state.
 
-### DNS Wait Bound
+The rule, as `discoverPaths` already has it from Independent Fixes: task cancellation throws
+`CancellationError`; a library-side cancel throws `TracerouteError.cancelled`; when both
+happened, the library-side cancel is reported. Trace, streaming trace and ping follow it, the
+battery's cancellation tests stop accepting either type, and the two follow-ups from the review
+of #100 are done here (the `cancelActiveTraces()` doc comment; one gated trace per cancellation
+source). This is a behavior change and gets an upgrade-guide entry.
 
-Until DNS is event-based, a DNS probe can wait without limit for a worker slot. Give each query
-an overall deadline of three times its `timeout` on the existing executor, as 0.17.1 did for the
-Team Cymru lookups. A started query finishes within about twice its `timeout` (one for send, one
-for receive), so the deadline does not cut off a healthy query. A query that hits it throws
-`DNSError.timeout`. This is a few lines and is replaced by Event-Based DNS.
+### Event-Based DNS
+
+Rewrite `performDNSQueryInternal` as a non-blocking connected UDP socket with a Dispatch read
+source and a timer. Encoding, parsing, peer checks and interface and source binding are reused
+unchanged. This covers the public DNS probes and the Team Cymru TXT lookups. After it, neither
+touches the executor, so the unbounded wait for a worker is gone at its cause.
+
+The transport contract (it is shared with STUN later, so it is one small type):
+
+- **Setup.** Set `O_NONBLOCK` and check both `fcntl` results. Setup owns the descriptor until
+  the read source exists; from then on it is closed exactly once, in the source's cancel
+  handler, after every source watching it has been cancelled. The continuation resumes after
+  the close. A source that was created is always activated before it is cancelled.
+- **Send.** A UDP send is all or nothing; a short count is a failure. `EINTR` retries. `EAGAIN`,
+  `EWOULDBLOCK` and `ENOBUFS` wait for writability and retry the whole datagram, inside the
+  deadline, with no blocking `poll` or `usleep`.
+- **Receive.** Read `errno` on a negative `recv`. `EAGAIN` waits. `ECONNREFUSED`,
+  `EHOSTUNREACH` and `ENETUNREACH` end the exchange at once (the ICMP error arrives as a read
+  event with no data). Zero bytes is an empty datagram, not a timeout. The drain is bounded and
+  the absolute deadline is checked before a reply is accepted.
+- **Foreign and malformed replies keep today's meaning.** The first datagram decides: a wrong
+  transaction ID or garbage fails with `malformedResponse`, as now. Ignoring them until the
+  deadline would change a probe's verdict and is not part of this stage.
+- **Truncation stays an error.** There is no TCP fallback today and none is added here.
+- **Timing.** RTT is stamped at `send` and in the read handler.
+
+Synchronous callers. `getPublicIPv4ViaDNS` (the IPv4 whoami fallback in `STUN.swift`) calls
+`DNSClient.queryTXT` from inside the blocking public-IP closure, and the test entry point
+`__dnsQuery` is synchronous. The blocking implementation stays, used only by that fallback,
+until Async Public-IP Discovery removes its last caller; the tests move to the async path.
+
+The limit on concurrent Cymru queries stays (it now bounds sockets, not slots) and its wait
+becomes cancellation-aware.
+
+Behavior changes for the upgrade guide: a DNS probe no longer waits for a worker, so `rttMs`
+no longer includes that wait; a refused port is reported at once instead of after the timeout.
+
+Tests: the existing DNS fault battery against the new transport; refused port; `EAGAIN` on send
+(injected); cancellation returns while the fixture is still silent, and the descriptor is closed
+once; with every executor slot held, a query to a healthy loopback server still answers.
 
 ### Release 0.18.0
 
@@ -153,119 +194,135 @@ After the four stages above. Bump `Version.swift`, consolidate `Unreleased` into
 organized by user-visible value with "Behavior changes" first, finish the upgrade guide for what
 shipped, tag the release-prep merge commit. Tagging and publishing need David's explicit go.
 
-### Event-Based DNS
+### Async Public-IP Discovery
 
-Rewrite `performDNSQueryInternal` as a non-blocking connected UDP socket with a Dispatch read
-source and a timer, in the pattern `PingOperation` already uses. Encoding, parsing, peer checks
-and interface and source binding are reused unchanged. One owner stops readiness delivery and
-closes the descriptor exactly once, in the source's cancel handler. Cancellation and the deadline
-close the socket; a packet already sent cannot be recalled.
+Make the orchestration awaitable before changing STUN's transport. `getPublicIPv4`,
+`getPublicIPv4ViaDNS`, `publicIPv4Discovery` and their callers in `Traceroute.swift` and
+`Segmentation.swift` become async and are lifted out of the `runDetachedBlockingIO` closures
+that wrap them. Standalone `getPublicIPs` replaces its unstructured `Task` wrappers, which also
+swallow the caller's cancellation, with structured concurrency. The whoami fallback moves to the
+async DNS transport, and the blocking DNS implementation is deleted.
 
-This covers the public DNS probes and the Team Cymru TXT lookups, which use the same client.
-After it, neither touches the executor: no slot, no queue, no wait for a worker. The semaphore in
-`CymruDNSResolver.resolve` that rations executor slots is no longer needed for that purpose; it
-stays only if a limit on concurrent queries to the Cymru servers is wanted for its own sake.
-
-Tests: the existing `dnsFaults` battery (silent, slow, garbage, wrong transaction) against the
-new transport; cancellation closes the socket and returns while the fixture is still silent; a
-flood of well-formed replies with a foreign transaction ID does not starve the deadline; with
-every executor slot held, a DNS query to a healthy loopback server still answers.
+The STUN exchange itself is still blocking after this stage and runs as individual executor
+requests, one per attempt. Server names resolve as they do today. The classified IPv4 path keeps
+its DNS fallback; the standalone API stays STUN-only.
 
 ### Event-Based STUN
 
-The same transport change for the STUN exchange. Coordination becomes asynchronous: each server
-is tried as soon as its name resolves, and a family that succeeded is returned at the cap while
-a losing lookup is still stalled. Public-IP discovery is lifted out of the
-`runDetachedBlockingIO` closures that wrap it today. Server names resolve through the forward
-resolver of the next-but-one stage; until that lands they use the existing blocking helper on
-the executor, one request per name. `resolveSTUNServer` gets a seam. First-ready selection can
-change which server supplies the address; the changelog says so.
+The STUN exchange moves onto the transport from Event-Based DNS, against an already-resolved
+endpoint. A server is tried as soon as its name has resolved, and a family that succeeded is
+returned at the cap while a losing lookup is still stalled. Name resolution for STUN servers is
+not changed here; it moves with Resolution Off The Actor. First-ready selection can change which
+server supplies the address; the changelog says so. STUN keeps failing on the first invalid
+reply, as now.
 
-Tests: the `stunFaults` battery against the new transport; a healthy endpoint beside a stalled
-name yields an address, in classified and standalone discovery; standalone `getPublicIPs` still
-returns a partial result when one family answers.
+Tests: the STUN fault battery against the new transport; a refused port moves to the next
+server at once; a healthy endpoint beside a stalled name yields an address, in classified and
+standalone discovery; `getPublicIPs` still returns a partial result when one family answers.
 
 ### Event-Based Reverse DNS
 
-Replace `getnameinfo` in `RDNSCache` with a PTR query through the system resolver's event-based
-API, `DNSServiceQueryRecord`, delivered on a serial Dispatch queue and ended with
-`DNSServiceRefDeallocate` on answer, error, cancellation or deadline. No thread is held, and a
-lookup that is abandoned is actually stopped.
+Replace `getnameinfo` in `RDNSCache` with a PTR query through `DNSServiceQueryRecord`. No
+thread is held, and an abandoned lookup is actually stopped. The system's own `getaddrinfo` and
+`getnameinfo` are built on the same daemon queries, and a comparison on one Mac returned the
+same name for 12 of 13 addresses (the exception: 255.255.255.255 is `broadcasthost` through
+`getnameinfo` and has no PTR through this API).
 
-The outcome is typed where today every failure collapses to `nil`: answer, confirmed no name,
-resolver error, timeout, cancelled. `RDNSCache` caches only an answer or a confirmed no name. The
-stall breaker exists to protect executor slots; with no slots it is re-examined in this stage
-and kept only if a test shows it still saves a caller time. The public optional hostname and the
-public synchronous `reverseDNS(_:)` are unchanged; the synchronous function keeps `getnameinfo`.
+The `DNSServiceRef` contract, which is where this API crashes if misused (deallocating off the
+callback queue crashed a stress loop in 4 of 4 runs):
 
-Reverse DNS goes before forward resolution because it is cosmetic enrichment: a parity gap
-costs a hostname, not a trace.
+- One owner object per lookup, with a serial queue given to `DNSServiceSetDispatchQueue`. Both
+  the start call's result and the queue call's result are checked.
+- The start call does a synchronous round trip to the system daemon, so it runs on the lookup's
+  queue, never on the actor or a cooperative thread. The deadline timer runs on a different
+  queue, so a stalled start cannot starve it; the caller is released at the deadline and a late
+  successful start is disposed of.
+- `DNSServiceRefDeallocate` is called only on the lookup's queue. Cancellation from another
+  thread hops to it. The callback context is released only after that deallocate.
+- `kDNSServiceFlagsReturnIntermediates` is set; without it a nameless address never calls back.
+  With it, intermediate CNAME records and remove events also arrive and are ignored: only an
+  added PTR record or an error is an outcome. The query stays active until deallocated, so the
+  first outcome deallocates.
+- A zoned link-local address passes its zone as the interface index. The PTR name's trailing
+  dot is stripped, so the hostname has the form `getnameinfo` gives.
+- A cap on concurrent lookups, awaited without a thread. Each lookup holds a descriptor, and the
+  executor's eight slots are today the only thing limiting how many run at once; a default
+  256-descriptor limit is reachable by a few concurrent traces otherwise.
 
-Tests: a seam that substitutes the query; stall, error and no-name outcomes; a cancelled lookup
-is not cached; a network change ends the wave; hostnames match `getnameinfo` for a sample of
-addresses on the test machine (a gated live test).
+Outcomes are typed: answer, no such record, error, timeout, cancelled. What "no such record"
+proves is decided here: the daemon can report it for a suppressed question as well as a real
+negative answer, so if the two cannot be told apart, only answers are cached. Link-local
+addresses are resolved by multicast, which never says "no such name" and so always ends in a
+timeout; they get a short cap of their own and do not count toward the stall breaker, or every
+IPv6 trace would wait out the full budget on its first hop. The stall breaker stays: it saves
+each trace the lookup budget while the resolver is broken.
 
-### Event-Based Forward Resolution
+The public optional hostname and the public synchronous `reverseDNS(_:)` are unchanged; the
+synchronous function keeps `getnameinfo` on its caller's thread. The two can therefore disagree
+for an address named only in `/etc/hosts`; the upgrade guide says so.
 
-One async resolver used by trace, streaming trace, ping, the TCP and UDP probes, `discoverPaths`
-(resolved once, then passed to its flows) and STUN server names.
+Tests: a seam substituting the query; each outcome; a cancelled lookup is not cached; a network
+change ends the wave; a start call gated past the deadline releases the caller and deallocates
+exactly once; the off-queue deallocate stress test; a descriptor-count test at a lowered limit;
+a gated live comparison against `getnameinfo`.
 
-- **Names** resolve through `DNSServiceGetAddrInfo` with a deadline, cancelled by
-  `DNSServiceRefDeallocate`. The tracer actor is never blocked.
-- **Literals** never touch a resolver: they are parsed in-process, zone suffix kept. The DNS-SD
-  call rejects literals outright (measured, below), so this split is required, not optional.
-- **Address selection must match `getaddrinfo`.** Today the library takes the first address
-  `getaddrinfo(AF_UNSPEC)` returns, which the system has sorted by RFC 6724 destination-address
-  rules. DNS-SD delivers addresses as they arrive. The resolver collects the answers for both
-  families up to a short settle time and applies the same choice. This is the main risk in the
-  plan and is what the parity gate below exists for.
-- **NAT64.** In `.auto` mode a v4 literal goes through `getaddrinfo` today so the system can
-  synthesize a v6 address on a v6-only network. The replacement has to do the same, and how is
-  not yet established; candidates are the RFC 7050 prefix discovery (`ipv4only.arpa`) and
-  keeping `getaddrinfo` for this one case. Decided in this stage on a real NAT64 network.
-- A resolution that timed out is reported as a timeout, not as `resolutionFailed`.
-- The probes spend one budget: resolution time comes out of `config.timeout`.
+### Resolution Off The Actor
 
-**Parity gate.** A checked-in comparison tool resolves a list of names both ways and reports
-every difference in chosen address, family, canonical form and zone. It is run, and its output
-recorded in the PR, on: dual-stack, v4-only, v6-only with NAT64, a VPN with split DNS, names from
-`/etc/hosts`, single-label names using a search domain, and `.local` names. Any difference is
-either fixed or listed with the owner's acceptance. If parity cannot be reached for a case,
-`getaddrinfo` is kept for that case on a dedicated thread with a deadline, and the plan says so.
+Forward resolution keeps `getaddrinfo`. The reviews and a measurement settled this:
 
-A first measurement on one dual-stack Mac (2026-11-22, a scratch tool, not checked in): for
-`example.com`, `one.one.one.one` and `localhost`, DNS-SD returned the same addresses in the same
-order as `getaddrinfo`. For the machine's own hostname it returned the same two addresses in the
-opposite order (v6 first, where `getaddrinfo` put v4 first). For IPv4, IPv6 and zoned literals it
-returned an error. A name that does not exist failed in both.
+- `getaddrinfo` orders its answers using the routes and source addresses of each candidate and,
+  ahead of the RFC 6724 rules, the kernel's statistics about recent connections. The event-based
+  API returns addresses in arrival order. On one Mac, the first address it delivered from a cold
+  cache differed from `getaddrinfo`'s for 7 of 21 public names. Sorting the collected answers by
+  RFC 6724 matched all 21 but not the machine's own hostname, where `getaddrinfo` preferred IPv4.
+- NAT64 synthesis for an IPv4 literal exists only inside `getaddrinfo`; the event-based API
+  rejects literals.
+- Which address gets probed is the measurement. A resolver that is race-free and picks a
+  different destination than the system would is the worse failure.
+
+So this stage changes where `getaddrinfo` runs, not what it returns:
+
+- One async adapter, used by trace, streaming trace, ping, the TCP and UDP probes, STUN server
+  names and `discoverPaths` (which resolves once, with its forced-IPv4 contract, and passes the
+  address to its flows while keeping the original hostname for display).
+- It submits `resolveHost` to the executor with a deadline. By this stage nothing else uses the
+  executor, so enrichment cannot starve a forward lookup, and the existing bridge with a
+  whole-call deadline is the path 0.17.1 fixed. Hints are unchanged, including the separate
+  hint set `resolveSTUNServer` uses.
+- Forced-family literals keep their inline fast path. An `.auto` literal still needs
+  `getaddrinfo` for NAT64. Whether it can skip the call when the host has a routable IPv4
+  address is measured in this stage; if not, it goes through the executor like a name.
+- The adapter reads its seam on the async side before submitting. `TraceHandle` cancellation
+  and task cancellation both reach the resolution, and the trace revalidates before creating
+  its socket.
+- A resolution that hit its deadline is reported through the existing
+  `TracerouteError.resolutionFailed(host:details:)` with details saying it timed out, so no new
+  case is needed. The TCP and UDP probes, which do not throw for network failures, report it in
+  their result as they report other failures, and spend one budget: resolution time comes out
+  of `config.timeout`.
+
+Stalled lookups for eight different names can still hold every slot until `getaddrinfo` gives
+up. That is bounded for the caller by the deadline and is the residual this plan accepts.
 
 Tests: with a trace's resolver gated shut and shown to have been entered, `cancelActiveTraces()`
-returns and the victim trace finishes while the gate stays shut; a literal `trace` and `ping`
-never call the resolver; with at least core-count pings in resolution, an unrelated async task
-still runs.
-
-### Retire The Executor
-
-Once nothing in the library submits to it, delete `BlockingIOExecutor`, `ContinuationBox`,
-`BlockingIOCancellationBridge`, `DeadlineTimerBox`, `runDetachedBlockingIO` and the executor
-seam, with their tests. Whatever blocking call is left (the synchronous `reverseDNS(_:)`, any
-`getaddrinfo` case kept by the parity gate) runs on its own thread with a deadline, not on a
-shared pool. If a shared pool turns out to be unavoidable, this stage becomes the per-request
-state machine from the first version of this plan (git history of this file, commit `006ca88`).
+returns and the victim trace finishes while the gate stays shut; with at least core-count pings
+in resolution, an unrelated async task still runs; a forced-family literal never calls the
+resolver.
 
 ### Overall Deadline
 
 The #84 contract, for `traceClassified` and `discoverPaths` (including the per-flow pipeline in
-`performClassifiedTraceWithFlowID`). It can land any time after Receive Loop Bounds; it is
-simpler after the event-based stages, because expiry then stops the work instead of abandoning
-it.
+`performClassifiedTraceWithFlowID`). It can land any time after Consistent Cancellation, whose
+cancel state it extends; it is simpler after the event-based stages, because expiry then stops
+the work instead of abandoning it.
 
 - One absolute deadline on one monotonic clock, the one Dispatch timers use, started on entry to
   the actor-isolated method.
 - The default is the sum of the caps of the phases active for this call (skipping disabled
   reverse DNS, a configured or cached public IP, an embedded ASN database), plus a stated
   scheduling allowance. So by default it fires only when a phase overran its own cap. A
-  caller-supplied total replaces the default.
+  caller-supplied total replaces the default. For `discoverPaths` the sum accounts for its
+  sequential batches of flows.
 - A phase may tighten the deadline and never resets it. At a phase's own cap, enrichment degrades
   as now. Classification gets its own cap, and when it expires the trace is returned with ASN
   data missing.
@@ -273,19 +330,18 @@ it.
   expiry for the outgoing phase when the deadline has passed, so a late timer cannot blame the
   next phase or lose to a late result.
 - Hops are never discarded. If the overall deadline passes after the probe window, the measured
-  hops are returned (see Decisions for how).
-- `TraceHandle` is an actor reached through `Task { await handle.cancel() }`, and
-  `withTraceCancellation` hard-codes `TracerouteError.cancelled`. Naming the right phase needs a
-  synchronous cancel source that carries a reason: caller, network change, or deadline.
+  hops are returned (see Decisions for how). For `discoverPaths`, paths from batches that
+  finished are returned when a later batch expires.
 - Public-IP discovery that was attempted and got no answer is remembered for the rest of the
   call, so the classifier does not start it again.
 - The shared ASN load in `_ASNMemoryCache` is cancelled when its last waiter leaves; each
-  subscriber's wait has its own deadline. An injected `ASNResolver` that ignores cancellation
-  cannot be stopped: the caller is released and the documentation says so.
+  subscriber's wait has its own deadline, which must not be part of the key that decides whether
+  two callers share a load. An injected `ASNResolver` that ignores cancellation cannot be
+  stopped: the caller is released and the documentation says so.
 
 Tests: a caller-tightened total with phases that each finish inside their own cap but whose sum
 exceeds it; expiry in each phase names that phase; two subscribers to one ASN load with
-different deadlines.
+different deadlines; a `discoverPaths` whose second batch expires returns the first batch.
 
 ## Gates
 
@@ -307,8 +363,8 @@ swift package --allow-writing-to-directory docc generate-documentation --target 
 - After 0.18.0 the API check also runs against `v0.18.0`. If the new error case is accepted, it
   goes in a breakage allowlist file passed to the check, and nothing else does.
 - Each event-based stage adds one more: with every executor slot held by a gated blocker, the
-  operation it converts still completes against a healthy loopback fixture. Event-Based Forward
-  Resolution also has the parity gate described in its section.
+  operation it converts still completes against a healthy loopback fixture reached by a literal
+  address.
 
 If a second review pass on any stage finds a new blocker, the stage stops and the decision goes
 to David.
@@ -329,39 +385,53 @@ written for both people and coding agents updating a consumer from 0.17.
 
 Each has a recommended default. Work proceeds on the default until he says otherwise.
 
-1. **Cancellation errors (Consistent Cancellation).** Recommended: fix before 0.18.0. Ping's
+1. **Is Event-Based DNS in 0.18.0?** Recommended: yes. Without it the release ships a DNS probe
+   that can wait without limit for a worker, and all three reviewers found the cheap interim
+   bound wrong: it can report a healthy server as unreachable. The cost is one more stage before
+   the release.
+2. **Cancellation errors (Consistent Cancellation).** Recommended: fix before 0.18.0. Ping's
    error type changes for a caller that cancels its own task.
-2. **Overall deadline on by default?** Recommended: yes, with the default equal to the sum of
+3. **Forward resolution keeps `getaddrinfo`.** Recommended, as described in Resolution Off The
+   Actor. The alternatives the reviewers named: sort the event-based API's answers in-process by
+   RFC 6724 and document that the choice can differ from the system's (Gemini); or resolve
+   through the event-based API to warm the daemon's cache and then call `getaddrinfo`, which
+   answered in 1 to 7 ms from cache in one measurement (Fable, as an untested idea).
+4. **Overall deadline on by default?** Recommended: yes, with the default equal to the sum of
    the active phase caps plus an allowance, and a caller-supplied total that replaces it.
-3. **What happens to the hops when the overall deadline passes after probing?** Recommended:
-   return the `ClassifiedTrace` with enrichment missing and a field naming the phase that ran
-   out, and throw only when the deadline passes before the probe window completes. The
-   alternative is to throw and carry the partial trace in the error.
-4. **Shape of the deadline error.** The first-round reviewers split.
-   - A new `TracerouteError` case (Fable, Gemini; the author's recommendation): callers route on
-     `TracerouteError`, so a separate type would fall into a generic catch at run time with no
-     warning, while a new case breaks exhaustive switches at compile time, which is the louder
-     signal. 0.14 added `DNSError` cases in a minor release. The phase payload would be a struct
-     with static members, so a later phase is not a second break.
-   - A separate type such as `TraceDeadlineExceeded` (Codex): it keeps existing code compiling.
-5. **When to cut 0.18.0.** Recommended: after the first four stages.
-6. **Forward-resolution budget.** There is no configuration to derive one from today.
+5. **What happens to the hops when the overall deadline passes after probing?** Recommended:
+   return the result with enrichment missing and a field naming the phase that ran out, and
+   throw only when the deadline passes before the probe window completes. The alternative is to
+   throw and carry the partial result in the error.
+6. **Shape of the deadline error**, for the case that does throw. The reviewers split, and the
+   split did not close in the second round.
+   - A separate type such as `TraceDeadlineExceeded` (Codex, both rounds): adding a case to
+     `TracerouteError` breaks exhaustive switches in consumers, which the source-compatibility
+     rule forbids as stated.
+   - A new `TracerouteError` case (Fable and Gemini in the first round): callers route on
+     `TracerouteError`, so a separate type falls into a generic catch at run time with no
+     warning, and 0.14 added `DNSError` cases in a minor release.
+   The author leans to the separate type now, because decision 5's default makes this error rare
+   and the compatibility rule is the owner's.
+7. **Forward-resolution budget.** There is no configuration to derive one from today.
    Recommended: a new `SwiftFTRConfig` option for traces, defaulting to 10 seconds, with probes
    spending from their existing `timeout`. The 10 seconds is a proposal, not a measurement.
-7. **Parity differences.** If the parity gate finds a case where the event-based resolver picks
-   a different address than `getaddrinfo`, is matching `getaddrinfo` exactly required, or is a
-   documented difference acceptable? Recommended: exact match for the chosen address on every
-   listed network type, since downstream consumers compare hop and destination addresses.
 
 ## Out of scope
 
 Still unbounded after this plan, or deliberately deferred. Roadmap, not this plan:
 
+- Replacing `getaddrinfo` for forward resolution.
 - The public synchronous `reverseDNS(_:)`, direct `TraceClassifier.classify` with an
   uncooperative resolver, and `preloadASNDatabase()` with a remote source.
 - `testBufferbloat`, whose load generation uses `URLSession.shared` and is awaited without
   cancellation after the ping phase ends.
 - The `swift-ftr` CLI's own synchronous `reverseDNS` and `getaddrinfo` calls.
+- DNS over TCP on truncation, and EDNS0. A truncated answer is `malformedResponse` today.
+- Ignoring replies with a foreign transaction ID until the deadline, for DNS and STUN.
+- The blocking `poll` and `usleep` in `SendRetry.swift`, which can hold the tracer actor or an
+  operation's queue for up to the 250 ms burst budget.
+- `discoverPublicIPWithHostname()` not being ended by a network change.
+- Using real PTR time-to-live values in `RDNSCache` instead of one cache-wide value.
 - Collapsing the multipath per-flow pipeline onto the shared classified-trace implementation,
   which would also fix the configuration it drops (#91).
 - Coalescing identical in-flight forward lookups.
@@ -374,22 +444,48 @@ Still unbounded after this plan, or deliberately deferred. Roadmap, not this pla
 ## Review record
 
 **First version (per-request state machine), 2026-11-22.** Reviewed once by Codex
-(`gpt-6.2-astra`, high), Gemini (`gemini-4-carbon-high`) and Claude Fable 5.2 (high), each
-without sight of the others. What survives into this version: ping and the probes do not resolve
-on the actor (all three caught the first draft saying they did); literals must never wait on a
-shared resource (Fable, Gemini); Receive Loop Bounds before Overall Deadline (all three); the
-executor-independent part of #95 ships first (Fable); hops survive the overall deadline (all
-three); the `discoverPaths` commit rule, the lost `getnameinfo` status and ownership of abandoned
-ASN work (Codex, Gemini). The state-machine findings are in git history with that version.
+(`gpt-6.2-astra`, high), Gemini (`gemini-4-carbon-high`) and Claude Fable 5.2 (high),
+independently. Its brief listed "replacing getaddrinfo with DNS-SD is out of scope" as decided by
+the owner. That was the author's scoping, not David's decision.
 
-That review's brief listed "replacing getaddrinfo with DNS-SD is out of scope" as a constraint
-decided by the owner. It was the author's scoping, not David's decision, so the reviewers were
-steered away from the approach this version takes.
+**Second version (everything event-based, executor deleted), 2026-11-22.** Prompted by David
+asking why a DNS query needs a worker at all. Reviewed once by the same three; Fable also ran
+measurements on one Mac (macOS 26.7.3, dual-stack, a split-DNS VPN up; one run each). This
+document is that version with their findings folded in:
 
-**This version (event-based), 2026-11-22.** Prompted by David asking why a DNS query needs a
-worker at all, and whether the whole thing can be event-based. The approach changed, so it gets
-one new review round; the outcome is recorded here when it returns.
+- Event-based is right for DNS, STUN and reverse DNS (all three).
+- Forward resolution cannot reproduce `getaddrinfo`'s choice by collecting answers and waiting
+  (all three; Fable's measurement and reading of the system library's source). Hence it keeps
+  `getaddrinfo`, and the executor is kept for it instead of deleted.
+- The author's own comparison had called `getaddrinfo` first, so the event-based API answered
+  from a warm cache in sorted order and looked more alike than it is (Fable).
+- The interim "three times the timeout" DNS bound counts from submission and reports a healthy
+  server as unreachable when the workers are busy (all three). Replaced by Event-Based DNS
+  before the release.
+- The `DNSServiceRef` rules, the required flag, the synchronous start call and the descriptor
+  cap (all three; crash and descriptor limit measured by Fable).
+- Link-local reverse lookups always time out (Gemini).
+- Consistent Cancellation needs the reason-carrying cancel state, not just different `throw`s
+  (Gemini).
+- Standalone `getPublicIPs` does not use the executor today, the DNS client has a synchronous
+  caller in the whoami fallback, and STUN's transport cannot be gated before its orchestration
+  is async (all three). Hence Async Public-IP Discovery.
+- The UDP transport contract: errno handling, send retry, close ordering (all three).
+
+Declined, with the reason:
+
+- Reimplementing RFC 6724 ordering and NAT64 prefix discovery in the library so the executor
+  can be deleted outright (Gemini). It cannot match the system's choice where connection history
+  matters, and it is the larger risk for the smaller gain.
+- A shared connection to the daemon for reverse lookups (Gemini, Fable as one option). A cap on
+  concurrent lookups is simpler and bounds descriptors as well; revisit if the cap costs time.
+- Changing foreign-transaction-ID handling now (raised by all three as a choice to make). Kept
+  as today so a probe's verdict does not change in the same release as its transport.
+
+No third review round: this version adopts the reviewers' recommendations and does not introduce
+a new approach.
 
 Unverified claims this plan repeats: that a stalled `getnameinfo` holds a slot for about 30
-seconds (repo comments and an earlier measurement, not re-measured). The DNS-SD comparison above
-is one machine on one network.
+seconds (repo comments and an earlier measurement, not re-measured); behavior on NAT64, on a
+network with broken IPv6, and with the system daemon stopped or stalled (documentation and
+source reading only). The measurements cited are one machine on one network.
