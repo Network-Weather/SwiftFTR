@@ -152,23 +152,27 @@ final class EndlessReplies: @unchecked Sendable {
 
   /// Whether the socket stayed fed since `mark` and the operation read it: the sender is still
   /// running, no gap between sends reached the receive timeout (after which a read reports no
-  /// data), and at least `minimumSent` more replies were sent and `minimumRead` more were read.
-  /// The default of ten reads is far more than loopback ever has in flight at this spacing, so
-  /// those replies were read, not merely still on their way. A test that checks reading before it
-  /// cancels passes zero for both, since a prompt return can come before the next reply.
+  /// data), neither has the time since the last send, and at least `minimumSent` more replies
+  /// were sent and `minimumRead` more were read. The default of ten reads is far more than
+  /// loopback ever has in flight at this spacing, so those replies were read, not merely still on
+  /// their way. A test that checks reading before it cancels passes zero for both, since a prompt
+  /// return can come before the next reply; the read count is an estimate, so with zero its
+  /// change is not checked at all.
   func fedAndRead(
     since mark: Traffic, minimumSent: Int = 1, minimumRead: Int = 10
   ) -> (ok: Bool, detail: String) {
     lock.lock()
     defer { lock.unlock() }
     let read = readCount()
+    let sinceLastSend = lastSend.map { monotonicNow() - $0 }
     let ok =
       !senderGone && !stopped && sentCount > 0 && sentCount - mark.sent >= minimumSent
-      && longestGap < receiveTimeout
-      && mark.read >= 0 && read >= 0 && read - mark.read >= minimumRead
+      && longestGap < receiveTimeout && sinceLastSend.map { $0 < receiveTimeout } == true
+      && mark.read >= 0 && read >= 0 && (minimumRead == 0 || read - mark.read >= minimumRead)
     let detail =
       "sender running: \(!senderGone && !stopped), sent \(mark.sent) -> \(sentCount), "
-      + "read \(mark.read) -> \(read), longest gap \(longestGap)s"
+      + "read \(mark.read) -> \(read), longest gap \(longestGap)s, "
+      + "since last send \(sinceLastSend.map { "\($0)s" } ?? "never")"
     return (ok, detail)
   }
 
@@ -478,7 +482,9 @@ struct FaultInjectionReceiveLoopTests {
       queuedAtHandover.value == datagramCount,
       "\(queuedAtHandover.value) of \(datagramCount) datagrams were queued before the trace read")
     #expect(datagramCount > receiveBatchLimit, "the backlog fits in one read callback")
-    #expect(network.probes.value == 1, "the silent network saw \(network.probes.value) probes")
+    #expect(
+      await eventually(within: 5) { network.probes.value == 1 },
+      "the silent network saw \(network.probes.value) probes")
     #expect(result.reached, "the reply behind the backlog was never read")
     #expect(result.hops.count == 1)
     #expect(result.hops.first?.reachedDestination == true)
@@ -560,6 +566,7 @@ struct FaultInjectionReceiveLoopTests {
     // The timeout outlasts the watchdog, so the retry is observed while the stream still runs.
     let config = StreamingTraceConfig(probeTimeout: 60, retryAfter: 0.2, maxHops: 4)
 
+    let before = replies.traffic()
     let consumer = Task {
       try await replies.install(network) {
         for try await _ in tracer.traceStream(to: "fake.test", config: config) {}
@@ -567,7 +574,6 @@ struct FaultInjectionReceiveLoopTests {
     }
     defer { consumer.cancel() }
     // Four initial probes, then the retry re-sends TTLs 1...3.
-    let before = replies.traffic()
     let retried = await eventually(within: Self.watchdog) { network.probes.value == 7 }
     let flow = replies.fedAndRead(since: before)
     await tracer.cancelActiveTraces()
@@ -637,7 +643,9 @@ struct FaultInjectionReceiveLoopTests {
     // Ping's sends run on the queue its receive loop drains on, so all three going out shows the
     // loop let them through.
     #expect(result.statistics.sent == 3)
-    #expect(network.probes.value == 3, "the network saw \(network.probes.value) probes")
+    #expect(
+      await eventually(within: 5) { network.probes.value == 3 },
+      "the network saw \(network.probes.value) probes")
     #expect(result.statistics.received == 0)
     // The last probe is owed its full reply window.
     #expect(elapsed >= 2 * config.interval + config.timeout * 0.9, "returned after \(elapsed)s")
