@@ -286,19 +286,17 @@ struct DNSProbeOutcomeTests {
   func unreachableBeforeTheSendIsIgnored() async throws {
     let server = try Self.answering()
     defer { server.stop() }
-    let attempts = FaultCounter()
-    let staged = FaultCounter()
+    let staging = EventBasedDNSTests.StaleEventStaging()
     let reads = FaultCounter()
     let preSendReads = FaultCounter()
-    // The first send puts a request on the wire, waits for its reply, then reports ENOBUFS, so the
-    // reply is readable before the exchange has sent anything.
-    let send = EventBasedDNSTests.sendThatLiesFirst(attempts: attempts, staged: staged)
+    // The first send provokes a reply and reports ENOBUFS; the real send waits until it is read.
+    let send = EventBasedDNSTests.staleEventSend(staging)
     // The first read consumes that reply and reports EHOSTUNREACH instead.
     let receive: TestSeams.ReceiveDatagram = { fd, buffer in
       reads.increment()
       let received = Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
       guard reads.value == 1 else { return received }
-      if attempts.value == 1 { preSendReads.increment() }
+      if !staging.realSendSucceeded { preSendReads.increment() }
       Darwin.errno = EHOSTUNREACH
       return -1
     }
@@ -308,10 +306,11 @@ struct DNSProbeOutcomeTests {
         try await Self.probe(port: server.port)
       }
     }
-    try #require(staged.value == 1, "the first reply never arrived before the retry")
+    try #require(staging.staged, "the first reply never arrived before the retry")
+    try #require(staging.consumedBeforeRealSend, "the reply was not read before the real send")
+    try #require(staging.realSendSucceeded, "the request never really left")
     try #require(preSendReads.value == 1, "the seam did not see the read before the send")
     #expect(result.outcome == .answered, "\(result.error ?? "nil")")
-    #expect(attempts.value == 2)
     #expect(reads.value >= 2)
   }
 
