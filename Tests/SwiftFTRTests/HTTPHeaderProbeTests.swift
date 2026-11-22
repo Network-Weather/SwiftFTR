@@ -15,9 +15,7 @@ struct HTTPHeaderProbeTests {
       config: HTTPProbeConfig(url: "http://probe.test/large-body", timeout: 5),
       sessionConfiguration: testSessionConfiguration())
 
-    try await waitBounded("the request stopping") {
-      await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
-    }
+    try await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
     let snapshot = await HTTPProbeProtocolRecorder.shared.snapshot()
 
     #expect(result.isReachable)
@@ -37,7 +35,7 @@ struct HTTPHeaderProbeTests {
         timeout: 2,
         followRedirects: false))
     noRedirectServer.stop()
-    try await waitBounded("the server finishing") { await noRedirectServer.waitUntilFinished() }
+    try await noRedirectServer.waitUntilFinished()
 
     #expect(noRedirectResult.statusCode == 302)
     #expect(noRedirectServer.requestPaths == ["/redirect"])
@@ -50,7 +48,7 @@ struct HTTPHeaderProbeTests {
         timeout: 2,
         followRedirects: true))
     redirectServer.stop()
-    try await waitBounded("the server finishing") { await redirectServer.waitUntilFinished() }
+    try await redirectServer.waitUntilFinished()
 
     #expect(redirectResult.statusCode == 204)
     #expect(redirectServer.requestPaths == ["/redirect", "/final"])
@@ -98,9 +96,7 @@ struct HTTPHeaderProbeTests {
     let result = try await probe.value
     let cancellationDuration = Date().timeIntervalSince(cancelledAt)
 
-    try await waitBounded("the request stopping") {
-      await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
-    }
+    try await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
     let snapshot = await HTTPProbeProtocolRecorder.shared.snapshot()
 
     #expect(cancellationDuration < 1)
@@ -126,53 +122,51 @@ private actor HTTPProbeProtocolRecorder {
 
   static let shared = HTTPProbeProtocolRecorder()
 
+  /// Advanced by every `reset()`. Events carry the generation their request started in, so a
+  /// request left over from an earlier test cannot change this test's counts.
+  private(set) var generation = 0
   private var startedCount = 0
   private var stoppedCount = 0
   private var bodyBytesDelivered = 0
   private var requestPaths: [String] = []
-  private var startWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
-  private var stopWaiters: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
   func reset() {
-    precondition(startWaiters.isEmpty && stopWaiters.isEmpty)
+    generation += 1
     startedCount = 0
     stoppedCount = 0
     bodyBytesDelivered = 0
     requestPaths = []
   }
 
-  func recordStarted(path: String) {
+  func recordStarted(path: String, generation: Int) {
+    guard generation == self.generation else { return }
     startedCount += 1
     requestPaths.append(path)
-    resumeReadyStartWaiters()
   }
 
-  func recordStopped() {
+  func recordStopped(generation: Int) {
+    guard generation == self.generation else { return }
     stoppedCount += 1
-    resumeReadyStopWaiters()
   }
 
-  func recordBodyBytes(_ count: Int) {
+  func recordBodyBytes(_ count: Int, generation: Int) {
+    guard generation == self.generation else { return }
     bodyBytesDelivered += count
   }
 
-  /// Bounded by ``waitBounded(_:within:_:)``, so a start that never comes fails the test.
+  // The waits poll the counts rather than register a continuation, so one that gives up leaves
+  // nothing behind in this shared recorder for a later test to trip over.
+
+  /// Fails the test if `count` requests have not started within ten seconds.
   nonisolated func waitUntilStarted(count: Int = 1) async throws {
-    try await waitBounded("\(count) request(s) starting") { await self.waitForStart(count: count) }
+    let started = await eventually(within: 10) { await self.snapshot().startedCount >= count }
+    try #require(started, "\(count) request(s) never started")
   }
 
-  private func waitForStart(count: Int) async {
-    guard startedCount < count else { return }
-    await withCheckedContinuation { continuation in
-      startWaiters.append((count, continuation))
-    }
-  }
-
-  func waitUntilStopped(count: Int = 1) async {
-    guard stoppedCount < count else { return }
-    await withCheckedContinuation { continuation in
-      stopWaiters.append((count, continuation))
-    }
+  /// Fails the test if `count` requests have not stopped within ten seconds.
+  nonisolated func waitUntilStopped(count: Int = 1) async throws {
+    let stopped = await eventually(within: 10) { await self.snapshot().stoppedCount >= count }
+    try #require(stopped, "\(count) request(s) never stopped")
   }
 
   func snapshot() -> Snapshot {
@@ -181,22 +175,6 @@ private actor HTTPProbeProtocolRecorder {
       stoppedCount: stoppedCount,
       bodyBytesDelivered: bodyBytesDelivered,
       requestPaths: requestPaths)
-  }
-
-  private func resumeReadyStartWaiters() {
-    let ready = startWaiters.filter { startedCount >= $0.count }
-    startWaiters.removeAll { startedCount >= $0.count }
-    for waiter in ready {
-      waiter.continuation.resume()
-    }
-  }
-
-  private func resumeReadyStopWaiters() {
-    let ready = stopWaiters.filter { stoppedCount >= $0.count }
-    stopWaiters.removeAll { stoppedCount >= $0.count }
-    for waiter in ready {
-      waiter.continuation.resume()
-    }
   }
 }
 
@@ -207,6 +185,8 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
 
   private let lock = NSLock()
   private var loadingTask: Task<Void, Never>?
+  /// The recorder generation this request started in; set before `loadingTask` is.
+  private var generation = 0
 
   override class func canInit(with request: URLRequest) -> Bool {
     request.url?.host == "probe.test"
@@ -223,7 +203,9 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
     let loadingTask = Task { [protocolBox] in
       let loader = protocolBox.value
       guard let url = loader.request.url else { return }
-      await HTTPProbeProtocolRecorder.shared.recordStarted(path: url.path)
+      let generation = await HTTPProbeProtocolRecorder.shared.generation
+      loader.setGeneration(generation)
+      await HTTPProbeProtocolRecorder.shared.recordStarted(path: url.path, generation: generation)
 
       switch url.path {
       case "/large-body":
@@ -253,10 +235,23 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
     lock.unlock()
 
     loadingTask?.cancel()
+    let generation = currentGeneration
     Task {
       await loadingTask?.value
-      await HTTPProbeProtocolRecorder.shared.recordStopped()
+      await HTTPProbeProtocolRecorder.shared.recordStopped(generation: generation)
     }
+  }
+
+  private func setGeneration(_ value: Int) {
+    lock.lock()
+    generation = value
+    lock.unlock()
+  }
+
+  private var currentGeneration: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return generation
   }
 
   private func loadLargeBody(for url: URL) async {
@@ -279,7 +274,8 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
       } catch {
         return
       }
-      await HTTPProbeProtocolRecorder.shared.recordBodyBytes(chunk.count)
+      await HTTPProbeProtocolRecorder.shared.recordBodyBytes(
+        chunk.count, generation: currentGeneration)
       client?.urlProtocol(self, didLoad: chunk)
     }
     client?.urlProtocolDidFinishLoading(self)
@@ -301,7 +297,6 @@ private final class LocalHTTPServer: @unchecked Sendable {
   private var listeningSocket: Int32?
   private var recordedRequestPaths: [String] = []
   private var isFinished = false
-  private var finishWaiters: [CheckedContinuation<Void, Never>] = []
 
   var redirectURL: URL {
     URL(string: "http://127.0.0.1:\(port)/redirect")!
@@ -399,19 +394,17 @@ private final class LocalHTTPServer: @unchecked Sendable {
     }
   }
 
-  func waitUntilFinished() async {
-    await withCheckedContinuation { continuation in
-      lock.lock()
-      let shouldResume = isFinished
-      if !shouldResume {
-        finishWaiters.append(continuation)
-      }
-      lock.unlock()
+  /// Fails the test if the server has not served its requests within ten seconds. Polls rather
+  /// than registering a waiter, so giving up holds nothing that keeps the server alive.
+  func waitUntilFinished() async throws {
+    let finished = await eventually(within: 10) { self.hasFinished }
+    try #require(finished, "the server never finished serving its requests")
+  }
 
-      if shouldResume {
-        continuation.resume()
-      }
-    }
+  private var hasFinished: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return isFinished
   }
 
   private func run(socketDescriptor: Int32) {
@@ -496,13 +489,7 @@ private final class LocalHTTPServer: @unchecked Sendable {
 
     lock.lock()
     isFinished = true
-    let waiters = finishWaiters
-    finishWaiters.removeAll()
     lock.unlock()
-
-    for waiter in waiters {
-      waiter.resume()
-    }
   }
 }
 

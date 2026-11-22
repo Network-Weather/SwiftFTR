@@ -80,6 +80,8 @@ struct PingLifecycleTests {
       config: PingConfig(count: 3, interval: 60, timeout: 1, preferredFamily: .v4)
     )
     let task = Task { try await fixture.operation.run() }
+    // A ping still running when the test gives up must not keep its socket open.
+    defer { task.cancel() }
 
     try await waitBounded("the first ping send") { await fixture.sends.waitForFirstSend() }
     task.cancel()
