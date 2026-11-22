@@ -286,4 +286,4 @@ an unmodified caller sees. The project CHANGELOG has the details.
   result while TCP/UDP probes throw `CancellationError`.
 - Let TCP-probe automation accept nonzero status when the accompanying result is unreachable.
 - Refresh SwiftPM resolution so SwiftIP2ASN 0.4.1 or later is selected (0.5.2 or later with
-  SwiftFTR 0.17.1).
+  SwiftFTR 0.17.1, 0.6.0 or later with SwiftFTR 0.18).
