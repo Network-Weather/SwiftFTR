@@ -183,7 +183,7 @@ The transport contract (it is shared with STUN later, so it is one small type):
   datagram, and the absolute deadline is checked before a reply is accepted.
 - **Foreign replies are ignored; malformed ones keep today's meaning.** A datagram without the
   query's transaction ID, or too short to carry one, is ignored until the deadline (decision 8,
-  done in #NNN). A datagram with the right ID that is otherwise invalid fails with
+  done in #116). A datagram with the right ID that is otherwise invalid fails with
   `malformedResponse`, as now.
 - **Truncation stays an error.** There is no TCP fallback today and none is added here.
 - **Timing.** RTT is stamped at `send` and in the read handler.
@@ -442,7 +442,7 @@ otherwise. Decided ones say so.
    before 0.18.0 (David, 2026-11-22). It closes a gap review found in the event-based
    transport: a stale datagram queued before the query left but read after it is taken as the
    reply. It changes one verdict: a server that sends only wrong-ID datagrams is reported as
-   timed out, not as reachable with a malformed response. Done in #NNN, for DNS on both the
+   timed out, not as reachable with a malformed response. Done in #116, for DNS on both the
    event-based and the blocking path; a datagram too short to carry an ID is ignored too.
 9. **Structured DNS probe outcome.** Decided: add an additive `outcome` field to
    `DNSProbeResult`; `isReachable` stays false for a refused port; the throwing query methods keep
