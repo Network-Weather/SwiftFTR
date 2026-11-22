@@ -14,6 +14,16 @@ Unreleased
   treats as a client bug and traps on (`EXC_BREAKPOINT` in `_dispatch_queue_xref_dispose`). Every
   blocking call that carries a deadline went through this path. A downstream consumer saw it in
   the field as rare crashes. The timer is now created only when it will be armed.
+- **A call cancelled while it was being submitted no longer hangs forever.** Every blocking
+  system call (reverse DNS, public-IP discovery, ASN and DNS queries) crosses one bridge onto a
+  bounded executor. If the caller was cancelled in the short window while that bridge was
+  submitting the work, nothing was left to resume the caller: it stayed suspended permanently,
+  deadline or not. In a test that cancels 10,000 calls at varying moments, some never returned;
+  now all do. An operation that finishes for any reason resumes its caller if nothing else has.
+- **Abandoned blocking calls are released.** An operation whose caller gave up while it was
+  still queued, by cancellation or by deadline, was never freed, and a deadline that fired first
+  also kept its timer. During an outage, when queued lookups time out one after another, that was
+  one leaked operation per lookup.
 - **A Team Cymru ASN lookup no longer waits without limit for a free worker.** The DNS fallback
   that `.dns` and `.hybrid` use bounded each query once it was running, but not the time it spent
   queued for one of the eight shared blocking-I/O slots. With every slot held by stalled resolver
