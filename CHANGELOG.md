@@ -3,6 +3,52 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+Robustness under a failing network, found by a new offline fault-injection battery that stages
+each kind of failure phase by phase. A network change now ends every operation that is in flight,
+including `discoverPaths`, and several waits are now bounded by the caller's own configuration.
+No public API is added or removed: `swift package diagnose-api-breaking-changes v0.17.1` reports
+none. Upgrading from 0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
+
+### Behavior changes
+
+What an unmodified caller will see differently:
+
+- **`discoverPaths` throws `TracerouteError.cancelled` on `networkChanged()` and
+  `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
+  measured on the old network. A topology that finished before the invalidation but had not yet
+  been returned is discarded too. Cancelling the calling task still throws `CancellationError`.
+- **A network change ends a trace waiting on reverse DNS at once.** `networkChanged()` and
+  `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
+  `traceClassified()`, so the trace threw `TracerouteError.cancelled` only when the slowest lookup
+  reached its deadline (5 s by default). It now throws at once.
+- **Invalid DNS inputs are reported before queueing.** A query with an invalid timeout, name or
+  server address, or a source address of the wrong family for the server, throws that error
+  (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) without waiting for a free
+  blocking-I/O worker.
+- **`discoverPaths` honours `publicIPDiscoveryTimeout`.** Its flows used the 6 s default whatever
+  was configured.
+
+### Bug fixes
+
+- **A cancelled reverse-DNS lookup is no longer cached as "no hostname".** A lookup cut short by
+  cancellation was recorded as a negative answer for the full cache TTL (24 h by default), so the
+  hop showed no hostname until the cache was cleared.
+- **A cancelled `discoverPaths` flow stops promptly.** A flow cancelled during public-IP discovery
+  no longer goes on to resolve its destination, and one cancelled during classification no longer
+  waits on an ASN database load shared with other resolvers.
+- **A STUN timeout under one microsecond no longer waits forever.** It truncated to a zero socket
+  timeout, which means none. Reachable through `getPublicIPs(stunTimeout:)`.
+
+### Tooling
+
+- An offline fault-injection battery (`FaultInjection*Tests`) stages failing networks phase by
+  phase through task-local test seams and loopback fixtures, and asserts that every operation
+  returns while its stall is still in force, under a watchdog derived from its configuration. See
+  `docs/ROBUSTNESS-TESTING.md`.
+
 0.17.1 — 2026-11-21
 -------------------
 
