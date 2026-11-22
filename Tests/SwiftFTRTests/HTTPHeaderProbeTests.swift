@@ -4,24 +4,30 @@ import Testing
 
 @testable import SwiftFTR
 
+/// How long a probe may run before it is reported as waiting for something it should not. Each
+/// probe here is given a timeout well past it, so only the behaviour under test can end it first.
+private let watchdog: TimeInterval = 20
+
 @Suite("HTTP Header Probe Tests", .serialized)
 struct HTTPHeaderProbeTests {
-  @Test("Stops loading a large, slow body after receiving headers")
+  @Test("Stops loading a body after receiving headers")
   func stopsLoadingBodyAfterHeaders() async throws {
     let generation = await HTTPProbeProtocolRecorder.shared.reset()
 
-    let startedAt = Date()
-    let result = try await httpProbe(
-      config: HTTPProbeConfig(url: probeURL("/large-body", generation: generation), timeout: 5),
-      sessionConfiguration: testSessionConfiguration())
+    // The body is withheld until loading stops, and the probe's timeout outlasts the watchdog,
+    // so a probe that waited for the body trips the watchdog.
+    let (result, _) = try await measure(within: watchdog) {
+      try await httpProbe(
+        config: HTTPProbeConfig(url: probeURL("/held-body", generation: generation), timeout: 60),
+        sessionConfiguration: testSessionConfiguration())
+    }
 
     try await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
     let snapshot = await HTTPProbeProtocolRecorder.shared.snapshot()
 
     #expect(result.isReachable)
     #expect(result.statusCode == 200)
-    #expect(Date().timeIntervalSince(startedAt) < 1)
-    #expect(snapshot.bodyBytesDelivered < HTTPProbeURLProtocol.totalBodyBytes)
+    #expect(snapshot.bodyBytesDelivered == 0)
     #expect(snapshot.stoppedCount == 1)
   }
 
@@ -90,20 +96,19 @@ struct HTTPHeaderProbeTests {
 
     let probe = Task {
       try await httpProbe(
-        config: HTTPProbeConfig(url: probeURL("/never", generation: generation), timeout: 30),
+        config: HTTPProbeConfig(url: probeURL("/never", generation: generation), timeout: 60),
         sessionConfiguration: testSessionConfiguration())
     }
     try await HTTPProbeProtocolRecorder.shared.waitUntilStarted()
 
-    let cancelledAt = Date()
     probe.cancel()
-    let result = try await probe.value
-    let cancellationDuration = Date().timeIntervalSince(cancelledAt)
+    // `/never` answers nothing until loading stops, and the probe's timeout outlasts the
+    // watchdog, so a probe that returns was ended by its cancellation.
+    let (result, _) = try await measure(within: watchdog) { try await probe.value }
 
     try await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
     let snapshot = await HTTPProbeProtocolRecorder.shared.snapshot()
 
-    #expect(cancellationDuration < 1)
     #expect(!result.isReachable)
     #expect(result.error == "Cancelled")
     #expect(snapshot.stoppedCount == 1)
@@ -262,6 +267,8 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
       switch url.path {
       case "/large-body":
         await loader.loadLargeBody(for: url)
+      case "/held-body":
+        await loader.holdBody(for: url)
       case "/never":
         do {
           try await Task.sleep(for: .seconds(60))
@@ -292,6 +299,26 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
       await loadingTask?.value
       await HTTPProbeProtocolRecorder.shared.recordStopped(generation: generation)
     }
+  }
+
+  /// Sends the headers of a response whose body never arrives: nothing more is sent until
+  /// loading stops. The response declares its type, so URLSession hands it to the delegate at
+  /// once instead of waiting for body bytes to sniff one from.
+  private func holdBody(for url: URL) async {
+    guard
+      let response = HTTPURLResponse(
+        url: url,
+        statusCode: 200,
+        httpVersion: "HTTP/1.1",
+        headerFields: [
+          "Content-Length": String(Self.totalBodyBytes),
+          "Content-Type": "application/octet-stream",
+        ])
+    else {
+      return
+    }
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    try? await Task.sleep(for: .seconds(120))
   }
 
   private func loadLargeBody(for url: URL) async {

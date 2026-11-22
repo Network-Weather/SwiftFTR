@@ -29,21 +29,29 @@ struct FaultInjectionFixtureTests {
     }
     try await Task.sleep(nanoseconds: 50_000_000)
     gate.open()
-    #expect(await eventually(within: 1) { released.value == 3 })
+    #expect(await eventually(within: 10) { released.value == 3 })
   }
 
   @Test("The watchdog fails an operation that never returns, without waiting for it")
   func watchdogFires() async throws {
-    let start = monotonicNow()
+    // The operation ignores cancellation and is held by a gate that opens only once the watchdog
+    // has returned, so a watchdog that returns at all did so without waiting for it. The gate's
+    // own limit ends the operation if a watchdog that waits holds the gate shut.
+    let gate = StallGate()
+    defer { gate.open() }
+    let finished = FaultCounter()
     await #expect(throws: WatchdogExpired.self) {
       _ = try await measure(within: 0.2) {
-        // Outlives the watchdog and ignores cancellation, but does end, so no task is stranded.
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-          DispatchQueue.global().asyncAfter(deadline: .now() + 2) { continuation.resume() }
-        }
+        await gate.waitAsync(limit: 20)
+        finished.increment()
       }
     }
-    #expect(monotonicNow() - start < 1.0)
+    #expect(finished.value == 0, "the watchdog returned only after the operation had ended")
+
+    // Released, the abandoned operation ends, so nothing is stranded.
+    gate.open()
+    #expect(
+      await eventually(within: 10) { finished.value == 1 }, "the abandoned operation never ended")
   }
 
   @Test("The UDP responder hands a zero-byte request to its script")
@@ -71,13 +79,23 @@ struct FaultInjectionFixtureTests {
     let client = socket(AF_INET, SOCK_STREAM, 0)
     defer { close(client) }
     var (address, length) = loopbackAddress(family: AF_INET, port: refusing.port)
-    let start = monotonicNow()
+    // Non-blocking, so a SYN that is dropped rather than reset fails the poll's 10 s watchdog
+    // instead of holding the test for the minute and more a blocking connect would wait.
+    _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL, 0) | O_NONBLOCK)
     let result = withUnsafePointer(to: &address) {
       $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(client, $0, length) }
     }
-    let code = errno
-    #expect(result == -1 && code == ECONNREFUSED, "connect returned \(result), errno \(code)")
-    #expect(monotonicNow() - start < 0.5, "the refusal was not immediate")
+    var code = errno
+    if result == -1 && code == EINPROGRESS {
+      var pending = pollfd(fd: client, events: Int16(POLLOUT), revents: 0)
+      let ready = poll(&pending, 1, 10_000)
+      #expect(ready == 1, "the connect was neither refused nor accepted within 10 s")
+      var soError: Int32 = 0
+      var soErrorLength = socklen_t(MemoryLayout<Int32>.size)
+      _ = getsockopt(client, SOL_SOCKET, SO_ERROR, &soError, &soErrorLength)
+      code = soError
+    }
+    #expect(code == ECONNREFUSED, "connect returned \(result), errno \(code)")
 
     // Nothing else may take the port while the fixture holds it.
     let rival = socket(AF_INET, SOCK_STREAM, 0)
@@ -106,7 +124,7 @@ struct FaultInjectionFixtureTests {
     }
     #expect(connected == 0)
     _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
-    #expect(await eventually(within: 2) { server.accepted.value == 1 })
+    #expect(await eventually(within: 10) { server.accepted.value == 1 })
 
     // stop() runs on its own thread. The handler is held at the exit gate, so stop() must not
     // return until the gate opens: returning earlier means it did not wait for the handler.
@@ -121,7 +139,7 @@ struct FaultInjectionFixtureTests {
     // Released, the handler finishes and stop() returns, without waiting for the handler's own
     // 30 s behavior.
     exitGate.open()
-    #expect(await eventually(within: 1) { stopped.value == 1 }, "stop() did not return")
+    #expect(await eventually(within: 10) { stopped.value == 1 }, "stop() did not return")
 
     // The connection was shut down, so the client sees end-of-file: 0, not a receive timeout.
     setReceiveTimeout(client, seconds: 1)
