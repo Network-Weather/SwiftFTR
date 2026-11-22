@@ -85,6 +85,33 @@ private func _dnsSocketTimeout(_ timeout: TimeInterval) throws -> timeval {
   return timeval(tv_sec: seconds, tv_usec: __darwin_suseconds_t(microseconds))
 }
 
+/// How long a DNS query may take from submission, queueing for an executor slot included.
+///
+/// The send and the receive are each bounded by `timeout` once the query runs; one more timeout
+/// covers the wait for one of the shared blocking-I/O slots, which sibling work can hold for as
+/// long as its own stalls last.
+func dnsQueryDeadline(timeout: TimeInterval) -> TimeInterval {
+  timeout * 3
+}
+
+/// Runs a blocking DNS query on the shared executor under ``dnsQueryDeadline(timeout:)``.
+///
+/// Reports an expired deadline as ``DNSError/timeout``, the error a query that ran and went
+/// unanswered already raises, so callers see one outcome for "no answer in time". An invalid
+/// timeout gets no deadline, so the query itself still rejects it with `invalidTimeout`.
+private func runDNSQuery<T: Sendable>(
+  timeout: TimeInterval,
+  _ query: @Sendable @escaping () throws -> T
+) async throws -> T {
+  let deadline =
+    (try? _validateDNSTimeout(timeout)) != nil ? dnsQueryDeadline(timeout: timeout) : nil
+  do {
+    return try await runDetachedBlockingIO(deadline: deadline, query)
+  } catch is BlockingIOTimeout {
+    throw DNSError.timeout
+  }
+}
+
 private func _applyDNSSocketTimeout(fd: Int32, timeout: TimeInterval) throws {
   var socketTimeout = try _dnsSocketTimeout(timeout)
   let optionSize = socklen_t(MemoryLayout<timeval>.size)
@@ -231,7 +258,7 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query A record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -306,7 +333,7 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query AAAA record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -382,7 +409,7 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: arpaQuery,
@@ -462,7 +489,7 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: arpaQuery,
@@ -541,7 +568,7 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query TXT record
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -618,7 +645,7 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Perform query
-    let answers = try await runDetachedBlockingIO {
+    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: name,
@@ -1092,7 +1119,7 @@ public func reverseDNS(
   }
 
   // Query PTR record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(timeout: timeout) {
     try performDNSQueryInternal(
       server: server,
       query: reverseName,
@@ -1161,7 +1188,7 @@ public func reverseIPv6(
   }
 
   // Query PTR record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(timeout: timeout) {
     try performDNSQueryInternal(
       server: server,
       query: reverseName,
@@ -1243,7 +1270,7 @@ public func queryAAAA(
   }
 
   // Query AAAA record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(timeout: timeout) {
     try performDNSQueryInternal(
       server: server,
       query: hostname,
@@ -1316,7 +1343,7 @@ public func queryA(
   }
 
   // Query A record
-  let answers = try await runDetachedBlockingIO {
+  let answers = try await runDNSQuery(timeout: timeout) {
     try performDNSQueryInternal(
       server: server,
       query: hostname,
@@ -1567,7 +1594,7 @@ private func performDNSProbe(
 ) async -> DNSProbeResultInternal {
   do {
     // Try to perform query - success means RCODE=0
-    _ = try await runDetachedBlockingIO {
+    _ = try await runDNSQuery(timeout: timeout) {
       try performDNSQueryInternal(
         server: server,
         query: query,
