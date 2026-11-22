@@ -30,6 +30,11 @@ enum TestSeams {
   /// with. Returns what `send` would and sets `errno` the same way.
   typealias SendDatagram = @Sendable (_ fd: Int32, _ bytes: UnsafeRawBufferPointer) -> Int
 
+  /// `recv(2)` of one datagram into `buffer`, in place of the system call a ``UDPExchange`` reads
+  /// its reply with. Returns what `recv` would and sets `errno` the same way.
+  typealias ReceiveDatagram =
+    @Sendable (_ fd: Int32, _ buffer: UnsafeMutableRawBufferPointer) -> Int
+
   /// `close(2)`, in place of the system call a ``UDPExchange`` closes its socket with. A substitute
   /// must close `fd` (or the test leaks it) and return what `close` would.
   typealias CloseDescriptor = @Sendable (_ fd: Int32) -> Int32
@@ -40,6 +45,8 @@ enum TestSeams {
   @TaskLocal static var fileControl: FileControl?
 
   @TaskLocal static var sendDatagram: SendDatagram?
+
+  @TaskLocal static var receiveDatagram: ReceiveDatagram?
 
   @TaskLocal static var closeDescriptor: CloseDescriptor?
 

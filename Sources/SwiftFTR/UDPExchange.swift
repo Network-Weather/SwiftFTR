@@ -16,8 +16,9 @@ enum UDPExchangeFailure: Error, Equatable {
   /// The peer's host answered that nothing is listening on the port (an ICMP port unreachable,
   /// reported by the kernel as `ECONNREFUSED`). `rtt` is the time from sending to the refusal.
   case refused(rtt: TimeInterval)
-  /// The network reported the peer unreachable (`EHOSTUNREACH` or `ENETUNREACH`).
-  case unreachable(errno: Int32)
+  /// The network reported the peer unreachable (`EHOSTUNREACH` or `ENETUNREACH`). `rtt` is the
+  /// time from sending to the report.
+  case unreachable(errno: Int32, rtt: TimeInterval)
   /// `recv` failed with an errno not listed above.
   case receiveFailed(errno: Int32)
   /// No datagram arrived before the deadline.
@@ -80,6 +81,10 @@ final class UDPExchange: @unchecked Sendable {
         send(fd, bytes.baseAddress, bytes.count, 0)
       }
     let closeDescriptor = TestSeams.closeDescriptor ?? { fd in close(fd) }
+    let receiveDatagram =
+      TestSeams.receiveDatagram ?? { fd, buffer in
+        recv(fd, buffer.baseAddress, buffer.count, 0)
+      }
 
     let fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
     guard fd >= 0 else { throw UDPExchangeFailure.socketCreationFailed(errno: errno) }
@@ -99,7 +104,8 @@ final class UDPExchange: @unchecked Sendable {
 
     let exchange = UDPExchange(
       fd: fd, request: request, timeout: timeout, receiveCapacity: receiveCapacity,
-      sendDatagram: sendDatagram, closeDescriptor: closeDescriptor)
+      sendDatagram: sendDatagram, receiveDatagram: receiveDatagram,
+      closeDescriptor: closeDescriptor)
     return try await withTaskCancellationHandler {
       try await withCheckedThrowingContinuation { continuation in
         exchange.start(continuation)
@@ -113,6 +119,7 @@ final class UDPExchange: @unchecked Sendable {
   private let request: [UInt8]
   private let deadline: DispatchTime
   private let sendDatagram: TestSeams.SendDatagram
+  private let receiveDatagram: TestSeams.ReceiveDatagram
   private let closeDescriptor: TestSeams.CloseDescriptor
   private let queue = DispatchQueue(label: "com.swiftftr.udp-exchange", qos: .userInitiated)
 
@@ -142,12 +149,14 @@ final class UDPExchange: @unchecked Sendable {
     timeout: TimeInterval,
     receiveCapacity: Int,
     sendDatagram: @escaping TestSeams.SendDatagram,
+    receiveDatagram: @escaping TestSeams.ReceiveDatagram,
     closeDescriptor: @escaping TestSeams.CloseDescriptor
   ) {
     self.fd = fd
     self.request = request
     self.receiveBuffer = [UInt8](repeating: 0, count: max(1, receiveCapacity))
     self.sendDatagram = sendDatagram
+    self.receiveDatagram = receiveDatagram
     self.closeDescriptor = closeDescriptor
     // Clamped so an extreme timeout cannot overflow the clock; 10^18 ns is about 31 years.
     let nanoseconds = UInt64(min(max(timeout, 0) * 1_000_000_000, 1e18))
@@ -275,9 +284,7 @@ final class UDPExchange: @unchecked Sendable {
   private func handleRead() {
     for _ in 0..<Self.receiveAttemptsPerEvent {
       guard !finished else { return }
-      let received = receiveBuffer.withUnsafeMutableBytes { raw in
-        recv(fd, raw.baseAddress, raw.count, 0)
-      }
+      let received = receiveBuffer.withUnsafeMutableBytes { receiveDatagram(fd, $0) }
       let code = received < 0 ? errno : 0
       let receivedAt = DispatchTime.now()
       if received < 0, code == EAGAIN || code == EWOULDBLOCK { return }
@@ -296,7 +303,7 @@ final class UDPExchange: @unchecked Sendable {
         case ECONNREFUSED:
           finish(.failure(UDPExchangeFailure.refused(rtt: rtt)))
         case EHOSTUNREACH, ENETUNREACH:
-          finish(.failure(UDPExchangeFailure.unreachable(errno: code)))
+          finish(.failure(UDPExchangeFailure.unreachable(errno: code, rtt: rtt)))
         default:
           finish(.failure(UDPExchangeFailure.receiveFailed(errno: code)))
         }
