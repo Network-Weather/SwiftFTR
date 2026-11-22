@@ -3,8 +3,8 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-Unreleased
-----------
+0.18.0 — 2026-11-22
+-------------------
 
 Robustness under a failing network, found by a new offline fault-injection battery that stages
 each kind of failure phase by phase. A network change now ends every `trace`, `traceClassified`,
@@ -16,27 +16,38 @@ One public API is added, a structured outcome on `dnsProbe` results; none is rem
 `swift package diagnose-api-breaking-changes v0.17.1` reports no breaking change. Upgrading from
 0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
 
-### New public API
-
-- **`DNSProbeResult.outcome` and `DNSProbeResult.elapsed`.** `outcome` is a `DNSProbeOutcome`:
-  `answered`, `refused`, `timedOut`, `malformedReply`, `unreachable` or `failed`, so a caller can
-  tell a refused port from silence without parsing `error`. It is a struct with static members,
-  not an enum, so a later release can add an outcome without breaking a `switch`; keep a
-  `default` arm. `elapsed` is the time from sending the query until something came back from the
-  network, and `nil` when nothing did; it is the only timing for a refusal, whose `rtt` stays
-  `nil`. A new initializer takes both. The existing initializer, and JSON written by
-  0.17 without an `outcome` key, still work and derive both from the other fields. Encoding adds
-  the `outcome` and `elapsed` keys, which also appear in `swift-ftr probe dns --json` output.
-
 ### Behavior changes
 
-What an unmodified caller will see differently:
+What an unmodified caller will see differently. Each has an entry, with before-and-after code, in
+the "Migrating to SwiftFTR 0.18" DocC article.
 
-- **DNS round-trip times no longer include a wait for a worker.** `DNSQueryResult.rttMs` (the
-  `tracer.dns` queries), `DNSProbeResult.rtt` (`dnsProbe`), and the `rtt` of `reverseDNS`,
-  `reverseIPv6`, `queryA` and `queryAAAA` are now measured from sending the query to reading the
-  reply. They were measured from the call, so they included any wait for one of the eight shared
-  blocking-I/O workers, which stalled reverse-DNS lookups can hold for seconds, and socket setup.
+**Cancellation and network changes**
+
+- **`ping` throws `CancellationError` when its task is cancelled.** It threw
+  `TracerouteError.cancelled`, the error that means the tracer ended an operation, although ping
+  is not tied to `networkChanged()` or `cancelActiveTraces()`.
+- **`trace` and `traceClassified` say who cancelled them.** Cancelling the calling task throws
+  `CancellationError`; `networkChanged()` or `cancelActiveTraces()` throws
+  `TracerouteError.cancelled`, also when the caller cancelled too. A caller's own cancellation
+  used to be reported as `TracerouteError.cancelled` in most phases and as `CancellationError` in
+  one, so a caller that retried on `TracerouteError.cancelled` retried after cancelling itself.
+- **A `traceStream` consumer that cancels its task sees a normal end of iteration**, unless the
+  tracer had already ended the stream; the trace then stops probing and closes its socket. A
+  stream the tracer ends before it finishes still throws `TracerouteError.cancelled`.
+- **`discoverPaths` throws `TracerouteError.cancelled` on `networkChanged()` and
+  `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
+  measured on the old network. A topology or flow error that arrives after the invalidation began
+  but before the call returned is discarded too. Cancelling the calling task still throws
+  `CancellationError`; when both happened, `TracerouteError.cancelled` is reported.
+- **A network change ends a trace waiting on reverse DNS at once.** `networkChanged()` and
+  `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
+  `traceClassified()`, so the trace threw `TracerouteError.cancelled` only when the slowest lookup
+  reached its deadline (5 s by default). It now throws at once.
+- **`dnsProbe` throws `CancellationError` when its task is cancelled.** It returned a result with
+  `isReachable == false` and `error == "Unexpected error: CancellationError()"`.
+
+**DNS queries and `dnsProbe`**
+
 - **A refused DNS port is reported as a refusal, not as silence.** When the server's host answers
   that nothing is listening on the port (ICMP port unreachable), the query methods throw
   `DNSError.sendFailed`, and `dnsProbe`'s `error` says "Connection refused - the host is up but no
@@ -73,39 +84,37 @@ What an unmodified caller will see differently:
   waiting for the reply that is not a refusal or an unreachable report says "Receive failed - the
   socket reported an error while waiting for the reply (errno=…)", with `outcome == .failed`. It
   said "Timeout - no response". The query methods still throw `DNSError.timeout` for it.
-- **`dnsProbe` throws `CancellationError` when its task is cancelled.** It returned a result with
-  `isReachable == false` and `error == "Unexpected error: CancellationError()"`.
-- **`discoverPaths` throws `TracerouteError.cancelled` on `networkChanged()` and
-  `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
-  measured on the old network. A topology or flow error that arrives after the invalidation began
-  but before the call returned is discarded too. Cancelling the calling task still throws
-  `CancellationError`; when both happened, `TracerouteError.cancelled` is reported.
-- **A network change ends a trace waiting on reverse DNS at once.** `networkChanged()` and
-  `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
-  `traceClassified()`, so the trace threw `TracerouteError.cancelled` only when the slowest lookup
-  reached its deadline (5 s by default). It now throws at once.
+- **DNS round-trip times no longer include a wait for a worker.** `DNSQueryResult.rttMs` (the
+  `tracer.dns` queries), `DNSProbeResult.rtt` (`dnsProbe`), and the `rtt` of `reverseDNS`,
+  `reverseIPv6`, `queryA` and `queryAAAA` are now measured from sending the query to reading the
+  reply. They were measured from the call, so they included any wait for one of the eight shared
+  blocking-I/O workers, which stalled reverse-DNS lookups can hold for seconds, and socket setup.
 - **Invalid DNS inputs are reported before any socket is opened.** A query with an invalid
   timeout, name or server address, or a source address of the wrong family for the server, throws
   that error (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) at once. In 0.17 the
   source address's family was checked only once a blocking-I/O worker ran the query.
-- **`discoverPaths` honours `publicIPDiscoveryTimeout`.** Its flows used the 6 s default whatever
-  was configured.
+
+**Traces and multipath**
+
 - **A trace whose socket cannot be made non-blocking now fails instead of running.** `trace`,
   `traceClassified` and `traceStream` throw `TracerouteError.socketCreateFailed` when either
   `fcntl` call that sets `O_NONBLOCK` fails, before any probe is sent, as `ping` already did.
   Previously the failure was ignored and the trace ran on a blocking socket, where its receive
   loop could wait past its deadline for a reply that never came.
-- **`ping` throws `CancellationError` when its task is cancelled.** It threw
-  `TracerouteError.cancelled`, the error that means the tracer ended an operation, although ping
-  is not tied to `networkChanged()` or `cancelActiveTraces()`.
-- **`trace` and `traceClassified` say who cancelled them.** Cancelling the calling task throws
-  `CancellationError`; `networkChanged()` or `cancelActiveTraces()` throws
-  `TracerouteError.cancelled`, also when the caller cancelled too. A caller's own cancellation
-  used to be reported as `TracerouteError.cancelled` in most phases and as `CancellationError` in
-  one, so a caller that retried on `TracerouteError.cancelled` retried after cancelling itself.
-- **A `traceStream` consumer that cancels its task sees a normal end of iteration**, unless the
-  tracer had already ended the stream; the trace then stops probing and closes its socket. A
-  stream the tracer ends before it finishes still throws `TracerouteError.cancelled`.
+- **`discoverPaths` honours `publicIPDiscoveryTimeout`.** Its flows used the 6 s default whatever
+  was configured.
+
+### New public API
+
+- **`DNSProbeResult.outcome` and `DNSProbeResult.elapsed`.** `outcome` is a `DNSProbeOutcome`:
+  `answered`, `refused`, `timedOut`, `malformedReply`, `unreachable` or `failed`, so a caller can
+  tell a refused port from silence without parsing `error`. It is a struct with static members,
+  not an enum, so a later release can add an outcome without breaking a `switch`; keep a
+  `default` arm. `elapsed` is the time from sending the query until something came back from the
+  network, and `nil` when nothing did; it is the only timing for a refusal, whose `rtt` stays
+  `nil`. A new initializer takes both. The existing initializer, and JSON written by
+  0.17 without an `outcome` key, still work and derive both from the other fields. Encoding adds
+  the `outcome` and `elapsed` keys, which also appear in `swift-ftr probe dns --json` output.
 
 ### Bug fixes
 

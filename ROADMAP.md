@@ -22,9 +22,6 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   deadline whose error names the phase that was running is the requested API; a resolution
   budget is what moving `getaddrinfo` onto the executor needs; a way to read executor pressure
   (queued and running operations) is the companion.
-- **DNS queries wait without limit for a free blocking-I/O worker** (finding 8). The bound needs
-  the executor to withdraw queued work that has not started, so it comes with the Request State
-  Machine stage of [docs/BLOCKING-IO.md](docs/BLOCKING-IO.md).
 - **`getPublicIPs` blocks Swift's cooperative pool** (finding 9, from code reading): it runs STUN,
   including `getaddrinfo` for each server, in plain tasks with no deadline. Move it onto the
   bounded executor under a budget.

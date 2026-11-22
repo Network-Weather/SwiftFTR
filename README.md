@@ -59,7 +59,7 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.17.1")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.18.0")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
@@ -68,8 +68,15 @@ Install (SwiftPM)
 
 Upgrading
 ---------
-Upgrades within 0.14 through 0.17 are additive at the source level, but read each release's
-"Behavior changes" in [CHANGELOG.md](CHANGELOG.md). In particular, since 0.17.0 the default
+Upgrades within 0.14 through 0.18 are additive at the source level, but read each release's
+"Behavior changes" in [CHANGELOG.md](CHANGELOG.md).
+
+From 0.17, work through [Migrating to SwiftFTR 0.18](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo018.md):
+0.18 changes which error a cancelled `ping` or `trace` throws, ends `discoverPaths` on a network
+change, and reports DNS refusals, stale replies and unreachable servers differently. Each entry
+has before-and-after code.
+
+Since 0.17.0 the default
 `asnResolverStrategy` is `.hybrid(.embedded)` rather than `.dns`, so classified traces load the
 embedded ASN database and need no network for most lookups; pass `asnResolverStrategy: .dns` to
 keep the old behavior.
@@ -546,7 +553,7 @@ MIT — see LICENSE.
 Versioning & Releases
 ---------------------
 - Semantic Versioning. See CHANGELOG.md for release notes.
-- To consume via SwiftPM, use version `0.17.1` (Git tag `v0.17.1`) or a later compatible release.
+- To consume via SwiftPM, use version `0.18.0` (Git tag `v0.18.0`) or a later compatible release.
 
 Contributing
 ------------
