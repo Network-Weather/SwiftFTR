@@ -47,11 +47,14 @@ for hop in classified.hops {
 
 - ASN lookups default to `.hybrid(.embedded)` (see
   ``SwiftFTR/SwiftFTRConfig/asnResolverStrategy``): the embedded database answers first and DNS is
-  consulted only for addresses it does not cover. Non-global addresses are never sent to an ASN
-  resolver. Lookups are best-effort, so ASN fields may be `nil`.
-- Classification is bounded by its configuration: reverse DNS gives up after
-  ``SwiftFTR/SwiftFTRConfig/rdnsLookupTimeout`` and public-IP discovery after
-  ``SwiftFTR/SwiftFTRConfig/publicIPDiscoveryTimeout``; hops whose lookups run out of time report
-  numerically, and classification proceeds without a public address.
+  consulted only for addresses it does not cover. Private, carrier-grade NAT, link-local, loopback,
+  multicast and unspecified addresses are never sent to an ASN resolver. Other reserved ranges,
+  such as the documentation blocks, are not filtered. Lookups are best-effort, so ASN fields may be `nil`.
+- Enrichment steps have their own budgets, but a classified trace has no overall deadline.
+  ``SwiftFTR/SwiftFTRConfig/rdnsLookupTimeout`` bounds each reverse-DNS lookup and
+  ``SwiftFTR/SwiftFTRConfig/publicIPDiscoveryTimeout`` bounds each public-IP discovery attempt,
+  of which there can be two. Hops whose lookups run out of time report numerically, and
+  classification proceeds without a public address. Resolving a hostname destination is not
+  bounded by either setting.
 - Set ``SwiftFTR/SwiftFTRConfig/publicIP`` to use a known public address and bypass discovery for
   classified-trace enrichment.

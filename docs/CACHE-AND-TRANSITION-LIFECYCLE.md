@@ -25,8 +25,9 @@ The library's lifecycle controls are therefore independently callable:
   `seedPublicIP(_:source:)`; and
 - supplying a per-operation hop budget: `TraceOptions`.
 
-`networkChanged()` remains the conservative composition — cancel everything,
-invalidate everything — for callers without finer-grained evidence.
+`networkChanged()` remains the conservative composition — cancel every active
+trace and invalidate the reverse-DNS cache and the public IP, though not the ASN
+cache — for callers without finer-grained evidence.
 
 ## Current behavior
 
@@ -58,9 +59,11 @@ As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
   (RFC 6598 `100.64.0.0/10`), link-local, and loopback for both families. It
   is internal; `invalidateNetworkScopedRDNS()` and `seedPublicIP(_:source:)`
   both use it.
-- Blocking syscalls (reverse DNS, STUN and public-IP discovery, ASN and DNS
-  queries) run on a process-global executor bounded at eight concurrent
-  operations (`runDetachedBlockingIO` in `Utils.swift`). An operation whose
+- Blocking syscalls submitted through `runDetachedBlockingIO` in `Utils.swift`
+  (reverse DNS, DNS queries, Team Cymru ASN queries, the actor's public-IP
+  enrichment) run
+  on a process-global executor bounded at eight concurrent operations. The
+  standalone `getPublicIPs()` calls STUN directly and is not bounded by it. An operation whose
   caller is cancelled or times out while it is still queued is dropped without
   running; one already running holds its slot until the system call returns,
   even though its caller has been released.
@@ -74,7 +77,7 @@ caller that can tell a local roam from a WAN change had only two options, both
 bad:
 
 - **Over-invalidate.** Call `networkChanged()` for every transition. TTL-valid
-  global rDNS and ASN enrichment are discarded on events that cannot have
+  global rDNS is discarded on events that cannot have
   changed them, and names disappear exactly when the caller is comparing
   paths.
 - **Replace the actor.** Recreate `SwiftFTR` with a new config to change

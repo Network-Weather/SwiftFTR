@@ -142,10 +142,13 @@ Add to `Tests/SwiftFTRTests/`. Prefer Swift Testing for new suites; this XCTest 
 works. A test that touches the network must be skippable with `SKIP_NETWORK_TESTS`:
 ```swift
 func testNewFeature() async throws {
+    try XCTSkipIf(ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil)
     let config = SwiftFTRConfig(maxHops: 5)
     let tracer = SwiftFTR(config: config)
-    
-    let result = try await tracer.trace(to: "1.1.1.1")
+
+    let result = try await NetworkTestGate.shared.withPermit {
+        try await tracer.trace(to: "1.1.1.1")
+    }
     XCTAssertNotNil(result)
 }
 ```
@@ -156,14 +159,17 @@ There is no separate integration-test target: live-network tests also live in
 example:
 ```swift
 func testComplexScenario() async throws {
+    try XCTSkipIf(ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil)
     // Test that combines multiple features
     let config = SwiftFTRConfig(
         maxHops: 10,
         publicIP: "1.2.3.4"
     )
     let tracer = SwiftFTR(config: config)
-    
-    let classified = try await tracer.traceClassified(to: "8.8.8.8")
+
+    let classified = try await NetworkTestGate.shared.withPermit {
+        try await tracer.traceClassified(to: "8.8.8.8")
+    }
     XCTAssertEqual(classified.publicIP, "1.2.3.4")
 }
 ```

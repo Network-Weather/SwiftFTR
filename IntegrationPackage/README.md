@@ -30,7 +30,7 @@ with `swift run`.
 
 1. **Import Test** - Verifies SwiftFTR can be imported
 2. **Basic Trace** - Traces 1.1.1.1 and requires that it is reached with responsive hops
-3. **Classified Trace** - Classifies a trace to 8.8.8.8 and checks its segments
+3. **Classified Trace** - Classifies a trace to 8.8.8.8 and checks the destination and client ASN, the public IP, and that at least one hop has an address
 4. **Configuration API** - Tests SwiftFTRConfig
 5. **Error Handling** - Validates error types are accessible
 
