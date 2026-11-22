@@ -166,6 +166,11 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   Waits that cannot fail to end (a fixture's own stop path, a stall the test itself releases, a
   call with its own timeout) are left as they are.
 
+- The offline tests no longer assert wall-clock upper bounds, which failed on slow CI runners
+  while the library behaved correctly (#118). A test that an operation ends early gives it a
+  window longer than a watchdog; a test that a caller was released asserts it returned while the
+  stall was still in force.
+
 ### Dependencies
 
 - **SwiftIP2ASN floor raised to 0.6.0.** For `.remote` and `.hybrid(.remote)` ASN strategies, a
