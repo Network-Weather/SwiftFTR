@@ -76,6 +76,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
 | DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
 | DNS transport | refused port (IPv4 and IPv6); empty datagram; `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
+| DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; an empty datagram; `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; a failed send, an unclassified receive error and an invalid server; cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase, with the error checked per source; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
@@ -84,8 +85,8 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
-Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests` and `CymruEventBasedTests`
-for the event-based DNS transport. Every timed operation runs under a watchdog
+Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests` and
+`CymruEventBasedTests` for the event-based DNS transport. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
 Not covered, and why:
@@ -101,8 +102,9 @@ Not covered, and why:
 - **A DNS reply that arrives after the deadline but before the deadline timer runs.** The
   transport checks the deadline before it accepts a reply, but the two events race on one queue
   and no fixture can order them deterministically, so no test shows the check is needed.
-- **Host and network unreachable on a DNS query** (finding 19). Loopback cannot produce
-  `EHOSTUNREACH` or `ENETUNREACH`, and there is no receive seam.
+- **Host and network unreachable from the kernel** (finding 19). Loopback cannot produce
+  `EHOSTUNREACH` or `ENETUNREACH`, so `DNSProbeOutcomeTests.unreachable` injects them through the
+  receive seam; no test shows the kernel reporting them on a connected UDP socket.
 - **The `.dns` and `.hybrid` strategies end to end**: their fallback is Team Cymru over the real
   resolver. `CymruEventBasedTests` runs `CymruDNSResolver` against a loopback responder; the
   battery passes a stub resolver to every classified trace so no test reaches it.
@@ -237,17 +239,22 @@ numbers are as of the commit that added this section.
     `dnsProbe` said "Timeout - no response" about a host that had answered. Measured on `main`:
     `timeout` after 1 ms, for a fixture port and for port 53 on loopback. Now the query methods
     throw `sendFailed`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
-    that names the refusal.
-    Test: `EventBasedDNSTests.refusedPort`, IPv4 and IPv6.
+    that names the refusal and `outcome == .refused`, with `elapsed` set to when it arrived.
+    Tests: `EventBasedDNSTests.refusedPort` and `DNSProbeOutcomeTests.refused`, IPv4 and IPv6.
 18. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
     was treated like a failed one, `DNSError.timeout` after 1 ms on `main`. It is now
     `malformedResponse`, which `dnsProbe` reports as reachable. Test:
     `EventBasedDNSTests.emptyDatagram`.
-19. **Host and network unreachable on a DNS query are still reported as `timeout`.** From reading
-    the code, not staged. The transport ends the exchange at once on `EHOSTUNREACH` and
-    `ENETUNREACH`, but they map to `DNSError.timeout`, as the blocking client reported them, so
-    `dnsProbe` says "Timeout - no response" for an answer that came at once. Not fixed: telling
-    them apart needs a decision on which existing error describes them, and a way to stage them.
+19. **Host and network unreachable on a DNS query were reported as silence.** Confirmed through
+    the receive seam and fixed for `dnsProbe`. The transport ends the exchange at once on
+    `EHOSTUNREACH` and `ENETUNREACH`, and `dnsProbe` said "Timeout - no response". It now returns
+    `outcome == .unreachable`, with a message naming the errno and `elapsed` set to when the report
+    arrived. The query methods still throw `DNSError.timeout` for them, since no existing case
+    describes them and a new one would break exhaustive switches (ROADMAP). Test:
+    `DNSProbeOutcomeTests.unreachable`, both errnos.
+20. **A cancelled `dnsProbe` returned a fake result.** Confirmed and fixed. Cancelling the calling
+    task mid-probe returned `isReachable == false` with "Unexpected error: CancellationError()".
+    It now throws `CancellationError`. Test: `DNSProbeOutcomeTests.cancellation`.
 
 Observations that are not defects of the library:
 

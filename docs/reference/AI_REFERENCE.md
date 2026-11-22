@@ -473,9 +473,16 @@ public func httpProbe(config: HTTPProbeConfig) async throws -> HTTPProbeResult
 
 public func dnsProbe(server: String, query: String = "example.com", timeout: TimeInterval = 2.0) async throws -> DNSProbeResult
 public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult
-// DNSProbeResult: server, query, isReachable, rtt (send to reply; set when reachable), responseCode, error, timestamp
+// DNSProbeResult: server, query, outcome, isReachable, rtt (send to reply; set when reachable),
+//   elapsed, responseCode, error, timestamp
 //   isReachable: any DNS answer (responseCode set, NXDOMAIN included), or responseCode nil with
 //   error for a malformed reply; false for silence, a refused port and local errors
+//   outcome: DNSProbeOutcome, a struct with static members (switch needs `default`):
+//     .answered, .refused, .timedOut, .malformedReply, .unreachable, .failed; JSON: raw string
+//   elapsed: send to whatever came back (answered, malformedReply, refused, unreachable), else nil
+//   init without outcome/elapsed, and JSON without "outcome", derive both from the other fields
+//   Throws CancellationError when the calling task is cancelled
+//   switch r.outcome { case .refused: ...; case .timedOut: ...; default: ... }
 ```
 
 ### 15. DNS

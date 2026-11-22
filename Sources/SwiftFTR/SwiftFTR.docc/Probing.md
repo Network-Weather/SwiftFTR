@@ -91,7 +91,26 @@ if let rcode = result.responseCode {
 }
 ```
 
-Any DNS response (even NXDOMAIN) means the server is reachable, and so does a malformed reply, which carries no `responseCode` and says so in `error`. Silence until the timeout, a refused port (the host is up but nothing listens on the DNS port), and local or network errors indicate unreachability; `error` says which. The round-trip time runs from sending the query to reading the reply, and the wait for it holds no thread.
+Any DNS response (even NXDOMAIN) means the server is reachable, and so does a malformed reply, which carries no `responseCode` and says so in `error`. Silence until the timeout, a refused port (the host is up but nothing listens on the DNS port), and local or network errors indicate unreachability. The round-trip time runs from sending the query to reading the reply, and the wait for it holds no thread. Cancelling the calling task throws `CancellationError`.
+
+``DNSProbeResult/outcome`` says how the probe ended, so a refusal can be told from silence without reading `error`, which is a message for people. ``DNSProbeOutcome`` is a struct with static members rather than an enum, so a later release can add an outcome without breaking your `switch`; keep a `default` arm:
+
+```swift
+switch result.outcome {
+case .answered:
+    print("DNS answered in \(result.rtt!) s")
+case .refused:
+    // The host is up but no DNS server is listening; elapsed is when it said so.
+    print("Refused after \(result.elapsed!) s")
+case .timedOut:
+    print("No reply")
+default:
+    // .malformedReply, .unreachable, .failed, and outcomes added later.
+    print("\(result.outcome): \(result.error ?? "")")
+}
+```
+
+``DNSProbeResult/elapsed`` is the time until something came back from the network: set for `answered`, `malformedReply`, `refused` and `unreachable`, and equal to `rtt` when the server is reachable.
 
 ## Interface Binding
 
@@ -145,3 +164,4 @@ uses system routing; the binding begins at the probe socket.
 - ``dnsProbe(config:)``
 - ``DNSProbeConfig``
 - ``DNSProbeResult``
+- ``DNSProbeOutcome``
