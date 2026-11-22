@@ -266,14 +266,18 @@ struct PingExecutor: Sendable {
   private func createICMPSocket(family: Int32) throws -> Int32 {
     #if canImport(Darwin)
       let sockfd: Int32
-      switch family {
-      case AF_INET:
-        sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
-      case AF_INET6:
-        sockfd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)
-      default:
-        throw TracerouteError.platformNotSupported(
-          details: "Unsupported address family: \(family)")
+      if let substitute = TestSeams.makeICMPSocket {
+        sockfd = try substitute(family)
+      } else {
+        switch family {
+        case AF_INET:
+          sockfd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+        case AF_INET6:
+          sockfd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)
+        default:
+          throw TracerouteError.platformNotSupported(
+            details: "Unsupported address family: \(family)")
+        }
       }
       guard sockfd >= 0 else {
         throw TracerouteError.socketCreateFailed(

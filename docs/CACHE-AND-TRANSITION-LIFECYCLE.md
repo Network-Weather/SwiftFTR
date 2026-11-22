@@ -25,8 +25,9 @@ The library's lifecycle controls are therefore independently callable:
   `seedPublicIP(_:source:)`; and
 - supplying a per-operation hop budget: `TraceOptions`.
 
-`networkChanged()` remains the conservative composition — cancel everything,
-invalidate everything — for callers without finer-grained evidence.
+`networkChanged()` remains the conservative composition — cancel every active
+trace and invalidate the reverse-DNS cache and the public IP, though not the ASN
+cache — for callers without finer-grained evidence.
 
 ## Current behavior
 
@@ -45,11 +46,12 @@ As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
 - Public-IP discovery is generation-guarded: a result that arrives after an
   invalidation is neither returned nor cached
   (`effectivePublicIPForClassification`).
-- `RDNSCache` holds entries for 86400 s with LRU eviction at 1000 entries
+- `RDNSCache` holds entries for 86400 s, evicting the oldest-inserted entry at 1000 entries
   (both configurable through `SwiftFTRConfig`), caches negative results, and
-  has a stall breaker: after two consecutive lookups that consume their full
-  deadline, further lookups are suppressed until `clear()` or
-  `invalidateNetworkScoped()` runs. `clear()` also generation-guards against
+  has a stall breaker: after two consecutive lookups that take at least 90% of their
+  deadline, further lookups are suppressed while that count stays at two or
+  more. `clear()` and `invalidateNetworkScoped()` reset it, and so does a
+  lookup that was already in flight finishing quickly. `clear()` also generation-guards against
   in-flight lookups repopulating the cache.
 - The ASN cache is capacity-bounded (2048 entries) with **no TTL**; entries
   live until evicted or the cache is reset.
@@ -58,23 +60,27 @@ As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
   (RFC 6598 `100.64.0.0/10`), link-local, and loopback for both families. It
   is internal; `invalidateNetworkScopedRDNS()` and `seedPublicIP(_:source:)`
   both use it.
-- Blocking syscalls (reverse DNS, STUN and public-IP discovery, ASN and DNS
-  queries) run on a process-global executor bounded at eight concurrent
-  operations (`runDetachedBlockingIO` in `Utils.swift`). An operation whose
+- Blocking syscalls submitted through `runDetachedBlockingIO` in `Utils.swift`
+  (reverse DNS, DNS queries, Team Cymru ASN queries, the actor's public-IP
+  enrichment) run
+  on a process-global executor bounded at eight concurrent operations. The
+  standalone `getPublicIPs()` calls STUN directly and is not bounded by it. An operation whose
   caller is cancelled or times out while it is still queued is dropped without
   running; one already running holds its slot until the system call returns,
   even though its caller has been released.
 
 ## Why the controls are separate
 
-Before 0.17.0, `networkChanged()` was the only transition control, and it
-couples three actions — trace cancellation, public-IP invalidation, and full
-rDNS eviction — that callers legitimately need under different conditions. A
+Before 0.17.0 the transition controls were `networkChanged()`, `clearCaches()`
+and `invalidatePublicIP()`. There was no way to cancel traces without
+invalidating, and no way to evict only part of the rDNS cache: `networkChanged()`
+couples trace cancellation, public-IP invalidation and full rDNS eviction, which
+callers legitimately need under different conditions. A
 caller that can tell a local roam from a WAN change had only two options, both
 bad:
 
 - **Over-invalidate.** Call `networkChanged()` for every transition. TTL-valid
-  global rDNS and ASN enrichment are discarded on events that cannot have
+  global rDNS is discarded on events that cannot have
   changed them, and names disappear exactly when the caller is comparing
   paths.
 - **Replace the actor.** Recreate `SwiftFTR` with a new config to change
@@ -95,7 +101,7 @@ The library-owned state and what may invalidate it:
 |---|---|---|
 | Active trace handles | cache generation | `networkChanged()`; `cancelActiveTraces()` |
 | Discovered public IP | current generation | `invalidatePublicIP()`, `clearCaches()`, `networkChanged()` |
-| Globally routable rDNS | IP address | 86400 s TTL or LRU capacity; should survive local transitions |
+| Globally routable rDNS | IP address | 86400 s TTL or oldest-inserted capacity eviction; should survive local transitions |
 | Network-scoped rDNS (private, CGNAT, link-local, ULA, loopback) | IP address | `invalidateNetworkScopedRDNS()`; `networkChanged()` |
 | ASN results | globally routable address | Capacity only (no TTL); local transitions must not clear it |
 
@@ -169,10 +175,11 @@ A dynamic, actor-isolated way to provide a known-valid public IP so the next
 classified trace can skip discovery — distinct from the `publicIP` config
 override, which suppresses discovery permanently. The method:
 
-- accepts only syntactically valid, globally routable addresses, using the
-  library's scope classifier ("not RFC 1918" is insufficient — CGNAT space is
-  neither private nor publicly routable, and the check rejects every
-  non-global range for the address family, plus multicast);
+- accepts only syntactically valid addresses outside the special-purpose
+  ranges the library's scope classifier recognizes ("not RFC 1918" is
+  insufficient — CGNAT space is neither private nor publicly routable).
+  Acceptance does not prove global routability: ranges the classifier does not
+  know, such as deprecated IPv6 site-local `fec0::/10`, are accepted;
 - rejects placeholder strings by construction — there is no way to seed
   `"unknown"`;
 - stores the canonical (`inet_ntop`) form, bumps the cache generation so an
@@ -231,8 +238,8 @@ it see no behavior change. Beyond that, library-level tests demonstrate:
 - A seed made before an invalidation does not survive it.
 - `TraceOptions.maxHops` outside `1...255` throws the existing configuration
   error; a valid value bounds exactly that operation.
-- No cancellation path leaves an orphaned task holding a blocking-I/O
-  executor slot beyond its deadline.
+- Cancellation drops queued work and releases the caller; a system call that
+  is already running keeps its blocking-I/O executor slot until it returns.
 
 ## Open decisions
 

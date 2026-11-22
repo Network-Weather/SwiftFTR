@@ -267,8 +267,9 @@ an unmodified caller sees. The project CHANGELOG has the details.
   resolvers some hops that used to show a hostname report numerically. Raise the timeout if that
   matters to you.
 - ASN lookups default to `.hybrid(.embedded)` instead of `.dns`: the embedded database answers
-  first and DNS is consulted only for addresses it does not cover. Loading the database costs
-  memory once per process. Pass `asnResolverStrategy: .dns` in ``SwiftFTRConfig`` to keep the old
+  first and DNS is consulted only for addresses it does not cover. One loaded database is shared
+  by every tracer in the process and stays in memory while at least one resolver using it is
+  alive; releasing the last one means the next tracer loads it again. Pass `asnResolverStrategy: .dns` in ``SwiftFTRConfig`` to keep the old
   behavior.
 
 ## Migration checklist

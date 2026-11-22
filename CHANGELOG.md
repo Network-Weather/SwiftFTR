@@ -6,8 +6,8 @@ All notable changes to this project are documented here. This project follows Se
 0.17.1 — 2026-11-21
 -------------------
 
-A robustness release for the bridge that every blocking system call crosses: reverse DNS,
-public-IP discovery, ASN and DNS queries. A cancellation at the wrong instant could crash the
+A robustness release for the bridge that carries the library's blocking lookups: reverse DNS,
+DNS and ASN queries, and public-IP discovery during a classified trace. A cancellation at the wrong instant could crash the
 process or leave the caller suspended forever, and callers that gave up on queued work leaked it.
 All three are fixed, one more unbounded wait is bounded, and the embedded ASN database is
 refreshed.
@@ -23,9 +23,9 @@ Upgrading is a version bump, and it raises the SwiftIP2ASN floor to 0.5.2.
   treats as a client bug and traps on (`EXC_BREAKPOINT` in `_dispatch_queue_xref_dispose`). Every
   blocking call that carries a deadline went through this path. A downstream consumer saw it in
   the field as rare crashes. The timer is now created only when it will be armed.
-- **A call cancelled while it was being submitted no longer hangs forever.** Every blocking
-  system call (reverse DNS, public-IP discovery, ASN and DNS queries) crosses one bridge onto a
-  bounded executor. If the caller was cancelled in the short window while that bridge was
+- **A call cancelled while it was being submitted no longer hangs forever.** Blocking
+  lookups (reverse DNS, DNS and ASN queries, public-IP discovery during a classified trace) cross
+  one bridge onto a bounded executor. If the caller was cancelled in the short window while that bridge was
   submitting the work, nothing was left to resume the caller: it stayed suspended permanently,
   deadline or not. In a test that cancels 10,000 calls at varying moments, some never returned;
   now all do. An operation that finishes for any reason resumes its caller if nothing else has.

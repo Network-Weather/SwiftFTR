@@ -7,10 +7,13 @@ SwiftFTR's tests live in `Tests/SwiftFTRTests`. Most suites use Swift Testing (`
 ## Test Categories
 
 ### 1. Unit Tests
-Offline and deterministic, as CI runs them:
+The selection CI runs:
 ```bash
 SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug
 ```
+The two variables skip the tests designated as live-network; they do not disable networking.
+At least one remaining test still attempts public-IP discovery, so this run is not guaranteed
+to send nothing.
 Drop the variables to include the live-network suites (`swift test`).
 
 #### Environment gates
@@ -19,13 +22,13 @@ These variables only select tests; they do not change library or CLI behavior.
 
 | Variable | Effect |
 |---|---|
-| `SKIP_NETWORK_TESTS=1` | Skip the live-network tests; set together with `PTR_SKIP_STUN` for an offline run |
+| `SKIP_NETWORK_TESTS=1` | Skip the tests designated as live-network; set together with `PTR_SKIP_STUN` to select the same tests as CI |
 | `PTR_SKIP_STUN=1` | Skip the public-IP (STUN) integration subset, a legacy gate |
 | `SKIP_IPV6_TESTS=1` | Force-skip the IPv6 integration tests (`IPv6Reachability.swift`) |
 | `FORCE_IPV6_TESTS=1` | Run the IPv6 integration tests without probing for a v6 path |
 
-Live-network suites take a permit from `NetworkTestGate.shared.withPermit` so they do not
-interfere with one another.
+New network-heavy tests should take a permit from `NetworkTestGate.shared.withPermit` so they
+do not interfere with one another. Not every existing live suite does.
 
 ### 2. Integration Tests
 An executable that exercises the library end to end against the live network:
@@ -65,16 +68,16 @@ It needs the network. This script will:
 Generate coverage reports:
 ```bash
 swift test --enable-code-coverage
-xcrun llvm-cov report \
-    "$(swift build --show-bin-path)/SwiftFTRTests.xctest/Contents/MacOS/SwiftFTRTests" \
+# The test bundle is SwiftFTRTests or SwiftFTRPackageTests, depending on the toolchain.
+TEST_BIN="$(ls "$(swift build --show-bin-path)"/SwiftFTR*Tests.xctest/Contents/MacOS/SwiftFTR*Tests | head -1)"
+xcrun llvm-cov report "$TEST_BIN" \
     -instr-profile "$(swift test --show-codecov-path | xargs dirname)/default.profdata" \
     -ignore-filename-regex="Tests|.build"
 ```
 
 Generate HTML coverage report:
 ```bash
-xcrun llvm-cov show \
-    "$(swift build --show-bin-path)/SwiftFTRTests.xctest/Contents/MacOS/SwiftFTRTests" \
+xcrun llvm-cov show "$TEST_BIN" \
     -instr-profile "$(swift test --show-codecov-path | xargs dirname)/default.profdata" \
     -format=html \
     -output-dir=coverage-report \
@@ -142,28 +145,34 @@ Add to `Tests/SwiftFTRTests/`. Prefer Swift Testing for new suites; this XCTest 
 works. A test that touches the network must be skippable with `SKIP_NETWORK_TESTS`:
 ```swift
 func testNewFeature() async throws {
+    try XCTSkipIf(ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil)
     let config = SwiftFTRConfig(maxHops: 5)
     let tracer = SwiftFTR(config: config)
-    
-    let result = try await tracer.trace(to: "1.1.1.1")
+
+    let result = try await NetworkTestGate.shared.withPermit {
+        try await tracer.trace(to: "1.1.1.1")
+    }
     XCTAssertNotNil(result)
 }
 ```
 
 ### Integration Tests
 There is no separate integration-test target: live-network tests also live in
-`Tests/SwiftFTRTests/`, gated on `SKIP_NETWORK_TESTS` and wrapped in `NetworkTestGate`. For
-example:
+`Tests/SwiftFTRTests/`. New ones should check `SKIP_NETWORK_TESTS` and take a `NetworkTestGate`
+permit, as below; not every existing one does.
 ```swift
 func testComplexScenario() async throws {
+    try XCTSkipIf(ProcessInfo.processInfo.environment["SKIP_NETWORK_TESTS"] != nil)
     // Test that combines multiple features
     let config = SwiftFTRConfig(
         maxHops: 10,
         publicIP: "1.2.3.4"
     )
     let tracer = SwiftFTR(config: config)
-    
-    let classified = try await tracer.traceClassified(to: "8.8.8.8")
+
+    let classified = try await NetworkTestGate.shared.withPermit {
+        try await tracer.traceClassified(to: "8.8.8.8")
+    }
     XCTAssertEqual(classified.publicIP, "1.2.3.4")
 }
 ```
@@ -208,7 +217,7 @@ swift test --parallel --num-workers 8
 1. **Network Tests**: Some tests require network access and may fail in restricted environments
 2. **Timing Tests**: Performance tests may vary based on system load
 3. **ICMP Permissions**: Tests require ICMP datagram socket support (available on macOS without root)
-4. **IPv6**: v6 integration tests run only when a real v6 path is detected (`IPv6Reachability`); GitHub-hosted runners have none, so they skip there
+4. **IPv6**: v6 integration tests check for a v6 route by default (`IPv6Reachability`); `FORCE_IPV6_TESTS=1` bypasses that check, though not the network skip gates; GitHub-hosted runners have none, so they skip there
 
 ## Continuous Improvement
 

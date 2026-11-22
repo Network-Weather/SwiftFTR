@@ -11,7 +11,8 @@ The ``SwiftFTR/SwiftFTR/testBufferbloat(config:)`` API measures:
 2. **Loaded latency** — ping RTT while saturating the connection with parallel URLSession HTTP
    uploads and/or downloads
 3. **Latency increase** — the rise in average RTT from baseline to loaded, graded A through F
-4. **RPM score** — Round-trips Per Minute, computed as 60 divided by the average ping RTT and
+4. **RPM score** — Round-trips Per Minute, computed as the integer part of 60 divided by the average ping RTT
+   in seconds, with the RTT floored at one millisecond (so the score cannot exceed 60,000), and
    graded with the IETF responsiveness thresholds. It is derived from ICMP ping, not from the
    HTTP/TLS transactions that the IETF responsiveness test (and Apple's `networkQuality`) measure,
    so the figures are not directly comparable.

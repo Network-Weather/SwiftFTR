@@ -12,7 +12,9 @@ Key differences from ``SwiftFTR/SwiftFTR/trace(to:)``:
 - Unresponsive TTLs are automatically retried after a configurable delay
 - Timeout placeholders are emitted at the end for any TTLs that never responded
 - A probe that never left the host is emitted immediately with a
-  ``SwiftFTR/HopOutcome/notSent(errno:)`` outcome, since the failed send is known at once
+  ``SwiftFTR/HopOutcome/notSent(errno:)`` outcome, since the failed send is known at once. This covers a transient send failure when
+  other probes were sent; a non-transient error, or no probe sent at all, ends the stream with an
+  error instead
 - Hops carry no hostname or ASN data; enrich them yourself if you need it
 
 ## Basic Usage

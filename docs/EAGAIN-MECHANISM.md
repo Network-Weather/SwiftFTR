@@ -298,7 +298,9 @@ the errno, it was that one failed probe aborted a 40-probe trace. A `sendto` fai
 Recording the hop and continuing makes the trace robust to this class of
 failure regardless of which errno turns out to be responsible, and without
 depending on a timeout constant at all. That shipped in 0.16.0 as
-`HopOutcome.notSent(errno:)` (see [HOP-OUTCOME-MODEL.md](HOP-OUTCOME-MODEL.md)).
+`HopOutcome.notSent(errno:)` (see [HOP-OUTCOME-MODEL.md](HOP-OUTCOME-MODEL.md)). It applies to a
+transient send failure in a burst that otherwise reached the wire: a non-transient errno still
+aborts the trace, and so does a burst in which no probe was sent at all.
 
 ## Reproducing
 
