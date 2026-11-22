@@ -101,14 +101,14 @@ import Testing
         )
       }
 
-      _ = try await cancelProbeAfterFirstDatagram(
-        from: server.datagrams,
-        probe: probe
-      )
-
       // The server never replies and the timeout outlasts the watchdog, so a probe that returns
-      // was ended by its cancellation.
-      let (outcome, _) = try await measure(within: cancellationWatchdog) { await probe.result }
+      // was ended by its cancellation. The watchdog covers the wait for the first datagram too,
+      // since that wait also ends only when the probe does.
+      let datagrams = server.datagrams
+      let (outcome, _) = try await measure(within: cancellationWatchdog) {
+        _ = try await cancelProbeAfterFirstDatagram(from: datagrams, probe: probe)
+        return await probe.result
+      }
       #expect(throws: CancellationError.self) { try outcome.get() }
     }
   }
