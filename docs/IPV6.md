@@ -1,6 +1,6 @@
 # IPv6 Support in SwiftFTR
 
-Forward-looking plan for full IPv6 feature parity in SwiftFTR. Updated as stages land.
+Sequenced plan and architectural contracts for IPv6 feature parity in SwiftFTR. Stages 1–6 have shipped; Stage 7 (hardening) is what remains. Completed stages are struck through and kept here because they record where each piece of the v6 path lives.
 
 ## Goal & non-goals
 
@@ -29,7 +29,7 @@ All of these are downstream contracts. Changing any of them in a stage past Stag
 
 Independently shippable PRs, in priority order. Each stage builds on the patterns the previous stages established.
 
-### Stage 1 — `ping()` over ICMPv6 *(shipped first in this trajectory)*
+### ~~Stage 1 — `ping()` over ICMPv6~~ *(shipped)*
 
 - ICMPv6 codec (`makeICMPv6EchoRequest`, `parseICMPv6Message`) alongside the existing v4 in `ICMP.swift`.
 - Dual-stack `resolveHost(host:prefer:)` in `Ping.swift` returning `ResolvedHost { family, sockaddr_storage, canonical }`.
@@ -56,25 +56,24 @@ Dual-stack `tcpProbe(...)` and `udpProbe(...)`: same entry points work for both 
 
 ### ~~Stage 4 — STUN over IPv6 + dual-stack public-IP discovery~~ *(shipped)*
 
-`STUN.swift` is now dual-stack via a family-parameterized core (`stunGetPublicIP(family:host:port:...)`) that resolves, sockets, binds, sends, and parses XOR-MAPPED-ADDRESS for both v4 (Family 0x01) and v6 (Family 0x02) per RFC 5389 §15.2 — including the v6-specific un-XOR of bytes 4..15 against the transaction ID. `STUNPublicIP` gained a `family` field; new `PublicIPs { v4, v6 }` struct and `public func getPublicIPs() async -> PublicIPs` run both families in parallel via `async let` and return whichever succeeded (never throws). v6 source-IP binding reuses the family-aware `bindProbeSourceIP` helper introduced in Stage 3. Back-compat shims for `stunGetPublicIPv4*` and `getPublicIPv4`; new `stunGetPublicIPv6*` companions added.
+`STUN.swift` is now dual-stack via a family-parameterized core (`stunGetPublicIP(family:host:port:...)`) that resolves, sockets, binds, sends, and parses XOR-MAPPED-ADDRESS for both v4 (Family 0x01) and v6 (Family 0x02) per RFC 5389 §15.2 — including the v6-specific un-XOR of bytes 4..15 against the transaction ID. `STUNPublicIP` gained a `family` field; new `PublicIPs { v4, v6 }` struct and `getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:) async -> PublicIPs` (every parameter defaulted) run both families in parallel via `async let` and return whichever succeeded (never throws). v6 source-IP binding reuses the family-aware `bindProbeSourceIP` helper introduced in Stage 3. Back-compat shims for `stunGetPublicIPv4*` and `getPublicIPv4`; new `stunGetPublicIPv6*` companions added.
 
 ### ~~Stage 5 — Resolver consolidation~~ *(shipped)*
 
 `Hostname.swift` is now the single source of truth for: dual-stack `resolveHost(host:prefer:)`, family-aware `bindSourceIP(sockfd:family:sourceIP:)` (renamed from `bindProbeSourceIP`), and new `bindInterface(sockfd:family:ifIndex:)`. The old v4-only `resolveIPv4` in `Traceroute.swift` was deleted after `Multipath.swift` (the last caller) migrated to `resolveHost(host:, prefer: .v4)`. `bindTraceInterface` / `bindTraceSourceIP` became thin wrappers that translate the string-error contract to the typed `TracerouteError` cases trace callers expect. TCP, UDP, STUN all call the shared helpers directly.
 
-### Stage 6 — `swift-ip2asn` 0.4.0 + IPv6 ASN labels
+### ~~Stage 6 — `swift-ip2asn` dual-stack database + IPv6 ASN labels~~ *(shipped, folded into Stage 2)*
 
-- Bump `swift-ip2asn` floor to `0.4.0` (dual-stack `UltraCompactDatabase.lookup`).
-- Switch `RemoteDatabase` URL to `https://pkgs.networkweather.com/db/ip2asn-v2.ultra` (dual-stack DB; legacy v4-only file stays at `/db/ip2asn.ultra` for older clients).
-- Verify `LocalASNResolver` returns sane ASNs for v6 hops on real traces.
-- This is the stage that completes the 0.13.0 release train.
+- The `swift-ip2asn` floor went to `0.4.0` for dual-stack `UltraCompactDatabase.lookup`; it is now `0.5.2`.
+- The remote database default is `https://pkgs.networkweather.com/db/ip2asn-v2.ultra` (dual-stack). SwiftFTR does not hard-code it: `.remote(bundledPath:url:)` with `url: nil` uses SwiftIP2ASN's `RemoteDatabase.defaultURL`.
+- The spike `Tests/TestSupport/ip2asnv6probe` (`swift run ip2asnv6probe`) checks that v6 strings dispatch to the v6 lookup against the bundled dataset.
 
 ### Stage 7 — Hardening
 
 - Add a CI matrix entry for a v6-capable runner (self-hosted, or GitHub's `larger-resource` runners when they offer v6).
 - Enable `testIPv6PingReachable` and the v6 trace integration tests on that runner.
-- Extend `icmpfuzz` to fuzz the v6 parsers.
-- v6 variant of `ResourceBenchmark` (memory and per-call cost).
+- ~~Extend `icmpfuzz` to fuzz the v6 parsers.~~ Shipped as the separate `icmpv6fuzz` target (`swift run -c release icmpv6fuzz`, `ITER` overrides the iteration count).
+- v6 variant of `ResourceBenchmark` (memory and per-call cost). `ResourceBenchmark` today measures ASN resolver strategies over IPv4 addresses only.
 - Audit `getaddrinfo` AF_UNSPEC behavior under DNS64 environments (NAT64 transparency — see "Known limitations" below).
 
 ## Testing strategy
@@ -99,7 +98,7 @@ GitHub-hosted macOS runners do **not** have public IPv6 reachability today. The 
 
 To exercise the v6 paths in CI:
 
-- **Recommended**: a self-hosted macOS runner on a dual-stack network. The existing matrix can gain a `runs-on: self-hosted` row that picks up the v6 tests automatically (no env-var changes needed — the reachability probe just succeeds).
+- **Recommended**: a self-hosted macOS runner on a dual-stack network. `ci.yml` has no matrix today; a job on such a runner that runs the suite without `SKIP_NETWORK_TESTS` picks up the v6 tests automatically (no env-var changes needed — the reachability probe just succeeds). The existing self-hosted `local-integration-tests.yml` runner (labels `macos`, `traceroute`) would do so if its network is dual-stack; whether it is has not been recorded here.
 - **Alternative**: GitHub's `larger-resource` macOS runners if/when they offer v6 — at the time of writing they do not.
 - **Local development**: the spike (`swift run icmpv6probe 2606:4700:4700::1111`) is the single most useful diagnostic; if it fails, integration tests will too. Cloudflare WARP provides a workable v6 path on otherwise v4-only home networks.
 

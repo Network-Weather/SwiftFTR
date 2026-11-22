@@ -70,7 +70,8 @@ Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner.
 ### Swift 6.4 adoption pass
 **Goal**: Take the 6.4 concurrency ergonomics where they simplify teardown, and stay warning-clean.
 
-- **Gated on Swift 6.4 GM** (in beta with Xcode 27 as of 2026-08; announced at WWDC June 2026).
+- **Gate met**: Swift 6.4 has shipped (Swift 6.4.2 with Xcode 27.2 as of 2026-11-21). A clean
+  debug build under 6.4.2 on that date produced no compiler warnings.
 - **SE-0520 warning triage**: compile under 6.4 and address new warnings on discarded throwing
   Tasks (grep on 2026-08-31 found most Task creations assigned or inside task groups, so
   expected fallout is small). Consider typed-throws `Task` where it clarifies error contracts.

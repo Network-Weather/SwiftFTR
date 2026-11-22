@@ -36,8 +36,9 @@ dependencies: [
 ```
 
 SwiftFTR 0.14 requires SwiftIP2ASN 0.4.1 or later in the compatible 0.x line. That release includes
-the July 2026 dual-stack database and disk-cache recovery fixes. Xcode and SwiftPM may retain an
-older resolved version until you update package dependencies.
+the July 2026 dual-stack database and disk-cache recovery fixes. SwiftFTR 0.17.1 raises the floor to
+SwiftIP2ASN 0.5.2. Xcode and SwiftPM may retain an older resolved version until you update package
+dependencies.
 
 ## Handle the new DNS errors
 
@@ -230,10 +231,12 @@ do {
 ```
 
 Selected legacy DNS, STUN/public-IP enrichment, ASN, and cached-rDNS operations run on a bounded
-Dispatch-backed executor. After submission, canceling the caller neither dequeues nor interrupts a
-synchronous operation, and the caller remains suspended until it finishes. Configured socket
-timeouts bound operations that have one. Hostname resolution through `resolveHost` and the public
-`reverseDNS` helper remain synchronous at their call sites.
+Dispatch-backed executor. In 0.14, canceling the caller after submission neither dequeued nor
+interrupted a synchronous operation, and the caller stayed suspended until it finished. Later
+releases resume the canceled caller with `CancellationError` instead of waiting, and an operation
+that has not started is discarded; a system call already in flight still holds its executor slot
+until it returns. Internal hostname resolution and the public synchronous `reverseDNS(_:)` helper still
+block at their call sites.
 
 ## Review classification changes
 
@@ -255,6 +258,20 @@ and VPN paths.
 - `swift-ftr interfaces` shows active interfaces by default; add `--include-inactive` to include
   down interfaces.
 
+## Upgrading past 0.14
+
+Releases after 0.14 are additive at the source level, but two of their behavior changes alter what
+an unmodified caller sees. The project CHANGELOG has the details.
+
+- Reverse DNS gives up after ``SwiftFTRConfig/rdnsLookupTimeout`` (default 5 seconds), so on slow
+  resolvers some hops that used to show a hostname report numerically. Raise the timeout if that
+  matters to you.
+- ASN lookups default to `.hybrid(.embedded)` instead of `.dns`: the embedded database answers
+  first and DNS is consulted only for addresses it does not cover. One loaded database is shared
+  by every tracer in the process and stays in memory while at least one resolver using it is
+  alive; releasing the last one means the next tracer loads it again. Pass `asnResolverStrategy: .dns` in ``SwiftFTRConfig`` to keep the old
+  behavior.
+
 ## Migration checklist
 
 - Handle both new ``DNSError`` cases.
@@ -268,4 +285,5 @@ and VPN paths.
 - Handle cancellation according to each API's contract; legacy HTTP reports a `"Cancelled"`
   result while TCP/UDP probes throw `CancellationError`.
 - Let TCP-probe automation accept nonzero status when the accompanying result is unreachable.
-- Refresh SwiftPM resolution so SwiftIP2ASN 0.4.1 is selected.
+- Refresh SwiftPM resolution so SwiftIP2ASN 0.4.1 or later is selected (0.5.2 or later with
+  SwiftFTR 0.17.1).

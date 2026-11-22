@@ -1,7 +1,17 @@
 # Bounding and cancelling the enrichment phase
 
-Implementation plan for the ROADMAP item "Bounded, cancellable enrichment".
+Implementation plan for what was the ROADMAP item "Bounded, cancellable enrichment".
 Evidence and measurements: [`BUG2-INVESTIGATION.md`](BUG2-INVESTIGATION.md).
+
+> **Status: shipped in 0.15.0 (#59).** Kept as the design record for why the executor,
+> deadlines and breaker work as they do. Two differences from the plan below: the rDNS circuit
+> breaker suppresses reverse DNS after two consecutive stalls until `RDNSCache.clear()` or
+> network-scoped invalidation runs (or an already in-flight lookup finishes quickly and resets
+> the count), rather than only for the rest of one batch; and 0.17.1
+> further fixed the executor (a cancellation race that could strand a caller, a timer-release
+> crash, and abandoned queued operations that were never freed). The file and line references in
+> "What is broken" describe the 0.14.0 code. Remaining unbounded waits (#84) are in
+> [ROADMAP.md](../ROADMAP.md).
 
 ## What is broken
 

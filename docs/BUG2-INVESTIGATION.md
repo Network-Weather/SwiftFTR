@@ -1,5 +1,17 @@
 # BUG 2 investigation: traceClassified() not completing within 60s
 
+> **Status: investigation record of the 0.14.0 code, not a description of current behavior.**
+> The line numbers, the `BlockingIOExecutor` properties in 1c and the step table in 1b describe
+> 0.14.0. Most of the fix directions at the end have since shipped: caller-side deadlines and
+> queued-operation cancellation in `runDetachedBlockingIO`, a bounded reverse-DNS phase with a
+> stall breaker, and a public-IP discovery budget (0.15.0, plan in
+> [ENRICHMENT-BOUNDING.md](ENRICHMENT-BOUNDING.md)); release of abandoned queued operations and
+> a queue-wait bound on Team Cymru lookups (0.17.1). The default ASN strategy is no longer `.dns`
+> (0.17.0). `traceClassified` still has no overall deadline and forward resolution still runs
+> `getaddrinfo` on the actor; both are open in [ROADMAP.md](../ROADMAP.md) (#84). The test file
+> named in Part 2, `Bug2HangInvestigationTests.swift`, was never committed to this repository,
+> so Part 2's results cannot be re-run from the tree as written.
+
 Investigation notes, 2026-08-30. Code audited at HEAD (e5b1cea). Verified that
 `git diff 46de63af..HEAD -- Sources/SwiftFTR/` touches only a docc file, so this
 audit applies exactly to the 0.14.0 code the downstream fleet ships.

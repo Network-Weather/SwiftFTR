@@ -6,6 +6,9 @@ We release patches for security vulnerabilities in the following versions:
 
 | Version | Supported          |
 | ------- | ------------------ |
+| 0.17.x  | :white_check_mark: |
+| 0.16.x  | :white_check_mark: |
+| 0.15.x  | :white_check_mark: |
 | 0.14.x  | :white_check_mark: |
 | 0.13.x  | :white_check_mark: |
 | 0.12.x  | :white_check_mark: |
@@ -22,8 +25,10 @@ We take the security of SwiftFTR seriously. If you believe you have found a secu
 
 Instead, please report them via one of these methods:
 
-1. **Email**: Send details to the maintainers (see CODEOWNERS file)
-2. **GitHub Security Advisory**: [Create a security advisory](https://github.com/Network-Weather/SwiftFTR/security/advisories/new)
+1. **GitHub Security Advisory** (preferred): [Create a security advisory](https://github.com/Network-Weather/SwiftFTR/security/advisories/new)
+2. **Email**: Send details to the maintainers. `.github/CODEOWNERS` names the maintainer team
+   (`@Network-Weather/swiftftr-maintainers`) but publishes no address, so use the advisory
+   unless you already have a maintainer's email.
 
 ### What to Include
 

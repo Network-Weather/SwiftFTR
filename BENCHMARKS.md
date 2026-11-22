@@ -1,14 +1,32 @@
 # SwiftFTR Benchmarks
 
-This document tracks the performance characteristics of SwiftFTR releases.
-Benchmarks are run using the `ResourceBenchmark` tool: `swift run ResourceBenchmark`.
+This document records measured performance of SwiftFTR: concurrent-ping throughput, the cost of
+the embedded ASN database across tracer instances, and ASN resolver strategies. Each section
+names the release, date and command it was measured with.
 
-## Methodology
-- **Test:** 500 concurrent pings to `8.8.8.8` (Timeout: 2s).
-- **Metric:** Memory (RSS) Delta, CPU Time, Throughput.
-- **Machine:** macOS arm64 (M-series).
+Tools in the tree today:
 
-## Results
+- `swift run -c release ResourceBenchmark` (`Tests/TestSupport/ResourceBenchmark.swift`):
+  lookup time and memory for the `.dns`, `.embedded`, `.hybrid` and `.remote` ASN resolver
+  strategies. DNS and remote are timed on a first and then a second lookup (cached for DNS; for
+  remote, answered again from the loaded database); embedded and hybrid
+  are preloaded first, so their figures are a preload time and a post-preload lookup time, not
+  a cold lookup. Needs network for the DNS and remote strategies. The remote run first
+  clears the SwiftIP2ASN download cache and then fetches a fresh database, so running it offline
+  leaves that cache empty.
+- `swift run -c release asnloadprobe <instances>` (`Tests/TestSupport/asnloadprobe`): embedded
+  database load cost across tracer instances.
+- `swift test -c release --filter AsnStrategyBench`: resolver strategy comparison as a test.
+
+The ASN figures below were measured against SwiftIP2ASN 0.5.1. The 0.17.1 floor is 0.5.2, whose
+database is slightly different in size; they have not been re-measured against it.
+
+## Concurrent ping throughput
+
+Measured by an earlier version of `ResourceBenchmark` that sent 500 concurrent pings to
+`8.8.8.8` (2s timeout) and reported RSS delta, CPU time and throughput on an M-series Mac.
+That tool was repurposed as the ASN resolver benchmark in 0.9.0, so these numbers cannot be
+reproduced from the current tree; `PingParallelismTests` covers ping concurrency as a test.
 
 ### v0.8.0 (November 2025)
 *Optimization: Event-driven DispatchSource + Private Serial Queues (Robustness Focus)*
@@ -34,12 +52,11 @@ Benchmarks are run using the `ResourceBenchmark` tool: `swift run ResourceBenchm
 | **Memory Per Ping** | ~7.4 KB |
 | **CPU Time** | 1.25s |
 
----
-
-## History
+### v0.8.0 release candidates
 - **v0.8.0-rc2 (Global Queue)**: 11.8 KB/ping, 248 pings/sec. Switched to private queues for reliability.
 - **v0.8.0-rc1 (Private Queue)**: 17.5 KB/ping.
 - **v0.8.0-final**: 17 KB/ping, 573 pings/sec.
+
 ## Embedded ASN database across tracer instances
 
 Measured with `swift run -c release asnloadprobe 8`, which constructs 8 `SwiftFTR` instances with

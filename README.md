@@ -34,7 +34,7 @@ How It Works
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
 5) Optional classification (when using `traceClassified`):
    - Enrich classified traces with a configured value or cached IPv4 discovery (STUN, then DNS fallback). The separate `getPublicIPs()` call returns uncached STUN results for v4 and v6 in parallel.
-   - Batch‑resolve ASNs using Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) or the embedded local database via swift-ip2asn. Apply heuristics for PRIVATE and CGNAT ranges.
+   - Batch‑resolve ASNs. By default (`.hybrid(.embedded)`) the embedded swift-ip2asn database answers first and Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) covers only addresses the database misses; `asnResolverStrategy` selects DNS-only, embedded-only, or a remote database instead. Apply heuristics for PRIVATE and CGNAT ranges.
    - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and "hole‑fill" missing stretches between identical segments.
 
 How Fast Is It?
@@ -59,16 +59,22 @@ Install (SwiftPM)
 
   ```swift
   dependencies: [
-      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.16.0")
+      .package(url: "https://github.com/Network-Weather/SwiftFTR.git", from: "0.17.1")
   ],
   targets: [
       .target(name: "YourTarget", dependencies: ["SwiftFTR"])
   ]
   ```
 
-Upgrading from 0.13
--------------------
-Read the published [Migrating to SwiftFTR 0.14](https://swiftftr.networkweather.com/documentation/swiftftr/migratingto014/)
+Upgrading
+---------
+Upgrades within 0.14 through 0.17 are additive at the source level, but read each release's
+"Behavior changes" in [CHANGELOG.md](CHANGELOG.md). In particular, since 0.17.0 the default
+`asnResolverStrategy` is `.hybrid(.embedded)` rather than `.dns`, so classified traces load the
+embedded ASN database and need no network for most lookups; pass `asnResolverStrategy: .dns` to
+keep the old behavior.
+
+From 0.13, read the published [Migrating to SwiftFTR 0.14](https://swiftftr.networkweather.com/documentation/swiftftr/migratingto014/)
 guide and the [0.14 changelog](CHANGELOG.md#0140--2026-07-22) before updating. Existing direct call
 sites remain source-compatible, but exhaustive `DNSError` switches, HTTP timing assumptions,
 route-bound bufferbloat tests, and interface classification may require small changes.
@@ -311,7 +317,7 @@ Notes for Embedding
 -------------------
 - **Thread Safety**: The `SwiftFTR` actor protects shared state, while operations designed for parallel use keep independent per-operation state. Its async API can be called from any actor or task.
 - **Public IP enrichment**: `SwiftFTRConfig(publicIP:)` overrides discovery for classified trace and multipath enrichment; it does not change `getPublicIPs()` or `discoverPublicIPWithHostname()`.
-- **ASN Lookups**: `traceClassified` uses DNS‑based Team Cymru with caching. Inject custom `ASNResolver` for offline lookups.
+- **ASN Lookups**: `traceClassified` resolves ASNs with `SwiftFTRConfig.asnResolverStrategy`, which defaults to `.hybrid(.embedded)`: the embedded database (about 15 MB, shared by every tracer in the process and kept loaded while at least one resolver using it is alive), with Team Cymru DNS only for addresses it does not cover. Use `.dns` for DNS-only lookups, `.embedded` for no network at all, or `.remote(bundledPath:url:)` for an updatable database. DNS results are cached in memory; local lookups are answered from the loaded database each time.
 - **Timeout Behavior**: `maxWaitMs` bounds the ICMP receive phase of `trace`. Resolution and optional STUN, rDNS, or ASN enrichment have their own I/O and timeout behavior.
 - **Error Handling**: Detailed `TracerouteError` with context about failures (permissions, network, platform).
 - **SwiftUI Ready**: No MainActor requirements - integrate directly into SwiftUI views and view models.
@@ -378,6 +384,13 @@ Options:
 - `--retry-after SEC`: Retry unresponsive TTLs after this time (default 4.0)
 - `--no-retry`: Disable automatic retry of unresponsive TTLs
 
+### Other subcommands
+- `probe tcp|udp|http|dns ...`: one-shot reachability probes (for example `swift-ftr probe tcp example.com 443`, `swift-ftr probe dns 1.1.1.1 example.com`)
+- `bufferbloat`: latency under load (`--target`, `--baseline`, `--load`, `--load-type`, `--streams`, `--no-rpm`, `--json`)
+- `interfaces`: list network interfaces and the exact BSD names that `-i/--interface` accepts (`--vpn-only`, `--physical-only`, `--include-inactive`, `--json`)
+
+Every subcommand prints its full option list with `--help`.
+
 Configuration and Flags
 -----------------------
 - Use `SwiftFTRConfig(publicIP: ...)` to bypass discovery for classified trace and multipath enrichment only; the standalone public-IP APIs ignore this value.
@@ -396,11 +409,11 @@ Design Details
 - Probing: One Echo Request per TTL; identifier is constant per run, sequence equals TTL for easy correlation.
 - Matching: Echo Reply and Time Exceeded handlers pull out embedded id/seq from the packet to map to the original probe.
 - Timing: RTT is measured with `CLOCK_MONOTONIC` to avoid wall‑clock jumps.
-- Classification: Team Cymru DNS WHOIS lookups with caching; PRIVATE and CGNAT ranges are recognized without lookups; missing stretches are “hole‑filled” between identical segment classes.
+- Classification: ASN lookups from the embedded database with Team Cymru DNS fallback by default, with caching; PRIVATE and CGNAT ranges are recognized without lookups; missing stretches are “hole‑filled” between identical segment classes.
 
 Testing
 -------
-- Unit tests: `swift test`
+- Unit tests: `swift test`. Some suites use the live network; to skip the tests designated as live-network, as CI does, set both gates: `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug`. The gates skip tests; they do not disable networking. See [TESTING.md](docs/development/TESTING.md).
 - Lightweight runner: `.build/debug/ptrtests`
 
 Fuzzing
@@ -415,14 +428,45 @@ Fuzzing
 
 Documentation
 -------------
-- DocC bundle at `Sources/SwiftFTR/SwiftFTR.docc`.
-- [`docs/CACHE-AND-TRANSITION-LIFECYCLE.md`](docs/CACHE-AND-TRANSITION-LIFECYCLE.md) — what the tracer caches,
-  what invalidates each class, and the controls a caller gets across a network transition (fresh as of 2026-09-03).
-- [`BENCHMARKS.md`](BENCHMARKS.md) — measured throughput, memory and ASN-database load cost per release,
-  with the `ResourceBenchmark` and `asnloadprobe` commands that reproduce them (fresh as of 2026-09-01).
-- [`docs/IPV6.md`](docs/IPV6.md) — sequenced plan and architectural contracts for IPv6 feature parity (ping, traceroute, probes, STUN, ASN).
-- [Robustness testing: fault injection, phase by phase](docs/ROBUSTNESS-TESTING.md): why and how the offline fault-injection battery simulates failing networks, the conditions and operations it covers, what is out of scope, the gate commands, and the defects it found. (updated 2026-11-21; update when: a seam, fixture or covered phase is added or removed, or a listed finding changes disposition)
-- [`docs/BUG2-INVESTIGATION.md`](docs/BUG2-INVESTIGATION.md) — audit and measurements behind the bounded-and-cancellable-enrichment work: continuation exit paths, the shared blocking-IO executor, and what did and did not reproduce.
+API reference is generated by DocC from `Sources/SwiftFTR/SwiftFTR.docc` and published at
+[swiftftr.networkweather.com](https://swiftftr.networkweather.com/). Design records,
+investigations and plans under `docs/` are indexed in [docs/README.md](docs/README.md), and
+contributor and release-process notes in [docs/development/README.md](docs/development/README.md).
+Every tracked Markdown file has exactly one entry in one of these indexes.
+
+### Project
+- [Changelog](CHANGELOG.md): release-by-release notes of new API, behavior changes, fixes and dependency changes, newest first. (updated 2026-11-21; update when: a PR merges to `main` or a release is cut)
+- [Roadmap](ROADMAP.md): forward-looking work, stack-ranked by priority, with the goal and constraints of each item. (updated 2026-11-21; update when: a PR completes or reprioritizes a roadmap item)
+- [Benchmarks](BENCHMARKS.md): measured ping throughput, embedded ASN database load cost and memory, and ASN resolver strategy timings, each with its release, date and command. (updated 2026-11-21; update when: a release changes the ASN database, resolver defaults or the ping I/O path, or a benchmark is re-run)
+- [Contributing](CONTRIBUTING.md): development setup, formatting, testing, documentation, commit style and the maintainer release checklist. (updated 2026-11-21; update when: the build, test, CI or release procedure changes)
+- [Security policy](SECURITY.md): supported versions, how to report a vulnerability, response timeline and the library's security-relevant design choices. (updated 2026-11-21; update when: a release line is added or dropped from support, or the reporting channel changes)
+- [Code of Conduct](CODE_OF_CONDUCT.md): Contributor Covenant 2.0 terms and the enforcement contact. (updated 2025-09-08; update when: the enforcement contact or Covenant version changes)
+- [Agent guidance](CLAUDE.md): commands, architecture overview, environment variables, conventions and merge/release duties for coding agents working in this repo. (updated 2026-11-21; update when: a command, environment variable, core component or repo convention changes)
+
+### API guides (DocC articles)
+- [SwiftFTR](Sources/SwiftFTR/SwiftFTR.docc/SwiftFTR.md): DocC landing page with the feature overview, quick samples, configuration and network-change controls, and the Topics map of the public API. (updated 2026-11-21; update when: a public type or `SwiftFTR` method is added or removed, or a `SwiftFTRConfig` default changes)
+- [Tracing](Sources/SwiftFTR/SwiftFTR.docc/Tracing.md): basic and classified traceroute, per-trace options, hop outcomes and enrichment bounds. (updated 2026-11-21; update when: `trace` or `traceClassified` signatures, `TraceOptions`, or ASN and enrichment defaults change)
+- [Streaming traceroute](Sources/SwiftFTR/SwiftFTR.docc/StreamingTrace.md): `traceStream` usage, `StreamingTraceConfig` defaults, retry and early-completion behavior. (updated 2026-11-21; update when: `StreamingTraceConfig` or the emission rules for streaming hops change)
+- [Ping](Sources/SwiftFTR/SwiftFTR.docc/Ping.md): `ping(to:config:)` usage, statistics semantics and concurrent pinging. (updated 2026-11-21; update when: `PingConfig`, `PingStatistics` or ping concurrency behavior changes)
+- [Probing](Sources/SwiftFTR/SwiftFTR.docc/Probing.md): the TCP, UDP, HTTP and DNS probe functions, their results, errors and binding behavior. (updated 2026-11-21; update when: a probe function, config or result type changes, or HTTP probes gain route binding)
+- [Bufferbloat](Sources/SwiftFTR/SwiftFTR.docc/Bufferbloat.md): `testBufferbloat` usage, load generation, grading and RPM calculation, video-call severity and baseline-only bound mode. (updated 2026-11-21; update when: grading thresholds, the RPM method, default load endpoints or `BufferbloatConfig` change)
+- [Multipath](Sources/SwiftFTR/SwiftFTR.docc/Multipath.md): `discoverPaths` usage, topology analysis, ICMP-versus-UDP limitations and the IPv4-only restriction. (updated 2026-11-21; update when: multipath gains UDP or IPv6 support, or `MultipathConfig` or `NetworkTopology` change)
+- [Interface binding](Sources/SwiftFTR/SwiftFTR.docc/InterfaceBinding.md): which operations honor interface and source-address binding, resolution order and binding errors. (updated 2026-11-21; update when: an operation gains or loses binding support, or HTTP probes become bindable)
+- [Migrating to 0.14](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo014.md): upgrade guide from 0.13 to 0.14 covering new `DNSError` cases, behavior and CLI changes, plus runtime changes in later releases. (updated 2026-11-21; update when: a later release changes a behavior it describes, or 0.13 adopters no longer need it)
+
+### Reference and examples
+- [Examples](docs/guides/EXAMPLES.md): worked Swift examples for each feature area, including trace, hop outcomes, configuration, network-change lifecycle, streaming, DNS, ping, multipath, bufferbloat, SwiftUI, concurrency, errors and ASN strategies. (updated 2026-11-21; update when: a public API used in a sample changes shape, or a release adds a feature area with no example)
+- [Condensed API reference](docs/reference/AI_REFERENCE.md): public types, method signatures, defaults, enum and error cases and CLI flags with short snippets, sized to load whole into an agent's context. (updated 2026-11-21; update when: a release changes a public signature, default, enum case or CLI flag)
+
+### Tools and fixtures
+- [hop-monitor](Sources/hop-monitor/README.md): the demo CLI that traces a path and then pings every hop continuously, with its output, statistics and limits. (updated 2026-11-21; update when: `Sources/hop-monitor/main.swift` changes its arguments, limits or statistics)
+- [Integration package](IntegrationPackage/README.md): the external-consumer package that imports SwiftFTR by path, what it checks and how CI builds and runs it. (updated 2026-11-21; update when: the package's checks change or a workflow stops building or running it)
+
+### GitHub configuration
+- [Workflows](.github/WORKFLOWS.md): what each GitHub Actions workflow triggers on, runs and produces, and how they depend on each other. (updated 2026-11-21; update when: a file under `.github/workflows/` is added, removed or changes its triggers or jobs)
+- [Pull request template](.github/pull_request_template.md): the summary, change type, testing commands and checklist every PR body starts from. (updated 2026-07-21; update when: the required pre-merge checks change)
+- [Bug report template](.github/ISSUE_TEMPLATE/bug_report.md): the environment, reproduction and log fields requested for bug issues. (updated 2026-11-21; update when: the CLI's options or the information needed to triage a bug change)
+- [Feature request template](.github/ISSUE_TEMPLATE/feature_request.md): the motivation, proposal and alternatives fields requested for feature issues. (updated 2025-09-08; update when: the project changes how it takes feature proposals)
 
 Generate and view the docs:
 
@@ -470,10 +514,12 @@ Lineage and techniques:
 
 Data and services:
 
-- Default ASN classification queries [Team Cymru's IP-to-ASN mapping
-  service](https://www.team-cymru.com/ip-asn-mapping) over DNS. The embedded
-  alternative is [swift-ip2asn](https://github.com/network-weather/swift-ip2asn),
-  whose database is built from [iptoasn.com](https://iptoasn.com) data.
+- Default ASN classification uses the database embedded in
+  [swift-ip2asn](https://github.com/network-weather/swift-ip2asn), built from
+  [iptoasn.com](https://iptoasn.com) data, and falls back to [Team Cymru's
+  IP-to-ASN mapping service](https://www.team-cymru.com/ip-asn-mapping) over DNS
+  for addresses the database does not cover. The CLI's `trace --json` output is an exception: it
+  also sends every hop, the destination and the public IP to Team Cymru for its ASN fields.
 
 Peer tools doing analogous work:
 
@@ -499,7 +545,7 @@ MIT — see LICENSE.
 Versioning & Releases
 ---------------------
 - Semantic Versioning. See CHANGELOG.md for release notes.
-- To consume via SwiftPM, use the `0.16.0` tag or a later compatible release.
+- To consume via SwiftPM, use version `0.17.1` (Git tag `v0.17.1`) or a later compatible release.
 
 Contributing
 ------------

@@ -13,7 +13,11 @@ This repository uses GitHub Actions for CI/CD automation. The workflows are desi
 **Jobs:**
 - **format**: Strict Swift format linting (required before merge)
 - **macos**: Build debug + release, run tests with network isolation, and compile both
-  external-consumer fixtures
+  external-consumer fixtures (`IntegrationPackage` and `TestLibraryUsage`)
+- **docs**: Generate DocC with `--warnings-as-errors`, so a broken symbol link fails the PR
+  rather than the next release
+
+All three jobs run on GitHub-hosted `macos-15`; `macos` and `docs` wait for `format`.
 
 **Environment Variables:**
 - `PTR_SKIP_STUN=1` - Skip the public-IP integration-test subset using the legacy gate
@@ -42,11 +46,9 @@ This repository uses GitHub Actions for CI/CD automation. The workflows are desi
 - `swift-ftr-macos-arm64.sha256` - Checksum file
 - `sbom.cdx.json` - Software Bill of Materials
 
-**Note:** This workflow consolidates the previous `release.yml` and `release-manual.yml` files, eliminating duplication.
-
 ### 3. Docs (`docs.yml`)
 **Triggers:**
-- Push to main branch (when Sources/** or README.md change)
+- Push to main branch when `Sources/**`, `README.md`, `Package.swift`, `Package.resolved`, `docs.yml` or `docc-generate.yml` change
 - Manual: `workflow_dispatch`
 - Called by: Other workflows via `workflow_call`
 
@@ -96,8 +98,9 @@ This repository uses GitHub Actions for CI/CD automation. The workflows are desi
 ## Workflow Dependencies
 
 ```
-ci.yml (on every push/PR)
-  └─> format check → build → isolated test → external-consumer build
+ci.yml (on push to main and PRs against main)
+  └─> format check ─┬─> build → isolated test → release build → external-consumer builds
+                    └─> DocC (warnings as errors)
 
 release.yml (on tag push or manual)
   └─> build release → attestations → GitHub Release
@@ -128,17 +131,6 @@ local-integration-tests.yml (manual or labeled PR)
    - The workflow rejects non-version tags, commits outside `main`, and CLI/tag version mismatches
 
 3. **Documentation:**
-   - Automatically rebuilds on main branch changes to Sources/**
+   - Automatically rebuilds on main branch changes to the paths listed under Docs above
    - Manual trigger available via Actions tab
    - Custom domain: swiftftr.networkweather.com
-
-## Consolidation History
-
-**2025-11-05:** Consolidated `release.yml` and `release-manual.yml` into single workflow
-- Eliminated ~70 lines of duplication
-- Improved ref handling for both automatic and manual releases
-
-**2026-07-21:** Hardened release publication
-- Require an existing annotated stable-version tag on `main`
-- Verify the built CLI version matches the tag
-- Keep documentation deployment on the reviewed `main` workflow
