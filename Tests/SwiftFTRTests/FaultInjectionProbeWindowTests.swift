@@ -495,12 +495,15 @@ struct FaultInjectionProbeWindowTests {
     let network = try FakeICMPNetwork { _ in [] }
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig())
+    let config = PingConfig(count: 3, interval: 0.05, timeout: 0.3)
+    // Ping also arms a safety timer at twice its whole schedule plus 5 s (5.8 s here), which ends
+    // a ping whose reply deadline never fires. The watchdog sits a second below it, which is
+    // still more than 4 s past the 0.4 s the ping takes.
+    let schedule = Double(config.count - 1) * config.interval + config.timeout
+    let safetyTimer = 2 * schedule + 5
 
-    let (result, elapsed) = try await measure(within: Self.watchdog) {
-      try await network.install {
-        try await tracer.ping(
-          to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: 0.3))
-      }
+    let (result, elapsed) = try await measure(within: safetyTimer - 1) {
+      try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     #expect(result.statistics.sent == 3)
     #expect(result.statistics.received == 0)
