@@ -158,7 +158,7 @@ battery's cancellation tests stop accepting either type, and the two follow-ups 
 of #100 are done here (the `cancelActiveTraces()` doc comment; one gated trace per cancellation
 source). This is a behavior change and gets an upgrade-guide entry.
 
-### ~~Event-Based DNS~~ (landed in #NNN)
+### ~~Event-Based DNS~~ (landed in #111)
 
 Rewrite `performDNSQueryInternal` as a non-blocking connected UDP socket with a Dispatch read
 source and a timer. Encoding, parsing, peer checks and interface and source binding are reused
