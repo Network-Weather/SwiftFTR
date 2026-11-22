@@ -476,6 +476,27 @@ struct DNSForeignReplyTests {
     #expect(peer.sent.value == 3)
   }
 
+  @Test("After a foreign datagram the blocking TXT query waits only for the time it has left")
+  func blockingWaitsForTheTimeLeft() async throws {
+    let timeout: TimeInterval = 0.5
+    // A foreign reply at 0.3 s, then the real one at 0.7 s: after the deadline, but inside a full
+    // timeout restarted by the foreign reply (0.8 s).
+    let peer = try ScriptedDNSPeer { query in
+      let reply = FaultInjectionWireTests.dnsResponse(to: query, answers: Self.txtRecord)
+      return [(Self.foreign(reply), 0.3), (reply, 0.4)]
+    }
+    defer { peer.stop() }
+
+    let (strings, _) = try await measure(within: Self.watchdog) {
+      TestSeams.$dnsServerPort.withValue(peer.port) {
+        DNSClient.queryTXTBlocking(
+          name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
+      }
+    }
+    #expect(await eventually(within: Self.watchdog) { peer.sent.value == 2 })
+    #expect(strings == nil, "the query took a reply sent after its deadline")
+  }
+
   @Test("The blocking TXT query fed foreign datagrams that never stop gives up at its deadline")
   func blockingEndlessForeign() async throws {
     let peer = try Self.endlessForeign()
