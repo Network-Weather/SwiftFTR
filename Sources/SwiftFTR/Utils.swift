@@ -596,15 +596,19 @@ final class BlockingIOExecutor: Sendable {
       try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
         let box = ContinuationBox(continuation)
 
-        queuedOperation.addExecutionBlock {
+        // Weak, because an operation cancelled while queued keeps its block without ever
+        // running it, and a block that held the operation would keep both alive for good.
+        queuedOperation.addExecutionBlock { [weak queuedOperation] in
+          // Whichever way this block exits, drop the timer: it holds the handler, which holds
+          // this operation, so leaving it armed would keep all three alive.
+          defer { deadlineTimer.cancel() }
           // A cancelled operation that already started still runs its block; skip the syscall
           // rather than paying for work whose result nobody can observe.
-          guard !queuedOperation.isCancelled else {
+          guard queuedOperation?.isCancelled != true else {
             box.resume(with: .failure(CancellationError()))
             return
           }
           box.resume(with: Result { try operation() })
-          deadlineTimer.cancel()
         }
         queuedOperation.qualityOfService = priority.blockingIOQualityOfService
         queuedOperation.queuePriority = priority.blockingIOQueuePriority
@@ -617,6 +621,9 @@ final class BlockingIOExecutor: Sendable {
 
         if let deadline {
           deadlineTimer.arm(after: deadline) {
+            // An operation cancelled while still queued never runs its block, so the block
+            // cannot be what releases the timer.
+            defer { deadlineTimer.cancel() }
             if box.resume(with: .failure(BlockingIOTimeout())) {
               queuedOperation.cancel()
             }
@@ -624,12 +631,24 @@ final class BlockingIOExecutor: Sendable {
         }
 
         cancellationBridge.register(queuedOperation, box: box)
+
+        // `onCancel` may have run since the check above, before there was anything registered
+        // for it to resume. Checking again now closes that window: a cancellation from here on
+        // finds the registration. Do not enqueue instead and rely on the operation finishing,
+        // because a cancelled operation still waits for a free worker before it finishes.
+        guard !Task.isCancelled else {
+          cancellationBridge.cancel(queuedOperation)
+          deadlineTimer.cancel()
+          return
+        }
         operationQueue.addOperation(queuedOperation)
       }
     } onCancel: {
+      // Resume first. Cancelling a queued operation finishes it without running its block, and
+      // finishing clears its registration, so cancelling first could leave nothing to resume.
+      cancellationBridge.cancel(queuedOperation)
       queuedOperation.cancel()
       deadlineTimer.cancel()
-      cancellationBridge.cancel(queuedOperation)
     }
   }
 }
@@ -638,6 +657,11 @@ final class BlockingIOExecutor: Sendable {
 ///
 /// `onCancel` cannot name the generic `ContinuationBox<T>` of the call it belongs to, so each
 /// in-flight operation registers a type-erased resume closure here for the duration of its run.
+///
+/// The registration is also a backstop against a stranded caller: an operation that finishes
+/// while still registered resumes its caller, which is a no-op whenever the block, the deadline
+/// or `onCancel` got there first. It is only a backstop, because a cancelled operation does not
+/// finish until a worker is free to dequeue it.
 private final class BlockingIOCancellationBridge: @unchecked Sendable {
   private let lock = NSLock()
   private var pending: [ObjectIdentifier: @Sendable () -> Void] = [:]
@@ -648,22 +672,19 @@ private final class BlockingIOCancellationBridge: @unchecked Sendable {
     pending[key] = { box.resume(with: .failure(CancellationError())) }
     lock.unlock()
     operation.completionBlock = { [weak self] in
-      self?.forget(key)
+      self?.resumeAndForget(key)
     }
   }
 
   func cancel(_ operation: Operation) {
-    let key = ObjectIdentifier(operation)
+    resumeAndForget(ObjectIdentifier(operation))
+  }
+
+  private func resumeAndForget(_ key: ObjectIdentifier) {
     lock.lock()
     let resume = pending.removeValue(forKey: key)
     lock.unlock()
     resume?()
-  }
-
-  private func forget(_ key: ObjectIdentifier) {
-    lock.lock()
-    pending.removeValue(forKey: key)
-    lock.unlock()
   }
 }
 
@@ -702,7 +723,7 @@ final class DeadlineTimerBox: @unchecked Sendable {
   }
 }
 
-private let blockingIOExecutor = BlockingIOExecutor(
+let blockingIOExecutor = BlockingIOExecutor(
   maximumConcurrentOperations: blockingIOConcurrencyLimit,
   name: "com.networkweather.SwiftFTR.blocking-io"
 )

@@ -383,10 +383,27 @@ private struct _OriginASNResult: Sendable {
   let registry: String?
 }
 
+/// Seconds a caller waits for one Team Cymru query, counted from submission rather than from the
+/// moment the query starts.
+///
+/// `timeout` bounds each server attempt once it is running, and `DNSClient.queryTXT` tries two
+/// servers, so a healthy query can take two timeouts. The third covers time spent queued for a
+/// slot on the shared blocking-I/O executor. Without a deadline that wait has no limit: sibling
+/// work holding every slot would hold ASN enrichment for as long as it stalled.
+func cymruQueryDeadline(timeout: TimeInterval) -> TimeInterval {
+  timeout * 3
+}
+
 // Team Cymru DNS-based resolver using TXT queries.
 /// Team Cymru DNS-based resolver using TXT queries for origin ASN and AS names.
 public struct CymruDNSResolver: ASNResolver {
-  public init() {}
+  /// Where the synchronous DNS queries run. Tests substitute a private executor so they can fill
+  /// it without starving the rest of the process.
+  private let executor: BlockingIOExecutor
+
+  public init() { self.executor = blockingIOExecutor }
+
+  init(executor: BlockingIOExecutor) { self.executor = executor }
 
   /// Resolves origin ASN metadata through Team Cymru's DNS service.
   ///
@@ -492,7 +509,9 @@ public struct CymruDNSResolver: ASNResolver {
     }
 
     // Keep the synchronous resolver off Swift's cooperative executor.
-    let txts = try? await runDetachedBlockingIO(priority: .userInitiated) {
+    let txts = try? await executor.run(
+      priority: .userInitiated, deadline: cymruQueryDeadline(timeout: timeout)
+    ) {
       DNSClient.queryTXT(name: q, timeout: timeout)
     }
     guard let txts = txts, let first = txts.first else { return nil }
@@ -519,7 +538,9 @@ public struct CymruDNSResolver: ASNResolver {
     let qn = "AS\(asn).asn.cymru.com"
 
     // Keep the synchronous resolver off Swift's cooperative executor.
-    let txts = try? await runDetachedBlockingIO(priority: .userInitiated) {
+    let txts = try? await executor.run(
+      priority: .userInitiated, deadline: cymruQueryDeadline(timeout: timeout)
+    ) {
       DNSClient.queryTXT(name: qn, timeout: timeout)
     }
     guard let txts = txts, let first = txts.first else { return nil }
