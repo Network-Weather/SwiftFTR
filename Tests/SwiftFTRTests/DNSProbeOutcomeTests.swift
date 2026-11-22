@@ -254,6 +254,33 @@ struct DNSProbeOutcomeTests {
     #expect(server.requests.value == 0)
   }
 
+  @Test("A TXT lookup whose connect has no route moves on to the next server")
+  func txtConnectFailureFallsThrough() async throws {
+    let server = try LoopbackUDPResponder { query in CymruFixture.answer(query) }
+    defer { server.stop() }
+    let connects = FaultCounter()
+    let connect: TestSeams.ConnectSocket = { fd, address, length in
+      connects.increment()
+      guard connects.value > 1 else {
+        Darwin.errno = ENETUNREACH
+        return -1
+      }
+      return Darwin.connect(fd, address, length)
+    }
+
+    let (txts, _) = try await measure(within: Self.watchdog) {
+      await TestSeams.$connectSocket.withValue(connect) {
+        await TestSeams.$dnsServerPort.withValue(server.port) {
+          await DNSClient.queryTXT(
+            name: "8.8.8.8.origin.asn.cymru.com", timeout: 5, servers: ["127.0.0.1", "127.0.0.1"])
+        }
+      }
+    }
+    #expect(txts == [CymruFixture.origin])
+    #expect(connects.value == 2)
+    #expect(server.requests.value == 1)
+  }
+
   @Test("The reported round trip excludes time spent inside the read call")
   func receiveStampPrecedesRead() async throws {
     let server = try Self.answering()
@@ -286,19 +313,17 @@ struct DNSProbeOutcomeTests {
   func unreachableBeforeTheSendIsIgnored() async throws {
     let server = try Self.answering()
     defer { server.stop() }
-    let attempts = FaultCounter()
-    let staged = FaultCounter()
+    let staging = EventBasedDNSTests.StaleEventStaging()
     let reads = FaultCounter()
     let preSendReads = FaultCounter()
-    // The first send puts a request on the wire, waits for its reply, then reports ENOBUFS, so the
-    // reply is readable before the exchange has sent anything.
-    let send = EventBasedDNSTests.sendThatLiesFirst(attempts: attempts, staged: staged)
+    // The first send provokes a reply and reports ENOBUFS; the real send waits until it is read.
+    let send = EventBasedDNSTests.staleEventSend(staging)
     // The first read consumes that reply and reports EHOSTUNREACH instead.
     let receive: TestSeams.ReceiveDatagram = { fd, buffer in
       reads.increment()
       let received = Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
       guard reads.value == 1 else { return received }
-      if attempts.value == 1 { preSendReads.increment() }
+      if !staging.realSendSucceeded { preSendReads.increment() }
       Darwin.errno = EHOSTUNREACH
       return -1
     }
@@ -308,10 +333,11 @@ struct DNSProbeOutcomeTests {
         try await Self.probe(port: server.port)
       }
     }
-    try #require(staged.value == 1, "the first reply never arrived before the retry")
+    try #require(staging.staged, "the first reply never arrived before the retry")
+    try #require(staging.consumedBeforeRealSend, "the reply was not read before the real send")
+    try #require(staging.realSendSucceeded, "the request never really left")
     try #require(preSendReads.value == 1, "the seam did not see the read before the send")
     #expect(result.outcome == .answered, "\(result.error ?? "nil")")
-    #expect(attempts.value == 2)
     #expect(reads.value >= 2)
   }
 

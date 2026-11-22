@@ -1,8 +1,8 @@
 # Event-based I/O: no thread held while waiting, one deadline per operation
 
 Sequenced plan for the ROADMAP item "Robustness under network and DNS failure, proven by tests".
-Stage: product. Status: Independent Fixes (#100) and Receive Loop Bounds (#108) have landed; Consistent
-Cancellation is next. The
+Stage: product. Status: Independent Fixes (#100), Receive Loop Bounds (#108) and Consistent
+Cancellation (#110) have landed; Event-Based DNS is next. The
 plan was reviewed twice (see Review record). Completed stages are struck through.
 
 ## Why
@@ -19,7 +19,7 @@ Four kinds of work are written as blocking calls instead:
 
 | Work | How it waits today | Where it runs |
 |---|---|---|
-| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket; since #111, a Dispatch read source (`UDPExchange.swift`) for DNS queries and probes, while Cymru lookups and the whoami fallback keep the blocking query | `BlockingIOExecutor`; since #111, no thread for DNS queries and probes |
+| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket; since Event-Based DNS, a Dispatch read source (`UDPExchange.swift`), with the blocking query kept only for the whoami fallback | `BlockingIOExecutor`; since Event-Based DNS, no thread |
 | Public-IP discovery (STUN, with a DNS fallback for IPv4) | blocking `recv`, plus `getaddrinfo` per server name | the executor in a classified trace; plain `Task` closures and `DispatchQueue.concurrentPerform` in standalone `getPublicIPs` |
 | Reverse DNS | `getnameinfo` | the executor |
 | Forward resolution of a destination | `getaddrinfo` | inline in the caller |
@@ -127,7 +127,7 @@ Tests: a loopback socket kept readable with well-formed replies carrying a forei
 (malformed packets end the drain at once, so they do not exercise this), for all three handlers;
 an injected `fcntl` failure, which needs a new seam.
 
-### Consistent Cancellation
+### ~~Consistent Cancellation~~ (landed in #110)
 
 Two error types mean two things: `CancellationError` when the caller cancelled its own task, and
 `TracerouteError.cancelled` when the library ended the operation (`networkChanged()`,

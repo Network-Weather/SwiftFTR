@@ -7,14 +7,14 @@ import Testing
 struct CacheGenerationTests {
   @Test(
     "Clearing rDNS during a lookup prevents stale cache repopulation", .timeLimit(.minutes(1)))
-  func rdnsClearWinsAgainstInFlightLookup() async {
+  func rdnsClearWinsAgainstInFlightLookup() async throws {
     let lookup = SuspendedLookup()
     let cache = RDNSCache(
       resolver: { ip in await lookup.resolve(ip) }
     )
 
     let task = Task { await cache.lookup("192.0.2.1") }
-    await lookup.waitUntilStarted()
+    try await lookup.waitUntilStarted()
     await cache.clear()
     await lookup.resume(returning: "old-network.example")
 
@@ -36,7 +36,7 @@ struct CacheGenerationTests {
   }
 
   @Test("Public IP discovery cannot cross an invalidation boundary", .timeLimit(.minutes(1)))
-  func publicIPInvalidationWinsAgainstDiscovery() async {
+  func publicIPInvalidationWinsAgainstDiscovery() async throws {
     let lookup = SuspendedLookup()
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
 
@@ -45,7 +45,7 @@ struct CacheGenerationTests {
         await lookup.resolve("public-ip")
       }
     }
-    await lookup.waitUntilStarted()
+    try await lookup.waitUntilStarted()
     await tracer.invalidatePublicIP()
     await lookup.resume(returning: "198.51.100.7")
 
@@ -124,7 +124,7 @@ struct CacheGenerationTests {
   }
 
   @Test("Stale lookups finishing after invalidateNetworkScoped do not re-trip the breaker")
-  func staleScopedLookupsDoNotRetripBreaker() async {
+  func staleScopedLookupsDoNotRetripBreaker() async throws {
     let lookup = MultiSuspendedLookup()
     let cache = RDNSCache(
       lookupDeadline: 0.05,
@@ -139,8 +139,8 @@ struct CacheGenerationTests {
     let task1 = Task { await cache.lookup("192.168.1.1") }
     let task2 = Task { await cache.lookup("192.168.1.2") }
 
-    await lookup.waitUntilStarted("192.168.1.1")
-    await lookup.waitUntilStarted("192.168.1.2")
+    try await lookup.waitUntilStarted("192.168.1.1")
+    try await lookup.waitUntilStarted("192.168.1.2")
 
     // Invalidate network-scoped rDNS and reset breaker
     await cache.invalidateNetworkScoped()
@@ -158,15 +158,15 @@ struct CacheGenerationTests {
   }
 
   @Test("In-flight scoped lookup is rejected while concurrent global lookup succeeds")
-  func inFlightScopedVsGlobal() async {
+  func inFlightScopedVsGlobal() async throws {
     let lookup = MultiSuspendedLookup()
     let cache = RDNSCache(resolver: { ip in await lookup.resolve(ip) })
 
     let scopedTask = Task { await cache.lookup("192.168.1.1") }
     let globalTask = Task { await cache.lookup("1.1.1.1") }
 
-    await lookup.waitUntilStarted("192.168.1.1")
-    await lookup.waitUntilStarted("1.1.1.1")
+    try await lookup.waitUntilStarted("192.168.1.1")
+    try await lookup.waitUntilStarted("1.1.1.1")
 
     // Invalidate network-scoped rDNS while both are in flight
     await cache.invalidateNetworkScoped()
@@ -276,7 +276,7 @@ struct CacheGenerationTests {
   }
 
   @Test("In-flight discovery cannot overwrite a newer manual seed")
-  func discoveryCannotOverwriteManualSeed() async {
+  func discoveryCannotOverwriteManualSeed() async throws {
     let lookup = SuspendedLookup()
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
 
@@ -285,7 +285,7 @@ struct CacheGenerationTests {
         await lookup.resolve("public-ip")
       }
     }
-    await lookup.waitUntilStarted()
+    try await lookup.waitUntilStarted()
 
     // Caller seeds a newer public IP while discovery is in-flight
     #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
@@ -351,7 +351,12 @@ private actor MultiSuspendedLookup {
     }
   }
 
-  func waitUntilStarted(_ key: String) async {
+  /// Bounded by ``waitBounded(_:within:_:)``, so a start that never comes fails the test.
+  nonisolated func waitUntilStarted(_ key: String) async throws {
+    try await waitBounded("the lookup of \(key) starting") { await self.waitForStart(key) }
+  }
+
+  private func waitForStart(_ key: String) async {
     if startedKeys.contains(key) { return }
     await withCheckedContinuation { cont in
       startWaiters[key, default: []].append(cont)
@@ -381,7 +386,12 @@ private actor SuspendedLookup {
     }
   }
 
-  func waitUntilStarted() async {
+  /// Bounded by ``waitBounded(_:within:_:)``, so a start that never comes fails the test.
+  nonisolated func waitUntilStarted() async throws {
+    try await waitBounded("the lookup starting") { await self.waitForStart() }
+  }
+
+  private func waitForStart() async {
     if didStart { return }
     await withCheckedContinuation { continuation in
       startWaiters.append(continuation)

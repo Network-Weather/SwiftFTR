@@ -122,7 +122,7 @@ default:
 | Silence until the timeout, or only datagrams without the query's transaction ID (empty ones included) | `timedOut` | false | nil | nil |
 | Any other `connect`, `send` or receive error; socket, bind or input errors | `failed` | false | nil | nil |
 
-`error` names the errno whenever there is one.
+For `.unreachable` outcomes, `error` includes the errno.
 
 ## Interface Binding
 

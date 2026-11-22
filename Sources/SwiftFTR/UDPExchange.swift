@@ -41,7 +41,7 @@ struct UDPExchangeReply: Sendable {
 /// ``UDPExchangeFailure``. The check answers only that question (for DNS, whether the datagram
 /// carries the query's transaction ID); the caller validates the rest of what comes back.
 ///
-/// Descriptor ownership: ``perform(family:request:timeout:receiveCapacity:configure:)`` owns the
+/// Descriptor ownership: ``perform(family:request:timeout:receiveCapacity:accepts:configure:)`` owns the
 /// socket until the read source exists and closes it itself if setup fails. From then on the
 /// descriptor is closed exactly once, by the cancel handler of the last source watching it, and
 /// the caller is resumed only after that close. Every source is activated as soon as it is
@@ -64,7 +64,8 @@ struct UDPExchangeReply: Sendable {
 ///     sent              read: datagram or empty,     success with the bytes, if before deadline
 ///                       accepted (or no check)
 ///     sent              read: datagram or empty,     consume and ignore; keep waiting, deadline
-///                       not accepted                 unchanged (a stale or foreign datagram)
+///                       not accepted                 unchanged (a stale or foreign datagram).
+///                                                    A read error is never put to the check
 ///     sent              read: ECONNREFUSED           refused; EHOSTUNREACH, ENETUNREACH:
 ///                                                    unreachable (both with rtt); other errno:
 ///                                                    receiveFailed

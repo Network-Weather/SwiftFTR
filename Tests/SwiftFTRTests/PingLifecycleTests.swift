@@ -80,8 +80,10 @@ struct PingLifecycleTests {
       config: PingConfig(count: 3, interval: 60, timeout: 1, preferredFamily: .v4)
     )
     let task = Task { try await fixture.operation.run() }
+    // A ping still running when the test gives up must not keep its socket open.
+    defer { task.cancel() }
 
-    await fixture.sends.waitForFirstSend()
+    try await waitBounded("the first ping send") { await fixture.sends.waitForFirstSend() }
     task.cancel()
 
     await #expect {
@@ -203,7 +205,7 @@ private final class SocketCloseRecorder: @unchecked Sendable {
   }
 }
 
+/// A ping is cancelled only by its caller's task, so it reports `CancellationError`.
 private func isPingCancellation(_ error: any Error) -> Bool {
-  guard case TracerouteError.cancelled = error else { return false }
-  return true
+  error is CancellationError
 }

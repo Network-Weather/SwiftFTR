@@ -10,8 +10,8 @@ Robustness under a failing network, found by a new offline fault-injection batte
 each kind of failure phase by phase. A network change now ends every `trace`, `traceClassified`,
 `traceStream` and `discoverPaths` in flight (ping and the probes are not tied to the tracer's
 network changes), and several waits are now bounded by the caller's own configuration. DNS
-queries and `dnsProbe` wait for their reply without holding a thread, so they no longer queue
-behind stalled reverse-DNS lookups for a blocking-I/O worker.
+queries, `dnsProbe` and Team Cymru ASN lookups wait for their reply without holding a thread, so
+they no longer queue behind stalled reverse-DNS lookups for a blocking-I/O worker.
 One public API is added, a structured outcome on `dnsProbe` results; none is removed or changed:
 `swift package diagnose-api-breaking-changes v0.17.1` reports no breaking change. Upgrading from
 0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
@@ -53,9 +53,11 @@ What an unmodified caller will see differently:
   earlier query on a reused port no longer makes a silent server look like one that answered: a
   server that sends only such datagrams is now `DNSError.timeout`, and `dnsProbe` reports
   `outcome == .timedOut` with `isReachable == false`. A datagram that carries the query's ID but
-  is otherwise invalid is still `malformedResponse` and `malformedReply`. The IPv4 whoami fallback
-  and the Team Cymru TXT lookups follow the same rule, so after a wrong-ID datagram they wait out
-  their timeout before trying the next server instead of moving on at once.
+  is otherwise invalid is still `malformedResponse` and `malformedReply`. The Team Cymru TXT
+  lookups, which use the same event-based transport, and the IPv4 whoami fallback, which still
+  waits in a blocking `recv`, follow the same rule: after a wrong-ID datagram they keep waiting
+  for the rest of that server's timeout before trying the next server, instead of moving on at
+  once.
 - **`dnsProbe` reports host and network unreachable as such.** When the network reports the
   server's host or network unreachable after the query is sent, `dnsProbe` returns
   `outcome == .unreachable` with an `error` naming it and its errno ("Host unreachable - …" or
@@ -93,6 +95,17 @@ What an unmodified caller will see differently:
   `fcntl` call that sets `O_NONBLOCK` fails, before any probe is sent, as `ping` already did.
   Previously the failure was ignored and the trace ran on a blocking socket, where its receive
   loop could wait past its deadline for a reply that never came.
+- **`ping` throws `CancellationError` when its task is cancelled.** It threw
+  `TracerouteError.cancelled`, the error that means the tracer ended an operation, although ping
+  is not tied to `networkChanged()` or `cancelActiveTraces()`.
+- **`trace` and `traceClassified` say who cancelled them.** Cancelling the calling task throws
+  `CancellationError`; `networkChanged()` or `cancelActiveTraces()` throws
+  `TracerouteError.cancelled`, also when the caller cancelled too. A caller's own cancellation
+  used to be reported as `TracerouteError.cancelled` in most phases and as `CancellationError` in
+  one, so a caller that retried on `TracerouteError.cancelled` retried after cancelling itself.
+- **A `traceStream` consumer that cancels its task sees a normal end of iteration**, unless the
+  tracer had already ended the stream; the trace then stops probing and closes its socket. A
+  stream the tracer ends before it finishes still throws `TracerouteError.cancelled`.
 
 ### Bug fixes
 
@@ -102,10 +115,12 @@ What an unmodified caller will see differently:
 - **A cancelled `discoverPaths` flow stops promptly.** A flow cancelled during public-IP discovery
   no longer goes on to resolve its destination, and one cancelled during classification no longer
   waits on an ASN database load shared with other resolvers.
-- **DNS queries no longer wait for a blocking-I/O worker.** Each query is one non-blocking UDP
-  exchange watched by Dispatch sources, so it holds no thread and starts at once even while every
-  worker is held. Behind a full executor a DNS query waited without limit. Cancelling the calling
-  task now ends a query at once.
+- **DNS queries and Team Cymru lookups no longer wait for a blocking-I/O worker.** Each query is
+  one non-blocking UDP exchange watched by Dispatch sources, so it holds no thread and starts at
+  once even while every worker is held. Behind a full executor a DNS query waited without limit,
+  and a Cymru lookup gave up after three timeouts without sending anything, so a trace lost its
+  ASN data. Cancelling the calling task now ends a query, and a Cymru lookup waiting for one of
+  its eight concurrent queries, at once.
 - **A DNS query whose send meets a full interface queue is retried within its timeout.**
   `ENOBUFS` retries after a short timer, where it failed with `DNSError.sendFailed` at once, and
   `EAGAIN` waits for the socket to drain without holding a thread. A send that does not succeed
@@ -119,6 +134,13 @@ What an unmodified caller will see differently:
   ignored cancellation, and, for ping, sent no further probes. Each read callback now handles at
   most 64 datagrams and checks for cancellation and its deadline before every read; a longer
   backlog is read over later callbacks, so no reply is lost.
+- **A stream cancelled by the tracer just before it ends reports the cancellation.** A
+  `cancelActiveTraces()` or `networkChanged()` that landed after a `traceStream` had finished
+  probing but before it ended the stream was recorded and then ignored: the consumer saw a normal
+  end. The stream now decides its outcome, unregisters and ends in one step on the tracer.
+- **A trace cancelled by both its caller and the tracer reports the tracer's cancellation.**
+  `traceClassified` cancelled during public-IP discovery reported `CancellationError` even when
+  `networkChanged()` had also ended it.
 - **A trace's socket is closed only once dispatch has let go of it.** The trace paths closed the
   descriptor as the call returned, while the cancelled read source could still hold it, so the
   number could be reused under it. The descriptor is now closed from the read source's
@@ -130,6 +152,10 @@ What an unmodified caller will see differently:
   phase through task-local test seams and loopback fixtures, and asserts that every operation
   returns while its stall is still in force, under a watchdog derived from its configuration. See
   `docs/ROBUSTNESS-TESTING.md`.
+- Tests that wait for a fixture to start, become ready or be cancelled, or poll until a fixture
+  has run, now fail after ten seconds instead of hanging the run when that never happens (#105).
+  Waits that cannot fail to end (a fixture's own stop path, a stall the test itself releases, a
+  call with its own timeout) are left as they are.
 
 ### Dependencies
 

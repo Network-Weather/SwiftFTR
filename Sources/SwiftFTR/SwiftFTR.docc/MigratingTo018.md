@@ -15,8 +15,9 @@ so a person or a coding agent can work through a consumer one change at a time:
 - **What to change**, with code before and after.
 
 To find the call sites to review, search the consumer for `discoverPaths(`, `networkChanged(`,
-`cancelActiveTraces(`, `publicIPDiscoveryTimeout`, `DNSError`, `socketCreateFailed`, `dnsProbe(`,
-`rttMs` and the `rtt` and `error` of the DNS result types.
+`cancelActiveTraces(`, `TracerouteError.cancelled`, `.cancelled`, `publicIPDiscoveryTimeout`,
+`DNSError`, `socketCreateFailed`, `dnsProbe(`, `rttMs` and the `rtt` and `error` of the DNS result
+types.
 
 ## Update the package
 
@@ -110,6 +111,79 @@ After:
 await tracer.networkChanged()
 startTracing()
 ```
+
+## Cancelling your own ping or trace throws CancellationError
+
+**What changed.** The two cancellation errors now mean one thing each. `CancellationError`: the
+caller cancelled its own task. `TracerouteError.cancelled`: the tracer ended the operation, through
+`networkChanged()` or `cancelActiveTraces()`; when both happened, this one is reported. `ping` threw
+`TracerouteError.cancelled` for its own task's cancellation, and `trace` and `traceClassified`
+threw it in most phases and `CancellationError` in one. `ping` is still not ended by
+`networkChanged()` or `cancelActiveTraces()`, so it now only ever throws `CancellationError` for a
+cancellation. `discoverPaths` already followed the rule. A `traceStream` consumer that cancels its
+task sees iteration end normally, unless the tracer had already ended the stream; a stream the
+tracer ends before it finishes throws `TracerouteError.cancelled`, even after its last hop has
+been delivered. Breaking out of a loop over a
+stream held in a variable cancels nothing: the trace runs until it finishes or the stream is
+released.
+
+**What a caller sees.** A ping or trace that the consumer itself cancels, for example by
+cancelling the task that runs it when a view goes away or a newer measurement replaces it, throws
+`CancellationError`. A handler written as `catch TracerouteError.cancelled` no longer catches it,
+so the error falls through to the consumer's general failure handling and can be shown or logged
+as a network failure.
+
+**What to change.** Catch both errors wherever a ping or trace can be cancelled, and handle each
+for what it means: `CancellationError` as "I stopped this myself", `TracerouteError.cancelled` as
+"the tracer abandoned this measurement". Neither is a failure of the network being diagnosed. Do
+not retry from the `TracerouteError.cancelled` handler: start the replacement from the code that
+handled the network change.
+
+Before:
+
+```swift
+do {
+  let result = try await tracer.ping(to: target, config: config)
+  record(result)
+} catch TracerouteError.cancelled {
+  // Assumed to cover the consumer's own cancellation of this task.
+  return
+} catch {
+  reportFailure(error)
+}
+```
+
+After:
+
+```swift
+do {
+  let result = try await tracer.ping(to: target, config: config)
+  record(result)
+} catch is CancellationError {
+  // This task was cancelled by the consumer.
+  return
+} catch TracerouteError.cancelled {
+  // networkChanged() or cancelActiveTraces() ended a trace; never thrown by ping.
+  return
+} catch {
+  reportFailure(error)
+}
+```
+
+The same change applies to `trace(to:)` and `traceClassified(to:)`. A consumer that only needs to
+know that the operation did not run to completion can test for both in one place:
+
+```swift
+} catch {
+  if error is CancellationError { return }
+  if case TracerouteError.cancelled = error { return }
+  reportFailure(error)
+}
+```
+
+Keep any check the consumer already makes before it uses a result, such as comparing a
+generation counter of its own: an operation that completed just before it was cancelled still
+returns its result.
 
 ## discoverPaths honours publicIPDiscoveryTimeout
 
@@ -435,6 +509,13 @@ let silent = result.outcome == .timedOut
 let noRoute = result.outcome == .unreachable && result.elapsed == nil
 let localFailure = result.outcome == .failed
 ```
+
+Apply the `silent` check only to results measured by 0.18 or later. For a result decoded from
+JSON that 0.17 wrote, or built with the initializer that takes no `outcome`, the outcome is a
+best-effort derivation from the old fields. In particular it cannot tell a refusal from silence:
+0.17 wrote "Timeout - no response" for a refused port too, so such a result derives
+`outcome == .timedOut` even when the host replied at once. Old data cannot recover the
+distinction.
 
 ## dnsProbe throws CancellationError when its task is cancelled
 

@@ -287,20 +287,78 @@ struct EventBasedDNSTests {
     }
   }
 
-  /// A send seam whose first call puts the datagram on the wire, waits until whatever it provokes
-  /// is waiting on the socket, and then reports `ENOBUFS`. So something is readable before the
-  /// exchange has sent, as a late reply to an earlier socket on the same port would be, and the
-  /// retry then really sends. `staged` counts first calls that reached that state.
-  static func sendThatLiesFirst(attempts: FaultCounter, staged: FaultCounter)
-    -> TestSeams.SendDatagram
-  {
+  /// What a ``staleEventSend(_:beforeRealSend:)`` seam observed.
+  final class StaleEventStaging: @unchecked Sendable {
+    private let lock = NSLock()
+    private var state = (attempts: 0, staged: false, deferrals: 0, consumed: false, sent: false)
+    /// Retries held back while the staged event is still unread; past this, the seam stops
+    /// waiting and the test fails on `consumedBeforeRealSend`.
+    static let maxDeferrals = 3000
+
+    var staged: Bool { read { $0.staged } }
+    var consumedBeforeRealSend: Bool { read { $0.consumed } }
+    var realSendSucceeded: Bool { read { $0.sent } }
+    var deferrals: Int { read { $0.deferrals } }
+
+    func update<T>(
+      _ change: (inout (attempts: Int, staged: Bool, deferrals: Int, consumed: Bool, sent: Bool)) ->
+        T
+    ) -> T {
+      lock.lock()
+      defer { lock.unlock() }
+      return change(&state)
+    }
+
+    private func read<T>(
+      _ get: ((attempts: Int, staged: Bool, deferrals: Int, consumed: Bool, sent: Bool)) -> T
+    ) -> T {
+      lock.lock()
+      defer { lock.unlock() }
+      return get(state)
+    }
+  }
+
+  /// A send seam that makes something readable before the exchange has sent, as a late reply to
+  /// an earlier socket on the same port would be. Its first call puts the datagram on the wire,
+  /// waits until what that provokes is waiting on the socket, and reports `ENOBUFS`. Retries
+  /// keep reporting `ENOBUFS` while that event is still unread; once the read handler has
+  /// consumed it, `beforeRealSend` runs and the request really leaves.
+  static func staleEventSend(
+    _ staging: StaleEventStaging, beforeRealSend: @escaping @Sendable () -> Void = {}
+  ) -> TestSeams.SendDatagram {
     { fd, bytes in
-      attempts.increment()
+      let attempt = staging.update { state -> Int in
+        state.attempts += 1
+        return state.attempts
+      }
+      if attempt == 1 {
+        _ = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+        let staged = Self.waitUntilReadable(fd, limit: 5)
+        staging.update { $0.staged = staged }
+        Darwin.errno = ENOBUFS
+        return -1
+      }
+      let pending = Self.waitUntilReadable(fd, limit: 0)
+      let deferred = staging.update { state -> Bool in
+        guard pending, !state.sent, state.deferrals < StaleEventStaging.maxDeferrals else {
+          return false
+        }
+        state.deferrals += 1
+        return true
+      }
+      if deferred {
+        Darwin.errno = ENOBUFS
+        return -1
+      }
+      beforeRealSend()
       let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
-      guard attempts.value == 1 else { return sent }
-      if Self.waitUntilReadable(fd, limit: 5) { staged.increment() }
-      Darwin.errno = ENOBUFS
-      return -1
+      let code = Darwin.errno
+      staging.update {
+        $0.consumed = !pending
+        $0.sent = sent == bytes.count
+      }
+      Darwin.errno = code
+      return sent
     }
   }
 
@@ -315,43 +373,46 @@ struct EventBasedDNSTests {
       return (FaultInjectionWireTests.dnsResponse(to: query, answers: record), 0)
     }
     defer { server.stop() }
-    let attempts = FaultCounter()
-    let staged = FaultCounter()
-    let send = Self.sendThatLiesFirst(attempts: attempts, staged: staged)
+    let staging = StaleEventStaging()
 
     let (answers, _) = try await measure(within: Self.watchdog) {
-      try await TestSeams.$sendDatagram.withValue(send) {
+      try await TestSeams.$sendDatagram.withValue(Self.staleEventSend(staging)) {
         try await __dnsQuery(
           server: "127.0.0.1", port: server.port, name: "stale.example", type: 1, timeout: 5)
       }
     }
-    try #require(staged.value == 1, "the first reply never arrived before the retry")
+    try #require(staging.staged, "the first reply never arrived before the retry")
+    // The stale reply was read and dropped before the request really left, and the answer is the
+    // one to that request.
+    #expect(staging.consumedBeforeRealSend, "still unread after \(staging.deferrals) retries")
+    #expect(staging.realSendSucceeded)
     #expect(answers.first?.rdata == Data([192, 0, 2, 2]))
-    #expect(attempts.value == 2)
+    #expect(server.requests.value == 2)
   }
 
   @Test("A refusal that arrives before the request has left does not end the exchange")
   func refusalBeforeTheSendIsIgnored() async throws {
-    let refusing = try RefusingUDPPort()
-    defer { withExtendedLifetime(refusing) {} }
-    let attempts = FaultCounter()
-    let staged = FaultCounter()
-    let send = Self.sendThatLiesFirst(attempts: attempts, staged: staged)
+    // Refuses the first datagram, then answers: the real send goes to a server that replies, so
+    // its outcome does not depend on Darwin suppressing a second port-unreachable to one peer.
+    let port = try RefusingThenAnsweringUDPPort { query in
+      FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord)
+    }
+    defer { port.stop() }
+    let staging = StaleEventStaging()
+    let send = Self.staleEventSend(staging) { port.startAnswering() }
 
-    let (thrown, _) = try await measure(within: Self.watchdog) {
-      await TestSeams.$sendDatagram.withValue(send) {
-        await Self.error {
-          try await __dnsQuery(
-            server: "127.0.0.1", port: refusing.port, name: "stale.example", type: 1, timeout: 1)
-        }
+    let (answers, _) = try await measure(within: Self.watchdog) {
+      try await TestSeams.$sendDatagram.withValue(send) {
+        try await __dnsQuery(
+          server: "127.0.0.1", port: port.port, name: "stale.example", type: 1, timeout: 5)
       }
     }
-    try #require(staged.value == 1, "the first refusal never arrived before the retry")
-    // The stale refusal did not end the exchange: the request was sent again. Whether that send
-    // is refused too is the kernel's choice, since Darwin suppresses a second port-unreachable to
-    // the same peer within about 50 ms, so either a refusal or a timeout is right here.
-    #expect(attempts.value == 2)
-    #expect(Self.isSendFailed(thrown) || Self.isTimeout(thrown), "\(String(describing: thrown))")
+    try #require(staging.staged, "the first refusal never arrived before the retry")
+    // The pending refusal was read and dropped before the request really left, and the outcome is
+    // the real send's: an answer, not the refusal.
+    #expect(staging.consumedBeforeRealSend, "still pending after \(staging.deferrals) retries")
+    #expect(staging.realSendSucceeded)
+    #expect(answers.first?.rdata == Data([192, 0, 2, 9]))
   }
 
   // MARK: Setup
@@ -629,5 +690,82 @@ final class DescriptorLedger: @unchecked Sendable {
       UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
     }
     return port == 0 ? nil : port
+  }
+}
+
+/// A loopback UDP port that refuses datagrams until ``startAnswering()``, then answers one.
+///
+/// Until then its socket is connected to another loopback port, so the kernel answers anyone else
+/// with ICMP port-unreachable. `startAnswering()` dissolves that association, so the next
+/// datagram reaches the socket and is answered with `reply`.
+final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
+  let port: UInt16
+  private let fd: Int32
+  private let reply: @Sendable ([UInt8]) -> [UInt8]
+  private let lock = NSLock()
+  private var answering = false
+  private let served = DispatchSemaphore(value: 0)
+
+  init(reply: @escaping @Sendable ([UInt8]) -> [UInt8]) throws {
+    let (bound, boundPort) = try bindLoopback(family: AF_INET, type: SOCK_DGRAM)
+    var (peer, length) = loopbackAddress(family: AF_INET, port: 9)
+    let connected = withUnsafePointer(to: &peer) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(bound, $0, length) }
+    }
+    guard connected == 0 else {
+      let code = errno
+      close(bound)
+      throw FixtureError.socket("connect", code)
+    }
+    setReceiveTimeout(bound, seconds: 5)
+    fd = bound
+    port = boundPort
+    self.reply = reply
+  }
+
+  /// Disconnects the socket and answers the next datagram on a thread of its own.
+  func startAnswering() {
+    lock.lock()
+    guard !answering else {
+      lock.unlock()
+      return
+    }
+    answering = true
+    lock.unlock()
+    var unspecified = sockaddr()
+    unspecified.sa_len = UInt8(MemoryLayout<sockaddr>.size)
+    unspecified.sa_family = sa_family_t(AF_UNSPEC)
+    _ = connect(fd, &unspecified, socklen_t(MemoryLayout<sockaddr>.size))
+    Thread.detachNewThread { [self] in
+      defer { served.signal() }
+      var buffer = [UInt8](repeating: 0, count: 2048)
+      var source = sockaddr_storage()
+      var sourceLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      let received = buffer.withUnsafeMutableBytes { raw in
+        withUnsafeMutablePointer(to: &source) {
+          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            recvfrom(fd, raw.baseAddress, raw.count, 0, $0, &sourceLength)
+          }
+        }
+      }
+      guard received > 0 else { return }
+      let answer = reply(Array(buffer.prefix(received)))
+      _ = answer.withUnsafeBytes { raw in
+        withUnsafePointer(to: &source) {
+          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            sendto(fd, raw.baseAddress, raw.count, 0, $0, sourceLength)
+          }
+        }
+      }
+    }
+  }
+
+  /// Waits for the answering thread, if one started, then closes the socket.
+  func stop() {
+    lock.lock()
+    let started = answering
+    lock.unlock()
+    if started { served.wait() }
+    close(fd)
   }
 }
