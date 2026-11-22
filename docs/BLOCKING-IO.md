@@ -2,7 +2,7 @@
 
 Sequenced plan for the ROADMAP item "Robustness under network and DNS failure, proven by tests".
 Stage: product. Status: Independent Fixes (#100), Receive Loop Bounds (#108) and Consistent
-Cancellation (#NNN) have landed; Event-Based DNS is next. The
+Cancellation (#110) have landed; Event-Based DNS is next. The
 plan was reviewed twice (see Review record). Completed stages are struck through.
 
 ## Why
@@ -127,7 +127,7 @@ Tests: a loopback socket kept readable with well-formed replies carrying a forei
 (malformed packets end the drain at once, so they do not exercise this), for all three handlers;
 an injected `fcntl` failure, which needs a new seam.
 
-### ~~Consistent Cancellation~~ (landed in #NNN)
+### ~~Consistent Cancellation~~ (landed in #110)
 
 Two error types mean two things: `CancellationError` when the caller cancelled its own task, and
 `TracerouteError.cancelled` when the library ended the operation (`networkChanged()`,
