@@ -39,6 +39,10 @@ enum TestSeams {
   /// Awaited by `discoverPaths` once it holds a topology, just before it checks for an
   /// invalidation and returns, so a test can order a network change before or after that step.
   @TaskLocal static var beforeMultipathCommit: (@Sendable () async -> Void)?
+
+  /// Awaited by a `traceStream` producer once its trace has ended, just before it unregisters and
+  /// finishes the stream, so a test can order `cancelActiveTraces()` before or after that step.
+  @TaskLocal static var beforeStreamCommit: (@Sendable () async -> Void)?
 }
 
 /// The IPv4 public-address discovery to submit to the blocking-I/O executor: the test substitute

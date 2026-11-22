@@ -8,11 +8,11 @@ import Testing
 struct HTTPHeaderProbeTests {
   @Test("Stops loading a large, slow body after receiving headers")
   func stopsLoadingBodyAfterHeaders() async throws {
-    await HTTPProbeProtocolRecorder.shared.reset()
+    let generation = await HTTPProbeProtocolRecorder.shared.reset()
 
     let startedAt = Date()
     let result = try await httpProbe(
-      config: HTTPProbeConfig(url: "http://probe.test/large-body", timeout: 5),
+      config: HTTPProbeConfig(url: probeURL("/large-body", generation: generation), timeout: 5),
       sessionConfiguration: testSessionConfiguration())
 
     try await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
@@ -67,8 +67,12 @@ struct HTTPHeaderProbeTests {
       HTTPProbeConfig(url: "http://probe.test/never", timeout: .nan),
     ]
 
-    for config in configurations {
-      await HTTPProbeProtocolRecorder.shared.reset()
+    for template in configurations {
+      let generation = await HTTPProbeProtocolRecorder.shared.reset()
+      let config = HTTPProbeConfig(
+        url: template.url.contains("probe.test")
+          ? "\(template.url)?generation=\(generation)" : template.url,
+        timeout: template.timeout)
       let result = try await httpProbe(
         config: config,
         sessionConfiguration: testSessionConfiguration())
@@ -82,11 +86,11 @@ struct HTTPHeaderProbeTests {
 
   @Test("Caller cancellation promptly stops URL loading")
   func cancellationStopsLoading() async throws {
-    await HTTPProbeProtocolRecorder.shared.reset()
+    let generation = await HTTPProbeProtocolRecorder.shared.reset()
 
     let probe = Task {
       try await httpProbe(
-        config: HTTPProbeConfig(url: "http://probe.test/never", timeout: 30),
+        config: HTTPProbeConfig(url: probeURL("/never", generation: generation), timeout: 30),
         sessionConfiguration: testSessionConfiguration())
     }
     try await HTTPProbeProtocolRecorder.shared.waitUntilStarted()
@@ -103,6 +107,34 @@ struct HTTPHeaderProbeTests {
     #expect(!result.isReachable)
     #expect(result.error == "Cancelled")
     #expect(snapshot.stoppedCount == 1)
+  }
+
+  @Test("A request from an earlier generation does not change a later test's counts")
+  func staleRequestDoesNotCount() async throws {
+    // A request made for one test that starts only after the next test has reset the recorder,
+    // as a request left over from a test that gave up would.
+    let stale = await HTTPProbeProtocolRecorder.shared.reset()
+    _ = await HTTPProbeProtocolRecorder.shared.reset()
+
+    let result = try await httpProbe(
+      config: HTTPProbeConfig(url: probeURL("/large-body", generation: stale), timeout: 5),
+      sessionConfiguration: testSessionConfiguration())
+    #expect(result.isReachable)
+
+    // Its start and its stop both arrive, and neither is counted.
+    let bothArrived = await eventually(within: 10) {
+      await HTTPProbeProtocolRecorder.shared.staleEventCount >= 2
+    }
+    #expect(bothArrived, "the stale request's start and stop never arrived")
+    let snapshot = await HTTPProbeProtocolRecorder.shared.snapshot()
+    #expect(snapshot.startedCount == 0)
+    #expect(snapshot.stoppedCount == 0)
+    #expect(snapshot.bodyBytesDelivered == 0)
+  }
+
+  /// A URL the test protocol serves, carrying the recorder generation its events belong to.
+  private func probeURL(_ path: String, generation: Int) -> String {
+    "http://probe.test\(path)?generation=\(generation)"
   }
 
   private func testSessionConfiguration() -> URLSessionConfiguration {
@@ -122,35 +154,51 @@ private actor HTTPProbeProtocolRecorder {
 
   static let shared = HTTPProbeProtocolRecorder()
 
-  /// Advanced by every `reset()`. Events carry the generation their request started in, so a
-  /// request left over from an earlier test cannot change this test's counts.
-  private(set) var generation = 0
+  /// Advanced by every `reset()`. Each request carries the generation it was created for, and
+  /// its events count only while that is the current one, so a request left over from an
+  /// earlier test cannot change this test's counts.
+  private var generation = 0
+  /// Start, stop and body events that arrived for an earlier generation and were not counted.
+  private(set) var staleEventCount = 0
   private var startedCount = 0
   private var stoppedCount = 0
   private var bodyBytesDelivered = 0
   private var requestPaths: [String] = []
 
-  func reset() {
+  /// Starts a new generation for the calling test and returns it.
+  @discardableResult
+  func reset() -> Int {
     generation += 1
+    defer { staleEventCount = 0 }
     startedCount = 0
     stoppedCount = 0
     bodyBytesDelivered = 0
     requestPaths = []
+    return generation
+  }
+
+  /// Whether an event for `eventGeneration` counts; one that does not is tallied as stale.
+  private func isCurrent(_ eventGeneration: Int) -> Bool {
+    guard eventGeneration == generation else {
+      staleEventCount += 1
+      return false
+    }
+    return true
   }
 
   func recordStarted(path: String, generation: Int) {
-    guard generation == self.generation else { return }
+    guard isCurrent(generation) else { return }
     startedCount += 1
     requestPaths.append(path)
   }
 
   func recordStopped(generation: Int) {
-    guard generation == self.generation else { return }
+    guard isCurrent(generation) else { return }
     stoppedCount += 1
   }
 
   func recordBodyBytes(_ count: Int, generation: Int) {
-    guard generation == self.generation else { return }
+    guard isCurrent(generation) else { return }
     bodyBytesDelivered += count
   }
 
@@ -185,8 +233,13 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
 
   private let lock = NSLock()
   private var loadingTask: Task<Void, Never>?
-  /// The recorder generation this request started in; set before `loadingTask` is.
-  private var generation = 0
+  /// The recorder generation the test created this request for, from its URL; -1 if it has none.
+  private var requestGeneration: Int {
+    request.url
+      .flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false)?.queryItems }?
+      .first { $0.name == "generation" }?.value
+      .flatMap(Int.init) ?? -1
+  }
 
   override class func canInit(with request: URLRequest) -> Bool {
     request.url?.host == "probe.test"
@@ -203,9 +256,8 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
     let loadingTask = Task { [protocolBox] in
       let loader = protocolBox.value
       guard let url = loader.request.url else { return }
-      let generation = await HTTPProbeProtocolRecorder.shared.generation
-      loader.setGeneration(generation)
-      await HTTPProbeProtocolRecorder.shared.recordStarted(path: url.path, generation: generation)
+      await HTTPProbeProtocolRecorder.shared.recordStarted(
+        path: url.path, generation: loader.requestGeneration)
 
       switch url.path {
       case "/large-body":
@@ -235,23 +287,11 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
     lock.unlock()
 
     loadingTask?.cancel()
-    let generation = currentGeneration
+    let generation = requestGeneration
     Task {
       await loadingTask?.value
       await HTTPProbeProtocolRecorder.shared.recordStopped(generation: generation)
     }
-  }
-
-  private func setGeneration(_ value: Int) {
-    lock.lock()
-    generation = value
-    lock.unlock()
-  }
-
-  private var currentGeneration: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return generation
   }
 
   private func loadLargeBody(for url: URL) async {
@@ -275,7 +315,7 @@ private final class HTTPProbeURLProtocol: URLProtocol, @unchecked Sendable {
         return
       }
       await HTTPProbeProtocolRecorder.shared.recordBodyBytes(
-        chunk.count, generation: currentGeneration)
+        chunk.count, generation: requestGeneration)
       client?.urlProtocol(self, didLoad: chunk)
     }
     client?.urlProtocolDidFinishLoading(self)

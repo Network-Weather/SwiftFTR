@@ -24,6 +24,9 @@ struct BlockingIOStrandingTests {
         release.wait()
       }
     }
+    // Also on an early exit, so a worker that starts after the check below gives up is not left
+    // blocked for the rest of the suite. The extra signal on the normal path is harmless.
+    defer { release.signal() }
     try #require(
       await eventually(within: 10) { occupied.value > 0 }, "the worker was never occupied")
 

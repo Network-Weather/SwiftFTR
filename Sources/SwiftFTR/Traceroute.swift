@@ -582,6 +582,7 @@ public actor SwiftFTR {
         // Register active trace
         await self.registerActiveTrace(handle)
 
+        var failure: Error?
         do {
           try await self.performStreamingTrace(
             to: host,
@@ -598,17 +599,11 @@ public actor SwiftFTR {
               }
             }
           )
-          await self.unregisterActiveTrace(handle)
-          continuation.finish()
         } catch {
-          await self.unregisterActiveTrace(handle)
-          if handle.cancelState.reason == .callerTask {
-            // The consumer stopped iterating; the stream has ended normally for it.
-            continuation.finish()
-          } else {
-            continuation.finish(throwing: handle.reportedError(for: error))
-          }
+          failure = error
         }
+        if let beforeCommit = TestSeams.beforeStreamCommit { await beforeCommit() }
+        await self.commitStream(handle: handle, failure: failure, to: continuation)
       }
 
       continuation.onTermination = { @Sendable termination in
@@ -626,9 +621,26 @@ public actor SwiftFTR {
     activeTraces.insert(handle)
   }
 
-  /// Unregister an active trace handle.
-  private func unregisterActiveTrace(_ handle: TraceHandle) {
-    activeTraces.remove(handle)
+  /// Ends a stream: decides its outcome, unregisters it and finishes it in one step on this actor,
+  /// with no suspension. `cancelActiveTraces()` withdraws a handle in the same kind of step before
+  /// it cancels it, so a handle that is no longer registered means the tracer ended this stream
+  /// before it finished: the tracer's cancellation is reported, whatever the producer's outcome.
+  /// A stream whose consumer cancelled has already ended for that consumer and finishes normally.
+  private func commitStream(
+    handle: TraceHandle,
+    failure: Error?,
+    to continuation: AsyncThrowingStream<StreamingHop, Error>.Continuation
+  ) {
+    let withdrawn = activeTraces.remove(handle) == nil
+    if handle.cancelState.reason == .callerTask {
+      continuation.finish()
+    } else if withdrawn {
+      continuation.finish(throwing: TracerouteError.cancelled)
+    } else if let failure {
+      continuation.finish(throwing: handle.reportedError(for: failure))
+    } else {
+      continuation.finish()
+    }
   }
 
   /// Internal implementation of streaming trace with two-phase timeout.

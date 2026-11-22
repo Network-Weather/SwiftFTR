@@ -493,6 +493,58 @@ struct FaultInjectionCancellationTests {
     }
   }
 
+  // MARK: traceStream's end
+
+  /// Runs `body` with a stream that has delivered its only hop and is held at its commit step until
+  /// `gate` opens. The consumer task returns how many hops it saw.
+  private static func withStreamAtCommit(
+    _ body: @Sendable (SwiftFTR, Task<Int, Error>, StallGate) async throws -> Void
+  ) async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let atCommit = FaultCounter()
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 1))
+    defer { network.stop() }
+    let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
+    let config = StreamingTraceConfig(probeTimeout: 10, retryAfter: nil, maxHops: 1)
+    let hold: @Sendable () async -> Void = {
+      atCommit.increment()
+      await gate.waitAsync(limit: 20)
+    }
+    try await network.install {
+      try await TestSeams.$beforeStreamCommit.withValue(hold) {
+        let consumer = Task {
+          var count = 0
+          for try await _ in tracer.traceStream(to: "fake.test", config: config) { count += 1 }
+          return count
+        }
+        let reached = await eventually(within: Self.watchdog) { atCommit.value > 0 }
+        #expect(reached, "the stream never reached its commit")
+        try await body(tracer, consumer, gate)
+      }
+    }
+    #expect(await tracer.activeTraces.isEmpty)
+  }
+
+  @Test("A stream cancelled by the tracer after its last hop but before it ends reports it")
+  func streamCancelledBeforeCommit() async throws {
+    try await Self.withStreamAtCommit { tracer, consumer, gate in
+      await tracer.cancelActiveTraces()
+      gate.open()
+      await Self.expectPromptCancellation(consumer, expected: .handle, "cancelled before commit") {}
+    }
+  }
+
+  @Test("A stream that ended before the tracer's cancellation keeps its normal end")
+  func streamCommittedBeforeCancellation() async throws {
+    try await Self.withStreamAtCommit { tracer, consumer, gate in
+      gate.open()
+      let (count, _) = try await measure(within: Self.watchdog) { try await consumer.value }
+      await tracer.cancelActiveTraces()
+      #expect(count == 1)
+    }
+  }
+
   @Test("A reverse-DNS lookup cut short by cancellation is not cached as a miss")
   func cancelledLookupNotCached() async throws {
     let calls = FaultCounter()
