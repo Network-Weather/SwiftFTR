@@ -354,31 +354,49 @@ default:
 }
 ```
 
-## dnsProbe reports host and network unreachable as such
+## dnsProbe reports unreachable servers and receive errors as such
 
-**What changed.** When the network reports the server's host or network unreachable after the
-query is sent (`EHOSTUNREACH` or `ENETUNREACH` on the socket), `dnsProbe` returns
-`outcome == .unreachable` with an `error` that says so and names the errno, such as "Host
-unreachable - the network reported the server's host unreachable (errno=65: No route to host)".
-0.17 said "Timeout - no response", although the report arrived before the timeout. `isReachable`
-stays `false` and `rtt` stays `nil`; ``DNSProbeResult/elapsed`` is when the report arrived. The
-query methods still throw `DNSError.timeout` for it.
+**What changed.** Three `dnsProbe` messages that hid what happened now say it:
 
-**What a caller sees.** A different `error` message for this case, sooner than the timeout.
+- When the network reports the server's host or network unreachable after the query is sent
+  (`EHOSTUNREACH` or `ENETUNREACH` on the socket), `outcome == .unreachable` and `error` says so
+  with the errno, such as "Host unreachable - the network reported the server's host unreachable
+  (errno=65: No route to host)". 0.17 said "Timeout - no response", although the report arrived
+  before the timeout. ``DNSProbeResult/elapsed`` is when the report arrived.
+- When this machine cannot send toward the server at all (`connect` or `send` fails with
+  `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or `ENETDOWN`), `outcome == .unreachable` and `error`
+  is "Network unreachable - this machine has no route to the server (errno=51: Network is
+  unreachable)" or a similar "Host unreachable - …"/"Network unreachable - …" message.
+  ``DNSProbeResult/elapsed`` is `nil`, because nothing came back. 0.17 said "Failed to send query".
+  Any other `connect` or `send` failure still starts "Failed to send query", now followed by the
+  errno.
+- A socket error while waiting for the reply that is neither a refusal nor an unreachable report
+  is `outcome == .failed` with "Receive failed - the socket reported an error while waiting for
+  the reply (errno=…)". 0.17 said "Timeout - no response".
 
-**What to change.** Nothing, unless the consumer matched the message "Timeout - no response" to
-detect silence. Replace that with `outcome == .timedOut`.
+`isReachable` stays `false` and `rtt` stays `nil` in every case. The query methods are unchanged:
+`DNSError.timeout` for the first and third, `DNSError.sendFailed` for the second.
+
+**What a caller sees.** Different `error` messages for these cases, the first one sooner than the
+timeout.
+
+**What to change.** Nothing, unless the consumer matched "Timeout - no response" to detect silence
+or "Failed to send query" to detect a local failure. Replace both with `outcome`; an exact match
+on "Failed to send query" no longer matches when an errno follows it.
 
 Before:
 
 ```swift
 let silent = !result.isReachable && result.error == "Timeout - no response"
+let localFailure = result.error == "Failed to send query"
 ```
 
 After:
 
 ```swift
 let silent = result.outcome == .timedOut
+let noRoute = result.outcome == .unreachable && result.elapsed == nil
+let localFailure = result.outcome == .failed
 ```
 
 ## dnsProbe throws CancellationError when its task is cancelled

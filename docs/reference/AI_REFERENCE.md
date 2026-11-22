@@ -479,7 +479,8 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult
 //   error for a malformed reply; false for silence, a refused port and local errors
 //   outcome: DNSProbeOutcome, a struct with static members (switch needs `default`):
 //     .answered, .refused, .timedOut, .malformedReply, .unreachable, .failed; JSON: raw string
-//   elapsed: send to whatever came back (answered, malformedReply, refused, unreachable), else nil
+//   elapsed: send to whatever came back from the network; nil when nothing did (timedOut,
+//     failed, and unreachable from connect/send: EHOSTUNREACH, EHOSTDOWN, ENETUNREACH, ENETDOWN)
 //   init without outcome/elapsed, and JSON without "outcome", derive both from the other fields
 //   Throws CancellationError when the calling task is cancelled
 //   switch r.outcome { case .refused: ...; case .timedOut: ...; default: ... }

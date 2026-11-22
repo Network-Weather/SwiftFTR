@@ -76,7 +76,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
 | DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
 | DNS transport | refused port (IPv4 and IPv6); empty datagram; `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
-| DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; an empty datagram; `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; a failed send, an unclassified receive error and an invalid server; cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
+| DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; an empty datagram; `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` from `connect` (connect seam) and `send`; other connect and send errors, an unclassified receive error and an invalid server; a stall inside the read excluded from the round trip; cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries and dnsProbe answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe | `Enrichment`, `EventBasedDNSTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase, with the error checked per source; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
@@ -255,6 +255,16 @@ numbers are as of the commit that added this section.
 20. **A cancelled `dnsProbe` returned a fake result.** Confirmed and fixed. Cancelling the calling
     task mid-probe returned `isReachable == false` with "Unexpected error: CancellationError()".
     It now throws `CancellationError`. Test: `DNSProbeOutcomeTests.cancellation`.
+21. **No route to the DNS server was reported as a send failure, without its errno.** Confirmed
+    through the connect and send seams and fixed for `dnsProbe`. A `connect` failure became
+    `DNSError.sendFailed` with the errno discarded, and a send-time errno was dropped, so "no route
+    to this server", the usual no-network case, read "Failed to send query". `EHOSTUNREACH`,
+    `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` are now `outcome == .unreachable` with the errno, and
+    other errnos are named in the message. The query methods still throw `sendFailed`. Test:
+    `DNSProbeOutcomeTests.locallyUnreachable`, both stages and all four errnos.
+22. **An unclassified receive error was reported as a timeout.** Fixed: `dnsProbe` said "Timeout -
+    no response" for a socket error that came at once. It now says a receive error occurred, with
+    the errno. Test: `DNSProbeOutcomeTests.failed`.
 
 Observations that are not defects of the library:
 

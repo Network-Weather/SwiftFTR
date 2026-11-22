@@ -110,7 +110,19 @@ default:
 }
 ```
 
-``DNSProbeResult/elapsed`` is the time until something came back from the network: set for `answered`, `malformedReply`, `refused` and `unreachable`, and equal to `rtt` when the server is reachable.
+``DNSProbeResult/elapsed`` is the time until something came back from the network, and `nil` when nothing did. It equals `rtt` when the server is reachable.
+
+| What happened | `outcome` | `isReachable` | `rtt` | `elapsed` |
+|---|---|---|---|---|
+| A DNS response, any response code | `answered` | true | set | = `rtt` |
+| A reply that is not valid DNS (empty, truncated, wrong ID) | `malformedReply` | true | set | = `rtt` |
+| ICMP port unreachable: nothing listens on the port | `refused` | false | nil | set |
+| ICMP host or network unreachable after the send | `unreachable` | false | nil | set |
+| `connect` or `send` fails with `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or `ENETDOWN` | `unreachable` | false | nil | nil |
+| Silence until the timeout | `timedOut` | false | nil | nil |
+| Any other `connect`, `send` or receive error; socket, bind or input errors | `failed` | false | nil | nil |
+
+`error` names the errno whenever there is one.
 
 ## Interface Binding
 
