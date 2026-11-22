@@ -161,6 +161,28 @@ struct FaultInjectionProbeWindowTests {
     #expect(elapsed < 2.0)
   }
 
+  @Test("A valid reply queued behind random datagrams is still processed", arguments: families)
+  func validReplyBehindRandomDatagrams(family: Int32) async throws {
+    let valid = pathScript(family: family, destinationTTL: 3)
+    let network = try FakeICMPNetwork(family: family) { probe in
+      var generator = SeededGenerator(seed: UInt64(probe.sequence) &* 0x9E37_79B9)
+      let noise = (0..<40).map { _ in
+        let length = Int.random(in: 0...96, using: &generator)
+        return FakeICMPNetwork.Reply(
+          (0..<length).map { _ in UInt8.random(in: 0...255, using: &generator) })
+      }
+      return noise + valid(probe)
+    }
+    defer { network.stop() }
+    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 6, maxWaitMs: 2000, noReverseDNS: true))
+
+    let result = try await measure(within: 10) {
+      try await network.install { try await tracer.trace(to: "fake.test") }
+    }.0
+    #expect(result.reached, "the destination's reply was lost behind the noise")
+    #expect(result.hops.prefix(3).allSatisfy { $0.ipAddress != nil })
+  }
+
   @Test("Replies quoting another trace's identifier are ignored", arguments: families)
   func foreignIdentifierIgnored(family: Int32) async throws {
     let network = try FakeICMPNetwork(family: family) { probe in
@@ -209,16 +231,7 @@ struct FaultInjectionProbeWindowTests {
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: 3000, publicIP: "198.51.100.7", noReverseDNS: true))
 
-    // A connected datagram socket rejects every `sendto` that names an address with EISCONN, a
-    // non-transient errno, so the very first probe fails.
-    let connectedFactory: TestSeams.MakeICMPSocket = { family in
-      let fd = try network.makeSocket(family)
-      var (address, length) = loopbackAddress(family: family, port: network.port)
-      _ = withUnsafePointer(to: &address) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
-      }
-      return fd
-    }
+    let connectedFactory = Self.connectedSocketFactory(network)
 
     func expectSendFailure(_ name: String, _ body: @escaping @Sendable () async throws -> Void)
       async
@@ -245,6 +258,38 @@ struct FaultInjectionProbeWindowTests {
       }
     }
     #expect(await tracer.activeTraces.isEmpty)
+    #expect(network.probes.value == 0)
+  }
+
+  /// A socket factory whose sockets are connected datagram sockets. One rejects every `sendto`
+  /// that names an address with EISCONN, a non-transient errno, so the very first probe fails.
+  static func connectedSocketFactory(_ network: FakeICMPNetwork) -> TestSeams.MakeICMPSocket {
+    { family in
+      let fd = try network.makeSocket(family)
+      var (address, length) = loopbackAddress(family: family, port: network.port)
+      _ = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
+      }
+      return fd
+    }
+  }
+
+  @Test("A ping whose every send fails reports nothing sent, not loss, without waiting")
+  func pingNonTransientSendError() async throws {
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 1))
+    defer { network.stop() }
+    let tracer = offlineTracer(SwiftFTRConfig())
+    let timeout: TimeInterval = 10
+
+    // A ping that counted its failed sends would wait out their reply window.
+    let (result, _) = try await measure(within: timeout / 2) {
+      try await network.install(socketFactory: Self.connectedSocketFactory(network)) {
+        try await tracer.ping(
+          to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: timeout))
+      }
+    }
+    #expect(result.statistics.sent == 0, "failed sends counted as sent")
+    #expect(result.statistics.received == 0)
     #expect(network.probes.value == 0)
   }
 
