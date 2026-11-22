@@ -6,8 +6,9 @@
 > queued-operation cancellation in `runDetachedBlockingIO`, a bounded reverse-DNS phase with a
 > stall breaker, and a public-IP discovery budget (0.15.0, plan in
 > [ENRICHMENT-BOUNDING.md](ENRICHMENT-BOUNDING.md)); release of abandoned queued operations and
-> a queue-wait bound on Team Cymru lookups (0.17.1); DNS queries and probes that wait on
-> Dispatch sources and use no executor worker (0.18). The default ASN strategy is no longer `.dns`
+> a queue-wait bound on Team Cymru lookups (0.17.1), since replaced by DNS queries and Cymru
+> lookups that wait on Dispatch sources and use no executor worker (0.18). The default ASN
+> strategy is no longer `.dns`
 > (0.17.0). `traceClassified` still has no overall deadline and forward resolution still runs
 > `getaddrinfo` on the actor; both are open in [ROADMAP.md](../ROADMAP.md) (#84). The test file
 > named in Part 2, `Bug2HangInvestigationTests.swift`, was never committed to this repository,

@@ -72,21 +72,22 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
-| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, discoverPaths | `Enrichment`, `Cancellation` |
+| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
 | DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage, oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
 | DNS transport | refused port (IPv4 and IPv6); empty datagram; `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
 | DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; an empty datagram; `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` from `connect` (connect seam) and `send`; other connect and send errors, an unclassified receive error and an invalid server; a stall inside the read excluded from the round trip; an unreachable error read before the send ignored; no read once the exchange has finished and closed its socket, with a second reply still queued (answered, timed out, cancelled); cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
-| Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries and dnsProbe answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe | `Enrichment`, `EventBasedDNSTests` |
+| Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
-| Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase, with the error checked per source; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
+| Cancellation | task cancellation, `networkChanged()`, `cancelActiveTraces()`, and the caller and the tracer together, across each operation and in each stalled phase, with the exact error checked per source; a stream consumer that cancels sees a normal end and the producer closes its socket; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails | trace, traceClassified, traceStream, ping | `ReceiveLoop` |
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
-Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests` and `DNSProbeOutcomeTests`
-for the event-based DNS transport. Every timed operation runs under a watchdog
+Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`
+and `CymruEventBasedTests` for the event-based DNS transport. Every timed operation runs under a
+watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
 Not covered, and why:
@@ -118,8 +119,8 @@ Not covered, and why:
   `EHOSTUNREACH` or `ENETUNREACH`, so `DNSProbeOutcomeTests.unreachable` injects them through the
   receive seam; no test shows the kernel reporting them on a connected UDP socket.
 - **The `.dns` and `.hybrid` strategies end to end**: their fallback is Team Cymru over the real
-  resolver. `CymruQueueDeadlineTests` covers their queueing bound; the battery passes a stub
-  resolver to every classified trace so no test reaches it.
+  resolver. `CymruEventBasedTests` runs `CymruDNSResolver` against a loopback responder; the
+  battery passes a stub resolver to every classified trace so no test reaches it.
 - **A TCP port that drops SYNs (filtered).** Producing one needs a firewall rule.
 
 ## Out of scope
@@ -188,11 +189,11 @@ numbers are as of the commit that added this section.
    query went onto the shared executor with no deadline, so its socket timeouts bounded the query
    but not the queueing: with the executor full, `dnsProbe` with a 0.3 s timeout waited as long as
    the occupant held it (3.0 s). A deadline counted from submission would have reported a healthy
-   server as unreachable when no packet was sent, so instead DNS queries now wait on Dispatch
-   sources (`UDPExchange.swift`) and need no worker. Team Cymru lookups still run on the executor,
-   behind the queue deadline `CymruQueueDeadlineTests` covers. Test:
+   server as unreachable when no packet was sent, so instead DNS queries and Team Cymru lookups
+   now wait on Dispatch sources (`UDPExchange.swift`) and need no worker. Tests:
    `EventBasedDNSTests.answersWithEveryWorkerHeld`, which waited out its 5 s watchdog before and
-   answers while every slot is held after.
+   answers while every slot is held after, and `CymruEventBasedTests.resolvesWithEveryWorkerHeld`,
+   which returned no ASN data at its 1.5 s queue deadline before.
 9. **`getPublicIPs` runs blocking STUN on Swift's cooperative pool, without a deadline.**
    Unverified, from reading the code. `STUN.swift:725` wraps `stunGetPublicIPWithFallback`,
    which calls `getaddrinfo` for each server hostname and blocks in `recv`, in plain `Task`s rather
@@ -264,17 +265,36 @@ numbers are as of the commit that added this section.
     arrived. The query methods still throw `DNSError.timeout` for them, since no existing case
     describes them and a new one would break exhaustive switches (ROADMAP). Test:
     `DNSProbeOutcomeTests.unreachable`, both errnos.
-20. **A cancelled `dnsProbe` returned a fake result.** Confirmed and fixed. Cancelling the calling
+20. **Cancellation did not say who cancelled.** Confirmed and fixed. `ping` threw
+    `TracerouteError.cancelled` when its own task was cancelled, in all 16 steps of the ping
+    sweep. A trace's task-cancellation handler set the same flag `cancelActiveTraces()` sets, so a
+    caller's cancellation was reported as the tracer's in every probe-window step (24 of 24), in
+    the reverse-DNS wave and in three of four `traceClassified` phases. In the fourth, public-IP
+    discovery, a `Task.checkCancellation()` noticed first and threw `CancellationError`, even when
+    the tracer had cancelled too. The handle now records the reason in a lock-protected state
+    that the task-cancellation handler sets synchronously, the tracer's reason outranking the
+    caller's, and `trace` and `traceClassified` report it on the tracer's actor. Tests: the
+    `FaultInjectionCancellationTests` sweeps, each asserting the exact type for each source and for
+    both together (`Canceller.both`, which cancels the task and the tracer's traces in one step on
+    the actor), and `streamConsumerCancellationCleansUp`.
+21. **A stream cancelled just before it ended finished normally.** Confirmed from reading and
+    fixed; found by Codex review of #110. A `cancelActiveTraces()` that landed after the producer
+    passed its last check but before it unregistered was recorded and then ignored. The producer
+    now commits, as `discoverPaths` does: it checks, unregisters and ends the stream in one
+    non-suspending step on the tracer. Tests: `streamCancelledBeforeCommit` and
+    `streamCommittedBeforeCancellation`, which hold the stream at that step through the
+    `beforeStreamCommit` seam; with the old unconditional finish the first fails.
+22. **A cancelled `dnsProbe` returned a fake result.** Confirmed and fixed. Cancelling the calling
     task mid-probe returned `isReachable == false` with "Unexpected error: CancellationError()".
     It now throws `CancellationError`. Test: `DNSProbeOutcomeTests.cancellation`.
-21. **No route to the DNS server was reported as a send failure, without its errno.** Confirmed
+23. **No route to the DNS server was reported as a send failure, without its errno.** Confirmed
     through the connect and send seams and fixed for `dnsProbe`. A `connect` failure became
     `DNSError.sendFailed` with the errno discarded, and a send-time errno was dropped, so "no route
     to this server", the usual no-network case, read "Failed to send query". `EHOSTUNREACH`,
     `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` are now `outcome == .unreachable` with the errno, and
     other errnos are named in the message. The query methods still throw `sendFailed`. Test:
     `DNSProbeOutcomeTests.locallyUnreachable`, both stages and all four errnos.
-22. **An unclassified receive error was reported as a timeout.** Fixed: `dnsProbe` said "Timeout -
+24. **An unclassified receive error was reported as a timeout.** Fixed: `dnsProbe` said "Timeout -
     no response" for a socket error that came at once. It now says a receive error occurred, with
     the errno. Test: `DNSProbeOutcomeTests.failed`.
 
@@ -287,5 +307,15 @@ Observations that are not defects of the library:
 - `TraceLifecycleTests.cancelActiveTracesCancelsClassifiedTrace` is not gated on
   `SKIP_NETWORK_TESTS`, so the offline suite sends a real trace toward `192.0.2.1` and real STUN
   queries. The seams added here would let it run offline.
+- An `AsyncThrowingStream` producer that finishes with an error inside its own `onTermination`
+  handler delivers that error to a consumer that cancelled; one that finishes after the handler
+  returns does not. `traceStream` therefore finishes normally when its consumer cancels, rather
+  than relying on its producer losing that race.
+- A wait on a test-owned signal that is a bare continuation, semaphore or stream cannot be ended
+  by `.timeLimit`, whose task group still joins the stuck child. Waits for a fixture to start,
+  become ready or be cancelled go through `waitBounded`, and polls for one to run through
+  `eventually`, each failing the test after ten seconds. A test that gives up does not join the
+  operation it was waiting on. Waits that cannot fail to end are left unbounded: a fixture's stop
+  path, a stall the test itself releases, a call with its own timeout.
 - `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
   identifies a socket by its bound local address when checking that the library closed it.

@@ -489,7 +489,10 @@ public actor SwiftFTR {
   /// - Parameters:
   ///   - host: Destination hostname or IPv4/IPv6 address.
   /// - Returns: A `TraceResult` with ordered hops and whether the destination responded.
-  /// - Throws: `TracerouteError` if resolution, socket operations fail, or trace is cancelled
+  /// - Throws: `CancellationError` when the calling task is cancelled,
+  ///   `TracerouteError.cancelled` when ``networkChanged()`` or ``cancelActiveTraces()`` ends it
+  ///   (also when the caller cancelled too), or another `TracerouteError` if resolution or socket
+  ///   operations fail.
   public func trace(
     to host: String
   ) async throws -> TraceResult {
@@ -502,7 +505,10 @@ public actor SwiftFTR {
   ///   - host: Destination hostname or IPv4/IPv6 address.
   ///   - options: Per-operation trace options such as `maxHops` override.
   /// - Returns: A `TraceResult` with ordered hops and whether the destination responded.
-  /// - Throws: `TracerouteError` if resolution, socket operations fail, or trace is cancelled
+  /// - Throws: `CancellationError` when the calling task is cancelled,
+  ///   `TracerouteError.cancelled` when ``networkChanged()`` or ``cancelActiveTraces()`` ends it
+  ///   (also when the caller cancelled too), or another `TracerouteError` if resolution or socket
+  ///   operations fail.
   public func trace(
     to host: String,
     options: TraceOptions
@@ -514,11 +520,16 @@ public actor SwiftFTR {
     activeTraces.insert(handle)
     defer { activeTraces.remove(handle) }
 
-    // Run trace in a task so we can check cancellation
-    return try await withTaskCancellationHandler {
-      try await performTrace(to: host, handle: handle, maxHopsOverride: options.maxHops)
-    } onCancel: {
-      Task { await handle.cancel() }
+    do {
+      return try await withTaskCancellationHandler {
+        try await performTrace(to: host, handle: handle, maxHopsOverride: options.maxHops)
+      } onCancel: {
+        handle.cancel(for: .callerTask)
+      }
+    } catch {
+      // Reported here, on the actor that `cancelActiveTraces()` runs on, so a tracer cancellation
+      // that arrived after the caller's but before this point is the one reported.
+      throw handle.reportedError(for: error)
     }
   }
 
@@ -544,6 +555,16 @@ public actor SwiftFTR {
   /// }
   /// ```
   ///
+  /// ``networkChanged()`` and ``cancelActiveTraces()`` end a stream that has not finished with
+  /// `TracerouteError.cancelled`. A consumer that cancels its own task sees iteration end
+  /// normally, as with any `AsyncSequence`: `next()` returns `nil` rather than throwing.
+  ///
+  /// The trace stops probing and closes its socket when the stream terminates: when the task
+  /// iterating it is cancelled, or when the stream and its iterator are released. Breaking out of
+  /// a `for try await` loop written inline over `traceStream(...)` releases the stream and so stops
+  /// the trace. Breaking out of a loop over a stream held in a variable does not: the trace keeps
+  /// its socket open and keeps re-probing until it finishes or the stream is released.
+  ///
   /// - Parameters:
   ///   - host: Destination hostname or IPv4/IPv6 address.
   ///   - streamConfig: Configuration for streaming behavior (timeouts, retry, etc.)
@@ -561,6 +582,7 @@ public actor SwiftFTR {
         // Register active trace
         await self.registerActiveTrace(handle)
 
+        var failure: Error?
         do {
           try await self.performStreamingTrace(
             to: host,
@@ -577,17 +599,19 @@ public actor SwiftFTR {
               }
             }
           )
-          await self.unregisterActiveTrace(handle)
-          continuation.finish()
         } catch {
-          await self.unregisterActiveTrace(handle)
-          continuation.finish(throwing: error)
+          failure = error
         }
+        if let beforeCommit = TestSeams.beforeStreamCommit { await beforeCommit() }
+        await self.commitStream(handle: handle, failure: failure, to: continuation)
       }
 
-      continuation.onTermination = { @Sendable _ in
+      continuation.onTermination = { @Sendable termination in
+        if case .cancelled = termination {
+          // Recorded before the producer can fail, so it finishes the stream normally.
+          handle.cancel(for: .callerTask)
+        }
         producerTask.cancel()
-        Task { await handle.cancel() }
       }
     }
   }
@@ -597,9 +621,26 @@ public actor SwiftFTR {
     activeTraces.insert(handle)
   }
 
-  /// Unregister an active trace handle.
-  private func unregisterActiveTrace(_ handle: TraceHandle) {
-    activeTraces.remove(handle)
+  /// Ends a stream: decides its outcome, unregisters it and finishes it in one step on this actor,
+  /// with no suspension. `cancelActiveTraces()` withdraws a handle in the same kind of step before
+  /// it cancels it, so a handle that is no longer registered means the tracer ended this stream
+  /// before it finished: the tracer's cancellation is reported, whatever the producer's outcome.
+  /// A stream whose consumer cancelled has already ended for that consumer and finishes normally.
+  private func commitStream(
+    handle: TraceHandle,
+    failure: Error?,
+    to continuation: AsyncThrowingStream<StreamingHop, Error>.Continuation
+  ) {
+    let withdrawn = activeTraces.remove(handle) == nil
+    if handle.cancelState.reason == .callerTask {
+      continuation.finish()
+    } else if withdrawn {
+      continuation.finish(throwing: TracerouteError.cancelled)
+    } else if let failure {
+      continuation.finish(throwing: handle.reportedError(for: failure))
+    } else {
+      continuation.finish()
+    }
   }
 
   /// Internal implementation of streaming trace with two-phase timeout.
@@ -609,7 +650,7 @@ public actor SwiftFTR {
     streamConfig: StreamingTraceConfig,
     yield: @Sendable @escaping (StreamingHop) -> Bool
   ) async throws {
-    try Task.checkCancellation()
+    try handle.checkCancellation()
     try config.validateForOperation()
     try streamConfig.validateForOperation()
 
@@ -628,9 +669,7 @@ public actor SwiftFTR {
     // Resolve destination (dual-stack, honors config.preferredFamily).
     let resolved = try resolveHost(host: host, prefer: config.preferredFamily)
 
-    if await handle.isCancelled {
-      throw TracerouteError.cancelled
-    }
+    try handle.checkCancellation()
 
     if let sourceIP = config.sourceIP {
       try validateSourceIPFamily(sourceIP, destinationFamily: resolved.family)
@@ -721,13 +760,12 @@ public actor SwiftFTR {
       await handle.clearCancellationHandler(id: registrationID)
     } catch {
       await handle.clearCancellationHandler(id: registrationID)
-      throw error
+      throw handle.reportedError(for: error)
     }
 
-    // Check TraceHandle cancellation
-    if await handle.isCancelled {
+    if let cancellation = handle.cancellationError() {
       streamOperation.cancel()
-      throw TracerouteError.cancelled
+      throw cancellation
     }
   }
 
@@ -866,13 +904,12 @@ public actor SwiftFTR {
       await handle.clearCancellationHandler(id: registrationID)
     } catch {
       await handle.clearCancellationHandler(id: registrationID)
-      throw error
+      throw handle.reportedError(for: error)
     }
 
-    // Also check TraceHandle cancellation
-    if await handle.isCancelled {
+    if let cancellation = handle.cancellationError() {
       operation.cancel()
-      throw TracerouteError.cancelled
+      throw cancellation
     }
 
     var hops = receiveResult.hops
@@ -902,10 +939,7 @@ public actor SwiftFTR {
         await self.rdnsCache.batchLookup(ips)
       }
 
-      try Task.checkCancellation()
-      if await handle.isCancelled {
-        throw TracerouteError.cancelled
-      }
+      try handle.checkCancellation()
 
       finalHops = finalHops.map { hop in
         TraceHop(
@@ -950,7 +984,10 @@ public actor SwiftFTR {
   ///   - vpnContext: Context for VPN-aware classification (optional, auto-detected from interface).
   ///   - resolver: ASN resolver implementation (default: uses internal cached resolver).
   /// - Returns: A ClassifiedTrace containing segment labels and (when available) ASN info.
-  /// - Throws: `TracerouteError` if resolution or socket operations fail
+  /// - Throws: `CancellationError` when the calling task is cancelled,
+  ///   `TracerouteError.cancelled` when ``networkChanged()`` or ``cancelActiveTraces()`` ends it
+  ///   (also when the caller cancelled too), or another `TracerouteError` if resolution or socket
+  ///   operations fail.
   public func traceClassified(
     to host: String,
     vpnContext: VPNContext? = nil,
@@ -968,7 +1005,10 @@ public actor SwiftFTR {
   ///   - resolver: ASN resolver implementation (default: uses internal cached resolver).
   ///   - options: Per-operation trace options such as `maxHops` override.
   /// - Returns: A ClassifiedTrace containing segment labels and (when available) ASN info.
-  /// - Throws: `TracerouteError` if resolution or socket operations fail
+  /// - Throws: `CancellationError` when the calling task is cancelled,
+  ///   `TracerouteError.cancelled` when ``networkChanged()`` or ``cancelActiveTraces()`` ends it
+  ///   (also when the caller cancelled too), or another `TracerouteError` if resolution or socket
+  ///   operations fail.
   public func traceClassified(
     to host: String,
     vpnContext: VPNContext? = nil,
@@ -982,7 +1022,24 @@ public actor SwiftFTR {
     activeTraces.insert(handle)
     defer { activeTraces.remove(handle) }
 
-    return try await withTaskCancellationHandler {
+    do {
+      return try await classifiedTrace(
+        to: host, vpnContext: vpnContext, resolver: resolver, options: options, handle: handle)
+    } catch {
+      // Reported here, on the actor that `cancelActiveTraces()` runs on, so a tracer cancellation
+      // that arrived after the caller's but before this point is the one reported.
+      throw handle.reportedError(for: error)
+    }
+  }
+
+  private func classifiedTrace(
+    to host: String,
+    vpnContext: VPNContext?,
+    resolver: ASNResolver?,
+    options: TraceOptions,
+    handle: TraceHandle
+  ) async throws -> ClassifiedTrace {
+    try await withTaskCancellationHandler {
       // Validate interface early if specified (before any network operations)
       if let interfaceName = config.interface {
         if config.enableLogging {
@@ -994,16 +1051,14 @@ public actor SwiftFTR {
         }
       }
 
-      try Task.checkCancellation()
-      if await handle.isCancelled { throw TracerouteError.cancelled }
+      try handle.checkCancellation()
 
       let effectivePublicIP = await effectivePublicIPForClassification {
-        if await handle.isCancelled { return nil }
+        if handle.cancellationError() != nil { return nil }
         return try? await self.discoverPublicIP(handle: handle)
       }
 
-      try Task.checkCancellation()
-      if await handle.isCancelled { throw TracerouteError.cancelled }
+      try handle.checkCancellation()
 
       // Perform base trace using the classified trace's handle
       let tr = try await performTrace(to: host, handle: handle, maxHopsOverride: options.maxHops)
@@ -1018,8 +1073,7 @@ public actor SwiftFTR {
       allIPs.insert(destIP)
       if let pip = effectivePublicIP { allIPs.insert(pip) }
 
-      try Task.checkCancellation()
-      if await handle.isCancelled { throw TracerouteError.cancelled }
+      try handle.checkCancellation()
 
       // Get hostnames (either from trace or via rDNS)
       var hostnameMap: [String: String] = [:]
@@ -1029,11 +1083,11 @@ public actor SwiftFTR {
           !tr.hops.contains { $0.ipAddress == ip && $0.hostname != nil }
         }
         if !ipsNeedingRDNS.isEmpty {
-          if await handle.isCancelled { throw TracerouteError.cancelled }
+          try handle.checkCancellation()
           let additionalHostnames = try await withTraceCancellation(handle: handle) {
             await self.rdnsCache.batchLookup(Array(ipsNeedingRDNS))
           }
-          if await handle.isCancelled { throw TracerouteError.cancelled }
+          try handle.checkCancellation()
           hostnameMap = additionalHostnames
         }
 
@@ -1045,8 +1099,7 @@ public actor SwiftFTR {
         }
       }
 
-      try Task.checkCancellation()
-      if await handle.isCancelled { throw TracerouteError.cancelled }
+      try handle.checkCancellation()
 
       // Use provided resolver or internal one
       let effectiveResolver = resolver ?? asnResolver
@@ -1071,7 +1124,7 @@ public actor SwiftFTR {
         )
       }
 
-      if await handle.isCancelled { throw TracerouteError.cancelled }
+      try handle.checkCancellation()
 
       // Enhance classified result with hostnames
       let enhancedHops = baseClassified.hops.map { hop in
@@ -1102,7 +1155,7 @@ public actor SwiftFTR {
         hops: enhancedHops
       )
     } onCancel: {
-      Task { await handle.cancel() }
+      handle.cancel(for: .callerTask)
     }
   }
 
@@ -1119,7 +1172,9 @@ public actor SwiftFTR {
   ///   - target: Hostname or IP address to ping
   ///   - config: Ping configuration (count, interval, timeout, payload size)
   /// - Returns: Ping result with response data and computed statistics
-  /// - Throws: `TracerouteError` on failure (resolution, socket creation, permission issues)
+  /// - Throws: `CancellationError` when the calling task is cancelled, or `TracerouteError` on
+  ///   failure (resolution, socket creation, permission issues). A ping is not ended by
+  ///   ``networkChanged()`` or ``cancelActiveTraces()``.
   ///
   /// ## Example
   /// ```swift
@@ -1305,15 +1360,26 @@ public actor SwiftFTR {
 
   /// Cancel all active traceroute operations without clearing caches.
   ///
-  /// Snapshots the currently running trace handles and cancels them: `trace`, `traceClassified`,
-  /// `traceStream` and `discoverPaths`, each of which then throws `TracerouteError.cancelled`.
-  /// Traces registered after this call begins remain tracked for subsequent cancellation.
+  /// Signals every operation registered when the call is made: `trace`, `traceClassified`,
+  /// `traceStream` and `discoverPaths`. One that has not finished stops and throws
+  /// `TracerouteError.cancelled`, even if its caller cancelled it too. One that has already
+  /// finished keeps its outcome. A `traceStream` finishes when its producer ends the stream, which
+  /// it does in one step on this tracer after the trace is over; delivering its last hop is not
+  /// finishing, so until that step the consumer's next call can still throw.
+  /// `discoverPaths` alone guarantees more: a topology not yet returned is discarded.
+  /// Operations registered after this call remain tracked for subsequent cancellation.
   /// This method does not invalidate rDNS, public IP, or ASN caches.
   public func cancelActiveTraces() async {
+    cancelRegisteredTraces()
+  }
+
+  /// Withdraws and cancels every registered operation in one step on this actor, without
+  /// suspending, so none of them can report its outcome part-way through.
+  internal func cancelRegisteredTraces() {
     let tracesToCancel = activeTraces
     activeTraces.removeAll()
     for trace in tracesToCancel {
-      await trace.cancel()
+      trace.cancel(for: .library)
     }
   }
 
@@ -1322,7 +1388,8 @@ public actor SwiftFTR {
   /// Call this method when the network configuration changes (e.g., WiFi to cellular,
   /// VPN connect/disconnect) to ensure fresh data for subsequent traces. Operations in flight
   /// (`trace`, `traceClassified`, `traceStream` and `discoverPaths`) are cancelled as by
-  /// ``cancelActiveTraces()`` and throw `TracerouteError.cancelled`.
+  /// ``cancelActiveTraces()``. `ping` and the TCP, UDP, DNS and HTTP probes are not tied to the
+  /// tracer and keep running.
   public func networkChanged() async {
     // Snapshot and remove the current generation before awaiting another actor.
     // Traces registered while cancellation is in progress remain tracked for a

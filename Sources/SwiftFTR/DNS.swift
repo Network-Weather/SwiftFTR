@@ -1801,9 +1801,9 @@ private func makeDNSQueryMessage(encodedQuery: [UInt8], queryType: UInt16) -> (
 /// A DNS query that waits for its reply in a blocking `recv` on the calling thread.
 ///
 /// Its only caller is ``DNSClient/queryTXTBlocking(name:timeout:servers:)``, for the whoami
-/// fallback in `getPublicIPv4ViaDNS` and the Team Cymru lookups. Every other DNS query uses the
-/// event-based ``exchangeDNSQuery``. Refusals, host and network unreachable and an empty datagram
-/// are all `DNSError.timeout` here.
+/// fallback in `getPublicIPv4ViaDNS`, which runs inside a blocking public-IP closure and cannot
+/// await. Every other DNS query uses the event-based ``exchangeDNSQuery``. Refusals, host and
+/// network unreachable and an empty datagram are all `DNSError.timeout` here.
 private func performDNSQueryBlocking(
   server: String,
   query: String,
@@ -1991,12 +1991,28 @@ struct DNSClient {
   /// Servers the TXT lookups try, in order, when the caller names none.
   static let defaultTXTServers = ["1.1.1.1", "8.8.8.8"]
 
-  /// TXT strings for `name` from the first of `servers` that answers, or `nil`, waiting in a
-  /// blocking `recv` on the calling thread.
+  /// TXT strings for `name` from the first of `servers` that answers, or `nil`.
   ///
-  /// Two callers, both on blocking threads: `getPublicIPv4ViaDNS`, which runs inside a blocking
-  /// public-IP closure and cannot await, and the Team Cymru lookups in `CymruDNSResolver`, which
-  /// run on the blocking-I/O executor. Do not add callers.
+  /// Each server gets `timeout` seconds. The wait holds no thread, and cancelling the calling
+  /// task ends it at once.
+  static func queryTXT(
+    name: String, timeout: TimeInterval = 1.0, servers: [String] = defaultTXTServers
+  ) async -> [String]? {
+    for server in servers {
+      // After cancellation each remaining attempt throws before it opens a socket.
+      let answers = try? await runDNSQuery(
+        server: server, query: name, queryType: DNSRecordType.txt.rawValue, timeout: timeout,
+        interface: nil, sourceIP: nil
+      ).answers
+      if let answers, let strings = txtStrings(from: answers) { return strings }
+    }
+    return nil
+  }
+
+  /// ``queryTXT(name:timeout:servers:)`` waiting in a blocking `recv` on the calling thread.
+  ///
+  /// Its only caller is `getPublicIPv4ViaDNS`, which runs inside a blocking public-IP closure and
+  /// cannot await. Do not add callers: use the async ``queryTXT(name:timeout:servers:)``.
   static func queryTXTBlocking(
     name: String, timeout: TimeInterval = 1.0, servers: [String] = defaultTXTServers
   ) -> [String]? {

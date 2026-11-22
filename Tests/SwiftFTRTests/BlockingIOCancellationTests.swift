@@ -67,7 +67,7 @@ struct BlockingIOCancellationTests {
       try await executor.run(priority: .userInitiated) { occupant.hold(until: slotHeld) }
     }
     defer { holder.cancel() }
-    while !occupant.didRun { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(await eventually(within: 10) { occupant.didRun }, "the occupant never ran")
 
     let victim = Task { try await executor.run(priority: .userInitiated) { queued.stall(0) } }
     try await Task.sleep(nanoseconds: 100_000_000)
@@ -90,7 +90,7 @@ struct BlockingIOCancellationTests {
     let victim = Task {
       try await executor.run(priority: .userInitiated) { probe.hold(until: syscall) }
     }
-    while !probe.didRun { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(await eventually(within: 10) { probe.didRun }, "the operation never ran")
     victim.cancel()
 
     // The syscall keeps running on its worker until the gate opens; only the caller is released.
@@ -163,7 +163,7 @@ struct BlockingIOCancellationTests {
     defer { syscall.open() }
 
     let victim = Task { try await runDetachedBlockingIO { probe.hold(until: syscall) } }
-    while !probe.didRun { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(await eventually(within: 10) { probe.didRun }, "the operation never ran")
     victim.cancel()
 
     let (result, _) = try await measure(within: watchdog) { await victim.result }

@@ -722,7 +722,7 @@ extension SwiftFTR {
     let tr = try await withTaskCancellationHandler {
       try await performTrace(to: host, handle: handle, flowIdentifier: flowIdentifier)
     } onCancel: {
-      Task { await handle.cancel() }
+      handle.cancel(for: .callerTask)
     }
 
     guard let destIP = tr.resolvedIP else {

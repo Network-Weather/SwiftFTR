@@ -11,7 +11,7 @@ struct BufferbloatLifecycleTests {
     let pingReadyToReturn = OneShotSignal()
     let dependencies = BufferbloatDependencies(
       ping: { _, _ in
-        await load.waitUntilStarted()
+        try await load.waitUntilStarted()
         await pingReadyToReturn.signal()
         return stubPingResult()
       },
@@ -24,8 +24,10 @@ struct BufferbloatLifecycleTests {
     let task = Task {
       try await runner.run()
     }
+    // A runner still waiting when the test gives up must not outlive it.
+    defer { task.cancel() }
 
-    await pingReadyToReturn.wait()
+    try await waitBounded("the ping reaching its return") { await pingReadyToReturn.wait() }
 
     let pendingState = await load.state
     #expect(pendingState.didStart)
@@ -46,7 +48,7 @@ struct BufferbloatLifecycleTests {
     let load = SuspendingOperationProbe()
     let dependencies = BufferbloatDependencies(
       ping: { _, _ in
-        await load.waitUntilStarted()
+        try await load.waitUntilStarted()
         throw StubPingError.failed
       },
       generateLoad: { _, _ in
@@ -70,12 +72,12 @@ struct BufferbloatLifecycleTests {
   }
 
   @Test("Caller cancellation stops ping and load", .timeLimit(.minutes(1)))
-  func callerCancellationStopsPingAndLoad() async {
+  func callerCancellationStopsPingAndLoad() async throws {
     let load = SuspendingOperationProbe()
     let ping = SuspendingOperationProbe()
     let dependencies = BufferbloatDependencies(
       ping: { _, _ in
-        await load.waitUntilStarted()
+        try await load.waitUntilStarted()
         await ping.run()
         try Task.checkCancellation()
         return stubPingResult()
@@ -89,8 +91,9 @@ struct BufferbloatLifecycleTests {
     let task = Task {
       try await runner.run()
     }
-    await load.waitUntilStarted()
-    await ping.waitUntilStarted()
+    defer { task.cancel() }
+    try await load.waitUntilStarted()
+    try await ping.waitUntilStarted()
     task.cancel()
 
     do {
@@ -114,12 +117,12 @@ struct BufferbloatLifecycleTests {
     "Caller cancellation after ping completion stops and awaits load",
     .timeLimit(.minutes(1))
   )
-  func callerCancellationAfterPingCompletionStopsAndAwaitsLoad() async {
+  func callerCancellationAfterPingCompletionStopsAndAwaitsLoad() async throws {
     let load = SuspendingOperationProbe()
     let pingReadyToReturn = OneShotSignal()
     let dependencies = BufferbloatDependencies(
       ping: { _, _ in
-        await load.waitUntilStarted()
+        try await load.waitUntilStarted()
         await pingReadyToReturn.signal()
         return stubPingResult()
       },
@@ -132,8 +135,10 @@ struct BufferbloatLifecycleTests {
     let task = Task {
       try await runner.run()
     }
+    // A runner still waiting when the test gives up must not outlive it.
+    defer { task.cancel() }
 
-    await pingReadyToReturn.wait()
+    try await waitBounded("the ping reaching its return") { await pingReadyToReturn.wait() }
 
     let pendingState = await load.state
     #expect(pendingState.didStart)
@@ -247,7 +252,12 @@ private actor SuspendingOperationProbe {
     didFinish = true
   }
 
-  func waitUntilStarted() async {
+  /// Bounded by ``waitBounded(_:within:_:)``, so a start that never comes fails the test.
+  nonisolated func waitUntilStarted() async throws {
+    try await waitBounded("the operation starting") { await self.waitForStart() }
+  }
+
+  private func waitForStart() async {
     guard !didStart else { return }
     await withCheckedContinuation { continuation in
       startWaiters.append(continuation)
