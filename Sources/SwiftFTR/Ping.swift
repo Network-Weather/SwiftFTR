@@ -213,11 +213,11 @@ struct PingExecutor: Sendable {
   /// instance never share identifier/sequence space (downstream contract).
   func ping(to target: String, config: PingConfig) async throws -> PingResult {
     try config.validateForOperation()
-    guard !Task.isCancelled else { throw TracerouteError.cancelled }
+    try Task.checkCancellation()
 
     // 1. Resolve target, honoring PreferredFamily.
     let resolved = try resolveHost(host: target, prefer: config.preferredFamily)
-    guard !Task.isCancelled else { throw TracerouteError.cancelled }
+    try Task.checkCancellation()
 
     // 2. Create datagram ICMP socket for the resolved family.
     let sockfd = try createICMPSocket(family: resolved.family)
@@ -227,7 +227,7 @@ struct PingExecutor: Sendable {
         closeSocket(sockfd)
       }
     }
-    guard !Task.isCancelled else { throw TracerouteError.cancelled }
+    try Task.checkCancellation()
 
     // 3. Apply interface/sourceIP bindings (operation config overrides global).
     try applyBindings(sockfd: sockfd, family: resolved.family, pingConfig: config)
@@ -238,7 +238,7 @@ struct PingExecutor: Sendable {
     // 4b. Increase receive buffer.
     var recvBufSize: Int32 = 256 * 1024
     _ = setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &recvBufSize, socklen_t(MemoryLayout<Int32>.size))
-    guard !Task.isCancelled else { throw TracerouteError.cancelled }
+    try Task.checkCancellation()
 
     // 4c. Unique identifier per ping session to avoid cross-socket collisions.
     let identifier = generateIdentifier()
@@ -855,7 +855,7 @@ final class PingOperation: @unchecked Sendable {
 
     if let currentContinuation {
       cleanupResources {
-        currentContinuation.resume(throwing: TracerouteError.cancelled)
+        currentContinuation.resume(throwing: CancellationError())
       }
     } else {
       cleanupResources()

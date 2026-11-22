@@ -203,7 +203,7 @@ private final class SocketCloseRecorder: @unchecked Sendable {
   }
 }
 
+/// A ping is cancelled only by its caller's task, so it reports `CancellationError`.
 private func isPingCancellation(_ error: any Error) -> Bool {
-  guard case TracerouteError.cancelled = error else { return false }
-  return true
+  error is CancellationError
 }

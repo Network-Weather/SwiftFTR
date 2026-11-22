@@ -309,7 +309,7 @@ struct FaultInjectionReceiveLoopTests {
     let stillArriving = replies.isRunning
 
     #expect(stillArriving, "the cancelled trace returned only once the replies stopped")
-    #expect(outcome.isCancellation, "\(outcome)")
+    #expect(outcome.isCallerCancellation, "\(outcome)")
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
     #expect(await tracer.activeTraces.isEmpty)
   }
@@ -417,7 +417,7 @@ struct FaultInjectionReceiveLoopTests {
     let stillArriving = replies.isRunning
 
     #expect(stillArriving, "the cancelled stream ended only once the replies stopped")
-    #expect(outcome.isCancellation, "\(outcome)")
+    #expect(outcome.isLibraryCancellation, "\(outcome)")
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
   }
 
@@ -531,7 +531,7 @@ struct FaultInjectionReceiveLoopTests {
     let stillArriving = replies.isRunning
 
     #expect(stillArriving, "the cancelled ping returned only once the replies stopped")
-    #expect(outcome.isCancellation, "\(outcome)")
+    #expect(outcome.isCallerCancellation, "\(outcome)")
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
   }
 
@@ -613,11 +613,17 @@ struct FaultInjectionReceiveLoopTests {
 }
 
 extension Result {
-  /// Whether this is a failure with ``TracerouteError/cancelled``.
-  fileprivate var isCancellation: Bool {
+  /// Whether this is a failure with ``TracerouteError/cancelled``: the tracer ended it.
+  fileprivate var isLibraryCancellation: Bool {
     guard case .failure(let error) = self, case .cancelled? = error as? TracerouteError else {
       return false
     }
     return true
+  }
+
+  /// Whether this is a failure with `CancellationError`: the caller's task ended it.
+  fileprivate var isCallerCancellation: Bool {
+    guard case .failure(let error) = self else { return false }
+    return error is CancellationError
   }
 }
