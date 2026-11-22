@@ -64,7 +64,7 @@ Dual-stack `tcpProbe(...)` and `udpProbe(...)`: same entry points work for both 
 
 ### ~~Stage 6 — `swift-ip2asn` dual-stack database + IPv6 ASN labels~~ *(shipped, folded into Stage 2)*
 
-- The `swift-ip2asn` floor went to `0.4.0` for dual-stack `UltraCompactDatabase.lookup`; it is now `0.5.2`.
+- The `swift-ip2asn` floor went to `0.4.0` for dual-stack `UltraCompactDatabase.lookup`; it is now `0.6.0`.
 - The remote database default is `https://pkgs.networkweather.com/db/ip2asn-v2.ultra` (dual-stack). SwiftFTR does not hard-code it: `.remote(bundledPath:url:)` with `url: nil` uses SwiftIP2ASN's `RemoteDatabase.defaultURL`.
 - The spike `Tests/TestSupport/ip2asnv6probe` (`swift run ip2asnv6probe`) checks that v6 strings dispatch to the v6 lookup against the bundled dataset.
 

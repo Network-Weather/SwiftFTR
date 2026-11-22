@@ -49,6 +49,14 @@ What an unmodified caller will see differently:
   returns while its stall is still in force, under a watchdog derived from its configuration. See
   `docs/ROBUSTNESS-TESTING.md`.
 
+### Dependencies
+
+- **SwiftIP2ASN floor raised to 0.6.0.** For `.remote` and `.hybrid(.remote)` ASN strategies, a
+  refresh no longer goes through URLSession's local HTTP cache, which fixes a warm-cache refresh
+  that could fail with HTTP 404. CIDR containment is corrected for prefixes that end inside a
+  byte (IPv4 /25, IPv6 /127). The bundled database is the 2026-11-16 build: 459,655 IPv4 ranges,
+  119,798 IPv6 ranges and 86,901 ASNs. Lookup APIs are source-compatible.
+
 0.17.1 — 2026-11-21
 -------------------
 

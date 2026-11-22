@@ -14,6 +14,8 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   edge case.
 - **The fault-injection battery exists** ([docs/ROBUSTNESS-TESTING.md](docs/ROBUSTNESS-TESTING.md)).
   What remains is the findings it left open, each with a disabled or missing test named there.
+- **Sequenced plan**: [docs/BLOCKING-IO.md](docs/BLOCKING-IO.md) orders the work into stages, each one
+  pull request, with the gates each must pass.
 - **Known unbounded waits** (#84): `traceClassified` has no overall deadline, and forward
   resolution runs `getaddrinfo` synchronously on the actor where it can be neither bounded nor
   cancelled; a 5 s resolver stall made `cancelActiveTraces()` wait 5 s (finding 5). An overall
@@ -21,8 +23,8 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   budget is what moving `getaddrinfo` onto the executor needs; a way to read executor pressure
   (queued and running operations) is the companion.
 - **DNS queries wait without limit for a free blocking-I/O worker** (finding 8). The bound needs
-  the executor to withdraw queued work that has not started, so it comes with the executor's
-  rewrite.
+  the executor to withdraw queued work that has not started, so it comes with the Request State
+  Machine stage of [docs/BLOCKING-IO.md](docs/BLOCKING-IO.md).
 - **`getPublicIPs` blocks Swift's cooperative pool** (finding 9, from code reading): it runs STUN,
   including `getaddrinfo` for each server, in plain tasks with no deadline. Move it onto the
   bounded executor under a budget.
