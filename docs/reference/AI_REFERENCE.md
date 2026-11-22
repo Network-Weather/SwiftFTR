@@ -477,6 +477,8 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult
 //   elapsed, responseCode, error, timestamp
 //   isReachable: any DNS answer (responseCode set, NXDOMAIN included), or responseCode nil with
 //   error for a malformed reply; false for silence, a refused port and local errors
+//   A reply missing question or answer records its header declares is malformed whatever its
+//   RCODE (checked before the RCODE); authority and additional sections are not checked
 //   Only a datagram carrying the query's transaction ID is a reply; others (wrong ID, under
 //   2 bytes, empty) are ignored until the timeout, so only such datagrams -> .timedOut
 //   outcome: DNSProbeOutcome, a struct with static members (switch needs `default`):

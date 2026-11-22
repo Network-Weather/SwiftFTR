@@ -78,6 +78,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | DNS transport | refused port (IPv4 and IPv6); empty datagram (ignored, so a timeout); `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
 | DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; a short datagram with the query's transaction ID (`malformedReply`); `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` from `connect` (connect seam) and `send`; other connect and send errors, an unclassified receive error and an invalid server; a stall inside the read excluded from the round trip; an unreachable error read before the send ignored; no read once the exchange has finished and closed its socket, with a second reply still queued (answered, timed out, cancelled); cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
 | DNS foreign replies | a reply with another transaction ID, then the real one, which answers with its own round trip (IPv4 and IPv6); empty and one-byte datagrams, then the real reply; only foreign replies, read while the query still waits, then a timeout and `timedOut`; a datagram with the query's ID but no valid header, still `malformedResponse` at once; a stale reply queued before the send and read after it; after a foreign datagram, a reply or refusal that comes only after the deadline, which is a timeout because each read event judges at most one datagram (query and dnsProbe); foreign replies that never stop, on a socket that never runs dry, with the deadline (IPv4 and IPv6) and cancellation still ending the query; a Team Cymru lookup answered foreign first; the blocking TXT path: a foreign and an empty datagram before the reply, a wait bounded by the time left after a foreign reply, a reply returned after the deadline (as the first read, or after a foreign one) taken as a timeout and the next server tried, and an endless feed | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, CymruDNSResolver, `DNSClient.queryTXTBlocking` | `DNSForeignReplyTests` |
+| DNS error replies | well-formed NXDOMAIN (SOA in authority; CNAME chain), SERVFAIL and REFUSED (question echoed; header only) keep their response code; the same codes with a declared answer record missing or cut short, or a declared question missing or cut short, are `malformedResponse` and `malformedReply` | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe | `DNSErrorReplyValidationTests` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()`, `cancelActiveTraces()`, and the caller and the tracer together, across each operation and in each stalled phase, with the exact error checked per source; a stream consumer that cancels sees a normal end and the producer closes its socket; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
@@ -86,8 +87,8 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
-Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`
-and `DNSForeignReplyTests` for the event-based DNS transport, and `CymruEventBasedTests` for the
+Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`,
+`DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport, and `CymruEventBasedTests` for the
 Team Cymru lookups on it. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
@@ -101,11 +102,10 @@ Not covered, and why:
   a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which is shared
   with every other user of SwiftIP2ASN on the machine, and the cache location cannot be redirected
   from SwiftFTR. A test would have to delete that cache.
-- **An incomplete reply with a non-zero response code** (#119). The response code is checked
-  before the answer section is parsed, so a truncated or malformed reply whose header carries
-  NXDOMAIN or SERVFAIL throws `serverError`, and `dnsProbe` reports it as
-  `outcome == .answered` with that `responseCode`, not as `.malformedReply`. This predates the
-  outcome field and is a known limitation of it; no test pins it either way.
+- **Missing authority or additional records.** A reply is checked for the question and answer
+  records its header declares, and an NXDOMAIN reply's SOA lives in the authority section, so an
+  NXDOMAIN reply whose header declares an authority record it does not carry is still reported as
+  NXDOMAIN. No response code has those sections checked, so no test stages it.
 - **The `finished` check at the top of the read handler.** Every path that finishes the exchange
   returns from the handler, and Dispatch invokes no event handler once the source is cancelled,
   so no test can enter the handler after `finish`: removing the check fails nothing.

@@ -3,6 +3,22 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Behavior changes
+
+- **A DNS error reply that is missing records its header declares is malformed** (#119). The
+  question and answer records a reply's header declares are now checked before its response
+  code, for every code, as they already were for NOERROR. A reply with the query's transaction
+  ID, an error code such as NXDOMAIN, SERVFAIL or REFUSED, and a declared question or answer
+  record that is missing or cut short now throws `DNSError.malformedResponse` from the query
+  methods (it threw `serverError`), and `dnsProbe` reports `outcome == .malformedReply` with
+  `responseCode == nil` (it reported `.answered` with that code). `isReachable` and `rtt` are
+  unchanged. Well-formed error replies keep their code, including NXDOMAIN with an SOA in the
+  authority section and REFUSED sent as a bare header; authority and additional records are
+  not checked, for any code.
+
 0.18.0 — 2026-11-22
 -------------------
 
