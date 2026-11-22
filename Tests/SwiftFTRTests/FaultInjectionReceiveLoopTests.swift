@@ -22,9 +22,8 @@ import Testing
 /// buffer, about 64 KiB queued for the 256 KiB buffer ping sets, so a valid reply sent into the
 /// flood is queued behind it. Senders also stop at the mark rather than sending flat out: past
 /// it, they would overflow loopback's input queue and drop datagrams for every socket on the
-/// host, including other tests'. The defaults (four senders, 48 KiB) held an unbounded receive
-/// loop for the whole watchdog on an M4 in debug builds, with no loss at the IP layer; in release
-/// builds the loop sometimes escaped after a few seconds.
+/// host, including other tests'. With the defaults (four senders, 48 KiB) the IP layer lost no
+/// datagrams outside the first burst of a run.
 ///
 /// IPv4 only: on Darwin the IPv6 loopback path keeps the socket readable only about three
 /// quarters of the time, even with twelve senders, so an IPv6 flood would not hold the loop. The
@@ -240,16 +239,27 @@ final class DescriptorLog: @unchecked Sendable {
 /// Every operation runs under a watchdog, so a handler that holds its queue fails its test
 /// instead of hanging the suite. Bounds come from the operation's configuration, and the main
 /// claim of each liveness test is an event: the operation returned while the flood was still
-/// running.
+/// running. Each liveness test repeats its run ``rounds`` times.
 @Suite("FaultInjection: receive loop bounds", .serialized)
 struct FaultInjectionReceiveLoopTests {
   /// Generous: an operation that is not starved returns within its own window plus scheduling.
   static let watchdog: TimeInterval = 10
 
+  /// Independent flooded runs per liveness test. A loopback flood cannot outpace a receive loop
+  /// with certainty, because loopback delivers at about the rate the loop drains: on an M4 in a
+  /// debug build, an unbounded loop was held for the whole watchdog in roughly 70 to 100 percent
+  /// of single runs and escaped late or on time in the rest. Any held run fails the test, and a
+  /// bounded loop returns within its window every time, so extra runs cost about a second.
+  static let rounds = 3
+
   // MARK: Trace
 
   @Test("A flooded trace still ends at its receive deadline")
   func traceDeadlineUnderFlood() async throws {
+    for _ in 0..<Self.rounds { try await traceDeadlineUnderFloodRound() }
+  }
+
+  private func traceDeadlineUnderFloodRound() async throws {
     let flood = ReplyFlood()
     defer { flood.stop() }
     let network = try FakeICMPNetwork(script: flood.silentScript())
@@ -277,6 +287,10 @@ struct FaultInjectionReceiveLoopTests {
 
   @Test("Cancelling a flooded trace returns promptly")
   func traceCancelledUnderFlood() async throws {
+    for _ in 0..<Self.rounds { try await traceCancelledUnderFloodRound() }
+  }
+
+  private func traceCancelledUnderFloodRound() async throws {
     let flood = ReplyFlood()
     defer { flood.stop() }
     let network = try FakeICMPNetwork(script: flood.silentScript())
@@ -364,6 +378,10 @@ struct FaultInjectionReceiveLoopTests {
 
   @Test("A flooded stream still ends at its probe timeout")
   func streamDeadlineUnderFlood() async throws {
+    for _ in 0..<Self.rounds { try await streamDeadlineUnderFloodRound() }
+  }
+
+  private func streamDeadlineUnderFloodRound() async throws {
     let flood = ReplyFlood()
     defer { flood.stop() }
     let network = try FakeICMPNetwork(script: flood.silentScript())
@@ -392,6 +410,10 @@ struct FaultInjectionReceiveLoopTests {
 
   @Test("Cancelling a flooded stream ends it promptly")
   func streamCancelledUnderFlood() async throws {
+    for _ in 0..<Self.rounds { try await streamCancelledUnderFloodRound() }
+  }
+
+  private func streamCancelledUnderFloodRound() async throws {
     let flood = ReplyFlood()
     defer { flood.stop() }
     let network = try FakeICMPNetwork(script: flood.silentScript())
@@ -429,6 +451,10 @@ struct FaultInjectionReceiveLoopTests {
 
   @Test("A flooded stream still sends its retries")
   func streamRetryUnderFlood() async throws {
+    for _ in 0..<Self.rounds { try await streamRetryUnderFloodRound() }
+  }
+
+  private func streamRetryUnderFloodRound() async throws {
     let flood = ReplyFlood()
     defer { flood.stop() }
     let network = try FakeICMPNetwork(script: flood.silentScript())
@@ -486,6 +512,10 @@ struct FaultInjectionReceiveLoopTests {
 
   @Test("A flooded ping still sends every probe and ends at its timeout")
   func pingDeadlineUnderFlood() async throws {
+    for _ in 0..<Self.rounds { try await pingDeadlineUnderFloodRound() }
+  }
+
+  private func pingDeadlineUnderFloodRound() async throws {
     let flood = ReplyFlood()
     defer { flood.stop() }
     let network = try FakeICMPNetwork(script: flood.silentScript())
@@ -513,6 +543,10 @@ struct FaultInjectionReceiveLoopTests {
 
   @Test("Cancelling a flooded ping returns promptly")
   func pingCancelledUnderFlood() async throws {
+    for _ in 0..<Self.rounds { try await pingCancelledUnderFloodRound() }
+  }
+
+  private func pingCancelledUnderFloodRound() async throws {
     let flood = ReplyFlood()
     defer { flood.stop() }
     let network = try FakeICMPNetwork(script: flood.silentScript())
