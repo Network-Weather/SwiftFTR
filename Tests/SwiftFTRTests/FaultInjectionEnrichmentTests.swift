@@ -145,6 +145,9 @@ struct FaultInjectionEnrichmentTests {
 
         let before = lookups.value
         _ = try await measure(within: Self.watchdog) { try await tracer.trace(to: "fake.test") }
+        // The trace's hops are cached by now, so ask for an address the cache has never seen.
+        let unseen = try await measure(within: Self.watchdog) { await rdns.lookup("198.51.100.77") }
+        #expect(unseen.0 == nil)
         #expect(lookups.value == before, "the breaker should suppress further lookups")
       }
     }

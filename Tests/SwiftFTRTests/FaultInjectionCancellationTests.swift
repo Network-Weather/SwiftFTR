@@ -50,13 +50,18 @@ struct FaultInjectionCancellationTests {
     }
   }
 
-  /// Asserts the task ends with the `expected` cancellation error within ``watchdog``, or, when
-  /// `mayComplete`, returns a value within it.
+  /// Runs `cancelling`, then asserts the task ends with the `expected` cancellation error, or, when
+  /// `mayComplete`, returns a value. Both must finish within ``watchdog``, timed from before
+  /// `cancelling` starts, so a slow or stuck cancellation call fails too.
   private static func expectPromptCancellation<T: Sendable>(
-    _ task: Task<T, Error>, expected: Expected, mayComplete: Bool = false, _ label: String
+    _ task: Task<T, Error>, expected: Expected, mayComplete: Bool = false, _ label: String,
+    cancelling: @escaping @Sendable () async -> Void
   ) async {
     do {
-      _ = try await measure(within: watchdog) { try await task.value }
+      _ = try await measure(within: watchdog) {
+        await cancelling()
+        return try await task.value
+      }
       if !mayComplete { Issue.record("\(label): completed instead of being cancelled") }
     } catch let expired as WatchdogExpired {
       Issue.record("\(label): \(expired)")
@@ -91,14 +96,14 @@ struct FaultInjectionCancellationTests {
           }
           try await Task.sleep(nanoseconds: UInt64(step - 8) * 15_000_000)
         }
-        await Self.cancel(task, on: tracer, by: canceller)
-        var expected = Expected.forTrace(canceller)
-        if canceller != .taskCancel, step < 8 {
-          // A trace not yet registered cannot be reached by the tracer; its own task can.
-          task.cancel()
-          expected = .either
+        // A trace not yet registered cannot be reached by the tracer; its own task can.
+        let alsoCancelTask = canceller != .taskCancel && step < 8
+        await Self.expectPromptCancellation(
+          task, expected: alsoCancelTask ? .either : Expected.forTrace(canceller), "step \(step)"
+        ) {
+          await Self.cancel(task, on: tracer, by: canceller)
+          if alsoCancelTask { task.cancel() }
         }
-        await Self.expectPromptCancellation(task, expected: expected, "step \(step)")
       }
     }
     #expect(await tracer.activeTraces.isEmpty)
@@ -123,12 +128,12 @@ struct FaultInjectionCancellationTests {
           #expect(await eventually(within: 2) { await !tracer.activeTraces.isEmpty })
         }
         try await Task.sleep(nanoseconds: UInt64(step) * 15_000_000)
-        await Self.cancel(task, on: tracer, by: canceller)
         // Cancelling the consuming task ends iteration normally, as for any AsyncSequence, or
         // with a cancellation error. Anything else is a failure, not a cancellation.
         await Self.expectPromptCancellation(
           task, expected: Expected.forTrace(canceller), mayComplete: canceller == .taskCancel,
-          "step \(step)")
+          "step \(step)"
+        ) { await Self.cancel(task, on: tracer, by: canceller) }
       }
     }
     #expect(await eventually(within: 1) { await tracer.activeTraces.isEmpty })
@@ -152,11 +157,11 @@ struct FaultInjectionCancellationTests {
           #expect(await eventually(within: 2) { network.probes.value > before })
         }
         try await Task.sleep(nanoseconds: UInt64(step) * 20_000_000)
-        task.cancel()
         // A cancelled ping may return the partial result it has or throw a cancellation error;
         // any other error means it failed rather than being cancelled.
         await Self.expectPromptCancellation(
-          task, expected: .either, mayComplete: true, "step \(step)")
+          task, expected: .either, mayComplete: true, "step \(step)"
+        ) { task.cancel() }
       }
     }
   }
@@ -207,9 +212,9 @@ struct FaultInjectionCancellationTests {
             }
           }
           #expect(reached, "the trace never reached \(phase)")
-          await Self.cancel(task, on: tracer, by: canceller)
           await Self.expectPromptCancellation(
-            task, expected: Expected.forTrace(canceller), "\(phase)")
+            task, expected: Expected.forTrace(canceller), "\(phase)"
+          ) { await Self.cancel(task, on: tracer, by: canceller) }
         }
       }
     }
@@ -240,8 +245,9 @@ struct FaultInjectionCancellationTests {
       try await network.install {
         let task = Task { try await tracer.trace(to: "fake.test") }
         #expect(await eventually(within: 3) { started.value > 0 })
-        await Self.cancel(task, on: tracer, by: canceller)
-        await Self.expectPromptCancellation(task, expected: .handle, "reverse DNS")
+        await Self.expectPromptCancellation(task, expected: .handle, "reverse DNS") {
+          await Self.cancel(task, on: tracer, by: canceller)
+        }
       }
     }
   }
@@ -306,9 +312,9 @@ struct FaultInjectionCancellationTests {
             }
             #expect(reached, "discovery never reached \(phase)")
             let resolvedBeforeCancel = resolutions.value
-            await Self.cancel(task, on: tracer, by: canceller)
             await Self.expectPromptCancellation(
-              task, expected: canceller == .taskCancel ? .caller : .handle, "\(phase)")
+              task, expected: canceller == .taskCancel ? .caller : .handle, "\(phase)"
+            ) { await Self.cancel(task, on: tracer, by: canceller) }
             if phase == .publicIPDiscovery {
               #expect(
                 resolutions.value == resolvedBeforeCancel,
@@ -322,9 +328,10 @@ struct FaultInjectionCancellationTests {
 
   // MARK: discoverPaths publication
 
-  /// Runs `body` with a fully answered discovery in flight, held at its commit step until
-  /// `gate` opens.
+  /// Runs `body` with a discovery in flight, held at its commit step until `gate` opens. The
+  /// discovery is fully answered, or, when `failing`, every flow's resolution fails.
   private static func withDiscoveryAtCommit(
+    failing: Bool = false,
     _ body: @Sendable (SwiftFTR, Task<NetworkTopology, Error>, StallGate) async throws -> Void
   ) async throws {
     let gate = StallGate()
@@ -340,9 +347,14 @@ struct FaultInjectionCancellationTests {
       atCommit.increment()
       await gate.waitAsync(limit: 20)
     }
+    let fail: TestSeams.ResolveHost = { host, _ in
+      throw TracerouteError.resolutionFailed(host: host, details: "staged")
+    }
     try await network.install {
       try await TestSeams.$beforeMultipathCommit.withValue(hold) {
-        let task = Task { try await tracer.discoverPaths(to: "fake.test", config: config) }
+        let task = TestSeams.$resolveHost.withValue(failing ? fail : TestSeams.resolveHost) {
+          Task { try await tracer.discoverPaths(to: "fake.test", config: config) }
+        }
         let reached = await eventually(within: Self.watchdog) { atCommit.value > 0 }
         #expect(reached, "discovery never reached its commit")
         try await body(tracer, task, gate)
@@ -356,9 +368,36 @@ struct FaultInjectionCancellationTests {
     arguments: [Canceller.networkChanged, .cancelActiveTraces])
   func discoverPathsInvalidatedBeforeCommit(canceller: Canceller) async throws {
     try await Self.withDiscoveryAtCommit { tracer, task, gate in
-      await Self.cancel(task, on: tracer, by: canceller)
+      await Self.expectPromptCancellation(task, expected: .handle, "invalidated before commit") {
+        await Self.cancel(task, on: tracer, by: canceller)
+        gate.open()
+      }
+    }
+  }
+
+  @Test(
+    "A caller that cancels before discoverPaths commits gets CancellationError, unless the tracer also invalidated it",
+    arguments: [false, true])
+  func discoverPathsCallerCancelledBeforeCommit(alsoInvalidated: Bool) async throws {
+    try await Self.withDiscoveryAtCommit { tracer, task, gate in
+      await Self.expectPromptCancellation(
+        task, expected: alsoInvalidated ? .handle : .caller, "caller cancelled before commit"
+      ) {
+        task.cancel()
+        if alsoInvalidated { await tracer.cancelActiveTraces() }
+        gate.open()
+      }
+    }
+  }
+
+  @Test("A discovery that fails after the tracer began invalidating it reports the invalidation")
+  func discoverPathsFailureAfterInvalidationBegan() async throws {
+    try await Self.withDiscoveryAtCommit(failing: true) { tracer, task, gate in
+      // The first, synchronous half of cancelActiveTraces(): the handle is withdrawn, but its
+      // cancel() has not been delivered yet.
+      await tracer.withdrawActiveTraces()
       gate.open()
-      await Self.expectPromptCancellation(task, expected: .handle, "invalidated before commit")
+      await Self.expectPromptCancellation(task, expected: .handle, "failed after withdrawal") {}
     }
   }
 
@@ -391,6 +430,12 @@ struct FaultInjectionCancellationTests {
     #expect(await rdns.count == 0, "the cancelled lookup was cached")
     #expect(await !rdns.isSuppressingLookups)
   }
+}
+
+extension SwiftFTR {
+  /// Withdraws every registered handle without cancelling it, as `cancelActiveTraces()` does
+  /// before it awaits each handle's `cancel()`.
+  fileprivate func withdrawActiveTraces() { activeTraces.removeAll() }
 }
 
 /// An ASN resolver that, when told to, waits for `gate` on a thread and ignores cancellation,

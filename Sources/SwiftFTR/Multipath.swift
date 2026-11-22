@@ -576,39 +576,38 @@ extension SwiftFTR {
     activeTraces.insert(handle)
     defer { activeTraces.remove(handle) }
 
-    let topology: NetworkTopology
+    let outcome: Result<NetworkTopology, Error>
     do {
-      topology = try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
-        group.addTask {
-          try await discovery.discoverPaths(to: target, multipathConfig: config)
-        }
-        group.addTask {
-          await waitForCancellation(of: handle)
-          if await handle.isCancelled { throw TracerouteError.cancelled }
-          return nil
-        }
-        defer { group.cancelAll() }
-        while let next = try await group.next() {
-          if let topology = next { return topology }
-        }
-        throw CancellationError()
-      }
+      outcome = .success(
+        try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
+          group.addTask {
+            try await discovery.discoverPaths(to: target, multipathConfig: config)
+          }
+          group.addTask {
+            await waitForCancellation(of: handle)
+            if await handle.isCancelled { throw TracerouteError.cancelled }
+            return nil
+          }
+          defer { group.cancelAll() }
+          while let next = try await group.next() {
+            if let topology = next { return topology }
+          }
+          throw CancellationError()
+        })
     } catch {
-      // A flow interrupted by cancellation may report it either way, depending on the phase it
-      // was in. Report the source instead: the handle means a network change, the task means the
-      // caller.
-      if await handle.isCancelled { throw TracerouteError.cancelled }
-      if Task.isCancelled { throw CancellationError() }
-      throw error
+      outcome = .failure(error)
     }
 
     if let beforeCommit = TestSeams.beforeMultipathCommit { await beforeCommit() }
-    // Commit: check and return in one step on this actor, with no suspension between them.
-    // `cancelActiveTraces()` (and so `networkChanged()`) removes the handle synchronously before
-    // it cancels anything, so a topology that reaches this point after an invalidation is
-    // discarded, and one returned here was committed before any invalidation began.
+    // Commit: decide and return in one step on this actor, with no suspension, whatever the
+    // outcome. `cancelActiveTraces()` (and so `networkChanged()`) removes the handle synchronously
+    // before it cancels anything, so a missing handle means the tracer invalidated this discovery:
+    // its topology or error is discarded and the library-side cancellation is reported, even if
+    // the caller also cancelled. Otherwise a cancelled caller gets `CancellationError`, however a
+    // flow reported it. Only then is the outcome itself returned or thrown.
     guard activeTraces.contains(handle) else { throw TracerouteError.cancelled }
-    return topology
+    if Task.isCancelled { throw CancellationError() }
+    return try outcome.get()
   }
 
   /// Runs flow workers that reuse caches without escaping the caller's task group.
