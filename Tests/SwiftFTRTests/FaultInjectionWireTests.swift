@@ -35,17 +35,22 @@ struct FaultInjectionWireTests {
     -> (Result<STUNPublicIP, Error>?, TimeInterval)
   {
     let box = ResultBox<STUNPublicIP>()
+    let duration = ResultBox<TimeInterval>()
     let (address, length) = server.address
-    let start = monotonicNow()
     let returned = await returnsWithin(timeout + 2) {
+      // Time the call itself, on the thread that makes it. Timing from the caller would add
+      // however long a loaded machine takes to start that thread, which is not STUN's doing.
+      let start = monotonicNow()
       box.set(
         Result {
           try stunGetPublicIP(
             family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
             timeout: timeout)
         })
+      duration.set(.success(monotonicNow() - start))
     }
-    return (returned ? box.value : nil, monotonicNow() - start)
+    let elapsed = (try? duration.value?.get()) ?? .infinity
+    return (returned ? box.value : nil, elapsed)
   }
 
   @Test("STUN accepts a well-formed binding response from the fixture")
