@@ -121,15 +121,19 @@ struct FaultInjectionWireTests {
     -> (Result<[__DNSAnswer], Error>?, TimeInterval)
   {
     let box = ResultBox<[__DNSAnswer]>()
-    let start = monotonicNow()
+    let duration = ResultBox<TimeInterval>()
     let returned = await returnsWithin(timeout + 2) {
+      // Timed on the calling thread, for the reason given in `runSTUN`.
+      let start = monotonicNow()
       box.set(
         Result {
           try __dnsQuery(
             server: "127.0.0.1", port: port, name: "fault.example", type: 1, timeout: timeout)
         })
+      duration.set(.success(monotonicNow() - start))
     }
-    return (returned ? box.value : nil, monotonicNow() - start)
+    let elapsed = (try? duration.value?.get()) ?? .infinity
+    return (returned ? box.value : nil, elapsed)
   }
 
   @Test("DNS accepts a well-formed answer from the fixture")
