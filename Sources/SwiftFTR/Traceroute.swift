@@ -1809,8 +1809,9 @@ private final class TraceReceiveOperation: @unchecked Sendable {
 
   private var continuation: CheckedContinuation<TraceReceiveResult, Error>?
   private var timerSource: DispatchSourceTimer?
-  /// Monotonic time at which the receive window closes, set when the sources start.
-  private var deadline: TimeInterval = .infinity
+  /// When the receive window closes, set when the sources start. The timer is scheduled on this
+  /// same value, so the timer and the read loop's check cannot disagree, even across a sleep.
+  private var deadline = DispatchTime.distantFuture
   private var recvBuffer = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
   private var cmsgBuffer = [UInt8](repeating: 0, count: 64)
 
@@ -1881,11 +1882,11 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     // Guard against setup after cancel() already completed
     if checkFinishedSync() { return }
 
-    deadline = monotonicNow() + timeout
+    deadline = .now() + timeout
     socket.startReading { self.handleRead() }
 
     let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + timeout)
+    timer.schedule(deadline: deadline)
     timer.setEventHandler { self.finish() }
     timer.activate()
     self.timerSource = timer
@@ -1894,7 +1895,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
   private func handleRead() {
     for _ in 0..<receiveBatchLimit {
       if checkFinishedSync() { return }
-      if monotonicNow() >= deadline {
+      if DispatchTime.now() >= deadline {
         finish()
         return
       }
@@ -2023,8 +2024,10 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private var continuation: CheckedContinuation<Void, Error>?
   private var deadlineTimer: DispatchSourceTimer?
   private var retryTimer: DispatchSourceTimer?
-  /// Monotonic time at which the probe timeout expires, set when the sources start.
-  private var deadline: TimeInterval = .infinity
+  /// When the probe timeout expires, set when the sources start. The deadline timer is scheduled
+  /// on this same value, so the timer and the read loop's check cannot disagree, even across a
+  /// sleep.
+  private var deadline = DispatchTime.distantFuture
   private var recvBuffer = [UInt8](repeating: 0, count: Constants.receiveBufferSize)
   private var cmsgBuffer = [UInt8](repeating: 0, count: 64)
 
@@ -2098,15 +2101,15 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     if checkFinishedSync() { return }
 
     // Read events for incoming ICMP responses
-    deadline = monotonicNow() + streamConfig.probeTimeout
+    deadline = .now() + streamConfig.probeTimeout
     socket.startReading { self.handleRead() }
 
     // Overall deadline timer
-    let deadline = DispatchSource.makeTimerSource(queue: queue)
-    deadline.schedule(deadline: .now() + streamConfig.probeTimeout)
-    deadline.setEventHandler { self.finish() }
-    deadline.activate()
-    self.deadlineTimer = deadline
+    let timer = DispatchSource.makeTimerSource(queue: queue)
+    timer.schedule(deadline: deadline)
+    timer.setEventHandler { self.finish() }
+    timer.activate()
+    self.deadlineTimer = timer
 
     // Retry timer (if configured)
     if let retryAfter = streamConfig.retryAfter {
@@ -2121,7 +2124,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private func handleRead() {
     for _ in 0..<receiveBatchLimit {
       if checkFinishedSync() { return }
-      if monotonicNow() >= deadline {
+      if DispatchTime.now() >= deadline {
         finish()
         return
       }

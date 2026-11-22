@@ -469,8 +469,9 @@ final class PingOperation: @unchecked Sendable {
   private var continuation: CheckedContinuation<PingResult, Error>?
   private var readSource: DispatchSourceRead?
   private var timerSource: DispatchSourceTimer?
-  /// When `timerSource` is due, on `monotonicTime`'s clock. Queue-owned; moved with the timer.
-  private var receiveDeadline: TimeInterval = .infinity
+  /// When `timerSource` is due. Queue-owned. The timer is always scheduled on this same value, so
+  /// the timer and the read loop's check cannot disagree.
+  private var receiveDeadline = DispatchTime.distantFuture
 
   // Queue-owned operation data.
   private var sentTimes: [Int: TimeInterval] = [:]
@@ -607,9 +608,9 @@ final class PingOperation: @unchecked Sendable {
     // but seq=2 isn't scheduled to send until t=2.0).
     let safetyBudget =
       2.0 * (Double(max(config.count - 1, 0)) * max(config.interval, 0) + config.timeout) + 5.0
-    receiveDeadline = monotonicTime() + safetyBudget
+    receiveDeadline = .now() + .nanoseconds(Int(safetyBudget * 1_000_000_000))
     let timer = DispatchSource.makeTimerSource(queue: queue)
-    timer.schedule(deadline: .now() + .nanoseconds(Int(safetyBudget * 1_000_000_000)))
+    timer.schedule(deadline: receiveDeadline)
     timer.setEventHandler { self.finishNormally() }
     timer.activate()
     self.timerSource = timer
@@ -694,9 +695,8 @@ final class PingOperation: @unchecked Sendable {
 
     let nowMono = monotonicTime()
     let deadlineDelta = max(0, lastSendTime + config.timeout - nowMono)
-    receiveDeadline = lastSendTime + config.timeout
-    timerSource?.schedule(
-      deadline: .now() + .nanoseconds(Int(deadlineDelta * 1_000_000_000)))
+    receiveDeadline = .now() + .nanoseconds(Int(deadlineDelta * 1_000_000_000))
+    timerSource?.schedule(deadline: receiveDeadline)
   }
 
   /// Reads at most ``receiveBatchLimit`` datagrams, so the deadline timer, cancellation and the
@@ -705,7 +705,7 @@ final class PingOperation: @unchecked Sendable {
   private func handleRead() {
     for _ in 0..<receiveBatchLimit {
       guard isRunning, descriptorState == .open else { return }
-      if monotonicTime() >= receiveDeadline {
+      if DispatchTime.now() >= receiveDeadline {
         finishNormally()
         return
       }
