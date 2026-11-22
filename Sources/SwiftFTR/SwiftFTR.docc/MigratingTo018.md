@@ -29,16 +29,21 @@ dependencies: [
 ## discoverPaths ends on a network change
 
 **What changed.** `networkChanged()` and `cancelActiveTraces()` now end a `discoverPaths` call in
-flight, as they already ended `trace`, `traceClassified` and `traceStream`. A topology that
-finished before the invalidation but had not yet been returned is discarded as well, so a call
-that returns a topology returned it before the network changed.
+flight, as they already ended `trace`, `traceClassified` and `traceStream`. A topology or a flow
+error that arrives after the invalidation began, but before `discoverPaths` returned, is discarded
+too, so a call that returns a topology returned it before `networkChanged()` or
+`cancelActiveTraces()` started.
 
 **What a caller sees.** `discoverPaths` throws `TracerouteError.cancelled` where 0.17 returned a
 topology measured on the old network. Cancelling the calling task still throws
-`CancellationError`, so the two sources can be told apart.
+`CancellationError`, so the two sources can be told apart; when both happened, the tracer's
+`TracerouteError.cancelled` is reported.
 
-**What to change.** Catch `TracerouteError.cancelled` wherever `discoverPaths` is called, and treat
-it as "measure again on the new network", not as a failure of the network being diagnosed.
+**What to change.** Catch `TracerouteError.cancelled` wherever `discoverPaths` is called and treat
+it as "this measurement was abandoned", not as a failure of the network being diagnosed. Do not
+restart discovery from that handler: the same error follows `cancelActiveTraces()`, which a
+consumer may call to stop. Start the replacement from the code that handles the network change,
+where the reason is known.
 
 Before:
 
@@ -62,15 +67,17 @@ do {
 } catch is CancellationError {
   return
 } catch TracerouteError.cancelled {
-  // networkChanged() or cancelActiveTraces() ended it. Nothing stale was returned.
-  scheduleRediscovery(of: target)
+  // networkChanged() or cancelActiveTraces() ended it; whoever called that decides what runs next.
+  return
 } catch {
   reportFailure(error)
 }
 ```
 
-If the consumer discards topologies that complete after it calls `networkChanged()` (for example
-by comparing a generation counter of its own), that check is now redundant. It is harmless to keep.
+Keep any check the consumer already makes before it displays or stores a result, such as
+comparing a network generation counter of its own. The tracer orders its own return against
+`networkChanged()`, but not the consumer's code that runs afterwards: a topology returned just
+before the change can still reach `show(topology)` after the consumer has moved to the new network.
 
 ## A network change ends a trace waiting on reverse DNS
 
@@ -140,7 +147,9 @@ family was checked only once a worker ran the query.
 
 **What a caller sees.** The same `DNSError` case as 0.17 (`invalidTimeout`, `invalidHostname`,
 `invalidIP`, or `bindFailed` for a source address of the wrong family), but without waiting behind
-other blocking work first. `dnsProbe` reports the error in its result, as before.
+other blocking work first. `dnsProbe` throws `invalidTimeout` and `invalidHostname`, as before; it
+reports an invalid server or a wrong-family source address in the returned result's `error`, as
+before, rather than throwing.
 
 **What to change.** Nothing is required. A consumer that pairs a DNS server with a bound source
 address can check the pairing up front; a `bindFailed` for a family mismatch means the pairing is

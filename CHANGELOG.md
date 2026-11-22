@@ -7,8 +7,9 @@ Unreleased
 ----------
 
 Robustness under a failing network, found by a new offline fault-injection battery that stages
-each kind of failure phase by phase. A network change now ends every operation that is in flight,
-including `discoverPaths`, and several waits are now bounded by the caller's own configuration.
+each kind of failure phase by phase. A network change now ends every `trace`, `traceClassified`,
+`traceStream` and `discoverPaths` in flight (ping and the probes are not tied to the tracer's
+network changes), and several waits are now bounded by the caller's own configuration.
 No public API is added or removed: `swift package diagnose-api-breaking-changes v0.17.1` reports
 none. Upgrading from 0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
 
@@ -18,8 +19,9 @@ What an unmodified caller will see differently:
 
 - **`discoverPaths` throws `TracerouteError.cancelled` on `networkChanged()` and
   `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
-  measured on the old network. A topology that finished before the invalidation but had not yet
-  been returned is discarded too. Cancelling the calling task still throws `CancellationError`.
+  measured on the old network. A topology or flow error that arrives after the invalidation began
+  but before the call returned is discarded too. Cancelling the calling task still throws
+  `CancellationError`; when both happened, `TracerouteError.cancelled` is reported.
 - **A network change ends a trace waiting on reverse DNS at once.** `networkChanged()` and
   `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
   `traceClassified()`, so the trace threw `TracerouteError.cancelled` only when the slowest lookup
