@@ -1,7 +1,8 @@
 import Foundation
+@_spi(Test) import SwiftFTR
 import Testing
 
-@_spi(Test) @testable import SwiftFTR
+@testable import SwiftFTR
 
 #if canImport(Darwin)
   import Darwin
