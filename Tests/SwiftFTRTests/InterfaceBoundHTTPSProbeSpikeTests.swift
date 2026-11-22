@@ -205,7 +205,7 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
         configuration: configuration,
         dependencies: dependencies(recorder: recorder))
     }
-    await recorder.waitUntilStarted()
+    try await recorder.waitUntilStarted()
 
     operation.cancel()
 
@@ -548,7 +548,12 @@ private actor SuspendedHTTPSExecution {
     }
   }
 
-  func waitUntilStarted() async {
+  /// Bounded by ``waitBounded(_:within:_:)``, so a start that never comes fails the test.
+  nonisolated func waitUntilStarted() async throws {
+    try await waitBounded("the request starting") { await self.waitForStart() }
+  }
+
+  private func waitForStart() async {
     guard !isStarted else { return }
     await withCheckedContinuation { continuation in
       startWaiters.append(continuation)

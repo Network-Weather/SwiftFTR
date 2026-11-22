@@ -89,7 +89,7 @@ struct HTTPHeaderProbeTests {
         config: HTTPProbeConfig(url: "http://probe.test/never", timeout: 30),
         sessionConfiguration: testSessionConfiguration())
     }
-    await HTTPProbeProtocolRecorder.shared.waitUntilStarted()
+    try await HTTPProbeProtocolRecorder.shared.waitUntilStarted()
 
     let cancelledAt = Date()
     probe.cancel()
@@ -152,7 +152,12 @@ private actor HTTPProbeProtocolRecorder {
     bodyBytesDelivered += count
   }
 
-  func waitUntilStarted(count: Int = 1) async {
+  /// Bounded by ``waitBounded(_:within:_:)``, so a start that never comes fails the test.
+  nonisolated func waitUntilStarted(count: Int = 1) async throws {
+    try await waitBounded("\(count) request(s) starting") { await self.waitForStart(count: count) }
+  }
+
+  private func waitForStart(count: Int) async {
     guard startedCount < count else { return }
     await withCheckedContinuation { continuation in
       startWaiters.append((count, continuation))

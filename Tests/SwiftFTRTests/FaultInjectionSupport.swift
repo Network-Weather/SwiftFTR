@@ -144,6 +144,20 @@ private final class WatchdogRace<T: Sendable>: @unchecked Sendable {
   }
 }
 
+/// Waits for `event`, or records a failure and throws once `limit` seconds pass, so an event that
+/// never happens fails the test instead of hanging the run. The abandoned wait is left suspended.
+func waitBounded(
+  _ what: String, within limit: TimeInterval = 10,
+  _ event: @escaping @Sendable () async -> Void
+) async throws {
+  do {
+    _ = try await measure(within: limit) { await event() }
+  } catch let expired as WatchdogExpired {
+    Issue.record("\(what) never happened: \(expired)")
+    throw expired
+  }
+}
+
 /// Polls `condition` until it holds or `limit` seconds pass. Returns whether it held.
 func eventually(
   within limit: TimeInterval, _ condition: @Sendable () async -> Bool
