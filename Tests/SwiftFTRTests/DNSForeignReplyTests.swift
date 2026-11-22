@@ -611,6 +611,34 @@ struct DNSForeignReplyTests {
 
   // MARK: Blocking path
 
+  /// A blocking call made on its own thread, timed on that thread.
+  struct Blocking<T: Sendable>: Sendable {
+    let value: T
+    let startedAt: TimeInterval
+    let returnedAt: TimeInterval
+    var elapsed: TimeInterval { returnedAt - startedAt }
+  }
+
+  /// Runs the blocking `body` on a thread of its own, never on Swift's cooperative pool, under the
+  /// watchdog. A call held there would stall every other async test in the process for as long as
+  /// it blocks. `port` is bound as the DNS server port on that thread, since task-locals do not
+  /// cross to a new thread; bind any other seam inside `body` the same way.
+  static func onOwnThread<T: Sendable>(
+    port: UInt16, _ body: @escaping @Sendable () -> T
+  ) async throws -> Blocking<T> {
+    try await measure(within: Self.watchdog) {
+      await withCheckedContinuation { (continuation: CheckedContinuation<Blocking<T>, Never>) in
+        Thread.detachNewThread {
+          let startedAt = monotonicNow()
+          let value = TestSeams.$dnsServerPort.withValue(port) { body() }
+          let returnedAt = monotonicNow()
+          continuation.resume(
+            returning: Blocking(value: value, startedAt: startedAt, returnedAt: returnedAt))
+        }
+      }
+    }.0
+  }
+
   static let txtRecord: [UInt8] =
     [0xC0, 0x0C, 0, 16, 0, 1, 0, 0, 0, 60, 0, 3, 2] + Array("ok".utf8)
 
@@ -622,11 +650,9 @@ struct DNSForeignReplyTests {
     }
     defer { peer.stop() }
 
-    let (strings, _) = try await measure(within: Self.watchdog) {
-      TestSeams.$dnsServerPort.withValue(peer.port) {
-        DNSClient.queryTXTBlocking(name: "blocking.example", timeout: 5, servers: ["127.0.0.1"])
-      }
-    }
+    let strings = try await Self.onOwnThread(port: peer.port) {
+      DNSClient.queryTXTBlocking(name: "blocking.example", timeout: 5, servers: ["127.0.0.1"])
+    }.value
     #expect(strings == ["ok"])
     #expect(
       await eventually(within: Self.watchdog) { peer.sent.value == 3 }, "sent: \(peer.sent.value)")
@@ -643,16 +669,11 @@ struct DNSForeignReplyTests {
     }
     defer { peer.stop() }
 
-    // Stamped as the blocking call returns, inside the measured task.
-    let ((strings, returnedAt), _) = try await measure(within: Self.watchdog) {
-      TestSeams.$dnsServerPort.withValue(peer.port) {
-        (
-          DNSClient.queryTXTBlocking(
-            name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"]),
-          monotonicNow()
-        )
-      }
+    // Stamped on the calling thread as the blocking call returns.
+    let call = try await Self.onOwnThread(port: peer.port) {
+      DNSClient.queryTXTBlocking(name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
     }
+    let (strings, returnedAt) = (call.value, call.returnedAt)
     #expect(await eventually(within: Self.watchdog) { peer.sent.value == 2 })
     #expect(strings == nil, "the query took a reply sent after its deadline")
     // It gave up before the real reply left, so it waited only for the time it had left; a wait
@@ -720,14 +741,12 @@ struct DNSForeignReplyTests {
       return received
     }
 
-    let (strings, _) = try await measure(within: Self.watchdog) {
-      TestSeams.$dnsServerPort.withValue(peer.port) {
-        TestSeams.$receiveDatagram.withValue(receive) {
-          DNSClient.queryTXTBlocking(
-            name: "late.example", timeout: timeout, servers: ["127.0.0.1", "127.0.0.1"])
-        }
+    let strings = try await Self.onOwnThread(port: peer.port) {
+      TestSeams.$receiveDatagram.withValue(receive) {
+        DNSClient.queryTXTBlocking(
+          name: "late.example", timeout: timeout, servers: ["127.0.0.1", "127.0.0.1"])
       }
-    }
+    }.value
     #expect(record.held.value == 1, "the reply was never held past the deadline")
     #expect(strings == ["ok"], "the query took a reply read after its deadline")
     #expect(queries.value == 2)
@@ -739,12 +758,10 @@ struct DNSForeignReplyTests {
     defer { peer.stop() }
     let timeout: TimeInterval = 0.3
 
-    let (strings, elapsed) = try await measure(within: Self.watchdog) {
-      TestSeams.$dnsServerPort.withValue(peer.port) {
-        DNSClient.queryTXTBlocking(
-          name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
-      }
+    let call = try await Self.onOwnThread(port: peer.port) {
+      DNSClient.queryTXTBlocking(name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
     }
+    let (strings, elapsed) = (call.value, call.elapsed)
     // Every foreign datagram arrived well inside the receive timeout, so only a wait bounded by
     // the time left, not restarted per datagram, can have ended while the feed was still running.
     let flow = peer.keptFeeding(since: 0, minimum: 10, limit: timeout)
