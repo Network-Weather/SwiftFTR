@@ -36,10 +36,11 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
   measured on the old network. A topology or flow error that arrives after the invalidation began
   but before the call returned is discarded too. Cancelling the calling task now always
-  throws `CancellationError`. In 0.17 it depended on when the cancellation landed:
-  `CancellationError` at a checkpoint between flows, but `TracerouteError.cancelled` inside a
-  running flow, because each flow's trace reported the caller's cancellation as the tracer's.
-  When both happened, `TracerouteError.cancelled` is reported.
+  throws `CancellationError`. In 0.17 it depended on where the cancellation landed:
+  `TracerouteError.cancelled` during a flow's probe receive window, where the flow's trace
+  reported the caller's cancellation as the tracer's, and `CancellationError` at the
+  task-cancellation checkpoints inside and between flows. When both happened,
+  `TracerouteError.cancelled` is reported.
 - **A network change ends a trace waiting on reverse DNS at once.** `networkChanged()` and
   `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
   `traceClassified()`, so the trace threw `TracerouteError.cancelled` only when the slowest lookup
@@ -95,11 +96,13 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   blocking-I/O workers, which stalled reverse-DNS lookups can hold for seconds, and socket setup.
 - **Invalid DNS inputs are reported before any socket is opened.** A query with an invalid
   timeout, name or server address, or a source address of the wrong family for the server, throws
-  that error (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) at once. In 0.17 the
-  entry points already rejected an invalid timeout or name before queueing, but the server
-  address and the source address's family were checked only once a blocking-I/O worker ran the
-  query. `dnsProbe` reports an invalid server address or a wrong-family source address in its
-  result's `error` rather than throwing, as before.
+  that error (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) at once. In 0.17 some
+  of these checks ran only once a blocking-I/O worker picked up the query, so behind busy workers
+  the error could be late. Which ones depended on the entry point: `dnsProbe` checked the timeout
+  and name first, the query functions checked less up front, and the server address and the
+  source address's family always waited for a worker. `dnsProbe` reports an invalid server
+  address or a wrong-family source address in its result's `error` rather than throwing, as
+  before.
 
 **Traces and multipath**
 
@@ -168,8 +171,8 @@ the "Migrating to SwiftFTR 0.18" DocC article.
 ### Tooling
 
 - An offline fault-injection battery (`FaultInjection*Tests`) stages failing networks phase by
-  phase through task-local test seams and loopback fixtures, and asserts that every operation
-  returns while its stall is still in force, under a watchdog chosen to expire before the staged stall ends. See
+  phase through task-local test seams and loopback fixtures, with watchdogs to catch an operation
+  that does not return and result checks to catch one that returns the wrong answer. See
   `docs/ROBUSTNESS-TESTING.md`.
 - Tests that wait for a fixture to start, become ready or be cancelled, or poll until a fixture
   has run, now fail after ten seconds instead of hanging the run when that never happens (#105).
