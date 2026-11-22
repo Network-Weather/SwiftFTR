@@ -57,15 +57,20 @@ and a hop with an address can be a router that forwarded the probe or one that r
 import SwiftFTR
 
 let result = try await SwiftFTR().trace(to: "example.com")
+// ICMPUnreachableReason names the IPv4 codes; an IPv6 trace carries ICMPv6 codes, which differ.
+let isIPv4 = !(result.resolvedIP ?? "").contains(":")
 
 for hop in result.hops {
     switch hop.outcome {
     case .replied:
         print("  \(hop.ttl): \(hop.ipAddress ?? "?")")
-    case .unreachable:
-        let reason = hop.outcome.unreachableReason?.displayName ?? "unreachable"
-        let policy = hop.outcome.unreachableReason?.isAdministrative == true ? " (policy)" : ""
-        print("  \(hop.ttl): \(hop.ipAddress ?? "?") !\(reason)\(policy)")
+    case .unreachable(let code):
+        if isIPv4, let reason = hop.outcome.unreachableReason {
+            let policy = reason.isAdministrative ? " (policy)" : ""
+            print("  \(hop.ttl): \(hop.ipAddress ?? "?") !\(reason.displayName)\(policy)")
+        } else {
+            print("  \(hop.ttl): \(hop.ipAddress ?? "?") !unreachable (code \(code))")
+        }
     case .timedOut:
         print("  \(hop.ttl): * * *")
     case .notSent(let errno):
@@ -395,7 +400,7 @@ let traceTask = Task {
 
         // Early exit on some condition
         if hop.reachedDestination {
-            break  // This cancels remaining work
+            break  // Leaving the loop releases this inline stream, which cancels the trace
         }
     }
 }
@@ -1638,13 +1643,16 @@ func traceWithRetry(
 ### Resolver Strategies
 By default `traceClassified` uses `.hybrid(.embedded)`: the SwiftIP2ASN database bundled with the
 package answers first, and Team Cymru DNS is consulted only for addresses it does not cover. The
-database is loaded once per process and shared by every tracer (about 15 MB per copy).
+tracers that are alive at the same time share one loaded copy of the database (about 15 MB). The
+copy is released when the last tracer using it goes away, and the next tracer loads it again, so
+keep the tracer you preloaded alive for as long as you want the database resident.
 ```swift
+import Foundation
 import SwiftFTR
 
 // Default: local database first, DNS fallback for misses
 let tracer = SwiftFTR()
-await tracer.preloadASNDatabase()  // optional: move the one-time load off the first trace
+await tracer.preloadASNDatabase()  // optional: move the load off the first trace; keep `tracer` alive
 
 // No network for ASN lookups at all; uncovered addresses simply have no ASN
 let offline = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: .embedded))

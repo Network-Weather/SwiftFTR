@@ -105,15 +105,15 @@ public struct SwiftFTRConfig: Sendable {
     public static let defaultRDNSLookupTimeout: TimeInterval         // 5.0
 
     public let maxHops: Int                       // default 40
-    public let maxWaitMs: Int                     // default 1000
+    public let maxWaitMs: Int                     // default 1000; receive window after the send burst
     public let payloadSize: Int                   // default 56
     public let publicIP: String?                  // permanent override for classified/multipath enrichment
     public let enableLogging: Bool                // default false
     public let noReverseDNS: Bool                 // default false
     public let rdnsCacheTTL: TimeInterval?        // nil = 86400 s
     public let rdnsCacheSize: Int?                // nil = 1000 entries
-    public let rdnsLookupTimeout: TimeInterval?   // nil = 5 s per lookup (lookups run concurrently)
-    public let publicIPDiscoveryTimeout: TimeInterval?  // nil = 6 s
+    public let rdnsLookupTimeout: TimeInterval?   // nil or invalid = 5 s per lookup (lookups run concurrently)
+    public let publicIPDiscoveryTimeout: TimeInterval?  // nil or invalid = 6 s per attempt
     public let interface: String?                 // BSD name, e.g. from NetworkInterfaceDiscovery
     public let sourceIP: String?                  // must be assigned to the interface; family must match destination
     public let asnResolverStrategy: ASNResolverStrategy  // default .hybrid(.embedded)
@@ -138,11 +138,16 @@ public struct SwiftFTRConfig: Sendable {
 }
 ```
 
-Arguments must be passed in declaration order. Values are validated when an operation starts;
-invalid values throw `TracerouteError.invalidConfiguration(reason:)`. `interface`, `sourceIP`,
-`publicIP` and `maxHops` are fixed per instance, so a host that needs several binding contexts
-holds several `SwiftFTR` instances. Each instance owns its rDNS cache, cached public IP and active
-traces; the loaded ASN database and the DNS-based ASN cache are shared process-wide.
+Arguments must be passed in declaration order. Values are validated when an operation starts:
+`maxHops` outside 1...255, `maxWaitMs` below 1, `payloadSize` outside 0...65507, a negative or
+non-finite `rdnsCacheTTL`, a negative `rdnsCacheSize`, or a non-positive hybrid `fallbackTimeout`
+throws `TracerouteError.invalidConfiguration(reason:)`. The two enrichment budgets never throw: a
+`rdnsLookupTimeout` or `publicIPDiscoveryTimeout` that is zero, negative, non-finite or out of
+range is replaced by its default (5 s and 6 s respectively). `interface`, `sourceIP`, `publicIP`
+and `maxHops` are fixed per instance, so a host that needs several binding contexts holds several
+`SwiftFTR` instances. Each instance owns its rDNS cache, cached public IP and active traces; the
+DNS-based ASN cache is shared process-wide, and a loaded ASN database is shared by
+every live resolver for the same source.
 
 ### 3. TraceOptions
 
@@ -157,11 +162,16 @@ public struct TraceOptions: Sendable, Equatable {
 
 ```swift
 public enum PreferredFamily: Sendable, Codable {
-    case auto   // IP literals use their own family; hostnames take the first getaddrinfo answer
-    case v4     // throws resolutionFailed if no IPv4 address
-    case v6     // throws resolutionFailed if no IPv6 address
+    case auto   // names and literals both go through getaddrinfo; the first answer is probed
+    case v4     // IPv4 literal used as is; IPv6 literal or no IPv4 address throws resolutionFailed
+    case v6     // IPv6 literal used as is; IPv4 literal or no IPv6 address throws resolutionFailed
 }
 ```
+
+`.auto` does not force a literal's family. On an IPv6-only NAT64 network the system resolver
+synthesizes an IPv6 address for an IPv4 literal, so tracing `1.1.1.1` can probe, and report in
+`resolvedIP`, an IPv6 address. On dual-stack networks an IPv4 literal comes back unchanged. Use
+`.v4` or `.v6` to pin the family.
 
 ### 5. TraceResult and TraceHop
 
@@ -200,7 +210,7 @@ public enum HopOutcome: Sendable, Equatable, Codable {
     case replied                  // Time Exceeded, or Echo Reply from the destination
 
     public var didReceiveReply: Bool { get }                    // true for .unreachable, .replied
-    public var unreachableReason: ICMPUnreachableReason? { get } // parsed code for .unreachable
+    public var unreachableReason: ICMPUnreachableReason? { get } // IPv4 code table lookup for .unreachable
 }
 
 public enum ICMPUnreachableReason: UInt8, Sendable, CaseIterable {
@@ -212,8 +222,17 @@ public enum ICMPUnreachableReason: UInt8, Sendable, CaseIterable {
 }
 ```
 
-A TTL whose probe could not be sent is reported as `.notSent` and the trace continues. If no
-probe at all reached the wire, the trace throws instead.
+`.unreachable(code:)` carries the code exactly as received: an ICMP code on an IPv4 trace, an
+ICMPv6 code on an IPv6 trace. `ICMPUnreachableReason` names the IPv4 codes only, so
+`unreachableReason` is meaningful only when the trace's `resolvedIP` is IPv4; on an IPv6 trace,
+read the numeric code.
+
+The trace socket is non-blocking. When a send hits transient buffer pressure (`EAGAIN`,
+`EWOULDBLOCK` or `ENOBUFS`) the burst retries it within a shared 250 ms budget; a probe still
+unsent when that budget runs out is reported as `.notSent` and the trace continues. If every probe
+failed that way, the trace throws `sendFailed` instead. Any other send error (for example
+`ENETDOWN` or `EHOSTUNREACH`) aborts the trace immediately with `sendFailed(errno:)`, even if
+earlier TTLs were already sent.
 
 ### 7. ClassifiedTrace and ClassifiedHop
 
@@ -247,7 +266,10 @@ public struct ClassifiedHop: Sendable, Codable {
 
 `traceClassified` gets the client's public IP from `config.publicIP`, then the actor cache (which
 `seedPublicIP` populates), then fresh IPv4 discovery (STUN, then a DNS TXT query to
-`whoami.ds.akahelp.net`) bounded by `publicIPDiscoveryTimeout`. If discovery fails or times out,
+`whoami.ds.akahelp.net`). Each discovery attempt is bounded by `publicIPDiscoveryTimeout`, and
+there can be two: one before the trace, and, if that one finds no address, a second during
+classification. With an empty cache and stalled discovery, a classified trace can therefore spend
+up to twice `publicIPDiscoveryTimeout` on public-IP discovery. If both fail or time out,
 classification proceeds without a public IP.
 
 ### 8. HopCategory
@@ -263,17 +285,29 @@ public enum HopCategory: String, Sendable, Codable {   // not CaseIterable
 }
 ```
 
-How the classifier assigns categories (`Sources/SwiftFTR/Segmentation.swift`):
-- **DESTINATION**: the hop's address equals the destination IP, or its ASN equals the destination's ASN.
-- **ISP**: ASN equals the client's ASN (from the public IP); CGNAT (100.64.0.0/10) outside a VPN
-  trace; non-global addresses seen after the first public hop.
-- **LOCAL**: non-global, non-CGNAT addresses before any public hop (LAN, link-local, loopback).
-- **TRANSIT**: public addresses whose ASN matches neither side, or that have no ASN data.
-- **VPN**: in a VPN trace (auto-detected for `utun*`, `ipsec*`, `ppp*` interfaces, or via an
-  explicit `VPNContext`), non-global and CGNAT hops; also any hop that is one of the host's VPN
-  local addresses.
-- **UNKNOWN**: hops with no address that could not be filled. A run of non-responding hops between
-  two hops of the same category takes that category (and the ASN, if both sides share it).
+How the classifier assigns categories (`Sources/SwiftFTR/Segmentation.swift`), checked in this
+order for each hop with an address:
+
+1. **Exact matches**: a hop whose address equals the destination IP is DESTINATION; one that is
+   among the host's VPN local addresses is VPN. These win over every rule below.
+2. **Non-VPN trace**:
+   - non-global, non-CGNAT addresses (LAN, link-local, loopback) are LOCAL before the first public
+     hop and ISP after it;
+   - CGNAT (100.64.0.0/10) is ISP;
+   - a public address whose ASN equals the client's ASN (from the public IP) is ISP; this is
+     checked before the destination ASN, so when client and destination share an ASN, an
+     intermediate public hop in it is ISP;
+   - otherwise a public address whose ASN equals the destination's ASN is DESTINATION;
+   - any other public address, or one with no ASN data, is TRANSIT.
+3. **VPN trace** (an explicit `VPNContext` says so, or the configured `interface` name starts
+   with `utun`, `ipsec`, `ppp`, `tun`, `tap`, `wg`, `gpd` or `ztun`):
+   - non-global addresses, CGNAT included, are VPN;
+   - a public address whose ASN equals the destination's ASN is DESTINATION;
+   - every other public address is TRANSIT, including one in the client's ASN: the client ASN
+     does not produce ISP on a VPN trace.
+
+Hops with no address are UNKNOWN. A run of them between two hops of the same category takes that
+category (and the ASN, if both sides share it).
 
 ### 9. VPNContext
 
@@ -347,9 +381,12 @@ public struct HybridASNResolver: ASNResolver {
 ```
 
 Despite the parameter name `ipv4Addrs`, the built-in resolvers accept IPv6 strings too; only
-globally routable addresses get ASN data. The embedded database is loaded once per process and
-shared by every resolver using it: about 15 MB per copy, with first-load process footprint around
-50 MB. Call `preloadASNDatabase()` early to move that load off the first classified trace. A
+globally routable addresses get ASN data. Resolvers for the same local source that are alive at
+the same time share one loaded copy of the database: about 15 MB, with first-load process
+footprint around 50 MB. The process-wide store holds that copy weakly, so it is released when the
+last resolver using it goes away, and the next resolver loads it again. Call `preloadASNDatabase()`
+early to move the load off the first classified trace, and keep that tracer alive for as long as
+the database should stay resident. A
 `resolver:` passed to `traceClassified` overrides the configured strategy for that call.
 
 ### 12. StreamingTraceConfig and StreamingHop
@@ -374,8 +411,13 @@ public struct StreamingHop: Sendable, Equatable {
 }
 ```
 
-Hops arrive in arrival order, not TTL order; streaming hops carry no rDNS or ASN data. Ending the
-iteration (or cancelling the consuming task) cancels the trace.
+Hops arrive in arrival order, not TTL order; streaming hops carry no rDNS or ASN data. The trace is
+cancelled when the stream terminates: when the task iterating it is cancelled, or when the stream
+and its iterator are released. Breaking out of a `for try await` loop over
+`tracer.traceStream(...)` written inline releases the stream and so stops the trace. Breaking out
+of a loop over a stream held in a variable does not: the producer keeps its socket open and keeps
+re-probing until the stream finishes or is released. To stop a trace explicitly, cancel the
+consuming task or call `cancelActiveTraces()`.
 
 ### 13. Ping
 
@@ -447,7 +489,10 @@ public struct DNSQueries: Sendable {          // via tracer.dns
 
 public struct DNSQueryResult: Sendable { query, queryType, server, records: [DNSRecord], rttMs: Double, timestamp }
 public struct DNSRecord: Sendable { name, type: DNSRecordType, recordClass, ttl: UInt32, data: DNSRecordData }
-public enum DNSRecordType: UInt16 { case a, ns, cname, soa, ptr, mx, txt, aaaa, srv, https, caa }
+public enum DNSRecordType: UInt16, Sendable {   // raw values are the DNS wire type codes
+    case a = 1, ns = 2, cname = 5, soa = 6, ptr = 12, mx = 15, txt = 16, aaaa = 28, srv = 33,
+         https = 65, caa = 257
+}
 public enum DNSRecordData: Sendable {
     case ipv4(String), ipv6(String), hostname(String)          // hostname: PTR, NS, CNAME
     case mx(priority: UInt16, exchange: String)
@@ -525,7 +570,9 @@ public struct BufferbloatConfig: Sendable {
                 uploadURL: String? = nil, downloadURL: String? = nil,
                 interface: String? = nil, sourceIP: String? = nil)
 }
-public enum LoadType: String { case upload, download, bidirectional }
+public enum LoadType: String, Sendable, Codable {   // raw and Codable values are capitalized
+    case upload = "Upload", download = "Download", bidirectional = "Bidirectional"
+}
 public struct BufferbloatResult: Sendable, Codable {
     target, loadType, baseline: LatencyMeasurements, loaded: LatencyMeasurements,
     latencyIncrease: LatencyIncrease, rpm: RPMScore?, grade: BufferbloatGrade,
@@ -604,6 +651,7 @@ let result = try await tracer.trace(to: "example.com")
 
 print("Target: \(result.destination) (\(result.resolvedIP ?? "?"))")
 print("Reached: \(result.reached), hops: \(result.hops.count), \(result.duration)s")
+let isIPv4 = !(result.resolvedIP ?? "").contains(":")  // reason names cover IPv4 codes only
 
 for hop in result.hops {
     switch hop.outcome {
@@ -611,7 +659,13 @@ for hop in result.hops {
         let ms = (hop.rtt ?? 0) * 1000
         var line = "\(hop.ttl)\t\(hop.ipAddress ?? "?")\t\(String(format: "%.2f ms", ms))"
         if let hostname = hop.hostname { line += "\t\(hostname)" }
-        if let reason = hop.outcome.unreachableReason { line += "\t!\(reason.displayName)" }
+        if case .unreachable(let code) = hop.outcome {
+            if isIPv4, let reason = hop.outcome.unreachableReason {
+                line += "\t!\(reason.displayName)"
+            } else {
+                line += "\t!unreachable (code \(code))"
+            }
+        }
         print(line)
     case .timedOut:
         print("\(hop.ttl)\t*")
@@ -702,9 +756,14 @@ func analyze(_ result: TraceResult) -> [String] {
         issues.append("\(notSent.count) probes never left the host (send pressure)")
     }
 
+    // ICMPUnreachableReason names IPv4 codes; report ICMPv6 codes numerically.
+    let isIPv4 = !(result.resolvedIP ?? "").contains(":")
     for hop in result.hops {
-        if let reason = hop.outcome.unreachableReason {
+        guard case .unreachable(let code) = hop.outcome else { continue }
+        if isIPv4, let reason = hop.outcome.unreachableReason {
             issues.append("TTL \(hop.ttl): \(reason.displayName)\(reason.isAdministrative ? " (policy)" : "")")
+        } else {
+            issues.append("TTL \(hop.ttl): unreachable (code \(code))")
         }
     }
 
@@ -908,15 +967,21 @@ struct TraceView: View {
 
 ## Performance and Caching
 
-- **Probe phase**: all TTLs are sent in one burst and the trace waits once, so the probe phase is
-  bounded by `maxWaitMs`, not by hop count.
+- **Probe phase**: all TTLs are sent in one burst, then the trace waits once for replies, for up
+  to `maxWaitMs` (less if the destination and every earlier hop answer first). The receive window
+  does not grow with hop count. The burst itself can take up to 250 ms more when sends hit
+  transient buffer pressure, and that time is not counted against `maxWaitMs`.
 - **rDNS phase**: lookups run concurrently, each bounded by `rdnsLookupTimeout` (default 5 s).
   Results are cached per instance (TTL 86400 s, 1000 entries by default).
-- **Public IP** (classified trace and multipath only): bounded by `publicIPDiscoveryTimeout`
-  (default 6 s); cached per instance until invalidated. Multipath reuses an existing cached value
-  but does not write its own discoveries back.
-- **ASN**: the embedded database answers locally (microseconds per lookup after the one-time
-  load). DNS-based results are cached process-wide with a soft cap of 2048 entries. ASN caches
+- **Public IP** (classified trace and multipath only): each discovery attempt is bounded by
+  `publicIPDiscoveryTimeout` (default 6 s), and a classified trace makes up to two attempts (before
+  the trace, then again during classification if the first found nothing). A discovered address is
+  cached per instance until invalidated. Multipath reuses an existing cached value but does not
+  write its own discoveries back; with no cached value, each flow discovers on its own, and those
+  attempts use the 6 s default regardless of the instance's `publicIPDiscoveryTimeout`.
+- **ASN**: the embedded database answers locally (microseconds per lookup once loaded; it reloads
+  if every resolver holding it has been released). DNS-based results are cached process-wide with
+  a soft cap of 2048 entries. ASN caches
   are not cleared by `networkChanged()`.
 
 ## Protocols Used
