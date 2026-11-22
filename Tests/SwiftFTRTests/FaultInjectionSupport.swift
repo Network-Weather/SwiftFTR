@@ -421,7 +421,9 @@ final class FakeICMPNetwork: @unchecked Sendable {
         if reply.delay <= 0 {
           send(reply.bytes, to: source)
         } else {
-          DispatchQueue.global().asyncAfter(deadline: .now() + reply.delay) {
+          // Captured by value: `source` is a `var` (the receive writes into it), though nothing
+          // writes it once this datagram has been read.
+          DispatchQueue.global().asyncAfter(deadline: .now() + reply.delay) { [source] in
             self.send(reply.bytes, to: source)
           }
         }
