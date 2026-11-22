@@ -14,18 +14,24 @@ This package tests SwiftFTR as an external dependency to ensure the library work
 ```bash
 cd IntegrationPackage
 swift build
-swift run
+swift run   # needs ICMP and network access: traces 1.1.1.1 and 8.8.8.8
 ```
+
+The package depends on SwiftFTR by local path (`../`), so it always tests the working tree.
 
 ## CI/CD Integration
 
-This test runs automatically in GitHub Actions as part of the PR test suite. It runs on both cloud runners (build only) and self-hosted runners (full execution).
+The CI workflow (`ci.yml`) builds this package on every push to `main` and every PR, on
+GitHub-hosted runners, without running it. The Local Integration Tests workflow
+(`local-integration-tests.yml`, self-hosted runner, manual or `test-integration` label) runs it
+with `swift run`.
 
 ## Test Coverage
 
 1. **Import Test** - Verifies SwiftFTR can be imported
-2. **Basic Trace** - Performs a simple traceroute
-3. **Configuration API** - Tests SwiftFTRConfig
-4. **Error Handling** - Validates error types are accessible
+2. **Basic Trace** - Traces 1.1.1.1 and requires that it is reached with responsive hops
+3. **Classified Trace** - Classifies a trace to 8.8.8.8 and checks its segments
+4. **Configuration API** - Tests SwiftFTRConfig
+5. **Error Handling** - Validates error types are accessible
 
 This ensures the library works correctly as a third-party dependency.

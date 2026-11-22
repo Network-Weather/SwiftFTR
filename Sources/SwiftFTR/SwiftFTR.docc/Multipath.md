@@ -154,12 +154,15 @@ if let jsonString = String(data: jsonData, encoding: .utf8) {
 
 **The current implementation uses ICMP-based multipath discovery**, which has important limitations:
 
-- Discovery is deliberately IPv4-only; IPv6 destinations and source addresses are rejected
+- Discovery is deliberately IPv4-only: a configured `.v6` family or IPv6 source address throws
+  ``SwiftFTR/TracerouteError/invalidConfiguration(reason:)`` before any probe is sent, and a
+  destination without an IPv4 address fails to resolve
+- Interface and source-address binding come from the tracer's ``SwiftFTRConfig``
 - Many ECMP routers **do not hash ICMP ID field** for load balancing decisions
 - ICMP-based discovery may find **significantly fewer paths** than UDP-based tools
 - UDP varies destination port (5-tuple hashing) which routers actively use for ECMP
 
-**Real-world example:**
+**Real-world example** (one vantage point, measured September 2025):
 - ICMP multipath to 8.8.8.8: **1 unique path**
 - UDP multipath (dublin-traceroute) to 8.8.8.8: **7 unique paths**
 
@@ -177,6 +180,7 @@ if let jsonString = String(data: jsonData, encoding: .utf8) {
 
 - ``SwiftFTR/NetworkTopology``
 - ``SwiftFTR/DiscoveredPath``
+- ``SwiftFTR/FlowIdentifier``
 
 ### Operations
 

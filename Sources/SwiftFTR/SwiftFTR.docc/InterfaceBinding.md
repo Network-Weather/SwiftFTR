@@ -151,7 +151,7 @@ let result = try await ftr.ping(
     )
 )
 
-print("Ping via selected interface: \(result.statistics.avgRTT ?? 0)ms")
+print("Ping via selected interface: \((result.statistics.avgRTT ?? 0) * 1000) ms")
 ```
 
 ### TCP Probe
@@ -419,10 +419,10 @@ route. SwiftFTR does not claim that setting a global binding changes URLSession 
 
 SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for interface binding:
 
-- Socket option 25 (`IP_BOUND_IF`) is Darwin-specific
+- `IP_BOUND_IF` (IPv4) and `IPV6_BOUND_IF` (IPv6) are Darwin-specific
 - Takes interface index from `if_nametoindex()`
 - Applied after `socket()` but before network operations
-- Applied to ICMP, DNS, TCP, and UDP sockets by the APIs listed above
+- Applied to ICMP, DNS, TCP, UDP, and STUN sockets by the APIs listed above
 - Requires valid interface name and index
 
 The binding applies only to the ping, traceroute, TCP, UDP, DNS, and STUN sockets identified in the

@@ -18,7 +18,7 @@ change library or CLI runtime behavior.
 
 ```bash
 # minimal local example
-.build/release/swift-ftr -w 1.0 127.0.0.1
+.build/release/swift-ftr -t 1.0 127.0.0.1
 ```
 
 ## Logs / Output

@@ -2,24 +2,39 @@
 
 ## Overview
 
-SwiftFTR includes comprehensive testing to ensure reliability and performance. Tests are automatically run on all pull requests via GitHub Actions.
+SwiftFTR's tests live in `Tests/SwiftFTRTests`. Most suites use Swift Testing (`import Testing`, `@Test`); some older ones use XCTest. CI runs the offline subset on every PR and every push to `main`; live-network tests run locally or on the self-hosted runner.
 
 ## Test Categories
 
 ### 1. Unit Tests
-Standard XCTest unit tests for individual components:
+Offline and deterministic, as CI runs them:
 ```bash
-swift test
+SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug
 ```
+Drop the variables to include the live-network suites (`swift test`).
+
+#### Environment gates
+
+These variables only select tests; they do not change library or CLI behavior.
+
+| Variable | Effect |
+|---|---|
+| `SKIP_NETWORK_TESTS=1` | Skip the live-network tests; set together with `PTR_SKIP_STUN` for an offline run |
+| `PTR_SKIP_STUN=1` | Skip the public-IP (STUN) integration subset, a legacy gate |
+| `SKIP_IPV6_TESTS=1` | Force-skip the IPv6 integration tests (`IPv6Reachability.swift`) |
+| `FORCE_IPV6_TESTS=1` | Run the IPv6 integration tests without probing for a v6 path |
+
+Live-network suites take a permit from `NetworkTestGate.shared.withPermit` so they do not
+interfere with one another.
 
 ### 2. Integration Tests
-Comprehensive tests that verify the library works correctly as a whole:
+An executable that exercises the library end to end against the live network:
 ```bash
 swift run integrationtest
 ```
 
 ### 3. Stress Tests
-Tests that push the library to its limits:
+Edge cases and load (`Tests/SwiftFTRTests/StressTests.swift`; several need the network):
 ```bash
 swift test --filter StressAndEdgeCaseTests
 ```
@@ -37,8 +52,8 @@ Use the comprehensive test script:
 ./Scripts/run-all-tests.sh
 ```
 
-This script will:
-- Run all unit tests
+It needs the network. This script will:
+- Run all unit tests (`swift test --enable-code-coverage`, including live-network suites)
 - Execute integration tests
 - Test the CLI tool
 - Verify external package integration
@@ -51,16 +66,16 @@ Generate coverage reports:
 ```bash
 swift test --enable-code-coverage
 xcrun llvm-cov report \
-    .build/debug/SwiftFTRPackageTests.xctest/Contents/MacOS/SwiftFTRPackageTests \
-    -instr-profile .build/debug/codecov/default.profdata \
+    "$(swift build --show-bin-path)/SwiftFTRTests.xctest/Contents/MacOS/SwiftFTRTests" \
+    -instr-profile "$(swift test --show-codecov-path | xargs dirname)/default.profdata" \
     -ignore-filename-regex="Tests|.build"
 ```
 
 Generate HTML coverage report:
 ```bash
 xcrun llvm-cov show \
-    .build/debug/SwiftFTRPackageTests.xctest/Contents/MacOS/SwiftFTRPackageTests \
-    -instr-profile .build/debug/codecov/default.profdata \
+    "$(swift build --show-bin-path)/SwiftFTRTests.xctest/Contents/MacOS/SwiftFTRTests" \
+    -instr-profile "$(swift test --show-codecov-path | xargs dirname)/default.profdata" \
     -format=html \
     -output-dir=coverage-report \
     -ignore-filename-regex="Tests|.build"
@@ -70,15 +85,18 @@ open coverage-report/index.html
 ## CI/CD Pipeline
 
 ### Cloud Runners (GitHub-hosted)
-Automatically runs on every PR:
+`ci.yml` runs on every PR and every push to `main` (details in
+[.github/WORKFLOWS.md](../../.github/WORKFLOWS.md)):
 
-1. **Unit Tests** - All XCTest suites (works on cloud runners)
-2. **Build Verification** - Ensures all targets compile
-3. **Security Checks** - Static analysis for common issues
-4. **Documentation Build** - Ensures docs compile
+1. **Format lint** - `swift format lint --strict -r Sources Tests`
+2. **Builds** - debug and release
+3. **Offline tests** - `swift test -c debug` with `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1`
+4. **External consumers** - builds `IntegrationPackage` and `TestLibraryUsage`
+5. **Documentation** - DocC with `--warnings-as-errors`
 
 ### Self-Hosted Runners Only
-Requires self-hosted runner or manual trigger:
+`local-integration-tests.yml` (runner labels `self-hosted`, `macos`, `traceroute`; manual
+trigger or the `test-integration` PR label) runs:
 
 1. **Integration Tests** - Full traceroute tests with real network
 2. **Stress Tests** - Edge cases requiring actual network access
@@ -120,7 +138,8 @@ Tests should NOT assume:
 ## Writing New Tests
 
 ### Unit Tests
-Add to `Tests/SwiftFTRTests/`:
+Add to `Tests/SwiftFTRTests/`. Prefer Swift Testing for new suites; this XCTest form also
+works. A test that touches the network must be skippable with `SKIP_NETWORK_TESTS`:
 ```swift
 func testNewFeature() async throws {
     let config = SwiftFTRConfig(maxHops: 5)
@@ -132,7 +151,9 @@ func testNewFeature() async throws {
 ```
 
 ### Integration Tests
-Add to `Tests/IntegrationTests/`:
+There is no separate integration-test target: live-network tests also live in
+`Tests/SwiftFTRTests/`, gated on `SKIP_NETWORK_TESTS` and wrapped in `NetworkTestGate`. For
+example:
 ```swift
 func testComplexScenario() async throws {
     // Test that combines multiple features
@@ -151,7 +172,7 @@ func testComplexScenario() async throws {
 
 Before submitting a PR, ensure:
 
-- [ ] All existing tests pass: `swift test`
+- [ ] Offline tests pass: `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug`
 - [ ] Integration tests pass: `swift run integrationtest`
 - [ ] CLI works: `.build/debug/swift-ftr --help`
 - [ ] No memory leaks (run with Address Sanitizer if possible)
@@ -187,7 +208,7 @@ swift test --parallel --num-workers 8
 1. **Network Tests**: Some tests require network access and may fail in restricted environments
 2. **Timing Tests**: Performance tests may vary based on system load
 3. **ICMP Permissions**: Tests require ICMP datagram socket support (available on macOS without root)
-4. **IPv6**: Currently only IPv4 is tested as the library doesn't support IPv6 yet
+4. **IPv6**: v6 integration tests run only when a real v6 path is detected (`IPv6Reachability`); GitHub-hosted runners have none, so they skip there
 
 ## Continuous Improvement
 

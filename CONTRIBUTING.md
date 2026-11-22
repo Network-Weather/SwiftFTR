@@ -7,8 +7,10 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 - Build & test:
   ```bash
   swift build -c debug
-  swift test -c debug
+  SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug
   ```
+  Drop the two variables to include the live-network tests; see
+  [docs/development/TESTING.md](docs/development/TESTING.md).
 - Run CLI:
   ```bash
   swift build -c release
@@ -21,9 +23,10 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
 3. Ensure formatting and tests pass locally:
    ```bash
    swift format lint --strict -r Sources Tests
-   swift test -c debug
+   SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug
    ```
-4. Open a Pull Request. The CI will run format, build, tests, docs.
+4. Open a Pull Request. CI runs format lint, debug and release builds, the offline tests, the
+   external-consumer builds, and DocC with warnings as errors (see [.github/WORKFLOWS.md](.github/WORKFLOWS.md)).
 
 ## Formatting
 - We enforce Swift formatting in CI using `swift format` (Swift 6 toolchain).
@@ -49,7 +52,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
   open docc/index.html
   ```
 - Docs auto‑publish to GitHub Pages on pushes to `main`: https://swiftftr.networkweather.com/
-- Manual documentation is maintained in the `docs/` directory
+- Manual documentation is maintained in the `docs/` directory, indexed in [docs/README.md](docs/README.md); every tracked Markdown file has one index entry in a `README.md`
 - Generated DocC output goes to `docc/` (gitignored)
 
 ## Testing
@@ -63,7 +66,7 @@ Thanks for your interest in improving SwiftFTR! This guide describes how to set 
   - `fix(tracer): use monotonic clock in receive loop`
   - `docs(docc): expand TraceClassifier examples`
   - `ci(fmt): enforce swift format lint in CI`
-- Keep commits focused and descriptive. Squash on merge if there are many WIP commits.
+- Keep commits focused and descriptive. Pull requests merge with merge commits, not squash, so tidy WIP commits before review.
 
 ## PR Guidelines
 - Describe the problem and solution. Include screenshots or sample output where helpful.

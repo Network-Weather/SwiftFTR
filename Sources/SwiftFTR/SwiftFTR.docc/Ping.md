@@ -6,10 +6,14 @@ Use ``SwiftFTR/SwiftFTR`` to send ICMP echo requests for network reachability an
 
 The ping functionality provides ICMP echo request/reply support with comprehensive statistics including RTT measurements, packet loss tracking, and jitter analysis.
 
-- Single or multiple ICMP echo requests
-- Configurable count, interval, timeout, and payload size
-- Statistics: min/avg/max RTT, packet loss percentage, standard deviation, jitter
+- Single or multiple ICMP echo requests to IPv4 or IPv6 targets
+- Configurable count, interval, timeout, payload size, interface, source address, and address
+  family (``SwiftFTR/PreferredFamily``)
+- Statistics: min/avg/max RTT, packet loss fraction, and jitter (the standard deviation of the
+  received RTTs; `nil` with fewer than two replies)
 - Async/await API with structured results
+
+All RTT values are `TimeInterval` seconds; multiply by 1000 for milliseconds.
 
 ## Basic Ping
 
@@ -109,12 +113,14 @@ async let quad9 = tracer.ping(to: "9.9.9.9", config: config)
 
 let (cf, goog, q9) = try await (cloudflare, google, quad9)
 
-print("Cloudflare: \(cf.statistics.avgRTT! * 1000) ms")
-print("Google: \(goog.statistics.avgRTT! * 1000) ms")
-print("Quad9: \(q9.statistics.avgRTT! * 1000) ms")
+for (name, result) in [("Cloudflare", cf), ("Google", goog), ("Quad9", q9)] {
+    let avg = result.statistics.avgRTT.map { String(format: "%.1f ms", $0 * 1000) } ?? "no reply"
+    print("\(name): \(avg)")
+}
 ```
 
-**Performance**: 20 concurrent pings to a high-latency target complete in ~1.1s (vs ~7.2s if serialized), achieving 6.4x speedup.
+**Performance**: when concurrent ping was introduced (0.5.2), 20 concurrent pings to a
+high-latency target completed in about 1.1 s, against about 7.2 s when serialized.
 
 ## Topics
 
@@ -125,6 +131,7 @@ print("Quad9: \(q9.statistics.avgRTT! * 1000) ms")
 ### Results
 
 - ``SwiftFTR/PingResult``
+- ``SwiftFTR/PingResponse``
 - ``SwiftFTR/PingStatistics``
 
 ### Operations

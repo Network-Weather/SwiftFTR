@@ -19,11 +19,16 @@ We intentionally deviate from Swift naming conventions in specific cases:
 **Pattern:** Snake_case property names in Codable structs
 
 ```swift
+// swift-format-ignore: AlwaysUseLowerCamelCase
 struct Root: Codable {
     let target_ip: String      // ⚠️ snake_case for JSON compatibility
     let public_ip: String?
-    let country_code: String?
+    ...
+}
+struct HopObj: Codable {
     let asn_info: HopASN?
+    let rtt_ms: Double?
+    ...
 }
 ```
 
@@ -45,7 +50,7 @@ enum CodingKeys: String, CodingKey {
 
 ```swift
 @_cdecl("LLVMFuzzerTestOneInput")  // ⚠️ Required by libFuzzer
-public func LLVMFuzzerTestOneInput(_ data: UnsafePointer<UInt8>, _ size: Int) -> Int32
+public func LLVMFuzzerTestOneInput(_ dataPtr: UnsafePointer<UInt8>, _ size: Int) -> Int32
 ```
 
 **Reason:** `LLVMFuzzerTestOneInput` is a required entry point name for libFuzzer integration. Cannot be changed.
@@ -55,14 +60,18 @@ public func LLVMFuzzerTestOneInput(_ data: UnsafePointer<UInt8>, _ size: Int) ->
 **Location:** `Sources/SwiftFTR/DNS.swift`, `Sources/SwiftFTR/ICMP.swift`
 
 ```swift
-@_spi(Testing)  // Private implementation for testing
-public func __dnsEncodeQName(_ name: String) -> [UInt8]?
+@_spi(Test)  // Private implementation for testing
+public func __dnsEncodeQName(_ name: String) -> [UInt8]
 
-@_spi(Testing)
-public func __parseICMPMessage(_ data: [UInt8]) -> ParsedICMP?
+@_spi(Test)
+public func __parseICMPMessage(buffer: UnsafeRawBufferPointer, from saStorage: sockaddr_storage)
+  -> TestParsedICMP?
 ```
 
-**Reason:** Double-underscore prefix (`__`) signals these are internal/private implementation details exposed only for testing via `@_spi(Testing)`. This naming convention is common in low-level systems programming and clearly indicates "do not use directly."
+Tests and internal tools reach them with `@_spi(Test) import SwiftFTR`. The fuzzers also use a
+separate `@_spi(Fuzz)` surface.
+
+**Reason:** Double-underscore prefix (`__`) signals these are internal/private implementation details exposed only for testing via `@_spi(Test)`. This naming convention is common in low-level systems programming and clearly indicates "do not use directly."
 
 ## Format Diagnostics
 
@@ -71,8 +80,9 @@ The current tree passes strict formatting. Intentional naming exceptions use nar
 
 ## CI Enforcement
 
-GitHub Actions runs `swift format lint --strict` on every push. PRs must pass formatting checks to
-merge.
+The CI workflow runs `swift format lint --strict -r Sources Tests` on every push to `main` and every
+PR, before any build or test job. The optional pre-push hook in `.githooks/pre-push` runs the same
+command locally (`git config core.hooksPath .githooks`).
 
 ## Summary
 

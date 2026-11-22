@@ -6,10 +6,9 @@ Implemented in 0.17.0, except for sharing an `RDNSCache` between tracer
 instances, which is tracked in [ROADMAP.md](../ROADMAP.md). This document is
 the design of record for the lifecycle contract: what the actor caches, what
 invalidates it, and which controls callers get. Scope is the SwiftFTR library
-contract only. How a caller decides
-what invalidates it, and which controls callers get. How a caller decides
-*when* to invoke these controls — network identity heuristics, revalidation
-policy, telemetry — is caller policy and out of scope.
+contract only. How a caller decides *when* to invoke these controls — network
+identity heuristics, revalidation policy, telemetry — is caller policy and out
+of scope.
 
 ## Decision summary
 
@@ -29,43 +28,50 @@ The library's lifecycle controls are therefore independently callable:
 `networkChanged()` remains the conservative composition — cancel everything,
 invalidate everything — for callers without finer-grained evidence.
 
-## What exists today
+## Current behavior
 
-Verified against the current sources.
+As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
+`Utils.swift`.
 
 - `networkChanged()` bumps the cache generation, clears the cached public IP,
-  snapshots and cancels active traces, and clears the entire rDNS cache as one
-  operation (`Traceroute.swift`).
-- `invalidatePublicIP()` and `clearCaches()` have existed since v0.3.0. Public-IP
-  invalidation is already independently callable; selective rDNS eviction and
-  cancellation-without-invalidation are not.
+  snapshots and cancels active traces, and clears the entire rDNS cache. It does
+  not clear the ASN cache.
+- `clearCaches()` bumps the generation and clears the public IP and the whole
+  rDNS cache; `invalidatePublicIP()` bumps the generation and clears only the
+  public IP. Neither cancels traces.
 - `SwiftFTRConfig.publicIP` is an immutable, authoritative override: when set,
   classified traces bypass public-IP discovery entirely. It is configuration,
   not a cache.
 - Public-IP discovery is generation-guarded: a result that arrives after an
   invalidation is neither returned nor cached
   (`effectivePublicIPForClassification`).
-- `RDNSCache` holds entries for 86400 s with LRU eviction at 1000 entries,
-  caches negative results, and has a stall breaker: after two consecutive
-  lookups that consume their full deadline, further lookups are suppressed
-  until `clear()` runs. `clear()` also generation-guards against in-flight
-  lookups repopulating the cache.
+- `RDNSCache` holds entries for 86400 s with LRU eviction at 1000 entries
+  (both configurable through `SwiftFTRConfig`), caches negative results, and
+  has a stall breaker: after two consecutive lookups that consume their full
+  deadline, further lookups are suppressed until `clear()` or
+  `invalidateNetworkScoped()` runs. `clear()` also generation-guards against
+  in-flight lookups repopulating the cache.
 - The ASN cache is capacity-bounded (2048 entries) with **no TTL**; entries
   live until evicted or the cache is reset.
-- The address-scope classifier (`IPAddressScope` in `Utils.swift`) already
+- The address-scope classifier (`IPAddressScope` in `Utils.swift`)
   distinguishes global, private (RFC 1918 and IPv6 ULA), carrier-grade NAT
   (RFC 6598 `100.64.0.0/10`), link-local, and loopback for both families. It
-  is currently internal.
-- Blocking syscalls (STUN, resolver work) run on a process-global bounded
-  executor (`Utils.swift`). Work belonging to a discarded actor still occupies
-  its slots until it completes.
+  is internal; `invalidateNetworkScopedRDNS()` and `seedPublicIP(_:source:)`
+  both use it.
+- Blocking syscalls (reverse DNS, STUN and public-IP discovery, ASN and DNS
+  queries) run on a process-global executor bounded at eight concurrent
+  operations (`runDetachedBlockingIO` in `Utils.swift`). An operation whose
+  caller is cancelled or times out while it is still queued is dropped without
+  running; one already running holds its slot until the system call returns,
+  even though its caller has been released.
 
-## Why the current shape is wrong
+## Why the controls are separate
 
-`networkChanged()` couples three actions — trace cancellation, public-IP
-invalidation, and full rDNS eviction — that callers legitimately need under
-different conditions. A caller that can tell a local roam from a WAN change
-has only two options today, both bad:
+Before 0.17.0, `networkChanged()` was the only transition control, and it
+couples three actions — trace cancellation, public-IP invalidation, and full
+rDNS eviction — that callers legitimately need under different conditions. A
+caller that can tell a local roam from a WAN change had only two options, both
+bad:
 
 - **Over-invalidate.** Call `networkChanged()` for every transition. TTL-valid
   global rDNS and ASN enrichment are discarded on events that cannot have
@@ -101,7 +107,7 @@ does exactly what it says and nothing more.
 ## The controls
 
 All four additions are additive; the pre-existing overloads remain
-source-compatible.
+source-compatible. Signatures below are the shipped ones.
 
 ### `cancelActiveTraces()`
 
@@ -109,10 +115,10 @@ source-compatible.
 public func cancelActiveTraces() async
 ```
 
-The cancellation half of `networkChanged()`, with its existing
-generation-safe behavior: snapshot current handles, remove them before
-awaiting their cancellation, and leave traces registered after the snapshot
-for a later call. It must not touch the rDNS, public-IP, or ASN caches.
+The cancellation half of `networkChanged()`, with its generation-safe
+behavior: snapshot current handles, remove them before awaiting their
+cancellation, and leave traces registered after the snapshot for a later call.
+It does not touch the rDNS, public-IP, or ASN caches.
 
 ### `invalidateNetworkScopedRDNS()`
 
@@ -127,7 +133,7 @@ untouched: one network's `192.168.1.1` hostname must not appear on another
 network, but an Internet hostname does not become wrong because the WiFi
 association changed.
 
-Two semantics need care in the implementation:
+Two semantics the implementation holds to:
 
 - **In-flight lookups.** The current generation guard is cache-wide: `clear()`
   rejects every in-flight result. Selective eviction needs a scope-aware
@@ -145,30 +151,34 @@ Two semantics need care in the implementation:
 ### `seedPublicIP(_:source:)`
 
 ```swift
-public enum PublicIPSource: Sendable {
+public enum PublicIPSource: Sendable, Equatable {
     case validatedCallerCache
     case gatewayReported
 }
 
+@discardableResult
 public func seedPublicIP(
     _ address: String,
     source: PublicIPSource
-) async -> Bool
+) -> Bool
 ```
+
+It is a synchronous actor method, so callers outside the actor `await` it.
 
 A dynamic, actor-isolated way to provide a known-valid public IP so the next
 classified trace can skip discovery — distinct from the `publicIP` config
-override, which suppresses discovery permanently. The method must:
+override, which suppresses discovery permanently. The method:
 
-- accept only syntactically valid, globally routable addresses, using the
+- accepts only syntactically valid, globally routable addresses, using the
   library's scope classifier ("not RFC 1918" is insufficient — CGNAT space is
-  neither private nor publicly routable, and the check must reject every
-  non-global range for the address family);
-- reject placeholder strings by construction — there is no way to seed
+  neither private nor publicly routable, and the check rejects every
+  non-global range for the address family, plus multicast);
+- rejects placeholder strings by construction — there is no way to seed
   `"unknown"`;
-- associate the value with the cache generation current at the call, and
-  report acceptance to the caller;
-- preserve the existing discovery path when a seed is rejected.
+- stores the canonical (`inet_ntop`) form, bumps the cache generation so an
+  older in-flight discovery cannot overwrite the seed, and returns whether the
+  address was accepted;
+- leaves the discovery path unchanged when a seed is rejected.
 
 **Ordering requirement**: a seed applies to the generation current when it is
 made. A caller that invalidates (bumping the generation) after validating a
@@ -177,23 +187,26 @@ Callers must therefore order invalidate-then-seed for the same transition; if
 that ordering cannot be guaranteed, a generation-token variant is the
 fallback (see Open decisions).
 
-If this API is not added, callers should accept one bounded discovery per
-measurement context rather than reconstruct the actor with an override.
-
 ### Per-operation trace options
 
 ```swift
-public struct TraceOptions: Sendable {
+public struct TraceOptions: Sendable, Equatable {
     public var maxHops: Int?
+    public init(maxHops: Int? = nil)
 }
+
+public func trace(to host: String, options: TraceOptions) async throws -> TraceResult
 
 public func traceClassified(
     to host: String,
     vpnContext: VPNContext? = nil,
     resolver: ASNResolver? = nil,
-    options: TraceOptions = .init()
+    options: TraceOptions
 ) async throws -> ClassifiedTrace
 ```
+
+These are overloads: the pre-existing `trace(to:)` and
+`traceClassified(to:vpnContext:resolver:)` remain and pass `TraceOptions()`.
 
 There is no universal correct `maxHops`; a caller that tracks path stability
 can bound probe cost per trace. The override is validated against the

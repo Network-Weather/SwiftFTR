@@ -1,5 +1,10 @@
 # Concurrency Unblocking Plan
 
+> **Historical plan** from the 0.8.0 work (#8). Much of it is visible in the tree today:
+> `@concurrent` on the async entry points across the probe, ping, DNS, ASN and trace files,
+> `NetworkTestGate`, `ActorSchedulingTests` and `PingParallelismTests`. Each deliverable has not
+> been audited one by one. `ProbeConcurrencyTests`, named below, does not exist.
+
 ## Context
 Tests in `Tests/SwiftFTRTests/ActorSchedulingTests.swift` expose two core problems:
 1. `Task {}` spawned from the `SwiftFTR` actor inherits the actor executor, so receiver loops inside `PingExecutor` do not start until the actor finishes synchronous work (e.g., tight send loops or bufferbloat orchestration). This causes wall-clock latency to scale with `count` rather than RTT.

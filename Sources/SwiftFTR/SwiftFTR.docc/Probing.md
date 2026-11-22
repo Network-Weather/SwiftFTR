@@ -1,17 +1,19 @@
 # Probing
 
-Use ``SwiftFTR/SwiftFTR`` to test network reachability with TCP, UDP, HTTP, and DNS probes.
+Test network reachability with TCP, UDP, HTTP, and DNS probes.
 
 ## Overview
 
-SwiftFTR provides four probe types for testing reachability without requiring elevated privileges. Each probe type is designed for a different use case and returns structured results with timing information.
+SwiftFTR provides four probe types for testing reachability without requiring elevated privileges. Each probe type is designed for a different use case and returns structured results with timing information. The probes are module-level functions, so they need no ``SwiftFTR/SwiftFTR`` instance and do not inherit its ``SwiftFTRConfig``.
 
-- **TCP Probe**: Port state detection — distinguishes open (SYN-ACK), closed (RST), and filtered (timeout)
-- **UDP Probe**: Connected-socket trick with ICMP unreachable detection
-- **HTTP Probe**: Web server reachability via URLSession, including TLS timing
-- **DNS Probe**: Direct DNS server queries with 11 record types
+- **TCP Probe** (``tcpProbe(config:)``): Port state detection — distinguishes open (SYN-ACK), closed (RST), and filtered (timeout)
+- **UDP Probe** (``udpProbe(config:)``): Connected-socket trick with ICMP unreachable detection
+- **HTTP Probe** (``httpProbe(config:)``): Web server reachability via URLSession, with best-effort network and TCP-handshake timing
+- **DNS Probe** (``dnsProbe(config:)``): DNS server reachability; for record lookups across 11 record types, use ``SwiftFTR/SwiftFTR/dns`` instead
 
-All probes share a common pattern: configure, call, and inspect the result. Each returns a `Codable` result struct with `isReachable`, RTT, and protocol-specific details.
+All probes share a common pattern: configure, call, and inspect the result. Each returns a `Codable` result struct with `isReachable`, RTT, and protocol-specific details. Each also has a convenience overload taking the host (or URL, or server) and timeout directly, such as `tcpProbe(host:port:timeout:)`.
+
+Invalid numeric settings throw ``SwiftFTR/TracerouteError/invalidConfiguration(reason:)`` from the TCP and UDP probes, and ``SwiftFTR/DNSError`` from the DNS probe. The HTTP probe reports invalid input, failures, and cancellation in its result's `error` field rather than throwing. Cancelling the calling task makes the TCP and UDP probes throw `CancellationError`.
 
 ## TCP Probe
 
@@ -121,21 +123,25 @@ uses system routing; the binding begins at the probe socket.
 
 ### TCP Probing
 
+- ``tcpProbe(config:)``
 - ``TCPProbeConfig``
 - ``TCPProbeResult``
 - ``TCPConnectionState``
 
 ### UDP Probing
 
+- ``udpProbe(config:)``
 - ``UDPProbeConfig``
 - ``UDPProbeResult``
 
 ### HTTP Probing
 
+- ``httpProbe(config:)``
 - ``HTTPProbeConfig``
 - ``HTTPProbeResult``
 
 ### DNS Probing
 
+- ``dnsProbe(config:)``
 - ``DNSProbeConfig``
 - ``DNSProbeResult``

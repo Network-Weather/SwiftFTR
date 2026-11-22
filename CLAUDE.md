@@ -49,13 +49,13 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - Main `actor` coordinating all operations; thread-safe without `@MainActor`
 - Manages active traces via `TraceHandle` for cancellation support
 - Public APIs: `trace()`, `traceClassified()`, `traceStream()`, `ping()`, `discoverPaths()`, plus probe APIs
-- `networkChanged()` invalidates all caches and cancels active traces
+- `networkChanged()` cancels active traces and clears the public-IP and rDNS caches (not the ASN cache); finer controls: `cancelActiveTraces()`, `invalidatePublicIP()`, `invalidateNetworkScopedRDNS()`, `seedPublicIP(_:source:)`
 
 **ICMP Module** (`Sources/SwiftFTR/ICMP.swift`)
 - `SOCK_DGRAM` + `IPPROTO_ICMP` socket (no root required on macOS)
 - Parallel probe: sends all TTL probes in one burst, listens with `DispatchSourceRead` (kqueue-backed)
 - Monotonic clock (`CLOCK_MONOTONIC`) timing for accurate RTT
-- `@_spi(Testing)` exposes `__parseICMPMessage` for unit tests
+- `@_spi(Test)` exposes `__parseICMPMessage` for unit tests
 
 **Classification System** (`Sources/SwiftFTR/Segmentation.swift`)
 - `TraceClassifier` categorizes hops: LOCAL, ISP, TRANSIT, VPN, DESTINATION
@@ -70,7 +70,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - `Ping.swift`: ICMP echo with statistics (min/avg/max RTT, jitter, packet loss)
 - `TCPProbe.swift`: Port state detection (open/closed/filtered)
 - `UDPProbe.swift`: Connected-socket with ICMP unreachable detection
-- `DNS.swift`: Direct server queries with 11 record types; `@_spi(Testing)` exposes `__dnsEncodeQName`
+- `DNS.swift`: Direct server queries with 11 record types; `@_spi(Test)` exposes `__dnsEncodeQName`
 - `HTTPProbe.swift`: Web server reachability via URLSession
 - `StreamingTrace.swift`: `AsyncThrowingStream`-based real-time hop delivery
 - `Multipath.swift`: Dublin Traceroute-style ECMP path enumeration
@@ -94,6 +94,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 |---|---|
 | `PTR_SKIP_STUN=1` | Skip the public-IP integration-test subset using this legacy gate; no runtime effect |
 | `SKIP_NETWORK_TESTS=1` | Skip the remaining live-network tests; set both variables for an offline run |
+| `SKIP_IPV6_TESTS=1` / `FORCE_IPV6_TESTS=1` | Force-skip or force-run the IPv6 integration tests instead of probing for a v6 path |
 | `SWIFTFTR_VERBOSE_HTTP_TIMING=1` | Verbose HTTP probe timing logs |
 | `SWIFTFTR_DEBUG_MULTIPATH` | Debug output for multipath discovery |
 
@@ -117,7 +118,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - **Naming**: camelCase with documented exceptions:
   - snake_case JSON properties in `Sources/swift-ftr/main.swift` (public API backward compat)
   - `LLVMFuzzerTestOneInput` (libFuzzer requirement)
-  - `__`-prefixed `@_spi(Testing)` helpers (internal testing exposure)
+  - `__`-prefixed `@_spi(Test)` helpers (internal testing exposure)
 - **Commits**: Conventional Commits with scopes (`feat(tracer):`, `fix(dns):`, `docs:`)
 - **Dependencies**: SwiftPM only — `swift-argument-parser`, `swift-docc-plugin`, `swift-ip2asn`
 

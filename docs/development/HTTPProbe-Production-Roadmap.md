@@ -2,6 +2,10 @@
 
 ## Status
 
+> As of 0.17.1 none of the six PRs below has landed: public `httpProbe(config:)` still uses
+> URLSession with system routing, and the `NWConnection` transport exists only in
+> `InterfaceBoundHTTPSProbeSpike.swift`. This plan is not yet referenced from `ROADMAP.md`.
+
 PR #53 establishes that `NWConnection` can perform a bounded HTTPS header probe on one exact,
 caller-selected interface while preserving the logical hostname for TLS SNI, certificate
 validation, and the HTTP `Host` field. Its release-binary cost is acceptable.

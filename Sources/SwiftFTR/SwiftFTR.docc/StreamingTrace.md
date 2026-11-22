@@ -11,6 +11,9 @@ Key differences from ``SwiftFTR/SwiftFTR/trace(to:)``:
 - Each hop is delivered as a ``StreamingHop`` via `AsyncThrowingStream`
 - Unresponsive TTLs are automatically retried after a configurable delay
 - Timeout placeholders are emitted at the end for any TTLs that never responded
+- A probe that never left the host is emitted immediately with a
+  ``SwiftFTR/HopOutcome/notSent(errno:)`` outcome, since the failed send is known at once
+- Hops carry no hostname or ASN data; enrich them yourself if you need it
 
 ## Basic Usage
 
@@ -33,6 +36,9 @@ for try await hop in tracer.traceStream(to: "1.1.1.1") {
 ```
 
 ## Custom Configuration
+
+The defaults are a 10 s `probeTimeout`, a 4 s `retryAfter`, `emitTimeouts: true`, and 40
+`maxHops`. Interface and source-address binding come from the tracer's ``SwiftFTRConfig``.
 
 ```swift
 let config = StreamingTraceConfig(

@@ -8,9 +8,17 @@ Bufferbloat occurs when excessive buffering in network equipment causes high lat
 
 The ``SwiftFTR/SwiftFTR/testBufferbloat(config:)`` API measures:
 1. **Baseline latency** — ping RTT on an idle network
-2. **Loaded latency** — ping RTT while saturating the connection with parallel TCP streams
-3. **Latency increase** — the difference, graded A through F
-4. **RPM score** — Round-trips Per Minute, the Apple/IETF responsiveness metric
+2. **Loaded latency** — ping RTT while saturating the connection with parallel URLSession HTTP
+   uploads and/or downloads
+3. **Latency increase** — the rise in average RTT from baseline to loaded, graded A through F
+4. **RPM score** — Round-trips Per Minute, computed as 60 divided by the average ping RTT and
+   graded with the IETF responsiveness thresholds. It is derived from ICMP ping, not from the
+   HTTP/TLS transactions that the IETF responsiveness test (and Apple's `networkQuality`) measure,
+   so the figures are not directly comparable.
+
+By default the download load comes from `speed.cloudflare.com` and the upload load goes to
+`httpbin.org`; set `downloadURL` and `uploadURL` on ``BufferbloatConfig`` to use your own
+endpoints.
 
 ## Quick Test
 
@@ -21,9 +29,9 @@ let tracer = SwiftFTR()
 let result = try await tracer.testBufferbloat()
 
 print("Grade: \(result.grade.rawValue)")           // A, B, C, D, or F
-print("Baseline: \(result.baseline.p50Ms) ms")
-print("Loaded: \(result.loaded.p50Ms) ms")
-print("Increase: \(result.latencyIncrease.absoluteMs) ms")
+print("Baseline: \(result.baseline.avgMs) ms avg")
+print("Loaded: \(result.loaded.avgMs) ms avg")
+print("Increase: \(result.latencyIncrease.absoluteMs) ms")  // loaded avg − baseline avg
 
 if let rpm = result.rpm {
     print("Working RPM: \(rpm.workingRPM) (\(rpm.grade.rawValue))")
@@ -32,14 +40,16 @@ if let rpm = result.rpm {
 
 ## Custom Configuration
 
+The values below are the defaults, except that `pingInterval` (default 0.1 s) is omitted.
+
 ```swift
 let config = BufferbloatConfig(
     target: "1.1.1.1",             // Ping target
     baselineDuration: 5.0,          // Seconds of idle measurement
     loadDuration: 10.0,             // Seconds of loaded measurement
     loadType: .bidirectional,       // .upload, .download, or .bidirectional
-    parallelStreams: 4,             // TCP streams per direction
-    calculateRPM: true             // Compute RPM score
+    parallelStreams: 4,             // HTTP streams per direction
+    calculateRPM: true              // Compute RPM score
 )
 
 let result = try await tracer.testBufferbloat(config: config)
@@ -82,17 +92,23 @@ would not be a valid bufferbloat measurement.
 
 ## Grading Scale
 
-| Grade | Latency Increase | Video Call Impact |
+The grade is based on the increase in average RTT. A test with no ping replies in either phase is
+graded F.
+
+| Grade | Latency Increase | Video Call Severity |
 |-------|-------------------|-------------------|
-| A     | < 25 ms           | Excellent — no issues expected |
-| B     | 25–75 ms          | Good — occasional minor glitches possible |
-| C     | 75–150 ms         | Fair — noticeable quality degradation |
-| D     | 150–300 ms        | Poor — frequent freezing and audio drops |
-| F     | ≥ 300 ms          | Failing — calls essentially unusable under load |
+| A     | < 25 ms           | None (when loaded jitter is under 30 ms) |
+| B     | 25–75 ms          | Minor (when loaded jitter is under 50 ms) |
+| C     | 75–150 ms         | Moderate |
+| D     | 150–300 ms        | Severe |
+| F     | ≥ 300 ms          | Severe |
 
 ## Video Call Impact
 
-The result includes a ``VideoCallImpact`` assessment with severity and a human-readable description:
+The result includes a ``VideoCallImpact`` assessment with severity and a human-readable description.
+Severity follows the grade and the loaded-phase jitter as in the table above; an A or B grade with
+higher jitter than shown is reported as Moderate. `impactsVideoCalls` is `true` when the grade is D
+or F, loaded jitter exceeds 50 ms, or the working RPM is below 1000.
 
 ```swift
 let impact = result.videoCallImpact
@@ -113,6 +129,9 @@ print("Description: \(impact.description)")
 - ``BufferbloatGrade``
 - ``LatencyMeasurements``
 - ``LatencyIncrease``
+- ``BufferbloatPingResult``
+- ``TestPhase``
+- ``LoadGenerationDetails``
 
 ### Responsiveness
 

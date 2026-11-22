@@ -4,6 +4,14 @@ Measured constraints on the `errno=35` failures that downstream production
 telemetry attributes to `sendto` on the trace socket. This is a measurement
 record, not a plan.
 
+> **Status as of 0.17.1.** The measurements and the content-filter hypothesis stand; the
+> hypothesis is still untested. Two things this page discusses have changed since it was
+> written: `SendRetry.swift` no longer justifies the 250 ms budget with buffer
+> pressure (its comment now cites this page and calls the budget a guess against `EAGAIN`), and
+> a probe whose send budget runs out no longer aborts the trace — it is reported as
+> `HopOutcome.notSent(errno:)` and the trace continues. Source line numbers in SwiftFTR files
+> are as of that writing.
+
 **Bottom line:** on `socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)` the send buffer is pure
 accounting and never holds a byte, so it cannot fill and cannot produce `EAGAIN`.
 Interface pressure — the thing a probe burst could in principle cause — reports
@@ -277,18 +285,20 @@ there is no reason to expect it to be under 250 ms. The retry may help
 priority-inverted extension outlasts any budget). I have no measurement either
 way.
 
-What I can say: the retry is not harmful, and 250 ms is not obviously wrong. But
-the justification written into `SendRetry.swift` — "the millisecond-scale buffer
-pressure the field reports" — describes a mechanism that does not exist on this
-socket type. The constant should be re-derived once step 1 above tells us what
-the field condition actually is.
+What I can say: the retry is not harmful, and 250 ms is not obviously wrong. The
+justification originally written into `SendRetry.swift` — "the millisecond-scale
+buffer pressure the field reports" — described a mechanism that does not exist on
+this socket type; the comment has since been corrected to call the budget a
+guess. The constant should be re-derived once step 1 above tells us what the
+field condition actually is.
 
-**Separately worth noting:** the *user-visible* bug in Signal 1 is not the errno,
-it is that one failed probe aborts a 40-probe trace. A `sendto` failure on hop
+**Separately worth noting:** the *user-visible* bug in the field report was not
+the errno, it was that one failed probe aborted a 40-probe trace. A `sendto` failure on hop
 17 costs the whole topology measurement even though 39 other probes were fine.
-Recording the hop as unreachable and continuing would make the trace robust to
-this class of failure regardless of which errno turns out to be responsible, and
-without depending on a timeout constant at all.
+Recording the hop and continuing makes the trace robust to this class of
+failure regardless of which errno turns out to be responsible, and without
+depending on a timeout constant at all. That shipped in 0.16.0 as
+`HopOutcome.notSent(errno:)` (see [HOP-OUTCOME-MODEL.md](HOP-OUTCOME-MODEL.md)).
 
 ## Reproducing
 

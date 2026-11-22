@@ -70,7 +70,7 @@ Updated: 17:02:48
 - Actor-based statistics collection for thread-safe concurrent updates
 - Maintains rolling window of RTT samples (last 100) for percentile calculations
 - Jitter calculated as average of absolute differences between consecutive RTTs
-- No STUN call needed (uses placeholder public IP for faster startup)
+- No public-IP discovery: it uses plain `trace()`, which does none. (It also sets `publicIP: "0.0.0.0"`, which only matters for classified traces and multipath.)
 
 ## Technical Notes
 
@@ -78,7 +78,7 @@ Updated: 17:02:48
 - **Sample window**: Last 100 RTT measurements
 - **Concurrent execution**: All hops monitored in parallel
 - **Display update**: Every 1 second
-- **Traceroute limit**: 10 hops max (configurable in code)
+- **Traceroute limit**: 30 hops max, 1000 ms probe wait (`maxHops` and `maxWaitMs` in `main.swift`)
 
 ## Use Cases
 

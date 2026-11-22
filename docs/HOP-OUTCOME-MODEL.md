@@ -1,6 +1,11 @@
 # Per-hop outcome model
 
-Implementation plan for the ROADMAP item "Per-hop outcome model".
+Implementation plan for what was the ROADMAP item "Per-hop outcome model".
+
+> **Status: shipped in 0.16.0 (#62).** `HopOutcome` is in `Sources/SwiftFTR/HopOutcome.swift`,
+> the hop types carry `outcome`, and the CLI's JSON emits it as a snake_case token. This page
+> is kept as the design record, including why timing and address stay outside the enum. "What
+> is wrong" describes the code before that release.
 
 ## What is wrong
 
