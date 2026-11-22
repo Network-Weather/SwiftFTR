@@ -102,7 +102,7 @@ struct FaultInjectionEnrichmentTests {
             try? await tracer.discoverPublicIP()
           }
         }
-        #expect(await eventually(within: 2) { entered.value > 0 })
+        #expect(await eventually(within: Self.watchdog) { entered.value > 0 })
         // The network-change path, not the direct invalidation one (CacheGenerationTests covers that).
         await tracer.networkChanged()
         gate.open()
@@ -254,7 +254,7 @@ struct FaultInjectionEnrichmentTests {
         released.increment()
       }
     }
-    let started = await eventually(within: 2) { occupied.value > 0 }
+    let started = await eventually(within: Self.watchdog) { occupied.value > 0 }
     #expect(started, "the occupant never took the executor's slot")
     return (gate, released)
   }

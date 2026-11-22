@@ -7,6 +7,10 @@ import Testing
 #if canImport(Darwin)
   import Darwin
 
+  /// How long a probe may take to send its first datagram, or to return once cancelled. Probes
+  /// that must be cancelled have timeouts that outlast it.
+  private let cancellationWatchdog: TimeInterval = 20
+
   @Suite("UDP probe routing and lifecycle")
   struct UDPProbeBindingTests {
     @Test(
@@ -89,7 +93,7 @@ import Testing
           config: UDPProbeConfig(
             host: route.address,
             port: server.port,
-            timeout: 30,
+            timeout: 3 * cancellationWatchdog,
             interface: route.interfaceName,
             sourceIP: route.address,
             preferredFamily: .v4
@@ -97,15 +101,15 @@ import Testing
         )
       }
 
-      let (_, start) = try await cancelProbeAfterFirstDatagram(
-        from: server.datagrams,
-        probe: probe
-      )
-
-      await #expect(throws: CancellationError.self) {
-        try await probe.value
+      // The server never replies and the timeout outlasts the watchdog, so a probe that returns
+      // was ended by its cancellation. The watchdog covers the wait for the first datagram too,
+      // since that wait also ends only when the probe does.
+      let datagrams = server.datagrams
+      let (outcome, _) = try await measure(within: cancellationWatchdog) {
+        _ = try await cancelProbeAfterFirstDatagram(from: datagrams, probe: probe)
+        return await probe.result
       }
-      #expect(ContinuousClock.now - start < .seconds(1))
+      #expect(throws: CancellationError.self) { try outcome.get() }
     }
   }
 
@@ -142,7 +146,7 @@ import Testing
       }
       group.addTask {
         do {
-          try await Task.sleep(for: .seconds(1))
+          try await Task.sleep(for: .seconds(cancellationWatchdog))
           return .timedOut
         } catch {
           return .cancelled

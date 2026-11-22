@@ -13,9 +13,27 @@ import Testing
 /// Every trace here runs against ``FakeICMPNetwork``, so the probes never leave the host. The
 /// first test is the positive control: it proves the fake delivers replies the library accepts,
 /// which is what makes the silent and garbage cases below mean anything.
+///
+/// No test bounds how long an operation took from above. One that must end early, before its
+/// window, is given a window that outlasts ``watchdog``, so waiting the window out trips the
+/// watchdog. One that must end at its window keeps a lower bound, and the watchdog, many windows
+/// long, catches a deadline that does not fire.
 @Suite("FaultInjection: probe window")
 struct FaultInjectionProbeWindowTests {
   static let families: [Int32] = [AF_INET, AF_INET6]
+
+  /// How long an operation may run before it is reported as stuck. It exists so a hang fails
+  /// instead of hanging the run; no correct operation here comes near it.
+  static let watchdog: TimeInterval = 20
+
+  /// A receive window, in milliseconds, that outlasts ``watchdog``: an operation given it that
+  /// returns at all did not wait it out.
+  static let windowPastWatchdogMs = 60_000
+
+  /// A stream whose probe timeout outlasts ``watchdog`` and which never retries, for the same
+  /// purpose: the default config's 10 s timeout would end a stream inside the watchdog.
+  static let streamPastWatchdog = StreamingTraceConfig(
+    probeTimeout: TimeInterval(windowPastWatchdogMs) / 1000, retryAfter: nil)
 
   // MARK: Positive control
 
@@ -24,9 +42,11 @@ struct FaultInjectionProbeWindowTests {
     let network = try FakeICMPNetwork(
       family: family, script: pathScript(family: family, destinationTTL: 3))
     defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 8, maxWaitMs: 3000, noReverseDNS: true))
+    let tracer = offlineTracer(
+      SwiftFTRConfig(maxHops: 8, maxWaitMs: Self.windowPastWatchdogMs, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure(within: 10) {
+    // Early completion: all hops answered, so a trace that sat out its window trips the watchdog.
+    let (result, _) = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
 
@@ -34,8 +54,6 @@ struct FaultInjectionProbeWindowTests {
     #expect(result.hops.count == 3)
     #expect(result.hops.allSatisfy { $0.ipAddress == network.resolved.canonical })
     #expect(result.hops.last?.reachedDestination == true)
-    // Early completion: all hops answered, so the trace must not sit out its 3 s window.
-    #expect(elapsed < 1.5, "a fully answered trace waited \(elapsed)s")
     #expect(network.probes.value >= 3)
   }
 
@@ -47,15 +65,14 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 6, maxWaitMs: 400, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure(within: 10) {
+    let (result, elapsed) = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
 
     #expect(!result.reached)
     #expect(result.hops.count == 6)
     #expect(result.hops.allSatisfy { $0.ipAddress == nil && $0.outcome == .timedOut })
-    #expect(
-      elapsed >= 0.35 && elapsed < 2.0, "silent trace returned after \(elapsed)s, window 0.4s")
+    #expect(elapsed >= 0.35, "silent trace returned after \(elapsed)s, before its 0.4s window")
     #expect(network.probes.value == 6, "every TTL should have been sent")
   }
 
@@ -66,17 +83,17 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 300, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure(within: 10) {
+    let (result, _) = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
     #expect(!result.reached)
+    // A trace that waited for the replies would have recorded them.
     #expect(result.hops.allSatisfy { $0.ipAddress == nil })
-    #expect(elapsed < 1.5)
 
     // The late replies land after the socket is closed. Give them time to arrive, then prove the
     // tracer is still usable.
     try await Task.sleep(nanoseconds: 500_000_000)
-    let again = try await measure(within: 10) {
+    let again = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }.0
     #expect(again.hops.count == 4)
@@ -124,16 +141,18 @@ struct FaultInjectionProbeWindowTests {
       return replies
     }
     defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 5, maxWaitMs: 3000, noReverseDNS: true))
+    let tracer = offlineTracer(
+      SwiftFTRConfig(maxHops: 5, maxWaitMs: Self.windowPastWatchdogMs, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure(within: 10) {
+    // The window outlasts the watchdog, so garbage that held the trace until its window ended
+    // trips the watchdog.
+    let (result, _) = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
 
     #expect(result.reached)
     #expect(result.hops.count == 3)
     #expect(result.hops.allSatisfy { $0.ipAddress != nil })
-    #expect(elapsed < 1.5, "garbage ahead of valid replies held the trace for \(elapsed)s")
   }
 
   @Test("Random datagrams never crash the receive loop", arguments: families)
@@ -154,11 +173,10 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 6, maxWaitMs: 400, noReverseDNS: true))
 
-    let (result, elapsed) = try await measure(within: 10) {
+    let (result, _) = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }
     #expect(result.hops.count <= 6)
-    #expect(elapsed < 2.0)
   }
 
   @Test("A valid reply queued behind random datagrams is still processed", arguments: families)
@@ -176,7 +194,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 6, maxWaitMs: 2000, noReverseDNS: true))
 
-    let result = try await measure(within: 10) {
+    let result = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }.0
     #expect(result.reached, "the destination's reply was lost behind the noise")
@@ -197,7 +215,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 300, noReverseDNS: true))
 
-    let result = try await measure(within: 10) {
+    let result = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }.0
     #expect(!result.reached)
@@ -215,7 +233,7 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 3, maxWaitMs: 300, noReverseDNS: true))
 
-    let result = try await measure(within: 10) {
+    let result = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }.0
     #expect(!result.reached)
@@ -229,23 +247,25 @@ struct FaultInjectionProbeWindowTests {
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
     let tracer = offlineTracer(
-      SwiftFTRConfig(maxHops: 4, maxWaitMs: 3000, publicIP: "198.51.100.7", noReverseDNS: true))
+      SwiftFTRConfig(
+        maxHops: 4, maxWaitMs: Self.windowPastWatchdogMs, publicIP: "198.51.100.7",
+        noReverseDNS: true))
 
     let connectedFactory = Self.connectedSocketFactory(network)
 
+    // The window outlasts the watchdog, so an operation that went on to wait for replies instead
+    // of failing at once trips the watchdog.
     func expectSendFailure(_ name: String, _ body: @escaping @Sendable () async throws -> Void)
       async
     {
-      let start = monotonicNow()
       do {
-        _ = try await measure(within: 5) { try await body() }
+        _ = try await measure(within: Self.watchdog) { try await body() }
         Issue.record("\(name) succeeded though no probe could be sent")
       } catch TracerouteError.sendFailed(let code) {
         #expect(code == EISCONN, "\(name) reported errno \(code)")
       } catch {
         Issue.record("\(name) threw \(error)")
       }
-      #expect(monotonicNow() - start < 1.0, "\(name) did not fail fast")
     }
 
     try await network.install(socketFactory: connectedFactory) {
@@ -254,7 +274,7 @@ struct FaultInjectionProbeWindowTests {
         _ = try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
       }
       await expectSendFailure("traceStream") {
-        for try await _ in tracer.traceStream(to: "fake.test") {}
+        for try await _ in tracer.traceStream(to: "fake.test", config: Self.streamPastWatchdog) {}
       }
     }
     #expect(await tracer.activeTraces.isEmpty)
@@ -279,10 +299,11 @@ struct FaultInjectionProbeWindowTests {
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 1))
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig())
-    let timeout: TimeInterval = 10
+    let timeout = TimeInterval(Self.windowPastWatchdogMs) / 1000
 
-    // A ping that counted its failed sends would wait out their reply window.
-    let (result, _) = try await measure(within: timeout / 2) {
+    // A ping that counted its failed sends would wait out their reply window, which outlasts the
+    // watchdog.
+    let (result, _) = try await measure(within: Self.watchdog) {
       try await network.install(socketFactory: Self.connectedSocketFactory(network)) {
         try await tracer.ping(
           to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: timeout))
@@ -304,21 +325,24 @@ struct FaultInjectionProbeWindowTests {
     let network = try FakeICMPNetwork { _ in [] }
     defer { network.stop() }
     let tracer = offlineTracer(
-      SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, publicIP: "198.51.100.7", noReverseDNS: true))
+      SwiftFTRConfig(
+        maxHops: 4, maxWaitMs: Self.windowPastWatchdogMs, publicIP: "198.51.100.7",
+        noReverseDNS: true))
+    let pingTimeout = TimeInterval(Self.windowPastWatchdogMs) / 1000
 
+    // Every window outlasts the watchdog, so an operation that went on to wait instead of
+    // failing at once trips the watchdog.
     func expectSocketFailure(_ name: String, _ body: @escaping @Sendable () async throws -> Void)
       async
     {
-      let start = monotonicNow()
       do {
-        _ = try await measure(within: 5) { try await body() }
+        _ = try await measure(within: Self.watchdog) { try await body() }
         Issue.record("\(name) succeeded without a socket")
       } catch TracerouteError.socketCreateFailed(let code, _) {
         #expect(code == EMFILE, "\(name)")
       } catch {
         Issue.record("\(name) threw \(error)")
       }
-      #expect(monotonicNow() - start < 1.0, "\(name) did not fail fast")
     }
 
     try await network.install(socketFactory: refuse) {
@@ -327,10 +351,11 @@ struct FaultInjectionProbeWindowTests {
         _ = try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
       }
       await expectSocketFailure("traceStream") {
-        for try await _ in tracer.traceStream(to: "fake.test") {}
+        for try await _ in tracer.traceStream(to: "fake.test", config: Self.streamPastWatchdog) {}
       }
       await expectSocketFailure("ping") {
-        _ = try await tracer.ping(to: "fake.test", config: PingConfig(count: 2, timeout: 1))
+        _ = try await tracer.ping(
+          to: "fake.test", config: PingConfig(count: 2, timeout: pingTimeout))
       }
     }
     #expect(await tracer.activeTraces.isEmpty)
@@ -342,14 +367,18 @@ struct FaultInjectionProbeWindowTests {
       throw TracerouteError.resolutionFailed(host: host, details: "injected NXDOMAIN")
     }
     let tracer = offlineTracer(
-      SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, publicIP: "198.51.100.7", noReverseDNS: true))
+      SwiftFTRConfig(
+        maxHops: 4, maxWaitMs: Self.windowPastWatchdogMs, publicIP: "198.51.100.7",
+        noReverseDNS: true))
+    let pingTimeout = TimeInterval(Self.windowPastWatchdogMs) / 1000
 
+    // Every window outlasts the watchdog, so an operation that went on to probe instead of
+    // failing at once trips the watchdog.
     func expectResolutionFailure(
       _ name: String, _ body: @escaping @Sendable () async throws -> Void
     ) async {
-      let start = monotonicNow()
       do {
-        _ = try await measure(within: 5) { try await body() }
+        _ = try await measure(within: Self.watchdog) { try await body() }
         Issue.record("\(name) succeeded without resolving")
       } catch TracerouteError.resolutionFailed(_, let details) {
         // Only the substitute says this, so a call that went around it cannot pass.
@@ -357,7 +386,6 @@ struct FaultInjectionProbeWindowTests {
       } catch {
         Issue.record("\(name) threw \(error)")
       }
-      #expect(monotonicNow() - start < 1.0, "\(name) did not fail fast")
     }
 
     // The destination is a loopback literal: an operation that went around the substitute would
@@ -368,10 +396,11 @@ struct FaultInjectionProbeWindowTests {
         _ = try await tracer.traceClassified(to: "127.0.0.1", resolver: EmptyASNResolver())
       }
       await expectResolutionFailure("traceStream") {
-        for try await _ in tracer.traceStream(to: "127.0.0.1") {}
+        for try await _ in tracer.traceStream(to: "127.0.0.1", config: Self.streamPastWatchdog) {}
       }
       await expectResolutionFailure("ping") {
-        _ = try await tracer.ping(to: "127.0.0.1", config: PingConfig(count: 1, timeout: 1))
+        _ = try await tracer.ping(
+          to: "127.0.0.1", config: PingConfig(count: 1, timeout: pingTimeout))
       }
     }
     #expect(await tracer.activeTraces.isEmpty)
@@ -386,7 +415,7 @@ struct FaultInjectionProbeWindowTests {
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
     let config = StreamingTraceConfig(probeTimeout: 0.5, retryAfter: 0.2, maxHops: 5)
 
-    let (hops, elapsed) = try await measure(within: 10) {
+    let (hops, elapsed) = try await measure(within: Self.watchdog) {
       try await network.install {
         var hops: [StreamingHop] = []
         for try await hop in tracer.traceStream(to: "fake.test", config: config) {
@@ -396,13 +425,14 @@ struct FaultInjectionProbeWindowTests {
       }
     }
     // The stream must sit out its window, not give up early.
-    #expect(elapsed >= 0.45 && elapsed < 2.0, "silent stream took \(elapsed)s, timeout 0.5s")
+    #expect(elapsed >= 0.45, "silent stream took \(elapsed)s, under its 0.5s timeout")
     #expect(hops.map(\.ttl).sorted() == Array(1...5), "one placeholder per TTL")
     #expect(hops.allSatisfy { $0.ipAddress == nil })
     // Five initial probes, then the retry at 0.2 s re-sends TTLs 1...4 (the retry stops below
     // maxHops), so exactly nine reach the network.
     #expect(
-      await eventually(within: 1) { network.probes.value == 9 }, "\(network.probes.value) probes")
+      await eventually(within: Self.watchdog) { network.probes.value == 9 },
+      "\(network.probes.value) probes")
   }
 
   @Test("Malformed datagrams do not stop a stream from delivering valid hops")
@@ -420,9 +450,12 @@ struct FaultInjectionProbeWindowTests {
     }
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
-    let config = StreamingTraceConfig(probeTimeout: 3, retryAfter: nil, maxHops: 5)
+    let config = StreamingTraceConfig(
+      probeTimeout: TimeInterval(Self.windowPastWatchdogMs) / 1000, retryAfter: nil, maxHops: 5)
 
-    let (hops, elapsed) = try await measure(within: 10) {
+    // The timeout outlasts the watchdog, so a stream that did not end once every hop up to the
+    // destination had answered trips the watchdog.
+    let (hops, _) = try await measure(within: Self.watchdog) {
       try await network.install {
         var hops: [StreamingHop] = []
         for try await hop in tracer.traceStream(to: "fake.test", config: config) {
@@ -431,7 +464,6 @@ struct FaultInjectionProbeWindowTests {
         return hops
       }
     }
-    #expect(elapsed < 1.5)
     // Hops arrive in arrival order, so a destination reply for a TTL past the destination can be
     // yielded before the real destination's; consumers take the lowest such TTL.
     let answered = Set(hops.filter { $0.ipAddress != nil }.map(\.ttl))
@@ -451,14 +483,16 @@ struct FaultInjectionProbeWindowTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig())
 
-    let (result, elapsed) = try await measure(within: 10) {
+    // The reply window outlasts the watchdog, so a ping that did not end on its last reply trips
+    // the watchdog.
+    let timeout = TimeInterval(Self.windowPastWatchdogMs) / 1000
+    let (result, _) = try await measure(within: Self.watchdog) {
       try await network.install {
         try await tracer.ping(
-          to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: 1.0))
+          to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: timeout))
       }
     }
     #expect(result.statistics.received == 3)
-    #expect(elapsed < 2.0)
   }
 
   @Test("Ping against a silent network reports full loss within its timeout")
@@ -466,12 +500,15 @@ struct FaultInjectionProbeWindowTests {
     let network = try FakeICMPNetwork { _ in [] }
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig())
+    let config = PingConfig(count: 3, interval: 0.05, timeout: 0.3)
+    // Ping also arms a safety timer at twice its whole schedule plus 5 s (5.8 s here), which ends
+    // a ping whose reply deadline never fires. The watchdog sits a second below it, which is
+    // still more than 4 s past the 0.4 s the ping takes.
+    let schedule = Double(config.count - 1) * config.interval + config.timeout
+    let safetyTimer = 2 * schedule + 5
 
-    let (result, elapsed) = try await measure(within: 10) {
-      try await network.install {
-        try await tracer.ping(
-          to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: 0.3))
-      }
+    let (result, elapsed) = try await measure(within: safetyTimer - 1) {
+      try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     #expect(result.statistics.sent == 3)
     #expect(result.statistics.received == 0)
@@ -479,7 +516,7 @@ struct FaultInjectionProbeWindowTests {
     #expect(network.probes.value == 3, "the network saw \(network.probes.value) probes")
     // The last probe leaves at about 0.1 s and is owed its 0.3 s reply window, so a ping that
     // gives up after its last send returns too early.
-    #expect(elapsed >= 0.35 && elapsed < 1.5, "silent ping took \(elapsed)s")
+    #expect(elapsed >= 0.35, "silent ping took \(elapsed)s")
   }
 }
 

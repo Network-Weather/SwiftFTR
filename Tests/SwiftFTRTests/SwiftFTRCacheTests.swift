@@ -591,42 +591,40 @@ final class SwiftFTRCacheTests: XCTestCase {
 
   /// Verify cache operations don't block the caller (non-blocking).
   func testCacheNonBlocking() async throws {
-    // Resolver that takes a long time
-    actor SlowResolver: ASNResolver {
+    // A resolver that holds one address until the test opens `gate` and answers any other at once.
+    final class GatedResolver: ASNResolver, @unchecked Sendable {
+      let gate = StallGate()
+      let slowStarted = FaultCounter()
       func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
-        try await Task.sleep(for: .milliseconds(500))
+        if ipv4Addrs.contains("203.0.113.1") {
+          slowStarted.increment()
+          await gate.waitAsync(limit: 60)
+        }
         var out: [String: ASNInfo] = [:]
-        for ip in ipv4Addrs { out[ip] = ASNInfo(asn: 65000, name: "Slow") }
+        for ip in ipv4Addrs { out[ip] = ASNInfo(asn: 65000, name: "Gated") }
         return out
       }
     }
 
-    let caching = CachingASNResolver(base: SlowResolver())
+    let base = GatedResolver()
+    defer { base.gate.open() }
+    let caching = CachingASNResolver(base: base)
 
-    // First call triggers slow resolution
-    async let slowCall = caching.resolve(ipv4Addrs: ["203.0.113.1"], timeout: 2.0)
+    // The first call is held in the resolver until the second has returned.
+    let slowCall = Task { try await caching.resolve(ipv4Addrs: ["203.0.113.1"], timeout: 2.0) }
+    let started = await eventually(within: 20) { base.slowStarted.value > 0 }
+    XCTAssertTrue(started, "the first lookup never reached the resolver")
 
-    // Give it a moment to start
-    try await Task.sleep(for: .milliseconds(50))
+    // A different address must not wait for the held one: it returns while the gate is still
+    // closed, or trips the watchdog. (Qualified: XCTestCase's own `measure` hides the helper.)
+    let (fast, _) = try await SwiftFTRTests.measure(within: 20) {
+      try await caching.resolve(ipv4Addrs: ["203.0.113.2"], timeout: 2.0)
+    }
+    XCTAssertEqual(fast["203.0.113.2"]?.asn, 65000)
 
-    // This should NOT block waiting for the first call
-    // It queries a different IP, so it should proceed independently
-    let start = Date()
-    async let fastCall = caching.resolve(ipv4Addrs: ["203.0.113.2"], timeout: 2.0)
-
-    // Wait for both
-    _ = try await slowCall
-    _ = try await fastCall
-
-    let elapsed = Date().timeIntervalSince(start)
-
-    // If blocking, this would take ~1s (500ms + 500ms serial)
-    // If non-blocking (parallel), should take ~500ms
-    // Allow some margin but should be well under 800ms
-    XCTAssertLessThan(
-      elapsed, 0.8,
-      "Concurrent cache calls should not block each other (took \(String(format: "%.2f", elapsed))s)"
-    )
+    base.gate.open()
+    let (slow, _) = try await SwiftFTRTests.measure(within: 20) { try await slowCall.value }
+    XCTAssertEqual(slow["203.0.113.1"]?.asn, 65000)
   }
 
   /// Stress test: many concurrent tasks with high volume.
@@ -645,23 +643,20 @@ final class SwiftFTRCacheTests: XCTestCase {
     let base = FastResolver()
     let caching = CachingASNResolver(base: base)
 
-    let start = Date()
-
-    // 100 concurrent tasks, each requesting 10 IPs
-    await withTaskGroup(of: Void.self) { group in
-      for i in 0..<100 {
-        group.addTask {
-          let ips = (0..<10).map { "203.0.113.\($0 + (i % 25))" }
-          _ = try? await caching.resolve(ipv4Addrs: ips, timeout: 1.0)
+    // 100 concurrent tasks, each requesting 10 IPs. The watchdog catches a cache that deadlocks
+    // under contention; it is not a claim about speed.
+    _ = try await SwiftFTRTests.measure(within: 20) {
+      await withTaskGroup(of: Void.self) { group in
+        for i in 0..<100 {
+          group.addTask {
+            let ips = (0..<10).map { "203.0.113.\($0 + (i % 25))" }
+            _ = try? await caching.resolve(ipv4Addrs: ips, timeout: 1.0)
+          }
         }
       }
     }
 
-    let elapsed = Date().timeIntervalSince(start)
     let calls = await base.getCallCount()
-
-    // Should complete quickly (cache is fast)
-    XCTAssertLessThan(elapsed, 2.0, "Stress test should complete in <2s (took \(elapsed)s)")
 
     // The requests cover 34 unique addresses. Each upstream call must reserve at least one new
     // address, so overlapping misses can never produce more calls than unique keys.
