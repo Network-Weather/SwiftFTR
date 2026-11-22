@@ -533,8 +533,16 @@ final class LoopbackTCPServer: @unchecked Sendable {
   init(family: Int32 = AF_INET, behavior: Behavior, exitGate: StallGate? = nil) throws {
     self.exitGate = exitGate
     self.behavior = behavior
-    (fd, port) = try bindLoopback(family: family, type: SOCK_STREAM)
-    guard listen(fd, 64) == 0 else { throw FixtureError.socket("listen", errno) }
+    // Held in locals until `listen` succeeds. Once every stored property is set, a throwing
+    // initializer runs `deinit`, and `stop()` would wait for an accept loop that never started.
+    let (bound, boundPort) = try bindLoopback(family: family, type: SOCK_STREAM)
+    guard listen(bound, 64) == 0 else {
+      let code = errno
+      close(bound)
+      throw FixtureError.socket("listen", code)
+    }
+    fd = bound
+    port = boundPort
     let thread = Thread { [self] in self.acceptLoop() }
     thread.start()
   }
@@ -641,8 +649,9 @@ final class RefusingTCPPort: @unchecked Sendable {
   init(family: Int32 = AF_INET) throws {
     let (listener, listenerPort) = try bindLoopback(family: family, type: SOCK_STREAM)
     guard listen(listener, 1) == 0 else {
+      let code = errno
       close(listener)
-      throw FixtureError.socket("listen", errno)
+      throw FixtureError.socket("listen", code)
     }
     let holder = socket(family, SOCK_STREAM, 0)
     guard holder >= 0 else {
