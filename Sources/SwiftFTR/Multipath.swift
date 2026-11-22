@@ -527,8 +527,9 @@ extension SwiftFTR {
   ///   - target: Hostname or IP to trace
   ///   - config: Multipath discovery configuration
   /// - Returns: Network topology with all discovered paths
-  /// - Throws: `CancellationError` when the calling task is cancelled, or
-  ///   `TracerouteError` when discovery cannot complete.
+  /// - Throws: `CancellationError` when the calling task is cancelled,
+  ///   `TracerouteError.cancelled` when ``networkChanged()`` or ``cancelActiveTraces()`` ends it,
+  ///   or `TracerouteError` when discovery cannot complete.
   ///
   /// - Important: This implementation uses **ICMP Echo Request** packets with varying
   ///   ICMP ID fields. Many ECMP routers do not hash ICMP fields, so this may find
@@ -568,7 +569,37 @@ extension SwiftFTR {
     )
     let discovery = MultipathDiscovery(worker: worker, config: swiftConfig)
 
-    return try await discovery.discoverPaths(to: target, multipathConfig: config)
+    // The flow workers are separate tracers, so this tracer's network change cannot reach them
+    // through their own handles. Register one here and race discovery against it. Both run as
+    // children of one group, so every flow worker is joined before this returns either way.
+    let handle = TraceHandle()
+    activeTraces.insert(handle)
+    defer { activeTraces.remove(handle) }
+
+    do {
+      return try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
+        group.addTask {
+          try await discovery.discoverPaths(to: target, multipathConfig: config)
+        }
+        group.addTask {
+          await waitForCancellation(of: handle)
+          if await handle.isCancelled { throw TracerouteError.cancelled }
+          return nil
+        }
+        defer { group.cancelAll() }
+        while let next = try await group.next() {
+          if let topology = next { return topology }
+        }
+        throw CancellationError()
+      }
+    } catch {
+      // A flow interrupted by cancellation may report it either way, depending on the phase it
+      // was in. Report the source instead: the handle means a network change, the task means the
+      // caller.
+      if await handle.isCancelled { throw TracerouteError.cancelled }
+      if Task.isCancelled { throw CancellationError() }
+      throw error
+    }
   }
 
   /// Runs flow workers that reuse caches without escaping the caller's task group.
@@ -593,6 +624,7 @@ extension SwiftFTR {
         publicIP: baseConfig.publicIP,
         enableLogging: baseConfig.enableLogging,
         noReverseDNS: baseConfig.noReverseDNS,
+        publicIPDiscoveryTimeout: baseConfig.publicIPDiscoveryTimeout,
         interface: baseConfig.interface,
         sourceIP: baseConfig.sourceIP,
         preferredFamily: .v4
@@ -635,6 +667,7 @@ extension SwiftFTR {
       publicIP: self.config.publicIP,
       enableLogging: self.config.enableLogging,
       noReverseDNS: self.config.noReverseDNS,
+      publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeout,
       interface: self.config.interface,
       sourceIP: self.config.sourceIP,
       preferredFamily: .v4
@@ -673,6 +706,9 @@ extension SwiftFTR {
     let effectivePublicIP = await effectivePublicIPForClassification {
       try? await self.discoverPublicIP()
     }
+    // Discovery swallows its own cancellation; do not start resolving a destination for a flow
+    // whose discovery has already been cancelled.
+    try Task.checkCancellation()
 
     // Perform base trace with flow ID
     let tr = try await withTaskCancellationHandler {
@@ -715,17 +751,23 @@ extension SwiftFTR {
     let effectiveResolver = asnResolver
 
     // Classify
+    // Raced against cancellation like traceClassified's classification, so a cancelled flow does
+    // not wait on an ASN load it shares with other resolvers.
+    try Task.checkCancellation()
     let classifier = TraceClassifier()
-    let baseClassified = try await classifier.classify(
-      trace: tr,
-      destinationIP: destIP,
-      resolver: effectiveResolver,
-      timeout: 1.5,
-      publicIP: effectivePublicIP,
-      interface: config.interface,
-      sourceIP: config.sourceIP,
-      enableLogging: config.enableLogging
-    )
+    let baseClassified = try await withTraceCancellation(handle: handle) {
+      try await classifier.classify(
+        trace: tr,
+        destinationIP: destIP,
+        resolver: effectiveResolver,
+        timeout: 1.5,
+        publicIP: effectivePublicIP,
+        interface: self.config.interface,
+        sourceIP: self.config.sourceIP,
+        enableLogging: self.config.enableLogging,
+        publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeoutForOperation
+      )
+    }
 
     // Enhance classified result with hostnames
     let enhancedHops = baseClassified.hops.map { hop -> ClassifiedHop in
