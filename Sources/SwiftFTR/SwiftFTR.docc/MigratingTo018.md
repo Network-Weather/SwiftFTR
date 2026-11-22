@@ -1,6 +1,6 @@
 # Migrating to SwiftFTR 0.18
 
-Handle the cancellation, discovery-budget and DNS validation changes introduced in SwiftFTR 0.18.
+Handle the cancellation, discovery-budget, DNS validation and trace socket-setup changes introduced in SwiftFTR 0.18.
 
 ## Overview
 
@@ -13,7 +13,7 @@ so a person or a coding agent can work through a consumer one change at a time:
 - **What to change**, with code before and after.
 
 To find the call sites to review, search the consumer for `discoverPaths(`, `networkChanged(`,
-`cancelActiveTraces(`, `publicIPDiscoveryTimeout` and `DNSError`.
+`cancelActiveTraces(`, `publicIPDiscoveryTimeout`, `DNSError` and `socketCreateFailed`.
 
 ## Update the package
 
@@ -167,4 +167,37 @@ After:
 ```swift
 let source = server.contains(":") ? wifiIPv6 : wifiIPv4
 let answers = try await queryA(hostname: name, server: server, sourceIP: source)
+```
+
+## A trace whose socket cannot be made non-blocking throws
+
+**What changed.** `trace`, `traceClassified` and `traceStream` check the two `fcntl` calls that
+make their probe socket non-blocking, as `ping` already did. In 0.17 a failure was ignored and the
+trace ran on a blocking socket, where its receive loop could wait for a reply past its deadline.
+
+**What a caller sees.** `TracerouteError.socketCreateFailed(errno:details:)`, with `details` of
+`fcntl F_GETFL failed` or `fcntl F_SETFL failed`, thrown before any probe is sent. The failure is
+rare: it means the descriptor itself is unusable.
+
+**What to change.** Nothing, if the consumer already handles `socketCreateFailed` from a trace,
+which socket creation has always thrown. Check that the handler reports it as a local failure to
+start the trace, not as a result about the network being diagnosed, and that it does not assume
+the error can only come before a socket exists.
+
+Before:
+
+```swift
+} catch TracerouteError.socketCreateFailed(let code, _) {
+  // Assumed only when ICMP sockets are unavailable.
+  showPermissionsHelp(errno: code)
+}
+```
+
+After:
+
+```swift
+} catch TracerouteError.socketCreateFailed(let code, let details) {
+  // Also thrown when the socket could not be made non-blocking.
+  reportLocalFailure("could not open a probe socket: \(details)", errno: code)
+}
 ```
