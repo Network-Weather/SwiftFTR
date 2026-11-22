@@ -66,6 +66,10 @@ What an unmodified caller will see differently:
   ignored cancellation, and, for ping, sent no further probes. Each read callback now handles at
   most 64 datagrams and checks for cancellation and its deadline before every read; a longer
   backlog is read over later callbacks, so no reply is lost.
+- **A stream cancelled by the tracer just before it ends reports the cancellation.** A
+  `cancelActiveTraces()` or `networkChanged()` that landed after a `traceStream` had finished
+  probing but before it ended the stream was recorded and then ignored: the consumer saw a normal
+  end. The stream now decides its outcome, unregisters and ends in one step on the tracer.
 - **A trace cancelled by both its caller and the tracer reports the tracer's cancellation.**
   `traceClassified` cancelled during public-IP discovery reported `CancellationError` even when
   `networkChanged()` had also ended it.

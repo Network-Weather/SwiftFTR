@@ -119,7 +119,8 @@ threw it in most phases and `CancellationError` in one. `ping` is still not ende
 `networkChanged()` or `cancelActiveTraces()`, so it now only ever throws `CancellationError` for a
 cancellation. `discoverPaths` already followed the rule. A `traceStream` consumer that cancels its
 task sees iteration end normally, unless the tracer had already ended the stream; a stream the
-tracer ends before it finishes throws `TracerouteError.cancelled`. Breaking out of a loop over a
+tracer ends before it finishes throws `TracerouteError.cancelled`, even after its last hop has
+been delivered. Breaking out of a loop over a
 stream held in a variable cancels nothing: the trace runs until it finishes or the stream is
 released.
 

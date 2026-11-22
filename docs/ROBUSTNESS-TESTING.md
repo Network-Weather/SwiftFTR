@@ -234,6 +234,13 @@ numbers are as of the commit that added this section.
     `FaultInjectionCancellationTests` sweeps, each asserting the exact type for each source and for
     both together (`Canceller.both`, which cancels the task and the tracer's traces in one step on
     the actor), and `streamConsumerCancellationCleansUp`.
+18. **A stream cancelled just before it ended finished normally.** Confirmed from reading and
+    fixed; found by Codex review of #110. A `cancelActiveTraces()` that landed after the producer
+    passed its last check but before it unregistered was recorded and then ignored. The producer
+    now commits, as `discoverPaths` does: it checks, unregisters and ends the stream in one
+    non-suspending step on the tracer. Tests: `streamCancelledBeforeCommit` and
+    `streamCommittedBeforeCancellation`, which hold the stream at that step through the
+    `beforeStreamCommit` seam; with the old unconditional finish the first fails.
 
 Observations that are not defects of the library:
 

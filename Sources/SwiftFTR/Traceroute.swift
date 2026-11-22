@@ -1363,8 +1363,9 @@ public actor SwiftFTR {
   /// Signals every operation registered when the call is made: `trace`, `traceClassified`,
   /// `traceStream` and `discoverPaths`. One that has not finished stops and throws
   /// `TracerouteError.cancelled`, even if its caller cancelled it too. One that has already
-  /// finished keeps its outcome. For a `traceStream`, delivering its last hop is not finishing:
-  /// until the producer has ended the stream, the consumer's next call can still throw.
+  /// finished keeps its outcome. A `traceStream` finishes when its producer ends the stream, which
+  /// it does in one step on this tracer after the trace is over; delivering its last hop is not
+  /// finishing, so until that step the consumer's next call can still throw.
   /// `discoverPaths` alone guarantees more: a topology not yet returned is discarded.
   /// Operations registered after this call remain tracked for subsequent cancellation.
   /// This method does not invalidate rDNS, public IP, or ASN caches.
