@@ -97,16 +97,23 @@ func dnsQueryDeadline(timeout: TimeInterval) -> TimeInterval {
 /// Runs a blocking DNS query on the shared executor under ``dnsQueryDeadline(timeout:)``.
 ///
 /// Reports an expired deadline as ``DNSError/timeout``, the error a query that ran and went
-/// unanswered already raises, so callers see one outcome for "no answer in time". An invalid
-/// timeout gets no deadline, so the query itself still rejects it with `invalidTimeout`.
+/// unanswered already raises, so callers see one outcome for "no answer in time".
+///
+/// The inputs `performDNSQueryInternal` rejects without I/O are checked here first, so a query
+/// that can never succeed reports why (`invalidTimeout`, `invalidHostname`, `invalidIP`) instead
+/// of queueing and timing out behind a full executor.
 private func runDNSQuery<T: Sendable>(
+  server: String,
+  query name: String,
   timeout: TimeInterval,
   _ query: @Sendable @escaping () throws -> T
 ) async throws -> T {
-  let deadline =
-    (try? _validateDNSTimeout(timeout)) != nil ? dnsQueryDeadline(timeout: timeout) : nil
+  try _validateDNSTimeout(timeout)
+  _ = try _encodeQName(name)
+  let family = detectAddressFamily(server)
+  guard family == AF_INET || family == AF_INET6 else { throw DNSError.invalidIP(server) }
   do {
-    return try await runDetachedBlockingIO(deadline: deadline, query)
+    return try await runDetachedBlockingIO(deadline: dnsQueryDeadline(timeout: timeout), query)
   } catch is BlockingIOTimeout {
     throw DNSError.timeout
   }
@@ -258,7 +265,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query A record
-    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -333,7 +342,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query AAAA record
-    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -409,7 +420,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: arpaQuery, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: arpaQuery,
@@ -489,7 +502,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: arpaQuery, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: arpaQuery,
@@ -568,7 +583,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query TXT record
-    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: hostname, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: hostname,
@@ -645,7 +662,9 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Perform query
-    let answers = try await runDNSQuery(timeout: resolvedTimeout) {
+    let answers = try await runDNSQuery(
+      server: resolvedServer, query: name, timeout: resolvedTimeout
+    ) {
       try performDNSQueryInternal(
         server: resolvedServer,
         query: name,
@@ -1119,7 +1138,7 @@ public func reverseDNS(
   }
 
   // Query PTR record
-  let answers = try await runDNSQuery(timeout: timeout) {
+  let answers = try await runDNSQuery(server: server, query: reverseName, timeout: timeout) {
     try performDNSQueryInternal(
       server: server,
       query: reverseName,
@@ -1188,7 +1207,7 @@ public func reverseIPv6(
   }
 
   // Query PTR record
-  let answers = try await runDNSQuery(timeout: timeout) {
+  let answers = try await runDNSQuery(server: server, query: reverseName, timeout: timeout) {
     try performDNSQueryInternal(
       server: server,
       query: reverseName,
@@ -1270,7 +1289,7 @@ public func queryAAAA(
   }
 
   // Query AAAA record
-  let answers = try await runDNSQuery(timeout: timeout) {
+  let answers = try await runDNSQuery(server: server, query: hostname, timeout: timeout) {
     try performDNSQueryInternal(
       server: server,
       query: hostname,
@@ -1343,7 +1362,7 @@ public func queryA(
   }
 
   // Query A record
-  let answers = try await runDNSQuery(timeout: timeout) {
+  let answers = try await runDNSQuery(server: server, query: hostname, timeout: timeout) {
     try performDNSQueryInternal(
       server: server,
       query: hostname,
@@ -1594,7 +1613,7 @@ private func performDNSProbe(
 ) async -> DNSProbeResultInternal {
   do {
     // Try to perform query - success means RCODE=0
-    _ = try await runDNSQuery(timeout: timeout) {
+    _ = try await runDNSQuery(server: server, query: query, timeout: timeout) {
       try performDNSQueryInternal(
         server: server,
         query: query,
