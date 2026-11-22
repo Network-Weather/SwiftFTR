@@ -233,7 +233,7 @@ struct PingExecutor: Sendable {
     try applyBindings(sockfd: sockfd, family: resolved.family, pingConfig: config)
 
     // 4. Set non-blocking mode.
-    try setNonBlocking(sockfd: sockfd)
+    try setProbeSocketNonBlocking(sockfd)
 
     // 4b. Increase receive buffer.
     var recvBufSize: Int32 = 256 * 1024
@@ -310,16 +310,6 @@ struct PingExecutor: Sendable {
     #else
       throw TracerouteError.platformNotSupported(details: "Ping requires ICMP datagram sockets")
     #endif
-  }
-
-  private func setNonBlocking(sockfd: Int32) throws {
-    let flags = fcntl(sockfd, F_GETFL, 0)
-    guard flags >= 0 else {
-      throw TracerouteError.socketCreateFailed(errno: errno, details: "fcntl F_GETFL failed")
-    }
-    guard fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
-      throw TracerouteError.socketCreateFailed(errno: errno, details: "fcntl F_SETFL failed")
-    }
   }
 
   private func applyBindings(sockfd: Int32, family: Int32, pingConfig: PingConfig) throws {

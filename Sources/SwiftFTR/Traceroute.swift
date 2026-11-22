@@ -655,7 +655,7 @@ public actor SwiftFTR {
         enableLogging: config.enableLogging)
     }
 
-    try setTraceSocketNonBlocking(fd)
+    try setProbeSocketNonBlocking(fd)
 
     if resolved.family == AF_INET {
       var on: Int32 = 1
@@ -813,7 +813,7 @@ public actor SwiftFTR {
         enableLogging: config.enableLogging)
     }
 
-    try setTraceSocketNonBlocking(fd)
+    try setProbeSocketNonBlocking(fd)
 
     // Best-effort IP_RECVTTL for v4 (v6 already enabled IPV6_RECVHOPLIMIT in createTraceSocket).
     if resolved.family == AF_INET {
@@ -1446,12 +1446,12 @@ internal func createTraceSocket(family: Int32, enableLogging: Bool) throws -> In
   return fd
 }
 
-/// Makes a trace socket non-blocking, or throws.
+/// Makes a trace or ping socket non-blocking, or throws.
 ///
-/// The receive loop reads until the socket reports no more data. On a blocking socket that last
-/// read would wait for the next datagram on the queue that also delivers the trace's deadline and
-/// cancellation, so a trace must not run on one.
-internal func setTraceSocketNonBlocking(_ fd: Int32) throws {
+/// The receive loops read until the socket reports no more data. On a blocking socket that last
+/// read would wait for the next datagram on the queue that also delivers the operation's deadline
+/// and cancellation, so no operation may run on one.
+internal func setProbeSocketNonBlocking(_ fd: Int32) throws {
   let control = TestSeams.fileControl ?? { fcntl($0, $1, $2) }
   let flags = control(fd, F_GETFL, 0)
   guard flags >= 0 else {
