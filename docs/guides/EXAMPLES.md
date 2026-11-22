@@ -1,14 +1,8 @@
 # SwiftFTR Examples
 
-Worked examples against the current public API. Version tags in headings say when a feature first
-shipped. The signatures themselves are summarized in
-[docs/reference/AI_REFERENCE.md](../reference/AI_REFERENCE.md); the doc comments in
-`Sources/SwiftFTR` are authoritative.
-
 ## Table of Contents
 - [Basic Usage](#basic-usage)
 - [Configuration Options](#configuration-options)
-- [Network Changes (v0.17.0+)](#network-changes-v0170)
 - [Streaming Traceroute (v0.11.0+)](#streaming-traceroute-v0110)
 - [DNS Queries (v0.8.0+)](#dns-queries-v080)
 - [Ping (v0.5.0+)](#ping-v050)
@@ -20,7 +14,6 @@ shipped. The signatures themselves are summarized in
 - [ASN Classification](#asn-classification)
 - [Custom Resolvers](#custom-resolvers)
 - [Performance Monitoring](#performance-monitoring)
-- [Testing & Debugging](#testing--debugging)
 
 ## Basic Usage
 
@@ -47,42 +40,6 @@ for hop in result.hops {
         print("  \(hop.ttl): * * *")
     }
 }
-```
-
-### Hop Outcomes (v0.16.0+)
-A hop with no address can mean the network stayed silent or that the probe never left the host,
-and a hop with an address can be a router that forwarded the probe or one that refused it.
-`hop.outcome` tells these apart.
-```swift
-import SwiftFTR
-
-let result = try await SwiftFTR().trace(to: "example.com")
-
-for hop in result.hops {
-    switch hop.outcome {
-    case .replied:
-        print("  \(hop.ttl): \(hop.ipAddress ?? "?")")
-    case .unreachable:
-        let reason = hop.outcome.unreachableReason?.displayName ?? "unreachable"
-        let policy = hop.outcome.unreachableReason?.isAdministrative == true ? " (policy)" : ""
-        print("  \(hop.ttl): \(hop.ipAddress ?? "?") !\(reason)\(policy)")
-    case .timedOut:
-        print("  \(hop.ttl): * * *")
-    case .notSent(let errno):
-        print("  \(hop.ttl): probe not sent (errno \(errno))")
-    }
-}
-```
-
-### Per-Call Hop Budget (v0.17.0+)
-```swift
-import SwiftFTR
-
-let tracer = SwiftFTR()  // config.maxHops defaults to 40
-
-// Override maxHops for one call; values outside 1...255 throw invalidConfiguration
-let nearby = try await tracer.trace(to: "1.1.1.1", options: TraceOptions(maxHops: 8))
-let classified = try await tracer.traceClassified(to: "1.1.1.1", options: TraceOptions(maxHops: 8))
 ```
 
 ## Configuration Options
@@ -167,44 +124,6 @@ func traceUsingCallerSelection(
     }
 }
 ```
-
-## Network Changes (v0.17.0+)
-
-`networkChanged()` cancels active traces and clears the cached public IP and reverse-DNS entries in
-one call. When you know only part of the network state changed, use the finer controls instead of
-replacing the `SwiftFTR` instance. ASN data is not network-scoped, and none of these clear it.
-
-```swift
-import SwiftFTR
-
-let tracer = SwiftFTR()
-
-// Conservative reset: cancel traces, drop public IP and rDNS caches
-await tracer.networkChanged()
-
-// Cancel in-flight traces but keep every cache
-await tracer.cancelActiveTraces()
-
-// Evict only private, CGNAT, link-local, loopback and unique-local rDNS entries;
-// globally routable hostnames survive
-await tracer.invalidateNetworkScopedRDNS()
-
-// Force fresh public-IP discovery on the next classified trace or multipath run
-await tracer.invalidatePublicIP()
-
-// Or supply a public IP you already know, so the next classified trace skips discovery.
-// Rejected (returns false) unless it is a valid, globally routable IPv4 or IPv6 address;
-// private, CGNAT, link-local, loopback, multicast and documentation ranges
-// (192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 2001:db8::/32) are all rejected.
-// Discarded by the next invalidatePublicIP(), clearCaches() or networkChanged().
-func seed(_ wanAddress: String) async {
-    let accepted = await tracer.seedPublicIP(wanAddress, source: .gatewayReported)
-    print("Seed accepted: \(accepted)")
-}
-```
-
-Unlike `SwiftFTRConfig(publicIP:)`, which permanently bypasses discovery for that instance, a
-seeded address lasts only until the next invalidation.
 
 ## Streaming Traceroute (v0.11.0+)
 
@@ -446,7 +365,7 @@ for record in aaaaResult.records {
 // Reverse DNS (PTR) lookup
 let ptr = try await tracer.dns.reverseIPv4(ip: "8.8.8.8")
 print("8.8.8.8 → \(ptr.records.first.map { "\($0.data)" } ?? "no PTR")")
-// Output: 8.8.8.8 → hostname("dns.google")
+// Output: 8.8.8.8 → ptr("dns.google")
 
 // TXT records — .txt wraps [String] (one string per TXT chunk)
 let txt = try await tracer.dns.txt(hostname: "example.com")
@@ -474,7 +393,7 @@ if let record = gatewayPTR.records.first, case .hostname(let hostname) = record.
 }
 
 // Query over IPv4 using an exact interface and address selected by the caller.
-func queryAOnInterface(interfaceName: String, sourceIPv4: String) async throws {
+func queryA(interfaceName: String, sourceIPv4: String) async throws {
   let snapshot = await NetworkInterfaceDiscovery().discover()
   guard let selectedInterface = snapshot.interface(named: interfaceName),
         selectedInterface.isUp,
@@ -651,21 +570,24 @@ func identifyGateway(ip: String) async throws -> NetworkDevice {
   )
 
   // Detect vendor from hostname patterns
-  let name = result.hostname?.lowercased() ?? ""
-  let vendor: String? =
-    if name.contains("docsis") {
+  let vendor: String? = if let hostname = result.hostname {
+    switch {
+    case hostname.lowercased().contains("docsis"):
       "Cable Modem"
-    } else if name.contains("unifi") {
+    case hostname.lowercased().contains("unifi"):
       "Ubiquiti UniFi"
-    } else if name.contains("netgear") {
+    case hostname.lowercased().contains("netgear"):
       "NETGEAR"
-    } else if name.contains("tp-link") {
+    case hostname.lowercased().contains("tp-link"):
       "TP-Link"
-    } else if name.contains("airport") {
+    case hostname.lowercased().contains("airport"):
       "Apple AirPort"
-    } else {
+    default:
       nil
     }
+  } else {
+    nil
+  }
 
   return NetworkDevice(ip: ip, hostname: result.hostname, vendor: vendor)
 }
@@ -1043,13 +965,13 @@ if let jsonString = String(data: jsonData, encoding: .utf8) {
 import SwiftFTR
 
 /*
- * IMPORTANT: SwiftFTR uses ICMP Echo Request (varying the ICMP identifier) for
- * multipath discovery. Many ECMP routers do not hash ICMP ID fields, so this may
- * find fewer paths than UDP-based tools like dublin-traceroute.
+ * IMPORTANT: SwiftFTR v0.5.0 uses ICMP Echo Request for multipath discovery.
+ * Many ECMP routers do not hash ICMP ID fields, so this may find fewer paths
+ * than UDP-based tools like dublin-traceroute.
  *
  * The discovered paths accurately represent ICMP routing behavior, which is
- * ideal for ping monitoring. UDP-based multipath is a ROADMAP item, not yet
- * implemented.
+ * ideal for ping monitoring. For TCP/UDP application path discovery, a future
+ * UDP-based implementation is planned (see ROADMAP.md).
  *
  * Example: UDP may find 7 paths, ICMP may find 1-2 paths to the same destination.
  * Both are correct - they show different protocols' routing behavior.
@@ -1209,15 +1131,15 @@ import SwiftFTR
 let tracer = SwiftFTR()
 
 // Test upload bufferbloat
-let uploadConfig = BufferbloatConfig(loadDuration: 10.0, loadType: .upload)
+let uploadConfig = BufferbloatConfig(loadType: .upload, loadDuration: 10.0)
 let uploadResult = try await tracer.testBufferbloat(config: uploadConfig)
 
 // Test download bufferbloat
-let downloadConfig = BufferbloatConfig(loadDuration: 10.0, loadType: .download)
+let downloadConfig = BufferbloatConfig(loadType: .download, loadDuration: 10.0)
 let downloadResult = try await tracer.testBufferbloat(config: downloadConfig)
 
 // Test bidirectional
-let bidirConfig = BufferbloatConfig(loadDuration: 10.0, loadType: .bidirectional)
+let bidirConfig = BufferbloatConfig(loadType: .bidirectional, loadDuration: 10.0)
 let bidirResult = try await tracer.testBufferbloat(config: bidirConfig)
 
 print("Upload bufferbloat: \(uploadResult.grade.rawValue) " +
@@ -1265,7 +1187,7 @@ let tracer = SwiftFTR()
 
 print("Testing network for video call quality...")
 let result = try await tracer.testBufferbloat(
-    config: BufferbloatConfig(loadDuration: 10.0, loadType: .bidirectional)
+    config: BufferbloatConfig(loadType: .bidirectional, loadDuration: 10.0)
 )
 
 // Check Zoom/Teams requirements:
@@ -1342,7 +1264,7 @@ struct TracerouteView: View {
         }
     }
     
-    // Runs on the main actor (View is main-actor isolated); the trace itself runs on the SwiftFTR actor
+    // This method doesn't need @MainActor
     func performTrace() async {
         isTracing = true
         errorMessage = nil
@@ -1604,7 +1526,6 @@ func robustTrace(to destination: String) async {
 
 ### Retry Logic
 ```swift
-import Foundation
 import SwiftFTR
 
 func traceWithRetry(
@@ -1634,33 +1555,6 @@ func traceWithRetry(
 ```
 
 ## ASN Classification
-
-### Resolver Strategies
-By default `traceClassified` uses `.hybrid(.embedded)`: the SwiftIP2ASN database bundled with the
-package answers first, and Team Cymru DNS is consulted only for addresses it does not cover. The
-database is loaded once per process and shared by every tracer (about 15 MB per copy).
-```swift
-import SwiftFTR
-
-// Default: local database first, DNS fallback for misses
-let tracer = SwiftFTR()
-await tracer.preloadASNDatabase()  // optional: move the one-time load off the first trace
-
-// No network for ASN lookups at all; uncovered addresses simply have no ASN
-let offline = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: .embedded))
-
-// DNS only (Team Cymru), the default before 0.17.0
-let dnsOnly = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: .dns))
-
-// App-bundled database with remote updates
-let bundled = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: .remote(
-    bundledPath: Bundle.main.path(forResource: "ip2asn", ofType: "ultra")
-)))
-
-// Hybrid with a longer DNS fallback budget
-let patient = SwiftFTR(config: SwiftFTRConfig(
-    asnResolverStrategy: .hybrid(.embedded, fallbackTimeout: 2.0)))
-```
 
 ### Custom ASN Resolver
 ```swift
@@ -1694,8 +1588,7 @@ let classified = try await tracer.traceClassified(
 ```swift
 import SwiftFTR
 
-// Passing a resolver overrides the configured strategy for that call.
-// This one forces DNS (Team Cymru) lookups, cached in memory.
+// Use the built-in caching resolver
 let baseResolver = CymruDNSResolver()
 let cachingResolver = CachingASNResolver(base: baseResolver)
 
@@ -1849,7 +1742,6 @@ Task {
 ### Mock Tracer for Testing
 ```swift
 import SwiftFTR
-import XCTest
 
 class MockTracer {
     func trace(to destination: String) async throws -> TraceResult {
