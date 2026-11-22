@@ -127,6 +127,7 @@ internal func bindInterface(sockfd: Int32, family: Int32, ifIndex: UInt32) -> St
 /// `UDPProbe.swift` is Stage 5 in `docs/IPV6.md`; this is the smaller extraction
 /// that unblocks Stage 2 traceroute.
 internal func resolveHost(host: String, prefer: PreferredFamily) throws -> ResolvedHost {
+  if let substitute = TestSeams.resolveHost { return try substitute(host, prefer) }
   let detected = detectAddressFamily(host)
 
   // Force-mode fast paths: when the caller explicitly asked for v4 or v6, skip

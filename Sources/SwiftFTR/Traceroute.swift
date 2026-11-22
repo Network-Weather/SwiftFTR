@@ -1188,14 +1188,17 @@ public actor SwiftFTR {
     let enableLogging = config.enableLogging
 
     return try await withTraceCancellation(handle: handle) {
-      try await runDetachedBlockingIO(deadline: self.config.publicIPDiscoveryTimeoutForOperation) {
-        try getPublicIPv4(
-          stunTimeout: 2.0,
-          dnsTimeout: 3.0,
-          interface: interface,
-          sourceIP: sourceIP,
-          enableLogging: enableLogging
-        ).ip
+      let discover = publicIPv4Discovery(
+        stunTimeout: 2.0,
+        dnsTimeout: 3.0,
+        interface: interface,
+        sourceIP: sourceIP,
+        enableLogging: enableLogging
+      )
+      return try await runDetachedBlockingIO(
+        deadline: self.config.publicIPDiscoveryTimeoutForOperation
+      ) {
+        try discover().ip
       }
     }
   }
@@ -1403,14 +1406,18 @@ private let IPV6_RECVHOPLIMIT_OPT: Int32 = 37
 /// both `SOCK_DGRAM` (unprivileged on Darwin).
 internal func createTraceSocket(family: Int32, enableLogging: Bool) throws -> Int32 {
   let fd: Int32
-  switch family {
-  case AF_INET:
-    fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
-  case AF_INET6:
-    fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)
-  default:
-    throw TracerouteError.socketCreateFailed(
-      errno: 0, details: "Unsupported family for trace socket: \(family)")
+  if let substitute = TestSeams.makeICMPSocket {
+    fd = try substitute(family)
+  } else {
+    switch family {
+    case AF_INET:
+      fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)
+    case AF_INET6:
+      fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)
+    default:
+      throw TracerouteError.socketCreateFailed(
+        errno: 0, details: "Unsupported family for trace socket: \(family)")
+    }
   }
   if fd < 0 {
     let error = errno
