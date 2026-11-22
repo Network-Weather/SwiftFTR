@@ -576,8 +576,9 @@ extension SwiftFTR {
     activeTraces.insert(handle)
     defer { activeTraces.remove(handle) }
 
+    let topology: NetworkTopology
     do {
-      return try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
+      topology = try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
         group.addTask {
           try await discovery.discoverPaths(to: target, multipathConfig: config)
         }
@@ -600,6 +601,14 @@ extension SwiftFTR {
       if Task.isCancelled { throw CancellationError() }
       throw error
     }
+
+    if let beforeCommit = TestSeams.beforeMultipathCommit { await beforeCommit() }
+    // Commit: check and return in one step on this actor, with no suspension between them.
+    // `cancelActiveTraces()` (and so `networkChanged()`) removes the handle synchronously before
+    // it cancels anything, so a topology that reaches this point after an invalidation is
+    // discarded, and one returned here was committed before any invalidation began.
+    guard activeTraces.contains(handle) else { throw TracerouteError.cancelled }
+    return topology
   }
 
   /// Runs flow workers that reuse caches without escaping the caller's task group.
