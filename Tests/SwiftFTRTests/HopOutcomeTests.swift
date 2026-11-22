@@ -81,12 +81,13 @@ struct HopOutcomeTests {
 @Suite("Send burst degradation")
 struct SendBurstDegradationTests {
 
-  /// A socket that is closed, so every `sendto` fails immediately with a non-transient errno.
-  private func closedSocket() -> Int32 {
-    let fd = socket(AF_INET, SOCK_DGRAM, 0)
-    close(fd)
-    return fd
-  }
+  /// A descriptor that is never open, so every call on it fails immediately with `EBADF`, a
+  /// non-transient errno.
+  ///
+  /// Not a socket that was opened and closed: the kernel hands the lowest free number to the next
+  /// `socket()` call, so under the parallel suite another test can be given that number and these
+  /// probes would be sent on its socket.
+  private let invalidDescriptor: Int32 = -1
 
   @Test("A non-transient errno still aborts the whole burst")
   func nonTransientErrnoStillThrows() throws {
@@ -96,7 +97,7 @@ struct SendBurstDegradationTests {
     // EBADF is not transient, so this must not be swallowed into a per-hop outcome.
     #expect(throws: (any Error).self) {
       _ = try sendTraceBurst(
-        sockfd: closedSocket(), resolved: resolved, identifier: 1, maxHops: 5,
+        sockfd: invalidDescriptor, resolved: resolved, identifier: 1, maxHops: 5,
         payloadSize: 56, retryDeadline: monotonicNow() + 0.05, outstanding: &outstanding)
     }
     #expect(outstanding.isEmpty)
@@ -109,7 +110,7 @@ struct SendBurstDegradationTests {
 
     #expect(throws: (any Error).self) {
       _ = try sendTraceBurst(
-        sockfd: closedSocket(), resolved: resolved, identifier: 1, maxHops: 3,
+        sockfd: invalidDescriptor, resolved: resolved, identifier: 1, maxHops: 3,
         payloadSize: 56, retryDeadline: monotonicNow() + 0.05, outstanding: &outstanding)
     }
   }

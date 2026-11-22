@@ -15,8 +15,8 @@ struct TCPProbeTests {
 
     #expect(result.isReachable)
     #expect(result.rtt != nil)
-    #expect(result.rtt! > 0)
-    #expect(result.rtt! < 5.0)
+    #expect(result.rtt.map { $0 > 0 } == true)
+    #expect(result.rtt.map { $0 < 5.0 } == true)
   }
 
   @Test("TCP probe to closed port (localhost)")
@@ -28,7 +28,7 @@ struct TCPProbeTests {
     // Expect success (RST = host reachable, port closed)
     #expect(result.isReachable)
     #expect(result.rtt != nil)
-    #expect(result.rtt! < 0.1)  // Localhost should be instant
+    #expect(result.rtt.map { $0 < 0.1 } == true)  // Localhost should be instant
   }
 
   @Test(
@@ -188,8 +188,8 @@ struct DNSProbeTests {
     #expect(result.rtt != nil)
     #expect(result.responseCode != nil)
     #expect(result.responseCode == 0)
-    #expect(result.rtt! > 0)
-    #expect(result.rtt! < 5.0)
+    #expect(result.rtt.map { $0 > 0 } == true)
+    #expect(result.rtt.map { $0 < 5.0 } == true)
   }
 
   @Test(
@@ -248,7 +248,7 @@ struct HTTPProbeTests {
     #expect(result.statusCode != nil)
     #expect(result.statusCode == 200)
     #expect(result.rtt != nil)
-    #expect(result.rtt! > 0)
+    #expect(result.rtt.map { $0 > 0 } == true)
   }
 
   @Test(
