@@ -7,13 +7,13 @@ import Foundation
 ///
 /// Uses Swift 6's actor isolation for thread safety.
 public actor TraceHandle {
-  private var _isCancelled = false
-  private var cancellationHandler: (@Sendable () -> Void)?
-  private var handlerRegistrationID: UInt64 = 0
+  /// Why the operation was cancelled, and the cleanup to run when it is. Lock-protected rather
+  /// than actor-isolated so that a task-cancellation handler can record its reason synchronously.
+  nonisolated let cancelState = TraceCancelState()
 
-  /// Whether this trace has been cancelled.
+  /// Whether this trace has been cancelled, by the tracer or by its caller.
   public var isCancelled: Bool {
-    _isCancelled
+    cancelState.reason != nil
   }
 
   /// Cancel this trace operation.
@@ -21,11 +21,12 @@ public actor TraceHandle {
   /// Once cancelled, the trace will stop at the next cancellation check point
   /// and throw `TracerouteError.cancelled`.
   public func cancel() {
-    guard !_isCancelled else { return }
-    _isCancelled = true
-    let handler = cancellationHandler
-    cancellationHandler = nil
-    handler?()
+    cancelState.cancel(.library)
+  }
+
+  /// Records that `reason` ended the operation, from any context, without suspending.
+  nonisolated func cancel(for reason: TraceCancellationReason) {
+    cancelState.cancel(reason)
   }
 
   /// Installs the operation-specific cleanup invoked by `cancel()`.
@@ -36,14 +37,7 @@ public actor TraceHandle {
   /// - Returns: A monotonically increasing registration ID identifying this handler.
   @discardableResult
   internal func installCancellationHandler(_ handler: @escaping @Sendable () -> Void) -> UInt64 {
-    handlerRegistrationID &+= 1
-    let id = handlerRegistrationID
-    if _isCancelled {
-      handler()
-    } else {
-      cancellationHandler = handler
-    }
-    return id
+    cancelState.installHandler(handler)
   }
 
   /// Removes an operation-specific cleanup handler after the operation ends.
@@ -52,18 +46,130 @@ public actor TraceHandle {
   /// registration ID. This prevents an asynchronous or delayed cleanup from clearing
   /// a subsequent phase's newly installed cancellation handler.
   internal func clearCancellationHandler(id: UInt64? = nil) {
-    if let id {
-      guard id == handlerRegistrationID else { return }
-    }
-    cancellationHandler = nil
+    cancelState.clearHandler(id: id)
   }
 
   /// Whether an in-flight receive operation is currently attached.
   internal var hasCancellationHandler: Bool {
-    cancellationHandler != nil
+    cancelState.hasHandler
+  }
+
+  /// The error the operation must report if it stops now, or `nil` if nothing has cancelled it.
+  ///
+  /// The recorded reason decides. The calling task's own cancelled flag stands in for the caller's
+  /// reason, because a task is marked cancelled before its cancellation handlers run.
+  nonisolated func cancellationError() -> Error? {
+    if let reason = cancelState.reason { return reason.error }
+    return Task.isCancelled ? CancellationError() : nil
+  }
+
+  /// Throws the error ``cancellationError()`` names, if any.
+  nonisolated func checkCancellation() throws {
+    if let error = cancellationError() { throw error }
+  }
+
+  /// The error to report for an operation that failed with `error`: the cancellation that ended
+  /// it, if one did, otherwise `error` itself.
+  nonisolated func reportedError(for error: Error) -> Error {
+    if let reason = cancelState.reason { return reason.error }
+    if Task.isCancelled, error.isCancellation { return CancellationError() }
+    return error
   }
 
   init() {}
+}
+
+/// What ended an operation. When more than one applies, the one of highest precedence is reported.
+enum TraceCancellationReason: Sendable, Equatable {
+  /// The caller cancelled its own task, or a stream's consumer stopped iterating.
+  case callerTask
+  /// The tracer ended it: `cancelActiveTraces()` or `networkChanged()`.
+  case library
+
+  /// Higher wins. A reason never gives way to one of lower precedence.
+  var precedence: Int {
+    switch self {
+    case .callerTask: 0
+    case .library: 1
+    }
+  }
+
+  /// The error an operation ended for this reason throws.
+  var error: Error {
+    switch self {
+    case .callerTask: CancellationError()
+    case .library: TracerouteError.cancelled
+    }
+  }
+}
+
+extension Error {
+  /// Whether this is one of the two errors that report a cancellation.
+  var isCancellation: Bool {
+    if self is CancellationError { return true }
+    if case TracerouteError.cancelled? = self as? TracerouteError { return true }
+    return false
+  }
+}
+
+/// A trace handle's cancellation reason and cleanup handler, settable from any context.
+final class TraceCancelState: @unchecked Sendable {
+  private let lock = NSLock()
+  private var recordedReason: TraceCancellationReason?
+  private var handler: (@Sendable () -> Void)?
+  private var handlerRegistrationID: UInt64 = 0
+
+  /// The reason recorded so far, or `nil` if nothing has cancelled the operation.
+  var reason: TraceCancellationReason? {
+    lock.lock()
+    defer { lock.unlock() }
+    return recordedReason
+  }
+
+  /// Records `reason` unless one of higher precedence is already recorded. The first cancellation,
+  /// whatever its reason, runs the installed handler, outside the lock.
+  func cancel(_ reason: TraceCancellationReason) {
+    lock.lock()
+    guard let current = recordedReason else {
+      recordedReason = reason
+      let pending = handler
+      handler = nil
+      lock.unlock()
+      pending?()
+      return
+    }
+    if reason.precedence > current.precedence { recordedReason = reason }
+    lock.unlock()
+  }
+
+  /// Installs `handler`, or runs it at once if the operation is already cancelled.
+  func installHandler(_ newHandler: @escaping @Sendable () -> Void) -> UInt64 {
+    lock.lock()
+    handlerRegistrationID &+= 1
+    let id = handlerRegistrationID
+    guard recordedReason == nil else {
+      lock.unlock()
+      newHandler()
+      return id
+    }
+    handler = newHandler
+    lock.unlock()
+    return id
+  }
+
+  /// Clears the handler, if `id` is `nil` or still names the latest registration.
+  func clearHandler(id: UInt64?) {
+    lock.lock()
+    defer { lock.unlock() }
+    if let id, id != handlerRegistrationID { return }
+    handler = nil
+  }
+
+  var hasHandler: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return handler != nil
+  }
 }
 
 // Extension to make TraceHandle Hashable for use in Set
@@ -140,7 +246,8 @@ private final class CancellationContinuationBox<T: Sendable>: @unchecked Sendabl
 ///
 /// If `handle` is cancelled (e.g. via `cancelActiveTraces()`) or the calling task is cancelled while the
 /// operation is in flight, the operation task is cancelled and this function immediately throws
-/// `TracerouteError.cancelled` without stranding the caller.
+/// without stranding the caller: `TracerouteError.cancelled` for the tracer's cancellation,
+/// `CancellationError` for the caller's (see ``TraceHandle/reportedError(for:)``).
 internal func withTraceCancellation<T: Sendable>(
   handle: TraceHandle?,
   _ operation: @escaping @Sendable () async throws -> T
@@ -148,9 +255,7 @@ internal func withTraceCancellation<T: Sendable>(
   guard let handle else {
     return try await operation()
   }
-  if await handle.isCancelled {
-    throw TracerouteError.cancelled
-  }
+  try handle.checkCancellation()
 
   let task = Task {
     try await operation()
@@ -177,10 +282,7 @@ internal func withTraceCancellation<T: Sendable>(
     await handle.clearCancellationHandler(id: registrationID)
     task.cancel()
     box.cancel()
-    if await handle.isCancelled || error is CancellationError {
-      throw TracerouteError.cancelled
-    }
-    throw error
+    throw handle.reportedError(for: error)
   }
 }
 

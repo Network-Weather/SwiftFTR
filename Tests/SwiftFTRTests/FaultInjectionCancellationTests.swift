@@ -20,21 +20,30 @@ struct FaultInjectionCancellationTests {
 
   enum Canceller: String, CaseIterable, CustomTestStringConvertible, Sendable {
     case taskCancel, networkChanged, cancelActiveTraces
+    /// The caller cancels its task and then the tracer cancels its traces, in one step on the
+    /// tracer, so the operation cannot report the first before the second has happened.
+    case both
     var testDescription: String { rawValue }
+
+    /// The cancellations that come from the tracer alone.
+    static let library: [Canceller] = [.networkChanged, .cancelActiveTraces]
   }
 
   /// The error a cancelled operation must throw.
   enum Expected {
     /// `TracerouteError.cancelled`: the tracer's handle ended it.
     case handle
-    /// `CancellationError`: the caller's task ended it, on an API that reports it that way.
+    /// `CancellationError`: the caller's task ended it.
     case caller
-    /// Either: the caller's task ended an API that may report it either way.
+    /// Either: the caller's task and the tracer both cancelled, but the tracer may have done so
+    /// before the operation registered, when it could not reach it.
     case either
 
-    /// What a trace, classified trace or stream must report for `canceller`.
+    /// What a trace, classified trace or stream must report for `canceller`: the caller's own
+    /// cancellation as `CancellationError`, and the tracer's, alone or with the caller's, as
+    /// `TracerouteError.cancelled`.
     static func forTrace(_ canceller: Canceller) -> Expected {
-      canceller == .taskCancel ? .either : .handle
+      canceller == .taskCancel ? .caller : .handle
     }
   }
 
@@ -47,14 +56,18 @@ struct FaultInjectionCancellationTests {
     case .taskCancel: task.cancel()
     case .networkChanged: await tracer.networkChanged()
     case .cancelActiveTraces: await tracer.cancelActiveTraces()
+    case .both: await tracer.cancelTaskThenActiveTraces(task)
     }
   }
 
   /// Runs `cancelling`, then asserts the task ends with the `expected` cancellation error, or, when
   /// `mayComplete`, returns a value. Both must finish within ``watchdog``, timed from before
   /// `cancelling` starts, so a slow or stuck cancellation call fails too.
+  ///
+  /// `mustComplete` is for a stream whose consumer cancelled: it must end normally, not throw.
   private static func expectPromptCancellation<T: Sendable>(
-    _ task: Task<T, Error>, expected: Expected, mayComplete: Bool = false, _ label: String,
+    _ task: Task<T, Error>, expected: Expected, mayComplete: Bool = false,
+    mustComplete: Bool = false, _ label: String,
     cancelling: @escaping @Sendable () async -> Void
   ) async {
     do {
@@ -66,8 +79,10 @@ struct FaultInjectionCancellationTests {
     } catch let expired as WatchdogExpired {
       Issue.record("\(label): \(expired)")
     } catch TracerouteError.cancelled {
+      #expect(!mustComplete, "\(label): threw instead of ending normally")
       #expect(expected != .caller, "\(label): caller cancellation reported as the tracer's")
     } catch is CancellationError {
+      #expect(!mustComplete, "\(label): threw instead of ending normally")
       #expect(expected != .handle, "\(label): the tracer's cancellation reported as the caller's")
     } catch {
       Issue.record("\(label): threw \(error)")
@@ -96,7 +111,8 @@ struct FaultInjectionCancellationTests {
           }
           try await Task.sleep(nanoseconds: UInt64(step - 8) * 15_000_000)
         }
-        // A trace not yet registered cannot be reached by the tracer; its own task can.
+        // A trace not yet registered cannot be reached by the tracer; its own task can. Which of
+        // the two then ends it depends on whether it registered first.
         let alsoCancelTask = canceller != .taskCancel && step < 8
         await Self.expectPromptCancellation(
           task, expected: alsoCancelTask ? .either : Expected.forTrace(canceller), "step \(step)"
@@ -109,7 +125,9 @@ struct FaultInjectionCancellationTests {
     #expect(await tracer.activeTraces.isEmpty)
   }
 
-  @Test("traceStream ends promptly whenever it is cancelled", arguments: Canceller.allCases)
+  @Test(
+    "traceStream ends promptly whenever it is cancelled",
+    arguments: [Canceller.taskCancel] + Canceller.library)
   func streamSweep(canceller: Canceller) async throws {
     let network = try FakeICMPNetwork { _ in [] }
     defer { network.stop() }
@@ -128,15 +146,64 @@ struct FaultInjectionCancellationTests {
           #expect(await eventually(within: 2) { await !tracer.activeTraces.isEmpty })
         }
         try await Task.sleep(nanoseconds: UInt64(step) * 15_000_000)
-        // Cancelling the consuming task ends iteration normally, as for any AsyncSequence, or
-        // with a cancellation error. Anything else is a failure, not a cancellation.
+        // Cancelling the consuming task ends iteration normally (see
+        // `consumerCancellationEndsIterationNormally`); the tracer's cancellation throws.
         await Self.expectPromptCancellation(
           task, expected: Expected.forTrace(canceller), mayComplete: canceller == .taskCancel,
-          "step \(step)"
+          mustComplete: canceller == .taskCancel, "step \(step)"
         ) { await Self.cancel(task, on: tracer, by: canceller) }
       }
     }
     #expect(await eventually(within: 1) { await tracer.activeTraces.isEmpty })
+  }
+
+  /// The premise of the stream tests: once a consumer that cancelled its own task has been
+  /// handed the end of iteration, a producer that finishes with an error later cannot change it.
+  /// (An error the producer finishes with inside `onTermination` itself does reach the consumer,
+  /// so `traceStream` finishes normally when its consumer cancels rather than relying on order.)
+  @Test("Cancelling a stream's consumer ends its iteration normally")
+  func consumerCancellationEndsIterationNormally() async throws {
+    let terminated = FaultCounter()
+    let (stream, continuation) = AsyncThrowingStream<Int, Error>.makeStream()
+    continuation.onTermination = { _ in terminated.increment() }
+    let consumer = Task {
+      var count = 0
+      for try await _ in stream { count += 1 }
+      return count
+    }
+    consumer.cancel()
+    let (count, _) = try await measure(within: Self.watchdog) { try await consumer.value }
+    #expect(count == 0)
+    #expect(terminated.value == 1)
+    // Too late to matter: the consumer has already returned.
+    continuation.finish(throwing: TracerouteError.cancelled)
+  }
+
+  @Test("A stream whose consumer cancels ends normally and its producer lets go of everything")
+  func streamConsumerCancellationCleansUp() async throws {
+    let network = try FakeICMPNetwork { _ in [] }
+    defer { network.stop() }
+    let log = DescriptorLog()
+    let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
+    let config = StreamingTraceConfig(probeTimeout: 10, retryAfter: 0.1, maxHops: 8)
+
+    try await network.install(socketFactory: log.wrap { try network.makeSocket($0) }) {
+      let consumer = Task {
+        var count = 0
+        for try await _ in tracer.traceStream(to: "fake.test", config: config) { count += 1 }
+        return count
+      }
+      let receiving = await eventually(within: 3) {
+        guard let handle = await tracer.activeTraces.first else { return false }
+        return await handle.hasCancellationHandler
+      }
+      #expect(receiving, "the stream never reached its receive window")
+      consumer.cancel()
+      _ = try await measure(within: Self.watchdog) { try await consumer.value }
+    }
+    #expect(await eventually(within: Self.watchdog) { await tracer.activeTraces.isEmpty })
+    #expect(log.opened == 1)
+    #expect(await eventually(within: Self.watchdog) { log.allClosed }, "the socket was left open")
   }
 
   @Test("ping returns promptly whenever its task is cancelled")
@@ -157,11 +224,11 @@ struct FaultInjectionCancellationTests {
           #expect(await eventually(within: 2) { network.probes.value > before })
         }
         try await Task.sleep(nanoseconds: UInt64(step) * 20_000_000)
-        // A cancelled ping may return the partial result it has or throw a cancellation error;
-        // any other error means it failed rather than being cancelled.
-        await Self.expectPromptCancellation(
-          task, expected: .either, mayComplete: true, "step \(step)"
-        ) { task.cancel() }
+        // Twenty probes half a second apart cannot finish here, so the ping must throw the
+        // caller's own cancellation.
+        await Self.expectPromptCancellation(task, expected: .caller, "step \(step)") {
+          task.cancel()
+        }
       }
     }
   }
@@ -169,7 +236,7 @@ struct FaultInjectionCancellationTests {
   // MARK: traceClassified, one stalled phase at a time
 
   enum ClassifiedPhase: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    case publicIPDiscovery, probeWindow, asnLookup
+    case publicIPDiscovery, probeWindow, reverseDNS, asnLookup
     var testDescription: String { rawValue }
   }
 
@@ -197,18 +264,28 @@ struct FaultInjectionCancellationTests {
       return STUNPublicIP(ip: "198.51.100.7")
     }
     let resolver = StallingASNResolver(stall: phase == .asnLookup, entered: entered)
+    // Reverse DNS on the executor under a long deadline, as production composes it.
+    let rdns = RDNSCache(lookupDeadline: 20) { _ in
+      entered.increment()
+      return try? await runDetachedBlockingIO(priority: .background, deadline: 20) {
+        gate.wait(limit: 20)
+        return String?.none
+      }
+    }
     let tracer = offlineTracer(
       SwiftFTRConfig(
-        maxHops: 4, maxWaitMs: 10_000, noReverseDNS: true, publicIPDiscoveryTimeout: 20))
+        maxHops: 4, maxWaitMs: 10_000, noReverseDNS: phase != .reverseDNS,
+        publicIPDiscoveryTimeout: 20),
+      rdns: rdns)
 
-    try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
-        try await network.install {
+    await TestSeams.$blockingIOExecutor.withValue(executor) {
+      await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+        await network.install {
           let task = Task { try await tracer.traceClassified(to: "fake.test", resolver: resolver) }
           let reached = await eventually(within: 3) {
             switch phase {
             case .probeWindow: network.probes.value >= 4
-            case .publicIPDiscovery, .asnLookup: entered.value > 0
+            case .publicIPDiscovery, .reverseDNS, .asnLookup: entered.value > 0
             }
           }
           #expect(reached, "the trace never reached \(phase)")
@@ -222,8 +299,8 @@ struct FaultInjectionCancellationTests {
   }
 
   @Test(
-    "A network change during a trace's reverse-DNS wave ends the trace promptly",
-    arguments: [Canceller.networkChanged, .cancelActiveTraces])
+    "A trace cancelled during its reverse-DNS wave ends promptly, reporting who cancelled it",
+    arguments: Canceller.allCases)
   func reverseDNSWave(canceller: Canceller) async throws {
     let gate = StallGate()
     defer { gate.open() }
@@ -241,11 +318,13 @@ struct FaultInjectionCancellationTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000), rdns: rdns)
 
-    try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await network.install {
+    await TestSeams.$blockingIOExecutor.withValue(executor) {
+      await network.install {
         let task = Task { try await tracer.trace(to: "fake.test") }
         #expect(await eventually(within: 3) { started.value > 0 })
-        await Self.expectPromptCancellation(task, expected: .handle, "reverse DNS") {
+        await Self.expectPromptCancellation(
+          task, expected: Expected.forTrace(canceller), "reverse DNS"
+        ) {
           await Self.cancel(task, on: tracer, by: canceller)
         }
       }
@@ -298,14 +377,14 @@ struct FaultInjectionCancellationTests {
     let config = MultipathConfig(
       flowVariations: 2, maxPaths: 8, earlyStopThreshold: 2, timeoutMs: 10_000, maxHops: 4)
 
-    try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
-        try await network.install {
+    await TestSeams.$blockingIOExecutor.withValue(executor) {
+      await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+        await network.install {
           let resolve: TestSeams.ResolveHost = { [network] _, _ in
             resolutions.increment()
             return network.resolved
           }
-          try await TestSeams.$resolveHost.withValue(resolve) {
+          await TestSeams.$resolveHost.withValue(resolve) {
             let task = Task { try await tracer.discoverPaths(to: "fake.test", config: config) }
             let reached = await eventually(within: 3) {
               phase == .probeWindow ? network.probes.value >= 8 : entered.value > 0
@@ -414,6 +493,58 @@ struct FaultInjectionCancellationTests {
     }
   }
 
+  // MARK: traceStream's end
+
+  /// Runs `body` with a stream that has delivered its only hop and is held at its commit step until
+  /// `gate` opens. The consumer task returns how many hops it saw.
+  private static func withStreamAtCommit(
+    _ body: @Sendable (SwiftFTR, Task<Int, Error>, StallGate) async throws -> Void
+  ) async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let atCommit = FaultCounter()
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 1))
+    defer { network.stop() }
+    let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
+    let config = StreamingTraceConfig(probeTimeout: 10, retryAfter: nil, maxHops: 1)
+    let hold: @Sendable () async -> Void = {
+      atCommit.increment()
+      await gate.waitAsync(limit: 20)
+    }
+    try await network.install {
+      try await TestSeams.$beforeStreamCommit.withValue(hold) {
+        let consumer = Task {
+          var count = 0
+          for try await _ in tracer.traceStream(to: "fake.test", config: config) { count += 1 }
+          return count
+        }
+        let reached = await eventually(within: Self.watchdog) { atCommit.value > 0 }
+        #expect(reached, "the stream never reached its commit")
+        try await body(tracer, consumer, gate)
+      }
+    }
+    #expect(await tracer.activeTraces.isEmpty)
+  }
+
+  @Test("A stream cancelled by the tracer after its last hop but before it ends reports it")
+  func streamCancelledBeforeCommit() async throws {
+    try await Self.withStreamAtCommit { tracer, consumer, gate in
+      await tracer.cancelActiveTraces()
+      gate.open()
+      await Self.expectPromptCancellation(consumer, expected: .handle, "cancelled before commit") {}
+    }
+  }
+
+  @Test("A stream that ended before the tracer's cancellation keeps its normal end")
+  func streamCommittedBeforeCancellation() async throws {
+    try await Self.withStreamAtCommit { tracer, consumer, gate in
+      gate.open()
+      let (count, _) = try await measure(within: Self.watchdog) { try await consumer.value }
+      await tracer.cancelActiveTraces()
+      #expect(count == 1)
+    }
+  }
+
   @Test("A reverse-DNS lookup cut short by cancellation is not cached as a miss")
   func cancelledLookupNotCached() async throws {
     let calls = FaultCounter()
@@ -436,6 +567,13 @@ extension SwiftFTR {
   /// Withdraws every registered handle without cancelling it, as `cancelActiveTraces()` does
   /// before it awaits each handle's `cancel()`.
   fileprivate func withdrawActiveTraces() { activeTraces.removeAll() }
+
+  /// Cancels `task`, then every registered trace, in one step on this tracer, so an operation
+  /// reporting from the tracer cannot see the first without the second.
+  fileprivate func cancelTaskThenActiveTraces<T>(_ task: Task<T, Error>) {
+    task.cancel()
+    cancelRegisteredTraces()
+  }
 }
 
 /// An ASN resolver that, when told to, waits for `gate` on a thread and ignores cancellation,

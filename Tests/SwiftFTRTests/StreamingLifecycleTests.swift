@@ -62,8 +62,11 @@ struct StreamingLifecycleTests {
 
   @Test("networkChanged stops an active streaming receive operation", .timeLimit(.minutes(1)))
   func networkChangeStopsStreamingOperation() async throws {
-    let tracer = SwiftFTR(
-      config: SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: true))
+    // A loopback peer that never answers, so the stream stays in its receive window until it is
+    // cancelled. A real first hop can answer within a millisecond and end the stream first.
+    let network = try FakeICMPNetwork { _ in [] }
+    defer { network.stop() }
+    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: true))
     let streamConfig = StreamingTraceConfig(
       probeTimeout: 30,
       retryAfter: nil,
@@ -71,39 +74,43 @@ struct StreamingLifecycleTests {
       maxHops: 1
     )
 
-    let consumer = Task {
-      var iterator = tracer.traceStream(
-        to: "192.0.2.1", config: streamConfig
-      ).makeAsyncIterator()
-      return try await iterator.next()
+    try await network.install {
+      let consumer = Task {
+        var iterator = tracer.traceStream(
+          to: "fake.test", config: streamConfig
+        ).makeAsyncIterator()
+        return try await iterator.next()
+      }
+
+      let receiving = await waitUntil {
+        guard let handle = await tracer.activeTraces.first else { return false }
+        return await handle.hasCancellationHandler
+      }
+      try #require(receiving, "The streaming receive operation should start before cancellation")
+
+      let started = ContinuousClock.now
+      await tracer.networkChanged()
+
+      do {
+        _ = try await consumer.value
+        Issue.record("the stream ended normally instead of reporting the network change")
+      } catch TracerouteError.cancelled {
+        // The tracer ended the live stream.
+      }
+
+      let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
+      #expect(unregistered)
+      #expect(started.duration(to: .now) < .seconds(1))
     }
-
-    let receiving = await waitUntil {
-      guard let handle = await tracer.activeTraces.first else { return false }
-      return await handle.hasCancellationHandler
-    }
-    try #require(receiving, "The streaming receive operation should start before cancellation")
-
-    let started = ContinuousClock.now
-    await tracer.networkChanged()
-
-    do {
-      _ = try await consumer.value
-    } catch is CancellationError {
-      // AsyncSequence cancellation may surface as CancellationError.
-    } catch TracerouteError.cancelled {
-      // The receive operation reports the library's cancellation error.
-    }
-
-    let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
-    #expect(unregistered)
-    #expect(started.duration(to: .now) < .seconds(1))
   }
 
   @Test("Ending iteration cancels the streaming producer", .timeLimit(.minutes(1)))
   func endingIterationCancelsProducer() async throws {
-    let tracer = SwiftFTR(
-      config: SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: true))
+    // A loopback peer that never answers, so the stream stays in its receive window until it is
+    // cancelled. A real first hop can answer within a millisecond and end the stream first.
+    let network = try FakeICMPNetwork { _ in [] }
+    defer { network.stop() }
+    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: true))
     let streamConfig = StreamingTraceConfig(
       probeTimeout: 30,
       retryAfter: nil,
@@ -111,26 +118,28 @@ struct StreamingLifecycleTests {
       maxHops: 1
     )
 
-    let consumer = Task {
-      var iterator = tracer.traceStream(
-        to: "192.0.2.1", config: streamConfig
-      ).makeAsyncIterator()
-      return try await iterator.next()
+    try await network.install {
+      let consumer = Task {
+        var iterator = tracer.traceStream(
+          to: "fake.test", config: streamConfig
+        ).makeAsyncIterator()
+        return try await iterator.next()
+      }
+
+      let receiving = await waitUntil {
+        guard let handle = await tracer.activeTraces.first else { return false }
+        return await handle.hasCancellationHandler
+      }
+      try #require(receiving, "The streaming receive operation should start before cancellation")
+
+      let started = ContinuousClock.now
+      consumer.cancel()
+      _ = try? await consumer.value
+
+      let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
+      #expect(unregistered)
+      #expect(started.duration(to: .now) < .seconds(1))
     }
-
-    let receiving = await waitUntil {
-      guard let handle = await tracer.activeTraces.first else { return false }
-      return await handle.hasCancellationHandler
-    }
-    try #require(receiving, "The streaming receive operation should start before cancellation")
-
-    let started = ContinuousClock.now
-    consumer.cancel()
-    _ = try? await consumer.value
-
-    let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
-    #expect(unregistered)
-    #expect(started.duration(to: .now) < .seconds(1))
   }
 
   private func waitUntil(

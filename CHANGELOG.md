@@ -54,6 +54,17 @@ What an unmodified caller will see differently:
   `fcntl` call that sets `O_NONBLOCK` fails, before any probe is sent, as `ping` already did.
   Previously the failure was ignored and the trace ran on a blocking socket, where its receive
   loop could wait past its deadline for a reply that never came.
+- **`ping` throws `CancellationError` when its task is cancelled.** It threw
+  `TracerouteError.cancelled`, the error that means the tracer ended an operation, although ping
+  is not tied to `networkChanged()` or `cancelActiveTraces()`.
+- **`trace` and `traceClassified` say who cancelled them.** Cancelling the calling task throws
+  `CancellationError`; `networkChanged()` or `cancelActiveTraces()` throws
+  `TracerouteError.cancelled`, also when the caller cancelled too. A caller's own cancellation
+  used to be reported as `TracerouteError.cancelled` in most phases and as `CancellationError` in
+  one, so a caller that retried on `TracerouteError.cancelled` retried after cancelling itself.
+- **A `traceStream` consumer that cancels its task sees a normal end of iteration**, unless the
+  tracer had already ended the stream; the trace then stops probing and closes its socket. A
+  stream the tracer ends before it finishes still throws `TracerouteError.cancelled`.
 
 ### Bug fixes
 
@@ -80,6 +91,13 @@ What an unmodified caller will see differently:
   ignored cancellation, and, for ping, sent no further probes. Each read callback now handles at
   most 64 datagrams and checks for cancellation and its deadline before every read; a longer
   backlog is read over later callbacks, so no reply is lost.
+- **A stream cancelled by the tracer just before it ends reports the cancellation.** A
+  `cancelActiveTraces()` or `networkChanged()` that landed after a `traceStream` had finished
+  probing but before it ended the stream was recorded and then ignored: the consumer saw a normal
+  end. The stream now decides its outcome, unregisters and ends in one step on the tracer.
+- **A trace cancelled by both its caller and the tracer reports the tracer's cancellation.**
+  `traceClassified` cancelled during public-IP discovery reported `CancellationError` even when
+  `networkChanged()` had also ended it.
 - **A trace's socket is closed only once dispatch has let go of it.** The trace paths closed the
   descriptor as the call returned, while the cancelled read source could still hold it, so the
   number could be reused under it. The descriptor is now closed from the read source's
@@ -91,6 +109,10 @@ What an unmodified caller will see differently:
   phase through task-local test seams and loopback fixtures, and asserts that every operation
   returns while its stall is still in force, under a watchdog derived from its configuration. See
   `docs/ROBUSTNESS-TESTING.md`.
+- Tests that wait for a fixture to start, become ready or be cancelled, or poll until a fixture
+  has run, now fail after ten seconds instead of hanging the run when that never happens (#105).
+  Waits that cannot fail to end (a fixture's own stop path, a stall the test itself releases, a
+  call with its own timeout) are left as they are.
 
 ### Dependencies
 

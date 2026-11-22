@@ -120,12 +120,14 @@ struct BlockingIOBridgeTests {
     }
     defer { probe.release(count: operationCount) }
 
-    var startIterator = probe.starts.makeAsyncIterator()
-    var observedActiveCounts: [Int] = []
-    for _ in 0..<width {
-      if let activeCount = await startIterator.next() {
-        observedActiveCounts.append(activeCount)
+    // Bounded: an operation that never starts fails the test instead of hanging it.
+    let (observedActiveCounts, _) = try await measure(within: 10) {
+      var startIterator = probe.starts.makeAsyncIterator()
+      var counts: [Int] = []
+      for _ in 0..<width {
+        if let activeCount = await startIterator.next() { counts.append(activeCount) }
       }
+      return counts
     }
 
     #expect(observedActiveCounts.sorted() == Array(1...width))
@@ -158,8 +160,10 @@ struct BlockingIOBridgeTests {
     }
     defer { probe.release(count: 1) }
 
-    var startIterator = probe.starts.makeAsyncIterator()
-    let started = await startIterator.next()
+    let (started, _) = try await measure(within: 10) {
+      var startIterator = probe.starts.makeAsyncIterator()
+      return await startIterator.next()
+    }
     #expect(started == 1)
 
     operation.cancel()

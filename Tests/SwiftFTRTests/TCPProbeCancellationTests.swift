@@ -83,7 +83,7 @@ struct TCPProbeCancellationTests {
     let operation = makeOperation(driver: driver, descriptor: 102)
     let task = Task { try await operation.run() }
 
-    await driver.waitUntilInstalled()
+    try await waitBounded("the probe installing its sources") { await driver.waitUntilInstalled() }
     task.cancel()
     try await driver.triggerTimeout()
 
@@ -109,9 +109,11 @@ struct TCPProbeCancellationTests {
     let operation = makeOperation(driver: driver, descriptor: 103)
     let task = Task { try await operation.run() }
 
-    await driver.waitUntilInstalled()
+    try await waitBounded("the probe installing its sources") { await driver.waitUntilInstalled() }
     task.cancel()
-    await driver.waitUntilSourceCancellationRequested()
+    try await waitBounded("the source cancellation request") {
+      await driver.waitUntilSourceCancellationRequested()
+    }
     try await driver.drainEventQueue()
 
     // DispatchSource.cancel() is asynchronous. Even after finish() returns,
@@ -144,7 +146,9 @@ struct TCPProbeCancellationTests {
       let operation = makeOperation(driver: driver, descriptor: Int32(descriptor))
       let task = Task { try await operation.run() }
 
-      await driver.waitUntilInstalled()
+      try await waitBounded("the probe installing its sources") {
+        await driver.waitUntilInstalled()
+      }
 
       await withTaskGroup(of: Void.self) { group in
         group.addTask {
@@ -190,7 +194,9 @@ struct TCPProbeCancellationTests {
       let operation = makeOperation(driver: driver, descriptor: Int32(300 + index))
       let task = Task { try await operation.run() }
 
-      await driver.waitUntilInstalled()
+      try await waitBounded("the probe installing its sources") {
+        await driver.waitUntilInstalled()
+      }
       try await driver.triggerConnectCompletion()
       let result = try await task.value
 
