@@ -578,9 +578,9 @@ func getPublicIPv4ViaDNS(
     print("[DNS-IP] Querying whoami.ds.akahelp.net TXT...")
   }
 
-  // Use existing DNSClient.queryTXT which tries multiple servers
+  // Blocking, because this runs inside a blocking public-IP closure; tries each server in turn.
   guard
-    let txtRecords = DNSClient.queryTXT(
+    let txtRecords = DNSClient.queryTXTBlocking(
       name: "whoami.ds.akahelp.net",
       timeout: timeout,
       servers: servers

@@ -4,32 +4,11 @@ import Foundation
   import Darwin
 #endif
 
-// MARK: - High-Precision Timing
+// MARK: - Timing
 
-/// High-precision time measurement using mach_absolute_time()
-/// Returns time in milliseconds with 0.1ms precision
-@available(macOS 10.0, *)
-private struct HighPrecisionTimer {
-  private let start: UInt64
-  private static let timebaseInfo: mach_timebase_info = {
-    var info = mach_timebase_info()
-    mach_timebase_info(&info)
-    return info
-  }()
-
-  init() {
-    self.start = mach_absolute_time()
-  }
-
-  /// Get elapsed time in milliseconds with 0.1ms precision
-  func elapsedMs() -> Double {
-    let end = mach_absolute_time()
-    let elapsed = end - start
-    let nanos = elapsed * UInt64(Self.timebaseInfo.numer) / UInt64(Self.timebaseInfo.denom)
-    let ms = Double(nanos) / 1_000_000.0
-    // Round to 0.1ms precision
-    return (ms * 10.0).rounded() / 10.0
-  }
+/// `seconds` in milliseconds, rounded to 0.1 ms, the precision `DNSQueryResult.rttMs` reports.
+private func roundedMilliseconds(_ seconds: TimeInterval) -> Double {
+  (seconds * 10_000).rounded() / 10
 }
 
 // MARK: - Public DNS Probe API
@@ -95,25 +74,94 @@ private func _validateDNSSourceFamily(_ sourceIP: String?, serverFamily: Int32) 
   }
 }
 
-/// Runs a blocking DNS query on the shared executor after rejecting inputs that need no I/O.
+/// Bytes read from a DNS reply. A longer datagram is truncated to this and then fails to parse,
+/// which reports it as `DNSError.malformedResponse`.
+private let dnsReceiveCapacity = 2048
+
+/// The first datagram a DNS server sent back for one query, not yet validated.
+private struct DNSReply {
+  let message: Data
+  let expectedID: UInt16
+  /// Seconds from sending the query to reading this datagram.
+  let rtt: TimeInterval
+
+  func answers() throws -> [DNSClient.Answer] {
+    try DNSClient.validateResponse(message: message, expectedID: expectedID)
+  }
+}
+
+/// Sends one DNS query over a ``UDPExchange`` and returns the first datagram back, unvalidated.
 ///
-/// The checks `performDNSQueryInternal` would make on its worker (`invalidTimeout`,
-/// `invalidHostname`, `invalidIP`, and `bindFailed` for a source address of the wrong family)
-/// run here first, so a query that can never succeed reports why at once, even when every
-/// worker is busy.
-private func runDNSQuery<T: Sendable>(
+/// The checks that need no I/O (`invalidTimeout`, `invalidHostname`, `invalidIP`, and
+/// `bindFailed` for a source address of the wrong family) run first, before any socket is
+/// opened. The wait for the reply holds no thread.
+///
+/// - Parameter serverPort: The server's UDP port. `nil` means 53, or the port a test binds
+///   through `TestSeams.dnsServerPort`.
+/// - Throws: ``DNSError`` for invalid input or a failed bind or connect, ``UDPExchangeFailure``
+///   from the transport, or `CancellationError`.
+private func exchangeDNSQuery(
   server: String,
-  query name: String,
-  sourceIP: String?,
+  query: String,
+  queryType: UInt16,
   timeout: TimeInterval,
-  _ query: @Sendable @escaping () throws -> T
-) async throws -> T {
+  interface: String?,
+  sourceIP: String?,
+  serverPort: UInt16? = nil
+) async throws -> DNSReply {
   try _validateDNSTimeout(timeout)
-  _ = try _encodeQName(name)
+  let encodedQuery = try _encodeQName(query)
   let family = detectAddressFamily(server)
   guard family == AF_INET || family == AF_INET6 else { throw DNSError.invalidIP(server) }
   try _validateDNSSourceFamily(sourceIP, serverFamily: family)
-  return try await runDetachedBlockingIO(query)
+
+  let port = serverPort ?? TestSeams.dnsServerPort ?? 53
+  let (request, id) = makeDNSQueryMessage(encodedQuery: encodedQuery, queryType: queryType)
+  let reply = try await UDPExchange.perform(
+    family: family, request: request, timeout: timeout, receiveCapacity: dnsReceiveCapacity
+  ) { fd in
+    try bindDNSSocket(fd, family: family, interface: interface, sourceIP: sourceIP)
+    // A connected UDP socket only receives responses from this DNS server and port.
+    try connectDNSSocket(fd, server: server, port: port, family: family)
+  }
+  return DNSReply(message: Data(reply.bytes), expectedID: id, rtt: reply.rtt)
+}
+
+/// The `DNSError` a query method throws for a transport failure.
+///
+/// A refusal is `sendFailed`: the query reached the host, but no DNS server was there to take it.
+/// Host and network unreachable, and other receive errors, stay `timeout`, as they were when the
+/// client waited in a blocking `recv`.
+private func dnsError(for failure: UDPExchangeFailure) -> DNSError {
+  switch failure {
+  case .socketCreationFailed: .socketCreationFailed
+  case .nonBlockingFailed(let code): .setsockoptFailed(option: "O_NONBLOCK", errno: code)
+  case .sendFailed, .refused: .sendFailed
+  case .unreachable, .receiveFailed, .timedOut: .timeout
+  }
+}
+
+/// Runs one DNS query and returns its validated answers with the measured round-trip time.
+///
+/// - Throws: ``DNSError``, or `CancellationError` when the calling task is cancelled.
+private func runDNSQuery(
+  server: String,
+  query: String,
+  queryType: UInt16,
+  timeout: TimeInterval,
+  interface: String?,
+  sourceIP: String?,
+  serverPort: UInt16? = nil
+) async throws -> (answers: [DNSClient.Answer], rtt: TimeInterval) {
+  let reply: DNSReply
+  do {
+    reply = try await exchangeDNSQuery(
+      server: server, query: query, queryType: queryType, timeout: timeout,
+      interface: interface, sourceIP: sourceIP, serverPort: serverPort)
+  } catch let failure as UDPExchangeFailure {
+    throw dnsError(for: failure)
+  }
+  return (try reply.answers(), reply.rtt)
 }
 
 private func _applyDNSSocketTimeout(fd: Int32, timeout: TimeInterval) throws {
@@ -248,7 +296,6 @@ public struct DNSQueries: Sendable {
     interface: String? = nil,
     sourceIP: String? = nil
   ) async throws -> DNSQueryResult {
-    let timer = HighPrecisionTimer()
     let startTime = Date()
 
     guard !hostname.isEmpty else {
@@ -262,20 +309,12 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query A record
-    let answers = try await runDNSQuery(
-      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
-    ) {
-      try performDNSQueryInternal(
-        server: resolvedServer,
-        query: hostname,
-        queryType: DNSRecordType.a.rawValue,
-        timeout: resolvedTimeout,
-        interface: resolvedInterface,
-        sourceIP: resolvedSourceIP
-      )
-    }
+    let (answers, rtt) = try await runDNSQuery(
+      server: resolvedServer, query: hostname, queryType: DNSRecordType.a.rawValue,
+      timeout: resolvedTimeout,
+      interface: resolvedInterface, sourceIP: resolvedSourceIP)
 
-    let rttMs = timer.elapsedMs()
+    let rttMs = roundedMilliseconds(rtt)
 
     // Parse all A records
     var records: [DNSRecord] = []
@@ -325,7 +364,6 @@ public struct DNSQueries: Sendable {
     interface: String? = nil,
     sourceIP: String? = nil
   ) async throws -> DNSQueryResult {
-    let timer = HighPrecisionTimer()
     let startTime = Date()
 
     guard !hostname.isEmpty else {
@@ -339,20 +377,12 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query AAAA record
-    let answers = try await runDNSQuery(
-      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
-    ) {
-      try performDNSQueryInternal(
-        server: resolvedServer,
-        query: hostname,
-        queryType: DNSRecordType.aaaa.rawValue,
-        timeout: resolvedTimeout,
-        interface: resolvedInterface,
-        sourceIP: resolvedSourceIP
-      )
-    }
+    let (answers, rtt) = try await runDNSQuery(
+      server: resolvedServer, query: hostname, queryType: DNSRecordType.aaaa.rawValue,
+      timeout: resolvedTimeout,
+      interface: resolvedInterface, sourceIP: resolvedSourceIP)
 
-    let rttMs = timer.elapsedMs()
+    let rttMs = roundedMilliseconds(rtt)
 
     // Parse all AAAA records
     var records: [DNSRecord] = []
@@ -402,7 +432,6 @@ public struct DNSQueries: Sendable {
     interface: String? = nil,
     sourceIP: String? = nil
   ) async throws -> DNSQueryResult {
-    let timer = HighPrecisionTimer()
     let startTime = Date()
 
     // Format IP to in-addr.arpa
@@ -417,20 +446,12 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDNSQuery(
-      server: resolvedServer, query: arpaQuery, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
-    ) {
-      try performDNSQueryInternal(
-        server: resolvedServer,
-        query: arpaQuery,
-        queryType: DNSRecordType.ptr.rawValue,
-        timeout: resolvedTimeout,
-        interface: resolvedInterface,
-        sourceIP: resolvedSourceIP
-      )
-    }
+    let (answers, rtt) = try await runDNSQuery(
+      server: resolvedServer, query: arpaQuery, queryType: DNSRecordType.ptr.rawValue,
+      timeout: resolvedTimeout,
+      interface: resolvedInterface, sourceIP: resolvedSourceIP)
 
-    let rttMs = timer.elapsedMs()
+    let rttMs = roundedMilliseconds(rtt)
 
     // Parse all PTR records
     var records: [DNSRecord] = []
@@ -484,7 +505,6 @@ public struct DNSQueries: Sendable {
     interface: String? = nil,
     sourceIP: String? = nil
   ) async throws -> DNSQueryResult {
-    let timer = HighPrecisionTimer()
     let startTime = Date()
 
     // Format IP to ip6.arpa
@@ -499,20 +519,12 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query PTR record
-    let answers = try await runDNSQuery(
-      server: resolvedServer, query: arpaQuery, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
-    ) {
-      try performDNSQueryInternal(
-        server: resolvedServer,
-        query: arpaQuery,
-        queryType: DNSRecordType.ptr.rawValue,
-        timeout: resolvedTimeout,
-        interface: resolvedInterface,
-        sourceIP: resolvedSourceIP
-      )
-    }
+    let (answers, rtt) = try await runDNSQuery(
+      server: resolvedServer, query: arpaQuery, queryType: DNSRecordType.ptr.rawValue,
+      timeout: resolvedTimeout,
+      interface: resolvedInterface, sourceIP: resolvedSourceIP)
 
-    let rttMs = timer.elapsedMs()
+    let rttMs = roundedMilliseconds(rtt)
 
     // Parse all PTR records
     var records: [DNSRecord] = []
@@ -566,7 +578,6 @@ public struct DNSQueries: Sendable {
     interface: String? = nil,
     sourceIP: String? = nil
   ) async throws -> DNSQueryResult {
-    let timer = HighPrecisionTimer()
     let startTime = Date()
 
     guard !hostname.isEmpty else {
@@ -580,20 +591,12 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Query TXT record
-    let answers = try await runDNSQuery(
-      server: resolvedServer, query: hostname, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
-    ) {
-      try performDNSQueryInternal(
-        server: resolvedServer,
-        query: hostname,
-        queryType: DNSRecordType.txt.rawValue,
-        timeout: resolvedTimeout,
-        interface: resolvedInterface,
-        sourceIP: resolvedSourceIP
-      )
-    }
+    let (answers, rtt) = try await runDNSQuery(
+      server: resolvedServer, query: hostname, queryType: DNSRecordType.txt.rawValue,
+      timeout: resolvedTimeout,
+      interface: resolvedInterface, sourceIP: resolvedSourceIP)
 
-    let rttMs = timer.elapsedMs()
+    let rttMs = roundedMilliseconds(rtt)
 
     // Parse all TXT records
     var records: [DNSRecord] = []
@@ -645,7 +648,6 @@ public struct DNSQueries: Sendable {
     interface: String? = nil,
     sourceIP: String? = nil
   ) async throws -> DNSQueryResult {
-    let timer = HighPrecisionTimer()
     let startTime = Date()
 
     guard !name.isEmpty else {
@@ -659,20 +661,11 @@ public struct DNSQueries: Sendable {
     let resolvedSourceIP = sourceIP ?? tracer.config.sourceIP
 
     // Perform query
-    let answers = try await runDNSQuery(
-      server: resolvedServer, query: name, sourceIP: resolvedSourceIP, timeout: resolvedTimeout
-    ) {
-      try performDNSQueryInternal(
-        server: resolvedServer,
-        query: name,
-        queryType: type.rawValue,
-        timeout: resolvedTimeout,
-        interface: resolvedInterface,
-        sourceIP: resolvedSourceIP
-      )
-    }
+    let (answers, rtt) = try await runDNSQuery(
+      server: resolvedServer, query: name, queryType: type.rawValue, timeout: resolvedTimeout,
+      interface: resolvedInterface, sourceIP: resolvedSourceIP)
 
-    let rttMs = timer.elapsedMs()
+    let rttMs = roundedMilliseconds(rtt)
 
     // Parse records based on type
     var records: [DNSRecord] = []
@@ -986,13 +979,11 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult {
     sourceIP: config.sourceIP
   )
 
-  let rtt = result.isReachable ? Date().timeIntervalSince(startTime) : nil
-
   return DNSProbeResult(
     server: config.server,
     query: config.query,
     isReachable: result.isReachable,
-    rtt: rtt,
+    rtt: result.rtt,
     responseCode: result.responseCode,
     error: result.error,
     timestamp: startTime
@@ -1135,20 +1126,9 @@ public func reverseDNS(
   }
 
   // Query PTR record
-  let answers = try await runDNSQuery(
-    server: server, query: reverseName, sourceIP: sourceIP, timeout: timeout
-  ) {
-    try performDNSQueryInternal(
-      server: server,
-      query: reverseName,
-      queryType: 12,  // PTR
-      timeout: timeout,
-      interface: interface,
-      sourceIP: sourceIP
-    )
-  }
-
-  let rtt = Date().timeIntervalSince(startTime)
+  let (answers, rtt) = try await runDNSQuery(
+    server: server, query: reverseName, queryType: 12, timeout: timeout,
+    interface: interface, sourceIP: sourceIP)
 
   // Parse first PTR record
   for answer in answers where answer.type == 12 {
@@ -1206,20 +1186,9 @@ public func reverseIPv6(
   }
 
   // Query PTR record
-  let answers = try await runDNSQuery(
-    server: server, query: reverseName, sourceIP: sourceIP, timeout: timeout
-  ) {
-    try performDNSQueryInternal(
-      server: server,
-      query: reverseName,
-      queryType: 12,  // PTR
-      timeout: timeout,
-      interface: interface,
-      sourceIP: sourceIP
-    )
-  }
-
-  let rtt = Date().timeIntervalSince(startTime)
+  let (answers, rtt) = try await runDNSQuery(
+    server: server, query: reverseName, queryType: 12, timeout: timeout,
+    interface: interface, sourceIP: sourceIP)
 
   // Parse first PTR record
   for answer in answers where answer.type == 12 {
@@ -1290,20 +1259,9 @@ public func queryAAAA(
   }
 
   // Query AAAA record
-  let answers = try await runDNSQuery(
-    server: server, query: hostname, sourceIP: sourceIP, timeout: timeout
-  ) {
-    try performDNSQueryInternal(
-      server: server,
-      query: hostname,
-      queryType: 28,  // AAAA
-      timeout: timeout,
-      interface: interface,
-      sourceIP: sourceIP
-    )
-  }
-
-  let rtt = Date().timeIntervalSince(startTime)
+  let (answers, rtt) = try await runDNSQuery(
+    server: server, query: hostname, queryType: 28, timeout: timeout,
+    interface: interface, sourceIP: sourceIP)
 
   // Parse all AAAA records
   var ipv6Addresses: [String] = []
@@ -1365,20 +1323,9 @@ public func queryA(
   }
 
   // Query A record
-  let answers = try await runDNSQuery(
-    server: server, query: hostname, sourceIP: sourceIP, timeout: timeout
-  ) {
-    try performDNSQueryInternal(
-      server: server,
-      query: hostname,
-      queryType: 1,  // A
-      timeout: timeout,
-      interface: interface,
-      sourceIP: sourceIP
-    )
-  }
-
-  let rtt = Date().timeIntervalSince(startTime)
+  let (answers, rtt) = try await runDNSQuery(
+    server: server, query: hostname, queryType: 1, timeout: timeout,
+    interface: interface, sourceIP: sourceIP)
 
   // Parse all A records
   var ipv4Addresses: [String] = []
@@ -1401,8 +1348,111 @@ public func queryA(
 
 private struct DNSProbeResultInternal {
   let isReachable: Bool
+  /// Seconds from sending the query to reading the answer; set exactly when `isReachable` is.
+  let rtt: TimeInterval?
   let responseCode: Int?
   let error: String?
+}
+
+/// Builds a DNS query for `encodedQuery` with a random transaction ID.
+private func makeDNSQueryMessage(encodedQuery: [UInt8], queryType: UInt16) -> (
+  bytes: [UInt8], id: UInt16
+) {
+  let id = UInt16.random(in: 0...UInt16.max)
+  var message: [UInt8] = []
+  func append16(_ value: UInt16) {
+    message.append(UInt8(value >> 8))
+    message.append(UInt8(value & 0xFF))
+  }
+
+  // Header
+  append16(id)  // ID
+  append16(0x0100)  // RD (recursion desired)
+  append16(1)  // QDCOUNT
+  append16(0)  // ANCOUNT
+  append16(0)  // NSCOUNT
+  append16(0)  // ARCOUNT
+
+  // Question
+  message.append(contentsOf: encodedQuery)
+  append16(queryType)  // QTYPE
+  append16(1)  // QCLASS IN
+  return (message, id)
+}
+
+/// Binds a DNS socket to `interface` and to `sourceIP`, when given.
+private func bindDNSSocket(
+  _ fd: Int32,
+  family serverFamily: Int32,
+  interface: String?,
+  sourceIP: String?
+) throws {
+  // Bind to interface if specified
+  if let iface = interface {
+    #if canImport(Darwin)
+      let ifaceIndex = if_nametoindex(iface)
+      guard ifaceIndex != 0 else {
+        throw DNSError.bindFailed("Interface '\(iface)' not found")
+      }
+
+      var index = ifaceIndex
+      let (proto, opt) =
+        serverFamily == AF_INET6
+        ? (IPPROTO_IPV6, IPV6_BOUND_IF) : (IPPROTO_IP, IP_BOUND_IF)
+      let result = setsockopt(
+        fd, proto, opt,
+        &index, socklen_t(MemoryLayout<UInt32>.size))
+
+      guard result >= 0 else {
+        throw DNSError.bindFailed("Failed to bind to interface '\(iface)'")
+      }
+    #else
+      throw DNSError.bindFailed("Interface binding not supported on this platform")
+    #endif
+  }
+
+  // Bind to source IP if specified
+  guard let srcIP = sourceIP else { return }
+  try _validateDNSSourceFamily(srcIP, serverFamily: serverFamily)
+
+  if serverFamily == AF_INET6 {
+    let (bare6, scopeID) = parseIPv6Scoped(srcIP)
+    var sourceAddr6 = sockaddr_in6()
+    sourceAddr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+    sourceAddr6.sin6_family = sa_family_t(AF_INET6)
+    sourceAddr6.sin6_port = 0
+    sourceAddr6.sin6_scope_id = scopeID
+    guard inet_pton(AF_INET6, bare6, &sourceAddr6.sin6_addr) == 1 else {
+      throw DNSError.bindFailed("Invalid source IPv6 address '\(srcIP)'")
+    }
+    let bindResult = withUnsafePointer(to: &sourceAddr6) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+        bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in6>.size))
+      }
+    }
+    guard bindResult >= 0 else {
+      throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
+    }
+  } else {
+    var sourceAddr = sockaddr_in()
+    sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    sourceAddr.sin_family = sa_family_t(AF_INET)
+    sourceAddr.sin_port = 0
+
+    guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
+      throw DNSError.bindFailed("Invalid source IP address '\(srcIP)'")
+    }
+
+    let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
+      ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
+        bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+
+    guard bindResult >= 0 else {
+      throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
+    }
+  }
 }
 
 /// Connect a UDP socket to a DNS server so the kernel only accepts datagrams
@@ -1450,24 +1500,19 @@ private func connectDNSSocket(
   }
 }
 
-/// Shared DNS query implementation that returns parsed answers
-/// - Parameters:
-///   - server: DNS server IP address
-///   - query: Domain name to query (or reverse DNS format)
-///   - queryType: DNS record type (A=1, AAAA=28, PTR=12, TXT=16, etc.)
-///   - timeout: Query timeout in seconds
-///   - interface: Network interface to bind to (macOS only)
-///   - sourceIP: Source IP address to bind to
-/// - Returns: Array of parsed DNS answers
-/// - Throws: DNSError on failure
-private func performDNSQueryInternal(
+/// A DNS query that waits for its reply in a blocking `recv` on the calling thread.
+///
+/// Its only caller is ``DNSClient/queryTXTBlocking(name:timeout:servers:)``, for the whoami
+/// fallback in `getPublicIPv4ViaDNS`, which runs inside a blocking public-IP closure and cannot
+/// await. Every other DNS query uses the event-based ``exchangeDNSQuery``. Refusals, host and
+/// network unreachable and an empty datagram are all `DNSError.timeout` here.
+private func performDNSQueryBlocking(
   server: String,
   query: String,
   queryType: UInt16,
   timeout: TimeInterval,
   interface: String?,
-  sourceIP: String?,
-  serverPort: UInt16 = 53
+  sourceIP: String?
 ) throws -> [DNSClient.Answer] {
   try _validateDNSTimeout(timeout)
   let encodedQuery = try _encodeQName(query)
@@ -1484,101 +1529,13 @@ private func performDNSQueryInternal(
   }
   defer { close(fd) }
 
-  // Bind to interface if specified
-  if let iface = interface {
-    #if canImport(Darwin)
-      let ifaceIndex = if_nametoindex(iface)
-      guard ifaceIndex != 0 else {
-        throw DNSError.bindFailed("Interface '\(iface)' not found")
-      }
-
-      var index = ifaceIndex
-      let (proto, opt) =
-        serverFamily == AF_INET6
-        ? (IPPROTO_IPV6, IPV6_BOUND_IF) : (IPPROTO_IP, IP_BOUND_IF)
-      let result = setsockopt(
-        fd, proto, opt,
-        &index, socklen_t(MemoryLayout<UInt32>.size))
-
-      guard result >= 0 else {
-        throw DNSError.bindFailed("Failed to bind to interface '\(iface)'")
-      }
-    #else
-      throw DNSError.bindFailed("Interface binding not supported on this platform")
-    #endif
-  }
-
-  // Bind to source IP if specified
-  if let srcIP = sourceIP {
-    try _validateDNSSourceFamily(srcIP, serverFamily: serverFamily)
-
-    if serverFamily == AF_INET6 {
-      let (bare6, scopeID) = parseIPv6Scoped(srcIP)
-      var sourceAddr6 = sockaddr_in6()
-      sourceAddr6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-      sourceAddr6.sin6_family = sa_family_t(AF_INET6)
-      sourceAddr6.sin6_port = 0
-      sourceAddr6.sin6_scope_id = scopeID
-      guard inet_pton(AF_INET6, bare6, &sourceAddr6.sin6_addr) == 1 else {
-        throw DNSError.bindFailed("Invalid source IPv6 address '\(srcIP)'")
-      }
-      let bindResult = withUnsafePointer(to: &sourceAddr6) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-          bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in6>.size))
-        }
-      }
-      guard bindResult >= 0 else {
-        throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
-      }
-    } else {
-      var sourceAddr = sockaddr_in()
-      sourceAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-      sourceAddr.sin_family = sa_family_t(AF_INET)
-      sourceAddr.sin_port = 0
-
-      guard inet_pton(AF_INET, srcIP, &sourceAddr.sin_addr) == 1 else {
-        throw DNSError.bindFailed("Invalid source IP address '\(srcIP)'")
-      }
-
-      let bindResult = withUnsafePointer(to: &sourceAddr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPtr in
-          bind(fd, sockaddrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-      }
-
-      guard bindResult >= 0 else {
-        throw DNSError.bindFailed("Failed to bind to source IP '\(srcIP)'")
-      }
-    }
-  }
-
+  try bindDNSSocket(fd, family: serverFamily, interface: interface, sourceIP: sourceIP)
   try _applyDNSSocketTimeout(fd: fd, timeout: timeout)
 
   // A connected UDP socket only receives responses from this DNS server and port.
-  try connectDNSSocket(fd, server: server, port: serverPort, family: serverFamily)
+  try connectDNSSocket(fd, server: server, port: 53, family: serverFamily)
 
-  // Build DNS query message
-  var msg = Data()
-  let id = UInt16.random(in: 0...UInt16.max)
-
-  func append16(_ v: UInt16) {
-    var b = v.bigEndian
-    withUnsafeBytes(of: &b) { msg.append(contentsOf: $0) }
-  }
-
-  // Header
-  append16(id)  // ID
-  append16(0x0100)  // RD (recursion desired)
-  append16(1)  // QDCOUNT
-  append16(0)  // ANCOUNT
-  append16(0)  // NSCOUNT
-  append16(0)  // ARCOUNT
-
-  // Question
-  msg.append(contentsOf: encodedQuery)
-  append16(queryType)  // QTYPE
-  append16(1)  // QCLASS IN
-
+  let (msg, id) = makeDNSQueryMessage(encodedQuery: encodedQuery, queryType: queryType)
   let sent = msg.withUnsafeBytes { raw in
     send(fd, raw.baseAddress, raw.count, 0)
   }
@@ -1588,7 +1545,7 @@ private func performDNSQueryInternal(
   }
 
   // Receive from the connected peer.
-  var buf = [UInt8](repeating: 0, count: 2048)
+  var buf = [UInt8](repeating: 0, count: dnsReceiveCapacity)
   let n = buf.withUnsafeMutableBytes { raw in
     recv(fd, raw.baseAddress, raw.count, 0)
   }
@@ -1597,13 +1554,13 @@ private func performDNSQueryInternal(
     throw DNSError.timeout
   }
 
-  // Parse response
-  let responseData = Data(buf.prefix(n))
-
-  return try DNSClient.validateResponse(message: responseData, expectedID: id)
+  return try DNSClient.validateResponse(message: Data(buf.prefix(n)), expectedID: id)
 }
 
-/// Legacy wrapper for dnsProbe() that preserves behavior of returning success even for NXDOMAIN
+/// Runs the query behind ``dnsProbe(config:)`` and reports it as a probe outcome.
+///
+/// Any DNS response, including an error code or a malformed reply, means the server is reachable.
+/// So does a refusal: the host answered, though nothing listens on the port.
 private func performDNSProbe(
   server: String,
   query: String,
@@ -1612,82 +1569,62 @@ private func performDNSProbe(
   interface: String?,
   sourceIP: String?
 ) async -> DNSProbeResultInternal {
+  let reply: DNSReply
   do {
-    // Try to perform query - success means RCODE=0
-    _ = try await runDNSQuery(
-      server: server, query: query, sourceIP: sourceIP, timeout: timeout
-    ) {
-      try performDNSQueryInternal(
-        server: server,
-        query: query,
-        queryType: queryType,
-        timeout: timeout,
-        interface: interface,
-        sourceIP: sourceIP
-      )
-    }
+    reply = try await exchangeDNSQuery(
+      server: server, query: query, queryType: queryType, timeout: timeout,
+      interface: interface, sourceIP: sourceIP)
+  } catch UDPExchangeFailure.refused(let rtt) {
     return DNSProbeResultInternal(
       isReachable: true,
-      responseCode: 0,
-      error: nil
+      rtt: rtt,
+      responseCode: nil,
+      error: "Connection refused - the host is reachable but no DNS server is listening"
     )
-  } catch DNSError.serverError(let rcode) {
+  } catch let failure as UDPExchangeFailure {
+    return dnsProbeOutcome(for: dnsError(for: failure), rtt: nil)
+  } catch {
+    return dnsProbeOutcome(for: error, rtt: nil)
+  }
+
+  do {
+    _ = try reply.answers()
+    return DNSProbeResultInternal(isReachable: true, rtt: reply.rtt, responseCode: 0, error: nil)
+  } catch {
+    return dnsProbeOutcome(for: error, rtt: reply.rtt)
+  }
+}
+
+/// The probe outcome for a failed query. `rtt` is the time to the reply, when one arrived.
+private func dnsProbeOutcome(for error: Error, rtt: TimeInterval?) -> DNSProbeResultInternal {
+  switch error {
+  case DNSError.serverError(let rcode):
     // DNS server responded with non-zero RCODE (NXDOMAIN, etc.)
     // This is still "reachable" for probe purposes
+    return DNSProbeResultInternal(isReachable: true, rtt: rtt, responseCode: rcode, error: nil)
+  case DNSError.malformedResponse:
+    // Got response, even if malformed
     return DNSProbeResultInternal(
-      isReachable: true,
-      responseCode: rcode,
-      error: nil
-    )
-  } catch DNSError.timeout {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      responseCode: nil,
-      error: "Timeout - no response"
-    )
-  } catch DNSError.socketCreationFailed {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      responseCode: nil,
-      error: "Failed to create socket"
-    )
-  } catch DNSError.setsockoptFailed(let option, let errorCode) {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      responseCode: nil,
-      error:
-        "Failed to configure \(option) (errno=\(errorCode)): \(String(cString: strerror(errorCode)))"
-    )
-  } catch DNSError.bindFailed(let msg) {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      responseCode: nil,
-      error: msg
-    )
-  } catch DNSError.invalidIP(let ip) {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      responseCode: nil,
-      error: "Invalid server IP: \(ip)"
-    )
-  } catch DNSError.sendFailed {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      responseCode: nil,
-      error: "Failed to send query"
-    )
-  } catch DNSError.malformedResponse {
-    return DNSProbeResultInternal(
-      isReachable: true,  // Got response, even if malformed
-      responseCode: nil,
-      error: "Malformed response"
-    )
-  } catch {
-    return DNSProbeResultInternal(
-      isReachable: false,
-      responseCode: nil,
-      error: "Unexpected error: \(error)"
-    )
+      isReachable: true, rtt: rtt, responseCode: nil, error: "Malformed response")
+  case DNSError.timeout:
+    return unreachable("Timeout - no response")
+  case DNSError.socketCreationFailed:
+    return unreachable("Failed to create socket")
+  case DNSError.setsockoptFailed(let option, let errorCode):
+    return unreachable(
+      "Failed to configure \(option) (errno=\(errorCode)): \(String(cString: strerror(errorCode)))")
+  case DNSError.bindFailed(let msg):
+    return unreachable(msg)
+  case DNSError.invalidIP(let ip):
+    return unreachable("Invalid server IP: \(ip)")
+  case DNSError.sendFailed:
+    return unreachable("Failed to send query")
+  default:
+    return unreachable("Unexpected error: \(error)")
+  }
+
+  func unreachable(_ message: String) -> DNSProbeResultInternal {
+    DNSProbeResultInternal(isReachable: false, rtt: nil, responseCode: nil, error: message)
   }
 }
 
@@ -1777,23 +1714,36 @@ struct DNSClient {
     let fullMessage: Data  // Full DNS message (needed for PTR parsing with compression)
   }
 
+  /// Servers the TXT lookups try, in order, when the caller names none.
+  static let defaultTXTServers = ["1.1.1.1", "8.8.8.8"]
+
+  /// TXT strings for `name` from the first of `servers` that answers, or `nil`.
+  ///
+  /// Each server gets `timeout` seconds. The wait holds no thread, and cancelling the calling
+  /// task stops at the current server.
   static func queryTXT(
-    name: String, timeout: TimeInterval = 1.0, servers: [String] = ["1.1.1.1", "8.8.8.8"]
-  )
-    -> [String]?
-  {
+    name: String, timeout: TimeInterval = 1.0, servers: [String] = defaultTXTServers
+  ) async -> [String]? {
     for server in servers {
-      if let res = queryTXTOnce(name: name, timeout: timeout, server: server) {
-        return res
-      }
+      guard !Task.isCancelled else { return nil }
+      let answers = try? await runDNSQuery(
+        server: server, query: name, queryType: DNSRecordType.txt.rawValue, timeout: timeout,
+        interface: nil, sourceIP: nil
+      ).answers
+      if let answers, let strings = txtStrings(from: answers) { return strings }
     }
     return nil
   }
 
-  private static func queryTXTOnce(name: String, timeout: TimeInterval, server: String) -> [String]?
-  {
-    guard
-      let answers = try? performDNSQueryInternal(
+  /// ``queryTXT(name:timeout:servers:)`` waiting in a blocking `recv` on the calling thread.
+  ///
+  /// Its only caller is `getPublicIPv4ViaDNS`, which runs inside a blocking public-IP closure and
+  /// cannot await. Do not add callers: use the async ``queryTXT(name:timeout:servers:)``.
+  static func queryTXTBlocking(
+    name: String, timeout: TimeInterval = 1.0, servers: [String] = defaultTXTServers
+  ) -> [String]? {
+    for server in servers {
+      let answers = try? performDNSQueryBlocking(
         server: server,
         query: name,
         queryType: DNSRecordType.txt.rawValue,
@@ -1801,7 +1751,14 @@ struct DNSClient {
         interface: nil,
         sourceIP: nil
       )
-    else { return nil }
+      if let answers, let strings = txtStrings(from: answers) { return strings }
+    }
+    return nil
+  }
+
+  /// The IN-class TXT answers, each answer's character-strings joined into one string, or `nil`
+  /// when there are none.
+  private static func txtStrings(from answers: [Answer]) -> [String]? {
     var out: [String] = []
     for ans in answers where ans.type == 16 && ans.klass == 1 {
       // TXT RDATA: one or more <character-string>; join all chunks into a single string per answer
@@ -2291,6 +2248,8 @@ public struct __DNSAnswer: Sendable {
   public let rdata: Data
 }
 
+/// One DNS query over the event-based transport to `server` on `port`, the path every public
+/// query method takes.
 // swift-format-ignore: AlwaysUseLowerCamelCase
 @_spi(Test)
 public func __dnsQuery(
@@ -2299,8 +2258,8 @@ public func __dnsQuery(
   name: String,
   type: UInt16,
   timeout: TimeInterval = 1.0
-) throws -> [__DNSAnswer] {
-  try performDNSQueryInternal(
+) async throws -> [__DNSAnswer] {
+  try await runDNSQuery(
     server: server,
     query: name,
     queryType: type,
@@ -2308,7 +2267,7 @@ public func __dnsQuery(
     interface: nil,
     sourceIP: nil,
     serverPort: port
-  ).map { answer in
+  ).answers.map { answer in
     __DNSAnswer(
       name: answer.name,
       type: answer.type,
