@@ -6,7 +6,7 @@ import Testing
 @Suite("Multipath Cancellation Tests")
 struct MultipathCancellationTests {
   @Test("Caller cancellation joins every flow worker", .timeLimit(.minutes(1)))
-  func callerCancellationJoinsEveryFlowWorker() async {
+  func callerCancellationJoinsEveryFlowWorker() async throws {
     let worker = ControlledMultipathWorker(expectedFlowCount: 5, behavior: .suspend)
     let discovery = MultipathDiscovery(worker: worker, config: SwiftFTRConfig())
     let config = MultipathConfig(
@@ -21,7 +21,8 @@ struct MultipathCancellationTests {
       try await discovery.discoverPaths(to: "example.test", multipathConfig: config)
     }
 
-    await worker.waitUntilAllFlowsStarted()
+    defer { operation.cancel() }
+    try await waitBounded("every flow starting") { await worker.waitUntilAllFlowsStarted() }
     operation.cancel()
 
     do {

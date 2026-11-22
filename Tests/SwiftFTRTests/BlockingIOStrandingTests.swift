@@ -24,7 +24,8 @@ struct BlockingIOStrandingTests {
         release.wait()
       }
     }
-    while occupied.value == 0 { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(
+      await eventually(within: 10) { occupied.value > 0 }, "the worker was never occupied")
 
     // Cancel from another task after a varying number of yields, so across the run the
     // cancellation lands at every point of the submission path.
@@ -70,7 +71,8 @@ struct BlockingIOStrandingTests {
         Thread.sleep(forTimeInterval: 0.3)
       }
     }
-    while occupied.value == 0 { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(
+      await eventually(within: 10) { occupied.value > 0 }, "the worker was never occupied")
 
     // The marker lives only in the operation's closure, so it dies when the bridge lets go.
     do {

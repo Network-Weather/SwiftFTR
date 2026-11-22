@@ -194,8 +194,9 @@ struct TraceLifecycleTests {
       }
     }
     guard started else {
+      // Not joined: a trace stuck before the resolver may not end even when cancelled.
       task.cancel()
-      Issue.record("the resolver was never invoked; the trace ended with \(await task.result)")
+      Issue.record("the resolver was not invoked within 10 seconds")
       return
     }
     #expect(await !tracer.activeTraces.isEmpty, "the trace was no longer running in enrichment")

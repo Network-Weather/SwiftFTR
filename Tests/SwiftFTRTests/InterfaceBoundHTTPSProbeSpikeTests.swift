@@ -212,7 +212,7 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
     await #expect(throws: CancellationError.self) {
       try await operation.value
     }
-    await recorder.waitUntilCancelled()
+    try await waitBounded("the request being cancelled") { await recorder.waitUntilCancelled() }
     #expect(await recorder.cancellationCount == 1)
   }
 
@@ -232,7 +232,7 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
     } throws: { error in
       error as? InterfaceBoundHTTPSProbeSpikeError == .timedOut
     }
-    await recorder.waitUntilCancelled()
+    try await waitBounded("the request being cancelled") { await recorder.waitUntilCancelled() }
     #expect(await recorder.cancellationCount == 1)
   }
 

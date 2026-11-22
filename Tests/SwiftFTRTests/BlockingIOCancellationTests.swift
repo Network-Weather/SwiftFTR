@@ -44,7 +44,7 @@ struct BlockingIOCancellationTests {
 
     // Occupy the only slot so the operation under test cannot start.
     let holder = Task { try await executor.run(priority: .userInitiated) { occupant.stall(1.5) } }
-    while !occupant.didRun { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(await eventually(within: 10) { occupant.didRun }, "the occupant never ran")
 
     let start = monotonicNow()
     let victim = Task { try await executor.run(priority: .userInitiated) { queued.stall(1.5) } }
@@ -68,7 +68,7 @@ struct BlockingIOCancellationTests {
 
     let start = monotonicNow()
     let victim = Task { try await executor.run(priority: .userInitiated) { probe.stall(2.0) } }
-    while !probe.didRun { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(await eventually(within: 10) { probe.didRun }, "the operation never ran")
     victim.cancel()
 
     await #expect(throws: CancellationError.self) { try await victim.value }
@@ -138,7 +138,7 @@ struct BlockingIOCancellationTests {
     let start = monotonicNow()
 
     let victim = Task { try await runDetachedBlockingIO { probe.stall(2.0) } }
-    while !probe.didRun { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(await eventually(within: 10) { probe.didRun }, "the operation never ran")
     victim.cancel()
 
     await #expect(throws: CancellationError.self) { try await victim.value }

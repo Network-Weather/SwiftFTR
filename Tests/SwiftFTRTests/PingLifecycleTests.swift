@@ -81,7 +81,7 @@ struct PingLifecycleTests {
     )
     let task = Task { try await fixture.operation.run() }
 
-    await fixture.sends.waitForFirstSend()
+    try await waitBounded("the first ping send") { await fixture.sends.waitForFirstSend() }
     task.cancel()
 
     await #expect {

@@ -15,7 +15,9 @@ struct HTTPHeaderProbeTests {
       config: HTTPProbeConfig(url: "http://probe.test/large-body", timeout: 5),
       sessionConfiguration: testSessionConfiguration())
 
-    await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
+    try await waitBounded("the request stopping") {
+      await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
+    }
     let snapshot = await HTTPProbeProtocolRecorder.shared.snapshot()
 
     #expect(result.isReachable)
@@ -35,7 +37,7 @@ struct HTTPHeaderProbeTests {
         timeout: 2,
         followRedirects: false))
     noRedirectServer.stop()
-    await noRedirectServer.waitUntilFinished()
+    try await waitBounded("the server finishing") { await noRedirectServer.waitUntilFinished() }
 
     #expect(noRedirectResult.statusCode == 302)
     #expect(noRedirectServer.requestPaths == ["/redirect"])
@@ -48,7 +50,7 @@ struct HTTPHeaderProbeTests {
         timeout: 2,
         followRedirects: true))
     redirectServer.stop()
-    await redirectServer.waitUntilFinished()
+    try await waitBounded("the server finishing") { await redirectServer.waitUntilFinished() }
 
     #expect(redirectResult.statusCode == 204)
     #expect(redirectServer.requestPaths == ["/redirect", "/final"])
@@ -96,7 +98,9 @@ struct HTTPHeaderProbeTests {
     let result = try await probe.value
     let cancellationDuration = Date().timeIntervalSince(cancelledAt)
 
-    await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
+    try await waitBounded("the request stopping") {
+      await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
+    }
     let snapshot = await HTTPProbeProtocolRecorder.shared.snapshot()
 
     #expect(cancellationDuration < 1)

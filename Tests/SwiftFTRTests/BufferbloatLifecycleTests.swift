@@ -24,8 +24,10 @@ struct BufferbloatLifecycleTests {
     let task = Task {
       try await runner.run()
     }
+    // A runner still waiting when the test gives up must not outlive it.
+    defer { task.cancel() }
 
-    await pingReadyToReturn.wait()
+    try await waitBounded("the ping reaching its return") { await pingReadyToReturn.wait() }
 
     let pendingState = await load.state
     #expect(pendingState.didStart)
@@ -89,6 +91,7 @@ struct BufferbloatLifecycleTests {
     let task = Task {
       try await runner.run()
     }
+    defer { task.cancel() }
     try await load.waitUntilStarted()
     try await ping.waitUntilStarted()
     task.cancel()
@@ -114,7 +117,7 @@ struct BufferbloatLifecycleTests {
     "Caller cancellation after ping completion stops and awaits load",
     .timeLimit(.minutes(1))
   )
-  func callerCancellationAfterPingCompletionStopsAndAwaitsLoad() async {
+  func callerCancellationAfterPingCompletionStopsAndAwaitsLoad() async throws {
     let load = SuspendingOperationProbe()
     let pingReadyToReturn = OneShotSignal()
     let dependencies = BufferbloatDependencies(
@@ -132,8 +135,10 @@ struct BufferbloatLifecycleTests {
     let task = Task {
       try await runner.run()
     }
+    // A runner still waiting when the test gives up must not outlive it.
+    defer { task.cancel() }
 
-    await pingReadyToReturn.wait()
+    try await waitBounded("the ping reaching its return") { await pingReadyToReturn.wait() }
 
     let pendingState = await load.state
     #expect(pendingState.didStart)

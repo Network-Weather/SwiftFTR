@@ -31,7 +31,7 @@ struct CymruQueueDeadlineTests {
       occupant.open()
       holder.cancel()
     }
-    while started.value == 0 { try await Task.sleep(nanoseconds: 5_000_000) }
+    try #require(await eventually(within: 10) { started.value > 0 }, "the query never started")
 
     let timeout: TimeInterval = 0.05
     let (result, _) = try await measure(within: watchdog) {
