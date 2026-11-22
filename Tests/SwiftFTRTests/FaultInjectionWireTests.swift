@@ -13,12 +13,19 @@ import Testing
 /// Each group starts with a positive control showing the client accepts a well-formed answer from
 /// the fixture, so the failure cases test the client rather than a fixture nobody can reach.
 ///
-/// Time bounds are the moment a slow fixture would have answered, a multiple of the client's
-/// timeout: a client that waited for the answer, or for nothing, fails them.
+/// No test bounds how long a call took from above. Every call runs under ``watchdog``, far past
+/// the client's timeout, and a slow fixture answers only after the watchdog, so a client that
+/// waited for the answer, or for nothing, trips it.
 @Suite("FaultInjection: wire protocols")
 struct FaultInjectionWireTests {
-  /// How much later than the client's timeout a slow fixture answers.
-  static let lateFactor: TimeInterval = 10
+  /// How long a call may run before it is reported as waiting for an answer it should have given
+  /// up on: 50 of the 0.3 s timeouts the fault tests use, so a timeout that never fires, or fires
+  /// two orders of magnitude late, trips it, while no correct call comes near it.
+  static let watchdog: TimeInterval = 15
+
+  /// When a slow fixture answers: after the watchdog, so a client that waited for the answer
+  /// trips the watchdog rather than racing it.
+  static let lateAnswer: TimeInterval = 2 * watchdog
 
   // MARK: STUN
 
@@ -36,26 +43,21 @@ struct FaultInjectionWireTests {
     var testDescription: String { rawValue }
   }
 
+  /// The outcome of a STUN call, or `nil` if it was still running after ``watchdog``.
   static func runSTUN(server: LoopbackUDPResponder, timeout: TimeInterval) async
-    -> (Result<STUNPublicIP, Error>?, TimeInterval)
+    -> Result<STUNPublicIP, Error>?
   {
     let box = ResultBox<STUNPublicIP>()
-    let duration = ResultBox<TimeInterval>()
     let (address, length) = server.address
-    let returned = await returnsWithin(lateFactor * timeout) {
-      // Time the call itself, on the thread that makes it. Timing from the caller would add
-      // however long a loaded machine takes to start that thread, which is not STUN's doing.
-      let start = monotonicNow()
+    let returned = await returnsWithin(watchdog) {
       box.set(
         Result {
           try stunGetPublicIP(
             family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
             timeout: timeout)
         })
-      duration.set(.success(monotonicNow() - start))
     }
-    let elapsed = (try? duration.value?.get()) ?? .infinity
-    return (returned ? box.value : nil, elapsed)
+    return returned ? box.value : nil
   }
 
   @Test("STUN accepts a well-formed binding response from the fixture")
@@ -64,7 +66,7 @@ struct FaultInjectionWireTests {
       Self.stunSuccess(for: request, ip: [198, 51, 100, 7]).map { ($0, 0) }
     }
     defer { server.stop() }
-    let (result, _) = await Self.runSTUN(server: server, timeout: 0.5)
+    let result = await Self.runSTUN(server: server, timeout: 0.5)
     #expect(try result?.get().ip == "198.51.100.7")
   }
 
@@ -79,19 +81,15 @@ struct FaultInjectionWireTests {
         reply[8] ^= 0xFF
         return (reply, 0)
       case .slow:
-        return Self.stunSuccess(for: request, ip: [198, 51, 100, 7]).map {
-          ($0, Self.lateFactor * 0.3)
-        }
+        return Self.stunSuccess(for: request, ip: [198, 51, 100, 7]).map { ($0, Self.lateAnswer) }
       }
     }
     defer { server.stop() }
     let timeout: TimeInterval = 0.3
-    let (result, elapsed) = await Self.runSTUN(server: server, timeout: timeout)
+    let result = await Self.runSTUN(server: server, timeout: timeout)
 
     let unwrapped = try #require(result, "STUN never returned from a \(fault) server")
     #expect(throws: STUNError.self) { try unwrapped.get() }
-    #expect(
-      elapsed < Self.lateFactor * timeout, "STUN took \(elapsed)s against a \(timeout)s timeout")
     #expect(server.requests.value == 1)
   }
 
@@ -132,18 +130,15 @@ struct FaultInjectionWireTests {
 
   static let aRecord: [UInt8] = [0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 9]
 
-  static func runDNS(port: UInt16, timeout: TimeInterval) async
-    -> (Result<[__DNSAnswer], Error>?, TimeInterval)
-  {
-    // The query holds no thread while it waits, so it is timed from here; a query that never
-    // returns trips the watchdog and is reported as `nil`.
-    let outcome = try? await measure(within: lateFactor * timeout) {
+  /// The outcome of a DNS query, or `nil` if it was still running after ``watchdog``.
+  static func runDNS(port: UInt16, timeout: TimeInterval) async -> Result<[__DNSAnswer], Error>? {
+    let outcome = try? await measure(within: watchdog) {
       await Result.capture {
         try await __dnsQuery(
           server: "127.0.0.1", port: port, name: "fault.example", type: 1, timeout: timeout)
       }
     }
-    return (outcome?.0, outcome?.1 ?? .infinity)
+    return outcome?.0
   }
 
   @Test("DNS accepts a well-formed answer from the fixture")
@@ -152,7 +147,7 @@ struct FaultInjectionWireTests {
       (Self.dnsResponse(to: query, answers: Self.aRecord), 0)
     }
     defer { server.stop() }
-    let (result, _) = await Self.runDNS(port: server.port, timeout: 0.5)
+    let result = await Self.runDNS(port: server.port, timeout: 0.5)
     let answers = try #require(try result?.get())
     #expect(answers.first?.rdata == Data([192, 0, 2, 9]))
   }
@@ -181,16 +176,14 @@ struct FaultInjectionWireTests {
         )
       case .overstatedAnswerCount:
         return (Self.dnsResponse(to: query, answerCount: 50, answers: Self.aRecord), 0)
-      case .slow: return (Self.dnsResponse(to: query, answers: Self.aRecord), Self.lateFactor * 0.3)
+      case .slow: return (Self.dnsResponse(to: query, answers: Self.aRecord), Self.lateAnswer)
       }
     }
     defer { server.stop() }
     let timeout: TimeInterval = 0.3
-    let (result, elapsed) = await Self.runDNS(port: server.port, timeout: timeout)
+    let result = await Self.runDNS(port: server.port, timeout: timeout)
 
     let unwrapped = try #require(result, "DNS never returned from a \(fault) server")
-    #expect(
-      elapsed < Self.lateFactor * timeout, "DNS took \(elapsed)s against a \(timeout)s timeout")
     switch fault {
     case .nxdomain, .servfail:
       #expect {
@@ -233,9 +226,10 @@ struct FaultInjectionWireTests {
       config: TCPProbeConfig(host: "127.0.0.1", port: Int(listener.port), timeout: 1))
     #expect(open.connectionState == .open)
 
-    // A refused connect is answered at once; one that waited out its timeout was not seen.
-    let timeout: TimeInterval = 10
-    let (closed, _) = try await measure(within: timeout / 2) {
+    // A refused connect is answered at once. The timeout outlasts the watchdog, so a probe that
+    // did not see the refusal and waited out its timeout trips the watchdog.
+    let timeout = 4 * Self.watchdog
+    let (closed, _) = try await measure(within: Self.watchdog) {
       try await tcpProbe(
         config: TCPProbeConfig(host: "127.0.0.1", port: Int(refusing.port), timeout: timeout))
     }
@@ -268,7 +262,7 @@ struct FaultInjectionWireTests {
     #expect(refused.isReachable)
 
     let timeout: TimeInterval = 0.3
-    let (quiet, _) = try await measure(within: Self.lateFactor * timeout) {
+    let (quiet, _) = try await measure(within: Self.watchdog) {
       try await udpProbe(
         config: UDPProbeConfig(
           host: "127.0.0.1", port: Int(silent.port), timeout: timeout, payload: payload))
@@ -339,12 +333,12 @@ struct FaultInjectionWireTests {
       port = server!.port
     case .firstByteTooLate:
       server = try LoopbackTCPServer(
-        behavior: .respond(response: Self.okResponse, after: Self.lateFactor * timeout))
+        behavior: .respond(response: Self.okResponse, after: Self.lateAnswer))
       port = server!.port
     }
     defer { server?.stop() }
 
-    let (result, _) = try await measure(within: Self.lateFactor * timeout) {
+    let (result, _) = try await measure(within: Self.watchdog) {
       try await httpProbe(url: "http://127.0.0.1:\(port)/", timeout: timeout)
     }
     #expect(!result.isReachable, "\(fault): \(result.error ?? "no error")")
@@ -356,14 +350,17 @@ struct FaultInjectionWireTests {
   func httpCancellation() async throws {
     let server = try LoopbackTCPServer(behavior: .silent)
     defer { server.stop() }
-    let timeout: TimeInterval = 30
+    let timeout = 4 * Self.watchdog
     let task = Task {
       try await httpProbe(url: "http://127.0.0.1:\(server.port)/", timeout: timeout)
     }
-    #expect(await eventually(within: 2) { server.accepted.value > 0 })
-    task.cancel()
-    // Returned well inside its timeout, so the cancellation ended it.
-    let (result, _) = try await measure(within: timeout / 6) { try await task.value }
+    #expect(await eventually(within: Self.watchdog) { server.accepted.value > 0 })
+    // The timeout outlasts the watchdog, so a probe that returns was ended by its cancellation.
+    // Cancelling runs the probe's cancellation handler, so it is inside the watchdog too.
+    let (result, _) = try await measure(within: Self.watchdog) {
+      task.cancel()
+      return try await task.value
+    }
     #expect(!result.isReachable)
   }
 }

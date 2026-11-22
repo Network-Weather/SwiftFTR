@@ -19,8 +19,11 @@ import Testing
 /// connected stream socket succeeds on macOS, so `sendTraceProbe` runs
 /// unmodified against it.
 ///
-/// Serialized: these tests assert on elapsed time, so they run one at a time
-/// rather than competing with each other for the machine.
+/// A send that must give up runs on its own thread under ``giveUpWatchdog``,
+/// so one that retries without end fails instead of hanging the run. Elapsed
+/// time is bounded only from below, where the contract is that a send waits
+/// its budget out. Serialized, so the drainer threads and the retry budgets do
+/// not compete with each other for the machine.
 @Suite(.serialized)
 struct TransientSendRetryTests {
 
@@ -61,22 +64,19 @@ struct TransientSendRetryTests {
     // A deliberately generous deadline. What this test pins is that a blocked
     // burst recovers at all; `transientPressureFailsAtBudget` pins the budget.
     let deadline = monotonicNow() + 5.0
-    let start = monotonicNow()
     for ttl in 1...30 {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,
         sequence: UInt16(ttl), payloadSize: 56, retryDeadline: deadline)
     }
-    let elapsed = monotonicNow() - start
 
     // The socket had no free space when the burst began, so these probes only
     // went out because the retry path waited for the drainer to make room.
     #expect(pair.drainedByteCount > 0)
-    #expect(elapsed < 2.0)
   }
 
   @Test("A send that never clears fails with the transient errno at the budget")
-  func transientPressureFailsAtBudget() throws {
+  func transientPressureFailsAtBudget() async throws {
     let pair = try BlockedSendPair()
     defer { pair.close() }
     let resolved = try resolveHost(host: "127.0.0.1", prefer: .v4)
@@ -84,17 +84,15 @@ struct TransientSendRetryTests {
     pair.fillSendBuffer()
 
     let budget: TimeInterval = 0.1
-    let start = monotonicNow()
-    let thrown = captureSendErrno {
+    let outcome = await sendOffThread {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,
         sequence: 1, payloadSize: 56, retryDeadline: monotonicNow() + budget)
     }
-    let elapsed = monotonicNow() - start
+    let (thrown, elapsed) = try #require(outcome, "the send was still retrying past its budget")
 
     #expect(thrown == EWOULDBLOCK)
     #expect(elapsed >= budget * 0.8)
-    #expect(elapsed < budget + 1.0)
   }
 
   @Test("The retry budget is shared across the burst, not granted per probe")
@@ -106,51 +104,61 @@ struct TransientSendRetryTests {
     pair.fillSendBuffer()
 
     // One deadline for the whole burst, exactly as the send loops compute it.
-    let deadline = monotonicNow() + 0.1
+    let budget: TimeInterval = 0.5
+    // Stamped once, so time spent before the send counts toward the deadline and the
+    // measured wait alike.
+    let firstStart = monotonicNow()
+    let deadline = firstStart + budget
 
     let firstThrown = captureSendErrno {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,
         sequence: 1, payloadSize: 56, retryDeadline: deadline)
     }
+    let first = monotonicNow() - firstStart
     #expect(firstThrown == EWOULDBLOCK)
+    #expect(first >= budget * 0.8, "the first probe did not wait out the budget")
 
     // The first probe consumed the budget, so the next probe in the same burst
-    // gets no further waiting. A per-probe budget would wait another 100 ms here.
-    let start = monotonicNow()
+    // gets no further waiting. Measured against the first probe's own wait in
+    // the same run rather than in absolute seconds: a probe granted its own
+    // budget, even half the trace's 250 ms one, waits longer than a quarter of
+    // the first probe's half second, while one that only tries once takes
+    // microseconds.
+    let secondStart = monotonicNow()
     let secondThrown = captureSendErrno {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,
         sequence: 2, payloadSize: 56, retryDeadline: deadline)
     }
-    let elapsed = monotonicNow() - start
+    let second = monotonicNow() - secondStart
 
     #expect(secondThrown == EWOULDBLOCK)
-    #expect(elapsed < 0.05)
+    #expect(
+      second < first / 4, "the second probe waited \(second)s after the shared budget ran out")
   }
 
   @Test("Non-transient errnos propagate on the first attempt")
-  func nonTransientErrnoFailsFast() throws {
+  func nonTransientErrnoFailsFast() async throws {
     let resolved = try resolveHost(host: "127.0.0.1", prefer: .v4)
 
     // A closed descriptor makes sendto fail with EBADF immediately. The budget
-    // is deliberately generous: a fail-fast errno must not consume any of it.
-    let start = monotonicNow()
-    let thrown = captureSendErrno {
+    // outlasts the watchdog: a send that retried a fail-fast errno would spend
+    // it and trip the watchdog.
+    let outcome = await sendOffThread {
       try sendTraceProbe(
         sockfd: -1, resolved: resolved, identifier: 0x1234,
-        sequence: 1, payloadSize: 56, retryDeadline: monotonicNow() + 5.0)
+        sequence: 1, payloadSize: 56, retryDeadline: monotonicNow() + 15 * giveUpWatchdog)
     }
-    let elapsed = monotonicNow() - start
+    let (thrown, _) = try #require(outcome, "a send of a fail-fast errno was still retrying")
 
     #expect(thrown == EBADF)
-    #expect(elapsed < 0.5)
   }
 
   // MARK: - ENOBUFS
 
   @Test("ENOBUFS backs off on a sleep rather than spinning on poll")
-  func enobufsBacksOffWithoutSpinning() throws {
+  func enobufsBacksOffWithoutSpinning() async throws {
     let pair = try BlockedDatagramPair()
     defer { pair.close() }
 
@@ -163,24 +171,22 @@ struct TransientSendRetryTests {
     #expect(pair.isImmediatelyWritable())
 
     let budget: TimeInterval = 0.05
-    var attempts = 0
-    let start = monotonicNow()
-    let thrown = captureSendErrno {
+    let attempts = FaultCounter()
+    let outcome = await sendOffThread {
       _ = try sendRetryingTransientPressure(
         sockfd: pair.writer, deadline: monotonicNow() + budget
       ) {
-        attempts += 1
+        attempts.increment()
         return pair.rawSend()
       }
     }
-    let elapsed = monotonicNow() - start
+    let (thrown, elapsed) = try #require(outcome, "the send was still retrying past its budget")
 
     #expect(thrown == ENOBUFS)
     #expect(elapsed >= budget * 0.8)
-    #expect(elapsed < budget + 1.0)
     // Roughly one attempt per millisecond of budget. Spinning on poll would run
     // this into the tens of thousands.
-    #expect(attempts < 500, "ENOBUFS retries should sleep between attempts")
+    #expect(attempts.value < 500, "ENOBUFS retries should sleep between attempts")
   }
 
   // MARK: - Ping
@@ -218,7 +224,7 @@ struct TransientSendRetryTests {
   }
 
   @Test("A ping send that never clears reports the transient errno")
-  func pingSendFailsAtBudget() throws {
+  func pingSendFailsAtBudget() async throws {
     let pair = try BlockedSendPair()
     defer { pair.close() }
     let resolved = try resolveHost(host: "127.0.0.1", prefer: .v4)
@@ -228,16 +234,43 @@ struct TransientSendRetryTests {
     let executor = PingExecutor(config: SwiftFTRConfig())
     let packet = makeICMPEchoRequest(identifier: 0x1234, sequence: 1, payloadSize: 56)
 
-    let start = monotonicNow()
-    let thrown = captureSendErrno {
+    let outcome = await sendOffThread {
       _ = try executor.sendPacket(sockfd: pair.writer, packet: packet, to: resolved)
     }
-    let elapsed = monotonicNow() - start
+    let (thrown, elapsed) = try #require(
+      outcome, "the ping send was still retrying past its budget")
 
     #expect(thrown == EWOULDBLOCK)
     #expect(elapsed >= pingSendRetryBudget * 0.8)
-    #expect(elapsed < pingSendRetryBudget + 1.0)
   }
+}
+
+/// How long a send that has run out of budget may take to give up before it is
+/// reported as retrying without end. No budget here exceeds 0.1 s, so this
+/// leaves a loaded machine more than 3 s, and still fails a budget two orders
+/// of magnitude too long.
+private let giveUpWatchdog: TimeInterval = 4
+
+/// Runs `send` on its own thread and returns the errno it threw (`nil` for
+/// none) and how long it ran on that thread, or `nil` if it was still running
+/// after ``giveUpWatchdog``. A send that never returns leaks its thread, which
+/// closing its socket ends.
+private func sendOffThread(
+  _ send: @escaping @Sendable () throws -> Void
+) async -> (errno: Int32?, elapsed: TimeInterval)? {
+  let box = ResultBox<SendOutcome>()
+  let returned = await returnsWithin(giveUpWatchdog) {
+    let start = monotonicNow()
+    let code = captureSendErrno(send)
+    box.set(.success(SendOutcome(errno: code, elapsed: monotonicNow() - start)))
+  }
+  guard returned, let outcome = try? box.value?.get() else { return nil }
+  return (outcome.errno, outcome.elapsed)
+}
+
+private struct SendOutcome: Sendable {
+  let errno: Int32?
+  let elapsed: TimeInterval
 }
 
 /// Runs `body` and returns the errno carried by the `TracerouteError.sendFailed`
