@@ -17,6 +17,8 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   being full) and assert a bound on the caller's wait and a degraded result rather than a hang or
   a trap. The executor and the resolvers are already injectable; forward resolution and the
   socket layer are not yet.
+- **Sequenced plan**: [docs/BLOCKING-IO.md](docs/BLOCKING-IO.md) orders the work into stages, each one
+  pull request, with the gates each must pass.
 - **Known unbounded waits** (#84): `traceClassified` has no overall deadline, and forward
   resolution runs `getaddrinfo` synchronously on the actor where it can be neither bounded nor
   cancelled. An overall deadline whose error names the phase that was running is the requested
