@@ -135,20 +135,15 @@ struct FaultInjectionWireTests {
   static func runDNS(port: UInt16, timeout: TimeInterval) async
     -> (Result<[__DNSAnswer], Error>?, TimeInterval)
   {
-    let box = ResultBox<[__DNSAnswer]>()
-    let duration = ResultBox<TimeInterval>()
-    let returned = await returnsWithin(lateFactor * timeout) {
-      // Timed on the calling thread, for the reason given in `runSTUN`.
-      let start = monotonicNow()
-      box.set(
-        Result {
-          try __dnsQuery(
-            server: "127.0.0.1", port: port, name: "fault.example", type: 1, timeout: timeout)
-        })
-      duration.set(.success(monotonicNow() - start))
+    // The query holds no thread while it waits, so it is timed from here; a query that never
+    // returns trips the watchdog and is reported as `nil`.
+    let outcome = try? await measure(within: lateFactor * timeout) {
+      await Result.capture {
+        try await __dnsQuery(
+          server: "127.0.0.1", port: port, name: "fault.example", type: 1, timeout: timeout)
+      }
     }
-    let elapsed = (try? duration.value?.get()) ?? .infinity
-    return (returned ? box.value : nil, elapsed)
+    return (outcome?.0, outcome?.1 ?? .infinity)
   }
 
   @Test("DNS accepts a well-formed answer from the fixture")
@@ -204,8 +199,14 @@ struct FaultInjectionWireTests {
         return rcode == (fault == .nxdomain ? 3 : 2)
       }
     case .oversized, .overstatedAnswerCount:
-      // Either rejected or the records that did arrive; never a crash or a hang.
-      _ = try? unwrapped.get()
+      // Fewer answer records arrived than the header claims (an oversized reply is cut off at the
+      // client's receive buffer), and an incomplete answer section is rejected.
+      #expect {
+        try unwrapped.get()
+      } throws: { error in
+        guard case DNSError.malformedResponse = error else { return false }
+        return true
+      }
     default:
       #expect(throws: DNSError.self) { try unwrapped.get() }
     }
@@ -355,6 +356,17 @@ struct FaultInjectionWireTests {
     // Returned well inside its timeout, so the cancellation ended it.
     let (result, _) = try await measure(within: timeout / 6) { try await task.value }
     #expect(!result.isReachable)
+  }
+}
+
+extension Result where Failure == Error {
+  /// The value `body` returns, or the error it throws.
+  static func capture(_ body: () async throws -> Success) async -> Self {
+    do {
+      return .success(try await body())
+    } catch {
+      return .failure(error)
+    }
   }
 }
 

@@ -19,7 +19,7 @@ Four kinds of work are written as blocking calls instead:
 
 | Work | How it waits today | Where it runs |
 |---|---|---|
-| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket (`performDNSQueryInternal`, `DNS.swift`) | `BlockingIOExecutor` |
+| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket; since #111, a Dispatch read source (`UDPExchange.swift`) for DNS queries and probes, while Cymru lookups and the whoami fallback keep the blocking query | `BlockingIOExecutor`; since #111, no thread for DNS queries and probes |
 | Public-IP discovery (STUN, with a DNS fallback for IPv4) | blocking `recv`, plus `getaddrinfo` per server name | the executor in a classified trace; plain `Task` closures and `DispatchQueue.concurrentPerform` in standalone `getPublicIPs` |
 | Reverse DNS | `getnameinfo` | the executor |
 | Forward resolution of a destination | `getaddrinfo` | inline in the caller |
@@ -158,7 +158,7 @@ battery's cancellation tests stop accepting either type, and the two follow-ups 
 of #100 are done here (the `cancelActiveTraces()` doc comment; one gated trace per cancellation
 source). This is a behavior change and gets an upgrade-guide entry.
 
-### Event-Based DNS
+### ~~Event-Based DNS~~ (DNS queries and probes landed in #111; Team Cymru lookups in #112)
 
 Rewrite `performDNSQueryInternal` as a non-blocking connected UDP socket with a Dispatch read
 source and a timer. Encoding, parsing, peer checks and interface and source binding are reused
@@ -436,6 +436,12 @@ otherwise. Decided ones say so.
 7. **Forward-resolution budget.** There is no configuration to derive one from today.
    Recommended: a new `SwiftFTRConfig` option for traces, defaulting to 10 seconds, with probes
    spending from their existing `timeout`. The 10 seconds is a proposal, not a measurement.
+8. **Stale DNS replies.** Decided: DNS ignores a datagram whose transaction ID does not match and
+   keeps waiting until the deadline, as its own change directly after Event-Based DNS and
+   before 0.18.0 (David, 2026-11-22). It closes a gap review found in the event-based
+   transport: a stale datagram queued before the query left but read after it is taken as the
+   reply. It changes one verdict: a server that sends only wrong-ID datagrams is reported as
+   timed out, not as reachable with a malformed response.
 
 ## Out of scope
 
@@ -448,7 +454,7 @@ Still unbounded after this plan, or deliberately deferred. Roadmap, not this pla
   cancellation after the ping phase ends.
 - The `swift-ftr` CLI's own synchronous `reverseDNS` and `getaddrinfo` calls.
 - DNS over TCP on truncation, and EDNS0. A truncated answer is `malformedResponse` today.
-- Ignoring replies with a foreign transaction ID until the deadline, for DNS and STUN.
+- Ignoring replies with a foreign transaction ID until the deadline, for STUN.
 - The blocking `poll` and `usleep` in `SendRetry.swift`, which can hold the tracer actor or an
   operation's queue for up to the 250 ms burst budget.
 - `discoverPublicIPWithHostname()` not being ended by a network change.

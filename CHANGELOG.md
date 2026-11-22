@@ -9,7 +9,9 @@ Unreleased
 Robustness under a failing network, found by a new offline fault-injection battery that stages
 each kind of failure phase by phase. A network change now ends every `trace`, `traceClassified`,
 `traceStream` and `discoverPaths` in flight (ping and the probes are not tied to the tracer's
-network changes), and several waits are now bounded by the caller's own configuration.
+network changes), and several waits are now bounded by the caller's own configuration. DNS
+queries and `dnsProbe` wait for their reply without holding a thread, so they no longer queue
+behind stalled reverse-DNS lookups for a blocking-I/O worker.
 No public API is added or removed: `swift package diagnose-api-breaking-changes v0.17.1` reports
 none. Upgrading from 0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
 
@@ -17,6 +19,21 @@ none. Upgrading from 0.17: see the "Migrating to SwiftFTR 0.18" DocC article.
 
 What an unmodified caller will see differently:
 
+- **DNS round-trip times no longer include a wait for a worker.** `DNSQueryResult.rttMs` (the
+  `tracer.dns` queries), `DNSProbeResult.rtt` (`dnsProbe`), and the `rtt` of `reverseDNS`,
+  `reverseIPv6`, `queryA` and `queryAAAA` are now measured from sending the query to reading the
+  reply. They were measured from the call, so they included any wait for one of the eight shared
+  blocking-I/O workers, which stalled reverse-DNS lookups can hold for seconds, and socket setup.
+- **A refused DNS port is reported as a refusal, not as silence.** When the server's host answers
+  that nothing is listening on the port (ICMP port unreachable), the query methods throw
+  `DNSError.sendFailed`, and `dnsProbe`'s `error` says "Connection refused - the host is up but no
+  DNS server is listening on this port". Both reported `DNSError.timeout` and "Timeout - no
+  response", although the refusal arrived at once. `dnsProbe` still reports the server
+  unreachable (`isReachable == false`, `rtt == nil`): it answers whether DNS works there. Silence
+  is still `DNSError.timeout`.
+- **An empty DNS reply is a malformed response.** A zero-byte datagram from the server throws
+  `DNSError.malformedResponse`, and `dnsProbe` reports the server reachable with "Malformed
+  response", as for any other malformed reply. It was reported as `DNSError.timeout`.
 - **`discoverPaths` throws `TracerouteError.cancelled` on `networkChanged()` and
   `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
   measured on the old network. A topology or flow error that arrives after the invalidation began
@@ -26,10 +43,10 @@ What an unmodified caller will see differently:
   `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
   `traceClassified()`, so the trace threw `TracerouteError.cancelled` only when the slowest lookup
   reached its deadline (5 s by default). It now throws at once.
-- **Invalid DNS inputs are reported before queueing.** A query with an invalid timeout, name or
-  server address, or a source address of the wrong family for the server, throws that error
-  (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) without waiting for a free
-  blocking-I/O worker.
+- **Invalid DNS inputs are reported before any socket is opened.** A query with an invalid
+  timeout, name or server address, or a source address of the wrong family for the server, throws
+  that error (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) at once. In 0.17 the
+  source address's family was checked only once a blocking-I/O worker ran the query.
 - **`discoverPaths` honours `publicIPDiscoveryTimeout`.** Its flows used the 6 s default whatever
   was configured.
 - **A trace whose socket cannot be made non-blocking now fails instead of running.** `trace`,
@@ -57,6 +74,14 @@ What an unmodified caller will see differently:
 - **A cancelled `discoverPaths` flow stops promptly.** A flow cancelled during public-IP discovery
   no longer goes on to resolve its destination, and one cancelled during classification no longer
   waits on an ASN database load shared with other resolvers.
+- **DNS queries no longer wait for a blocking-I/O worker.** Each query is one non-blocking UDP
+  exchange watched by Dispatch sources, so it holds no thread and starts at once even while every
+  worker is held. Behind a full executor a DNS query waited without limit. Cancelling the calling
+  task now ends a query at once.
+- **A DNS query whose send meets a full interface queue is retried within its timeout.**
+  `ENOBUFS` retries after a short timer, where it failed with `DNSError.sendFailed` at once, and
+  `EAGAIN` waits for the socket to drain without holding a thread. A send that does not succeed
+  before the timeout still throws `sendFailed`.
 - **A STUN timeout under one microsecond no longer waits forever.** It truncated to a zero socket
   timeout, which means none. Reachable through `getPublicIPs(stunTimeout:)`.
 - **Traces, streams and pings end on time under a flood of irrelevant replies.** Each receive
