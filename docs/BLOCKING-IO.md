@@ -1,7 +1,8 @@
 # Event-based I/O: no thread held while waiting, one deadline per operation
 
 Sequenced plan for the ROADMAP item "Robustness under network and DNS failure, proven by tests".
-Stage: product. Status: Independent Fixes has landed (#100); Receive Loop Bounds is next. The
+Stage: product. Status: Independent Fixes (#100) and Receive Loop Bounds (#108) have landed; Consistent
+Cancellation is next. The
 plan was reviewed twice (see Review record). Completed stages are struck through.
 
 ## Why
@@ -108,7 +109,7 @@ Not ported: #95's DNS queue deadline. Event-Based DNS removes the wait it was bo
 
 This stage starts the upgrade guide (see Upgrade guide).
 
-### Receive Loop Bounds
+### ~~Receive Loop Bounds~~ (landed in #108)
 
 `TraceReceiveOperation.handleRead`, `StreamingTraceReceiveOperation.handleRead` and
 `PingOperation.handleRead` each drain in `while true` on the serial queue that delivers their
@@ -455,7 +456,8 @@ Still unbounded after this plan, or deliberately deferred. Roadmap, not this pla
 - Collapsing the multipath per-flow pipeline onto the shared classified-trace implementation,
   which would also fix the configuration it drops (#91).
 - Coalescing identical in-flight forward lookups.
-- The UDP probe's receive loop, unless Receive Loop Bounds finds it has the same defect.
+- The UDP probe's setup. Its receive handler reads once per callback and does not have the
+  receive-loop defect; its `fcntl` that sets `O_NONBLOCK` is still unchecked.
 - Thread Sanitizer and Address Sanitizer jobs, scheduled soak runs, DNS and STUN parser fuzzing.
 - Root cause of the production timeouts in #84. This plan gives the means to find it; 56 of 59
   reported calls returned within five seconds of cancellation, so a blocked resolver is not

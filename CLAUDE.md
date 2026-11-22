@@ -65,12 +65,14 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 **ASN Resolution** (`Sources/SwiftFTR/ASN.swift`, `HybridASNResolver.swift`, `LocalASNResolver.swift`)
 - Multiple strategies via `ASNResolverStrategy`: `.dns` (Team Cymru), `.embedded` (SwiftIP2ASN local DB), `.remote(bundledPath:url:)`, `.hybrid(source, fallbackTimeout:)`
 - `_ASNMemoryCache`: in-memory cache with 2048 entry capacity
+- `CymruDNSResolver`: Team Cymru TXT queries over `UDPExchange`, at most 8 in flight per resolve
 
 **Probe Modules** — each in its own file:
 - `Ping.swift`: ICMP echo with statistics (min/avg/max RTT, jitter, packet loss)
 - `TCPProbe.swift`: Port state detection (open/closed/filtered)
 - `UDPProbe.swift`: Connected-socket with ICMP unreachable detection
-- `DNS.swift`: Direct server queries with 11 record types; `@_spi(Test)` exposes `__dnsEncodeQName`
+- `DNS.swift`: Direct server queries with 11 record types over `UDPExchange`; `@_spi(Test)` exposes `__dnsQuery` and `__dnsEncodeQName`. A blocking query remains only for the whoami fallback in `getPublicIPv4ViaDNS`
+- `UDPExchange.swift`: One UDP request/response on a non-blocking connected socket, waited on by Dispatch sources and a deadline timer; holds no thread
 - `HTTPProbe.swift`: Web server reachability via URLSession
 - `StreamingTrace.swift`: `AsyncThrowingStream`-based real-time hop delivery
 - `Multipath.swift`: Dublin Traceroute-style ECMP path enumeration
@@ -87,6 +89,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 3. **Dependency Injection**: Resolvers (ASN, DNS) are injectable via `SwiftFTRConfig` for testing
 4. **Per-Operation Interface Binding**: Override global interface on individual operations (ping, trace, etc.)
 5. **Resource Management**: Single socket per trace, buffer reuse, minimal allocations
+6. **Blocking I/O**: `BlockingIOExecutor` (`Utils.swift`, eight workers) carries reverse DNS (`getnameinfo`) and public-IP discovery for classified traces (STUN, with its blocking whoami DNS fallback). DNS queries, DNS probes and Team Cymru lookups do not use it
 
 ## Environment Variables
 

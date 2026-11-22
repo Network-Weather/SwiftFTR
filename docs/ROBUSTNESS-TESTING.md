@@ -22,8 +22,9 @@ that fail when any phase can wait without a bound or strand its caller.
 - **Seams, not mocks of the whole tracer.** `Sources/SwiftFTR/TestSeams.swift` holds task-local
   overrides, all `nil` in production: the blocking-I/O executor, forward resolution, the ICMP
   socket factory used by trace and ping, IPv4 public-address discovery, a hook that holds
-  `discoverPaths` at the step where it commits its result, and for the event-based UDP transport
-  (`UDPExchange`) its `fcntl`, `send` and `close` calls and the DNS server port. Task-locals
+  `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping
+  or UDP exchange socket non-blocking, and for the event-based UDP transport (`UDPExchange`) its
+  `send` and `close` calls and the DNS server port. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
   unset, and the public API is unchanged
@@ -47,6 +48,16 @@ that fail when any phase can wait without a bound or strand its caller.
   watchdog derived from configuration (`measure(within:)`): half the shortest stall for
   cancellation, the default public-IP budget for enrichment, the moment a slow fixture would have
   answered for the wire protocols.
+- **A socket that never runs dry, not a flood, for the receive loops.** A receive loop reads until
+  its socket reports no data, so the tests hold one by never letting that happen: the `fcntl`
+  seam leaves the probe socket blocking with a 1 s receive timeout, and a fixture sends a
+  well-formed reply for another identifier every 2 ms, so every read gets a datagram. A loopback
+  flood was tried first and cannot do this reliably. Paced to stay ahead, it held the unfixed loop
+  in roughly 70 to 100 percent of debug runs on an M4, and in the rest the loop found the socket
+  empty within seconds, because loopback delivers at about the rate a loop drains. Sent flat out,
+  it overflowed loopback's input queue (`net.link.generic.system.rcvq_maxlen`, 256): one run lost
+  about 85,000 of 285,000 packets host-wide and failed unrelated tests running in parallel. Over
+  IPv6, even twelve senders kept the socket readable only about 72 percent of the time.
 
 ## Conditions covered
 
@@ -69,6 +80,8 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()` and `cancelActiveTraces()` across each operation and in each stalled phase, with the error checked per source; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
+| Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails | trace, traceClassified, traceStream, ping | `ReceiveLoop` |
+| Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests` and `CymruEventBasedTests`
@@ -88,7 +101,7 @@ Not covered, and why:
 - **A DNS reply that arrives after the deadline but before the deadline timer runs.** The
   transport checks the deadline before it accepts a reply, but the two events race on one queue
   and no fixture can order them deterministically, so no test shows the check is needed.
-- **Host and network unreachable on a DNS query** (finding 16). Loopback cannot produce
+- **Host and network unreachable on a DNS query** (finding 19). Loopback cannot produce
   `EHOSTUNREACH` or `ENETUNREACH`, and there is no receive seam.
 - **The `.dns` and `.hybrid` strategies end to end**: their fallback is Team Cymru over the real
   resolver. `CymruEventBasedTests` runs `CymruDNSResolver` against a loopback responder; the
@@ -200,17 +213,36 @@ numbers are as of the commit that added this section.
     registered, which invalidation undoes synchronously before cancelling anything, and returns.
     Tests: `discoverPathsInvalidatedBeforeCommit` and `discoverPathsCommittedBeforeInvalidation`,
     which hold discovery at that step through the `beforeMultipathCommit` seam.
-14. **A refused DNS port was reported as silence.** Confirmed and fixed. `recv` on the connected
+14. **An endless supply of irrelevant replies held trace, stream and ping past their deadlines.**
+    Confirmed and fixed. Each receive loop read until its socket was empty, on the serial queue
+    that also delivers its deadline timer, its cancellation, ping's sends and a stream's retry. On
+    the unfixed code with real non-blocking sockets, a loopback flood of echo replies for another
+    identifier held the trace, the stream and the ping past a 10 s watchdog with a 0.3 s window,
+    held trace and stream cancellation the same way, and kept the stream's retry and ping's second
+    and third probes from being sent. Ping cancellation was already prompt: its loop re-checked its
+    state on every read. Each read callback now handles at most 64 datagrams and checks for
+    cancellation and the deadline before every read. For the trace either half alone keeps the
+    deadline and cancellation; ping's sends and the stream's retry need the bound. Tests:
+    `FaultInjectionReceiveLoopTests`.
+15. **A trace ran on a blocking socket when `fcntl` failed.** Confirmed and fixed. With the result
+    ignored, a failed `F_SETFL` left the socket blocking, and every trace path, and ping once its
+    own check was removed, waited in its last read past a 5 s watchdog with a 0.3 s window. The
+    trace paths now throw `socketCreateFailed`, as ping did. Test: `nonBlockingFailure`.
+16. **The trace paths closed their descriptor while the cancelled read source could still hold
+    it.** Fixed from reading the code; the race is not observable from a test. The descriptor is
+    now closed from the source's cancellation handler, before the call returns, as in ping and the
+    TCP and UDP probes. The tests check that every socket is closed when the call returns.
+17. **A refused DNS port was reported as silence.** Confirmed and fixed. `recv` on the connected
     socket failed at once with `ECONNREFUSED` and the client called it `DNSError.timeout`, so
     `dnsProbe` said "Timeout - no response" about a host that had answered. Measured on `main`:
     `timeout` after 1 ms, for a fixture port and for port 53 on loopback. Now the query methods
     throw `sendFailed` and `dnsProbe` reports the host reachable with the refusal as its error.
     Test: `EventBasedDNSTests.refusedPort`, IPv4 and IPv6.
-15. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
+18. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
     was treated like a failed one, `DNSError.timeout` after 1 ms on `main`. It is now
     `malformedResponse`, which `dnsProbe` reports as reachable. Test:
     `EventBasedDNSTests.emptyDatagram`.
-16. **Host and network unreachable on a DNS query are still reported as `timeout`.** From reading
+19. **Host and network unreachable on a DNS query are still reported as `timeout`.** From reading
     the code, not staged. The transport ends the exchange at once on `EHOSTUNREACH` and
     `ENETUNREACH`, but they map to `DNSError.timeout`, as the blocking client reported them, so
     `dnsProbe` says "Timeout - no response" for an answer that came at once. Not fixed: telling
@@ -225,3 +257,5 @@ Observations that are not defects of the library:
 - `TraceLifecycleTests.cancelActiveTracesCancelsClassifiedTrace` is not gated on
   `SKIP_NETWORK_TESTS`, so the offline suite sends a real trace toward `192.0.2.1` and real STUN
   queries. The seams added here would let it run offline.
+- `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
+  identifies a socket by its bound local address when checking that the library closed it.

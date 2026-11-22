@@ -75,10 +75,6 @@ final class UDPExchange: @unchecked Sendable {
     try Task.checkCancellation()
 
     // Read on the async side: the dispatch queue that runs the exchange cannot see task-locals.
-    let fileControl =
-      TestSeams.fileControl ?? { fd, command, argument in
-        fcntl(fd, command, argument)
-      }
     let sendDatagram =
       TestSeams.sendDatagram ?? { fd, bytes in
         send(fd, bytes.baseAddress, bytes.count, 0)
@@ -89,10 +85,11 @@ final class UDPExchange: @unchecked Sendable {
     guard fd >= 0 else { throw UDPExchangeFailure.socketCreationFailed(errno: errno) }
 
     do {
-      let flags = fileControl(fd, F_GETFL, 0)
-      guard flags >= 0 else { throw UDPExchangeFailure.nonBlockingFailed(errno: errno) }
-      guard fileControl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
-        throw UDPExchangeFailure.nonBlockingFailed(errno: errno)
+      // Shared with trace and ping; it reads `TestSeams.fileControl` here, on the async side.
+      do {
+        try setProbeSocketNonBlocking(fd)
+      } catch TracerouteError.socketCreateFailed(let code, _) {
+        throw UDPExchangeFailure.nonBlockingFailed(errno: code)
       }
       try configure(fd)
     } catch {
