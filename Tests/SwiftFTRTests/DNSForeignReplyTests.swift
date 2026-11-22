@@ -35,6 +35,7 @@ final class ScriptedDNSPeer: @unchecked Sendable {
   private var feedSent = 0
   private var lastFeed: TimeInterval?
   private var longestGap: TimeInterval = 0
+  private var scriptedSendStarts: [TimeInterval] = []
   private let threadsExited = DispatchSemaphore(value: 0)
   private var threads = 1
 
@@ -57,6 +58,14 @@ final class ScriptedDNSPeer: @unchecked Sendable {
     guard !wasStopped else { return }
     for _ in 0..<count { threadsExited.wait() }
     close(fd)
+  }
+
+  /// When each scripted datagram's `sendto` began, in order: a reader that has a datagram cannot
+  /// have it before this.
+  var scriptedSendTimes: [TimeInterval] {
+    lock.lock()
+    defer { lock.unlock() }
+    return scriptedSendStarts
   }
 
   /// How much the feed had sent at one moment.
@@ -123,6 +132,9 @@ final class ScriptedDNSPeer: @unchecked Sendable {
       for (datagram, after) in script(query) {
         if after > 0 { usleep(useconds_t(after * 1_000_000)) }
         guard !isStopped else { return }
+        lock.lock()
+        scriptedSendStarts.append(monotonicNow())
+        lock.unlock()
         _ = send(datagram, to: source, length)
       }
       if let feed { startFeeding(feed(query), to: source, length) }
@@ -526,8 +538,14 @@ struct DNSForeignReplyTests {
           name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
       }
     }
+    let returnedAt = monotonicNow()
     #expect(await eventually(within: Self.watchdog) { peer.sent.value == 2 })
     #expect(strings == nil, "the query took a reply sent after its deadline")
+    // It gave up before the real reply left, so it waited only for the time it had left; a wait
+    // restarted by the foreign reply would still be running when the real one arrived.
+    let sends = peer.scriptedSendTimes
+    try #require(sends.count == 2)
+    #expect(returnedAt < sends[1], "returned \(sends[1] - returnedAt)s after the real reply left")
   }
 
   enum LateRead: String, CaseIterable, CustomTestStringConvertible, Sendable {
