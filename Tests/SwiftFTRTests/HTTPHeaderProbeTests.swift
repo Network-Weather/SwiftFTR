@@ -101,10 +101,13 @@ struct HTTPHeaderProbeTests {
     }
     try await HTTPProbeProtocolRecorder.shared.waitUntilStarted()
 
-    probe.cancel()
     // `/never` answers nothing until loading stops, and the probe's timeout outlasts the
-    // watchdog, so a probe that returns was ended by its cancellation.
-    let (result, _) = try await measure(within: watchdog) { try await probe.value }
+    // watchdog, so a probe that returns was ended by its cancellation. Cancelling runs the
+    // probe's cancellation handler, so it is inside the watchdog too.
+    let (result, _) = try await measure(within: watchdog) {
+      probe.cancel()
+      return try await probe.value
+    }
 
     try await HTTPProbeProtocolRecorder.shared.waitUntilStopped()
     let snapshot = await HTTPProbeProtocolRecorder.shared.snapshot()

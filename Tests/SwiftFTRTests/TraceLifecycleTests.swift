@@ -48,18 +48,19 @@ struct TraceLifecycleTests {
       }
       #expect(receiving, "The streaming trace should start before cancellation")
 
-      await tracer.cancelActiveTraces()
-
       // The probe timeout outlasts the watchdog, so a stream that ends was ended by the
-      // cancellation.
-      let (outcome, _) = try await measure(within: lifecycleWatchdog) { await consumer.result }
+      // cancellation. The watchdog covers the cancellation request too, so a request that is
+      // slow to cancel the stream fails as surely as one that never does.
+      let ((outcome, unregistered), _) = try await measure(within: lifecycleWatchdog) {
+        await tracer.cancelActiveTraces()
+        let outcome = await consumer.result
+        return (outcome, await waitUntil { await tracer.activeTraces.isEmpty })
+      }
       if case .failure(let error) = outcome {
         var cancelled = error is CancellationError
         if case TracerouteError.cancelled = error { cancelled = true }
         #expect(cancelled, "threw \(error)")
       }
-
-      let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
       #expect(unregistered)
     }
 

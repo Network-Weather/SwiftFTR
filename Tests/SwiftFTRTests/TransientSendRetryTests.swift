@@ -105,9 +105,11 @@ struct TransientSendRetryTests {
 
     // One deadline for the whole burst, exactly as the send loops compute it.
     let budget: TimeInterval = 0.5
-    let deadline = monotonicNow() + budget
-
+    // Stamped once, so time spent before the send counts toward the deadline and the
+    // measured wait alike.
     let firstStart = monotonicNow()
+    let deadline = firstStart + budget
+
     let firstThrown = captureSendErrno {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,

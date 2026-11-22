@@ -171,8 +171,10 @@ struct FaultInjectionCancellationTests {
       for try await _ in stream { count += 1 }
       return count
     }
-    consumer.cancel()
-    let (count, _) = try await measure(within: Self.watchdog) { try await consumer.value }
+    let (count, _) = try await measure(within: Self.watchdog) {
+      consumer.cancel()
+      return try await consumer.value
+    }
     #expect(count == 0)
     #expect(terminated.value == 1)
     // Too late to matter: the consumer has already returned.
@@ -198,8 +200,10 @@ struct FaultInjectionCancellationTests {
         return await handle.hasCancellationHandler
       }
       #expect(receiving, "the stream never reached its receive window")
-      consumer.cancel()
-      _ = try await measure(within: Self.watchdog) { try await consumer.value }
+      _ = try await measure(within: Self.watchdog) {
+        consumer.cancel()
+        return try await consumer.value
+      }
     }
     #expect(await eventually(within: Self.watchdog) { await tracer.activeTraces.isEmpty })
     #expect(log.opened == 1)
@@ -529,9 +533,10 @@ struct FaultInjectionCancellationTests {
   @Test("A stream cancelled by the tracer after its last hop but before it ends reports it")
   func streamCancelledBeforeCommit() async throws {
     try await Self.withStreamAtCommit { tracer, consumer, gate in
-      await tracer.cancelActiveTraces()
-      gate.open()
-      await Self.expectPromptCancellation(consumer, expected: .handle, "cancelled before commit") {}
+      await Self.expectPromptCancellation(consumer, expected: .handle, "cancelled before commit") {
+        await tracer.cancelActiveTraces()
+        gate.open()
+      }
     }
   }
 

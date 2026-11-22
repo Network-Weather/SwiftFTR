@@ -355,9 +355,12 @@ struct FaultInjectionWireTests {
       try await httpProbe(url: "http://127.0.0.1:\(server.port)/", timeout: timeout)
     }
     #expect(await eventually(within: Self.watchdog) { server.accepted.value > 0 })
-    task.cancel()
     // The timeout outlasts the watchdog, so a probe that returns was ended by its cancellation.
-    let (result, _) = try await measure(within: Self.watchdog) { try await task.value }
+    // Cancelling runs the probe's cancellation handler, so it is inside the watchdog too.
+    let (result, _) = try await measure(within: Self.watchdog) {
+      task.cancel()
+      return try await task.value
+    }
     #expect(!result.isReachable)
   }
 }

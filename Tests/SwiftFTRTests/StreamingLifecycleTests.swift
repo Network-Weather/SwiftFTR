@@ -92,9 +92,13 @@ struct StreamingLifecycleTests {
       }
       try #require(receiving, "The streaming receive operation should start before cancellation")
 
-      await tracer.networkChanged()
-
-      let (outcome, _) = try await measure(within: lifecycleWatchdog) { await consumer.result }
+      // The watchdog covers the request as well as the stream's end and its unregistering, so a
+      // network change that is slow to cancel the stream fails as surely as one that never does.
+      let ((outcome, unregistered), _) = try await measure(within: lifecycleWatchdog) {
+        await tracer.networkChanged()
+        let outcome = await consumer.result
+        return (outcome, await waitUntil { await tracer.activeTraces.isEmpty })
+      }
       switch outcome {
       case .success:
         Issue.record("the stream ended normally instead of reporting the network change")
@@ -103,8 +107,6 @@ struct StreamingLifecycleTests {
       case .failure(let error):
         Issue.record("the stream threw \(error)")
       }
-
-      let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
       #expect(unregistered)
     }
   }
@@ -137,10 +139,12 @@ struct StreamingLifecycleTests {
       }
       try #require(receiving, "The streaming receive operation should start before cancellation")
 
-      consumer.cancel()
-      _ = try await measure(within: lifecycleWatchdog) { await consumer.result }
-
-      let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
+      // The watchdog covers the cancellation, the consumer's return and the producer's unregistering.
+      let (unregistered, _) = try await measure(within: lifecycleWatchdog) {
+        consumer.cancel()
+        _ = await consumer.result
+        return await waitUntil { await tracer.activeTraces.isEmpty }
+      }
       #expect(unregistered)
     }
   }
