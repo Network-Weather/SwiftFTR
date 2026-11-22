@@ -35,6 +35,10 @@ enum TestSeams {
   @TaskLocal static var makeICMPSocket: MakeICMPSocket?
 
   @TaskLocal static var discoverPublicIPv4: DiscoverPublicIPv4?
+
+  /// Awaited by `discoverPaths` once it holds a topology, just before it checks for an
+  /// invalidation and returns, so a test can order a network change before or after that step.
+  @TaskLocal static var beforeMultipathCommit: (@Sendable () async -> Void)?
 }
 
 /// The IPv4 public-address discovery to submit to the blocking-I/O executor: the test substitute
