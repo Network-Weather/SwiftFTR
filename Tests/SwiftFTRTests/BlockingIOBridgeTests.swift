@@ -170,7 +170,10 @@ struct BlockingIOBridgeTests {
     #expect(operation.isCancelled)
 
     // The caller is released rather than waiting for a syscall whose result it can no longer use.
-    await #expect(throws: CancellationError.self) { try await operation.value }
+    // Bounded: a caller left waiting for the blocked syscall fails here instead of hanging.
+    await #expect(throws: CancellationError.self) {
+      _ = try await measure(within: 10) { try await operation.value }
+    }
 
     // The syscall itself still runs to completion on its worker. Its result is discarded rather
     // than resumed a second time; a double resume would trap the checked continuation and fail the

@@ -97,7 +97,8 @@ struct BufferbloatLifecycleTests {
     task.cancel()
 
     do {
-      _ = try await task.value
+      // Bounded: a cancellation that does not reach the operation fails here instead of hanging.
+      _ = try await measure(within: 20) { try await task.value }
       Issue.record("Expected cancellation to be propagated")
     } catch is CancellationError {
       // Expected.
@@ -147,7 +148,8 @@ struct BufferbloatLifecycleTests {
     task.cancel()
 
     do {
-      _ = try await task.value
+      // Bounded: a cancellation that does not reach the operation fails here instead of hanging.
+      _ = try await measure(within: 20) { try await task.value }
       Issue.record("Expected cancellation to be propagated")
     } catch is CancellationError {
       // Expected.

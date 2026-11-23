@@ -210,7 +210,8 @@ struct InterfaceBoundHTTPSProbeSpikeTests {
     operation.cancel()
 
     await #expect(throws: CancellationError.self) {
-      try await operation.value
+      // Bounded: a cancellation that does not reach the operation fails here instead of hanging.
+      _ = try await measure(within: 20) { try await operation.value }
     }
     try await waitBounded("the request being cancelled") { await recorder.waitUntilCancelled() }
     #expect(await recorder.cancellationCount == 1)

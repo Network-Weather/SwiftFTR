@@ -107,12 +107,14 @@ struct FaultInjectionFixtureTests {
   }
 
   @Test(
-    "Stopping the TCP server ends every handler before it returns",
+    "Stopping the TCP server does not wait for its handlers; stopAndWait() ends every one",
     arguments: [
       LoopbackTCPServer.Behavior.silent,
       .respond(response: Array("late".utf8), after: 30),
     ])
-  func tcpServerStopJoinsHandlers(behavior: LoopbackTCPServer.Behavior) async throws {
+  func tcpServerStopDoesNotWaitAndStopAndWaitJoins(behavior: LoopbackTCPServer.Behavior)
+    async throws
+  {
     let exitGate = StallGate()
     defer { exitGate.open() }
     let server = try LoopbackTCPServer(behavior: behavior, exitGate: exitGate)
@@ -126,25 +128,59 @@ struct FaultInjectionFixtureTests {
     _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
     #expect(await eventually(within: 10) { server.accepted.value == 1 })
 
-    // stop() runs on its own thread. The handler is held at the exit gate, so stop() must not
-    // return until the gate opens: returning earlier means it did not wait for the handler.
-    let stopped = FaultCounter()
-    Thread.detachNewThread {
-      server.stop()
-      stopped.increment()
+    // The handler cannot finish while the exit gate is shut (its own limit is 30 s), so a stop()
+    // that returns within the 10 s watchdog did so without waiting for it. Run on its own thread,
+    // so a stop() that does wait cannot park this test's.
+    let returned = await returnsWithin(10) { server.stop() }
+    #expect(returned, "stop() waited for a handler")
+
+    // stopAndWait() must not return until the gate opens: returning earlier means it did not wait
+    // for the handler.
+    let joined = FaultCounter()
+    let join = Task {
+      await server.stopAndWait()
+      joined.increment()
     }
     try await Task.sleep(nanoseconds: 300_000_000)
-    #expect(stopped.value == 0, "stop() returned while a handler was still running")
+    #expect(joined.value == 0, "stopAndWait() returned while a handler was still running")
 
-    // Released, the handler finishes and stop() returns, without waiting for the handler's own
-    // 30 s behavior.
+    // Released, the handler finishes and stopAndWait() returns, without waiting for the
+    // handler's own 30 s behavior.
     exitGate.open()
-    #expect(await eventually(within: 10) { stopped.value == 1 }, "stop() did not return")
+    _ = try await measure(within: 10) { await join.value }
+    #expect(joined.value == 1)
 
     // The connection was shut down, so the client sees end-of-file: 0, not a receive timeout.
     setReceiveTimeout(client, seconds: 1)
     var buffer = [UInt8](repeating: 0, count: 16)
     let received = recv(client, &buffer, buffer.count, 0)
     #expect(received == 0, "recv returned \(received), errno \(errno)")
+  }
+
+  /// Whether a fresh socket, with no reuse options, can bind `port` on loopback: false while
+  /// another socket still holds it.
+  static func canBind(type: Int32, port: UInt16) -> Bool {
+    let probe = socket(AF_INET, type, 0)
+    guard probe >= 0 else { return false }
+    defer { close(probe) }
+    var (address, length) = loopbackAddress(family: AF_INET, port: port)
+    return withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(probe, $0, length) }
+    } == 0
+  }
+
+  @Test("A stopped UDP fixture's own thread closes its socket")
+  func udpFixtureThreadClosesItsSocket() async throws {
+    let responder = try LoopbackUDPResponder { _ in nil }
+    let network = try FakeICMPNetwork { _ in [] }
+    let ports = [responder.port, network.port]
+    #expect(!ports.contains { Self.canBind(type: SOCK_DGRAM, port: $0) }, "a port was not held")
+    responder.stop()
+    network.stop()
+    // stop() returns at once and leaves the socket to the serve thread, which must close it.
+    let released = await eventually(within: 10) {
+      ports.allSatisfy { Self.canBind(type: SOCK_DGRAM, port: $0) }
+    }
+    #expect(released, "a serve thread did not close its socket")
   }
 }
