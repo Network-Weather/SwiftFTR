@@ -6,7 +6,24 @@ All notable changes to this project are documented here. This project follows Se
 Unreleased
 ----------
 
+### Breaking changes
+
+- **`DNSError` adds `connectionRefused` and `unreachable`**, the one source break 0.19 takes
+  (decision 10 in docs/BLOCKING-IO.md). An exhaustive `switch` over `DNSError` must handle both;
+  `MigratingTo019.md` has the edit. `swift package diagnose-api-breaking-changes v0.18.1` reports
+  exactly these two, and `api-breakage-allowlist.txt` lists them for the CI gate.
+
 ### Behavior changes
+
+- **The DNS query methods throw `connectionRefused` for a refused port** (they threw
+  `sendFailed`): the server's host answered with ICMP port unreachable after the query was sent.
+- **The DNS query methods throw `unreachable` for a host or network unreachable report** (they
+  threw `timeout`): the ICMP report arrived after the query was sent, at once rather than at the
+  timeout, so a caller that retried on `timeout` no longer does for this case.
+- **The DNS query methods throw `unreachable` when this machine has no route to the server**
+  (they threw `sendFailed`): `connect` or `send` failed with `EHOSTUNREACH`, `EHOSTDOWN`,
+  `ENETUNREACH` or `ENETDOWN`. Every other send or connect failure still throws `sendFailed`, and
+  `dnsProbe`'s results do not change for any of these.
 
 - **A DNS reply that echoes another question is ignored** (#128). A reply carrying the query's
   transaction ID was accepted whatever question it echoed, and its answers were reported for the

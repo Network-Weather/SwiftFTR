@@ -31,6 +31,14 @@ swift format lint --strict -r Sources Tests
 swift format format --in-place -r Sources Tests
 ```
 
+### API compatibility
+```bash
+# Fails on any source break against the last release that the allowlist does not name
+# (one exact diagnostic per line, as the tool prints it; no comments). CI runs the same.
+swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
+  --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt"
+```
+
 ### Documentation
 ```bash
 swift package --allow-writing-to-directory docc \

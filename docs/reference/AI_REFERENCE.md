@@ -544,8 +544,15 @@ public enum DNSRecordData: Sendable {
 public enum DNSError: Error, Sendable {
     case invalidIP(String), invalidHostname(String), invalidTimeout(TimeInterval)
     case socketCreationFailed, setsockoptFailed(option: String, errno: Int32), bindFailed(String)
-    case sendFailed, timeout, malformedResponse, noRecords, serverError(rcode: Int)
+    case sendFailed, connectionRefused, unreachable
+    case timeout, malformedResponse, noRecords, serverError(rcode: Int)
 }
+// Exhaustive switches must name every case (0.19 added connectionRefused and unreachable).
+// connectionRefused: ICMP port unreachable after the send (the host is up, no DNS server).
+// unreachable: ICMP host/network unreachable after the send, or connect/send failing with
+//   EHOSTUNREACH, EHOSTDOWN, ENETUNREACH or ENETDOWN. Each maps as dnsProbe's outcome does.
+// sendFailed: any other send or connect failure (short send, EPERM, EMSGSIZE, buffer pressure
+//   past the timeout). timeout: silence, or a receive error not listed above.
 // malformedResponse: a datagram with the query's transaction ID that is not valid DNS. One with
 // another ID, too short to carry one, or echoing another question (another name, type or class;
 // the name compared case-insensitively) is ignored; only such datagrams end as timeout.

@@ -277,7 +277,7 @@ numbers are as of the commit that added this section.
     socket failed at once with `ECONNREFUSED` and the client called it `DNSError.timeout`, so
     `dnsProbe` said "Timeout - no response" about a host that had answered. Measured on `main`:
     `timeout` after 1 ms, for a fixture port and for port 53 on loopback. Now the query methods
-    throw `sendFailed`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
+    throw `connectionRefused`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
     that names the refusal and `outcome == .refused`, with `elapsed` set to when it arrived.
     Tests: `EventBasedDNSTests.refusedPort` and `DNSProbeOutcomeTests.refused`, IPv4 and IPv6.
 18. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
@@ -319,7 +319,7 @@ numbers are as of the commit that added this section.
     `DNSError.sendFailed` with the errno discarded, and a send-time errno was dropped, so "no route
     to this server", the usual no-network case, read "Failed to send query". `EHOSTUNREACH`,
     `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` are now `outcome == .unreachable` with the errno, and
-    other errnos are named in the message. The query methods still throw `sendFailed`. Test:
+    other errnos are named in the message. The query methods throw `unreachable`. Test:
     `DNSProbeOutcomeTests.locallyUnreachable`, both stages and all four errnos.
 24. **An unclassified receive error was reported as a timeout.** Fixed: `dnsProbe` said "Timeout -
     no response" for a socket error that came at once. It now says a receive error occurred, with

@@ -41,6 +41,26 @@ jobs:
       - name: Build external API compatibility consumer
         run: swift build --package-path TestLibraryUsage
 
+  api:
+    name: API compatibility (against v0.18.1)
+    runs-on: macos-15
+    needs: format
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # The baseline is a tag: fetch all history and tags so v0.18.1 can be checked out.
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Swift version
+        run: swift --version
+      # Fails on any source break that api-breakage-allowlist.txt does not name, one exact
+      # diagnostic per line. The breaks allowed are the ones docs/BLOCKING-IO.md names for 0.19.
+      - name: Diagnose API breaking changes
+        run: |
+          swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
+            --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt"
+
   docs:
     name: Documentation (DocC)
     runs-on: macos-15
