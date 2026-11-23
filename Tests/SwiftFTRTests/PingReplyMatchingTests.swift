@@ -145,8 +145,8 @@ struct PingReplyMatchingTests {
     #expect(
       result.responses.map { $0.rtt != nil } == [true, true, false], "\(Self.summary(result))")
     #expect(result.responses.compactMap(\.ttl).allSatisfy { $0 == Int(Self.kept) })
-    // Probe 3 leaves at about 0.1 s and is owed its 0.5 s window.
-    #expect(elapsed >= 0.55, "the ping ended after \(elapsed)s: \(Self.summary(result))")
+    // Probe 3 is owed its 0.5 s window from its own send, which the hold above delays.
+    ping.expectWaitedOut(config.timeout, after: 3, "ran \(elapsed)s: \(Self.summary(result))")
     #expect(
       await eventually(within: 5) { ping.network.probes.value == 3 },
       "probes: \(ping.network.probes.value)")
@@ -488,8 +488,8 @@ struct PingReplyMatchingTests {
     #expect(ping.premiseHeld, "probe 2's reply was never queued before probe 3's send")
     let s = result.statistics
     #expect(s.sent == 2 && s.received == 1, "\(Self.summary(result))")
-    // Probe 3 is owed its 0.5 s window.
-    #expect(elapsed >= 0.55, "the ping ended after \(elapsed)s: \(Self.summary(result))")
+    // Probe 3 is owed its 0.5 s window from its own send, which the hold above delays.
+    ping.expectWaitedOut(config.timeout, after: 3, "ran \(elapsed)s: \(Self.summary(result))")
   }
 }
 
@@ -519,6 +519,7 @@ final class DirectPing: @unchecked Sendable {
     var premises: [Bool] = []
     var sent: [UInt16: TimeInterval] = [:]
     var failing: Set<UInt16> = []
+    var closed: TimeInterval?
   }
 
   /// Sequences whose send fails, after `beforeSend` runs, as a send that outlasted its retries.
@@ -538,6 +539,23 @@ final class DirectPing: @unchecked Sendable {
 
   /// Each request's send time, as ping recorded it.
   var sendTimes: [UInt16: TimeInterval] { state.lock.withLock { state.sent } }
+
+  /// When ping closed its socket as it finished, on ping's clock, stamped on ping's queue; `nil`
+  /// until then. A "not early" bound is measured from a send time to this, never from the start
+  /// of a run that may contain a hold of unknown length.
+  var closeTime: TimeInterval? { state.lock.withLock { state.closed } }
+
+  /// Checks that ping waited out `window` after sequence `seq` left, measured on ping's clock from
+  /// that send to the close, both stamped on ping's queue.
+  func expectWaitedOut(_ window: TimeInterval, after seq: UInt16, _ detail: String) {
+    guard let sent = sendTimes[seq], let closed = closeTime else {
+      Issue.record("no send time for probe \(seq) or no close: \(detail)")
+      return
+    }
+    #expect(
+      closed - sent >= window * 0.95,
+      "probe \(seq) got \(closed - sent)s of its \(window)s window: \(detail)")
+  }
 
   /// Whether every staged condition the hooks checked held.
   var premiseHeld: Bool {
@@ -611,7 +629,12 @@ final class DirectPing: @unchecked Sendable {
         return time
       },
       monotonicTime: { clock.now() },
-      closeSocket: { _ = close($0) })
+      closeSocket: { fd in
+        state.lock.withLock {
+          state.closed = state.closed ?? pingClockSeconds(machAbsoluteTime: mach_absolute_time())
+        }
+        _ = close(fd)
+      })
   }
 
   func run() async throws -> PingResult { try await operation.run() }
