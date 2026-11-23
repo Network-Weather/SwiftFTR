@@ -258,7 +258,7 @@ overlap in time; the "After" column is what must have landed first.
 | Test Hygiene | | #135 (a watchdog on the ASN-enrichment cancellation test), #129 (fixture teardown that does not block an async test), the stronger `cancelledLookupNotCached` (ROADMAP). Tests only. |
 | DNS Error Cases | Small Fixes | `DNSError.connectionRefused` and `DNSError.unreachable`, mapped by where the failure came from: a refusal received after the send (`sendFailed` today), an unreachable received after the send (`timeout` today), and a local routing failure on connect or send (`sendFailed` today). `dnsProbe`'s result for each origin does not change. Adds the API allowlist and runs the API check in CI. |
 | Async Public-IP Discovery | Small Fixes | The stage below. STUN server names and each STUN attempt run as executor requests under one absolute discovery deadline; nothing moves onto the cooperative pool. Deletes the blocking DNS path, so it lands after Small Fixes has touched it. |
-| Event-Based STUN | Async Public-IP Discovery | The stage below, including a cancellable, bounded wait on each server-name lookup so a stalled name cannot hold discovery, and a stated rule for an empty datagram (today `recvTimeout`). |
+| Event-Based STUN | Async Public-IP Discovery | The stage below: every discovery method runs at once, bound to the tracer's interface (#151), with a cancellable, bounded wait on each server-name lookup and a stated rule for an empty datagram (today `recvTimeout`). |
 | Reverse-DNS Lookup | | The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test, the descriptor-count test at a lowered limit and the gated live comparison. Unused until the next row; the two are released together. |
 | Reverse-DNS Cache | Reverse-DNS Lookup | `RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker, and `withTraceCancellation` around the multipath flow's reverse-DNS wait. |
 | Resolution Off The Actor | Event-Based STUN, Reverse-DNS Cache | The stage below, as one change: the resolution seam is one closure shared by trace, streaming trace, ping and the probes, so it becomes async for all of them together. If it outgrows the cap, the second pull request is the forward-resolution budget option (decision 7) and `discoverPaths` resolving once. |
@@ -303,15 +303,34 @@ its DNS fallback; the standalone API stays STUN-only.
 ### Event-Based STUN
 
 The STUN exchange moves onto the transport from Event-Based DNS, against an already-resolved
-endpoint. A server is tried as soon as its name has resolved, and a family that succeeded is
-returned at the cap while a losing lookup is still stalled. Name resolution for STUN servers is
-not changed here; it moves with Resolution Off The Actor. First-ready selection can change which
-server supplies the address; the changelog says so. STUN keeps failing on the first invalid
-reply, as now.
+endpoint. STUN keeps failing on the first invalid reply, as now. Name resolution for STUN servers
+is not changed here beyond a bounded, cancellable wait on each lookup; it moves with Resolution
+Off The Actor.
 
-Tests: the STUN fault battery against the new transport; a refused port moves to the next
-server at once; a healthy endpoint beside a stalled name yields an address, in classified and
-standalone discovery; `getPublicIPs` still returns a partial result when one family answers.
+**The methods run at the same time, each bound to the tracer's interface** (David, 2026-11-22).
+Discovery exists to say what address the world sees for one interface, so a caller can contrast
+the exit of a VPN or the default route with the hardline's. Today the methods run in sequence
+(each STUN server, then the DNS whoami fallback), and the fallback is not bound to the tracer's
+interface or source address at all (#151), so on a bound tracer it can report another route's
+exit as this interface's.
+
+- Every method (each STUN server as its name resolves, and the whoami query for IPv4) starts at
+  once, holds no thread, and is bound to the same interface and source address as the trace. A
+  method that cannot be bound is not used; nothing runs unbound in its place.
+- For a classified trace the first valid answer wins and the rest are stopped. The result records
+  which method supplied it. Which method wins can differ from 0.18, where STUN had to fail before
+  whoami was asked; the changelog says so.
+- The STUN share of the budget from Async Public-IP Discovery goes away with the sequence it
+  protected: every method has the whole discovery deadline.
+- Standalone `getPublicIPs` stays per interface and STUN-only in its return type. Collecting
+  every method's answer for one interface, so that two methods disagreeing is itself reported, is
+  decision 12.
+
+Tests: the STUN fault battery against the new transport; a refused port does not delay the other
+methods; a healthy endpoint beside a stalled name yields an address, in classified and standalone
+discovery; whoami answers while STUN is silent without waiting for it; on a bound tracer every
+method's socket is bound, and with the bind failing no query is sent; `getPublicIPs` still returns
+a partial result when one family answers.
 
 ### Event-Based Reverse DNS
 
@@ -535,6 +554,13 @@ otherwise. Decided ones say so.
     `https://speed.cloudflare.com/__up` accepted a 1 KB and a 1 MB POST with status 200 on
     2026-11-22; its limits and terms were not checked. Callers who set `uploadURL` are unaffected.
     It is its own pull request (Upload Default), with an upgrade-guide entry.
+
+12. **Reporting every discovery method's answer.** Open. With the methods running at once
+    (Event-Based STUN), a caller could be given each method's answer for an interface, so that
+    STUN and whoami disagreeing is visible instead of the first answer hiding the second.
+    Recommended: not in 0.19.0; the first answer wins and names its method, and the fuller report
+    is a ROADMAP item, because it needs a new public result type and a decision on how long to
+    wait for the slower method.
 
 ## Out of scope
 
