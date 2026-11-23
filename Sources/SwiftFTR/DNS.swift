@@ -1968,6 +1968,8 @@ private func _encodeQName(_ name: String) throws -> [UInt8] {
 /// - IPv4 example: `"10.1.10.1"` → `"1.10.1.10.in-addr.arpa"`
 /// - IPv6 example: `"2001:4860:4860::8888"` → `"8.8.8.8.0.0.0.0...0.6.8.4.0.6.8.4.1.0.0.2.ip6.arpa"`
 private func _formatReverseDNS(_ ip: String, expectedFamily: Int32? = nil) -> String? {
+  // `inet_pton` would read only the text before a NUL and build that address's name instead.
+  guard !containsNUL(ip) else { return nil }
   var addr4 = in_addr()
   if ip.withCString({ inet_pton(AF_INET, $0, &addr4) }) == 1 {
     guard expectedFamily == nil || expectedFamily == AF_INET else { return nil }

@@ -168,6 +168,40 @@ struct PublicIPValidationTests {
     #expect(await tracer.publicIP == nil)
   }
 
+  @Test("The explicit-server reverse queries reject an address with an embedded NUL")
+  func reverseQueriesRejectEmbeddedNUL() async {
+    // Thrown before a socket is opened, so the loopback server is never asked.
+    let server = "127.0.0.1"
+    let v4 = "127.0.0.1\u{0}junk"
+    let v6 = "2001:db8::1\u{0}junk"
+    func isInvalidIP(_ operation: () async throws -> Void) async -> Bool {
+      do {
+        try await operation()
+        return false
+      } catch DNSError.invalidIP {
+        return true
+      } catch {
+        return false
+      }
+    }
+    let queriesV4 = await isInvalidIP {
+      _ = try await SwiftFTR().dns.reverseIPv4(ip: v4, server: server, timeout: 1)
+    }
+    let queriesV6 = await isInvalidIP {
+      _ = try await SwiftFTR().dns.reverseIPv6(ip: v6, server: server, timeout: 1)
+    }
+    let legacyV4 = await isInvalidIP {
+      _ = try await reverseDNS(ip: v4, server: server, timeout: 1)
+    }
+    let legacyV6 = await isInvalidIP {
+      _ = try await reverseIPv6(ip: v6, server: server, timeout: 1)
+    }
+    #expect(queriesV4, "DNSQueries.reverseIPv4 accepted an address with an embedded NUL")
+    #expect(queriesV6, "DNSQueries.reverseIPv6 accepted an address with an embedded NUL")
+    #expect(legacyV4, "reverseDNS(ip:server:) accepted an address with an embedded NUL")
+    #expect(legacyV6, "reverseIPv6(ip:server:) accepted an address with an embedded NUL")
+  }
+
   @Test("The address parsers reject a string with an embedded NUL")
   func parsersRejectEmbeddedNUL() {
     #expect(detectAddressFamily("127.0.0.1\u{0}junk") == -1)
