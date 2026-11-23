@@ -452,7 +452,9 @@ swift format lint --strict -r Sources Tests
 SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug          # twice in a row
 SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c release
 swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR
-# with --breakage-allowlist-path once the DNS Error Cases slice has added the allowlist
+# once the DNS Error Cases slice has landed, add:
+#   --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt"
+# (one exact diagnostic per line; the file takes no comments)
 swift package --allow-writing-to-directory docc generate-documentation --target SwiftFTR \
   --output-path docc --transform-for-static-hosting --warnings-as-errors
 ~/.claude/bin/orphan-audit

@@ -135,6 +135,14 @@ hashes, infrastructure identifiers, customer or usage details. Strip those when 
 evidence here. (David, 2026-11-22, relaxing the earlier rule that the application itself must not
 be named.)
 
+## CI runs on GitHub-hosted runners
+
+This repository is public and accepts pull requests from forks, so its workflows run on
+GitHub-hosted macOS runners, never on a self-hosted one: a self-hosted runner would execute a
+stranger's pull-request code on a private machine. This is a deliberate exception to the general
+rule that CI runs on self-hosted runners. Do not add `runs-on: self-hosted` (or a self-hosted
+label) to any workflow here. (David, 2026-11-22.)
+
 ## Size the pull request, not just the commits
 
 Plan PR boundaries before the work starts. One Codex review pass covers about 2,000 changed
