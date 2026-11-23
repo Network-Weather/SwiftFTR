@@ -37,7 +37,7 @@ that fail when any phase can wait without a bound or strand its caller.
 - **Local fixtures for every other protocol.** TCP listeners that refuse, accept and stay silent,
   reset mid-response or answer slowly; an HTTP responder on the same listener; UDP responders for
   STUN and DNS that stay silent, answer late or answer garbage. All bind `127.0.0.1` or `::1` on an
-  ephemeral port. No new test sends a packet off the host. The fixtures have tests of their own
+  ephemeral port, without `SO_REUSEADDR` (see the last observation below). No new test sends a packet off the host. The fixtures have tests of their own
   (`FaultInjectionFixtureTests`).
 - **Private executors.** Any test that stalls a blocking call does it on a private
   `BlockingIOExecutor`, installed through the seam, never on the process-wide one.
@@ -428,3 +428,18 @@ Observations that are not defects of the library:
   timeout that is not the one under test.
 - `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
   identifies a socket by its bound local address when checking that the library closed it.
+- A loopback fixture could take the port of an IPv6 probe socket and receive its replies. The
+  fake network hands trace and ping an unbound UDP socket, which takes an ephemeral port on `[::]`
+  at its first send. Fixtures bound `::1` on port 0 with `SO_REUSEADDR`, and with that option
+  Darwin chooses an IPv6 ephemeral port by exact address only, so it could hand a fixture a port
+  such a socket already held. Holding 2,000 implicitly bound sockets and binding 2,000 fixtures
+  gave about 240 collisions over IPv6 and none over IPv4 or without the option. Every later
+  datagram to that port went to the fixture, so a ping given a reply window past its watchdog
+  waited it out: the IPv6 ping reply-matching tests failed at their 20 s watchdog in about one
+  full debug suite run in fifteen. With another process churning such binds alongside, 4 of 60
+  IPv6 runs of the control test hit the watchdog and none of 60 IPv4 runs, each with every probe
+  seen and every reply sent. Fixtures no longer set the option. Another process that binds `::1`
+  with it, such as a suite built before this change running at the same time, can still take
+  the port. When a ping reply-matching test hits its watchdog it reports the fake network's
+  journal of probes received and replies sent. Test:
+  `FaultInjectionFixtureTests.loopbackFixtureKeepsOffWildcardPorts`.

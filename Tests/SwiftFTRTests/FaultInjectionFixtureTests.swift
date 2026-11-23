@@ -40,11 +40,14 @@ struct FaultInjectionFixtureTests {
     let gate = StallGate()
     defer { gate.open() }
     let finished = FaultCounter()
-    await #expect(throws: WatchdogExpired.self) {
-      _ = try await measure(within: 0.2) {
+    do {
+      _ = try await measure(within: 0.2, diagnose: "fixture state") {
         await gate.waitAsync(limit: 20)
         finished.increment()
       }
+      Issue.record("the watchdog did not fire")
+    } catch let expired as WatchdogExpired {
+      #expect(expired.diagnosis == "fixture state", "\(expired)")
     }
     #expect(finished.value == 0, "the watchdog returned only after the operation had ended")
 
@@ -52,6 +55,51 @@ struct FaultInjectionFixtureTests {
     gate.open()
     #expect(
       await eventually(within: 10) { finished.value == 1 }, "the abandoned operation never ended")
+  }
+
+  @Test("A loopback fixture is never handed the port of a socket bound to the unspecified address")
+  func loopbackFixtureKeepsOffWildcardPorts() throws {
+    // A probe socket the library sends on unbound takes an ephemeral port on the unspecified
+    // address at its first send. A fixture later handed the same number on ::1 would receive
+    // every loopback reply meant for the probe socket, and the operation would wait out its whole
+    // window. Hold `held` such sockets and bind `binds` fixtures one at a time: were the kernel
+    // free to hand out held ports, about held * binds / 16384 (some 31) would collide.
+    let held = 128
+    let binds = 4000
+    var holders: [Int32] = []
+    defer { for fd in holders { close(fd) } }
+    var heldPorts = Set<UInt16>()
+    for _ in 0..<held {
+      let fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+      guard fd >= 0 else { throw FixtureError.socket("socket", errno) }
+      holders.append(fd)
+      var any = sockaddr_in6()
+      any.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      any.sin6_family = sa_family_t(AF_INET6)
+      let bound = withUnsafePointer(to: &any) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+      }
+      guard bound == 0 else { throw FixtureError.socket("bind", errno) }
+      var actual = sockaddr_storage()
+      var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      _ = withUnsafeMutablePointer(to: &actual) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+      }
+      heldPorts.insert(
+        withUnsafeBytes(of: actual) {
+          UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+        })
+    }
+    var collisions: [UInt16] = []
+    for _ in 0..<binds {
+      let (fd, port) = try bindLoopback(family: AF_INET6, type: SOCK_DGRAM)
+      close(fd)
+      if heldPorts.contains(port) { collisions.append(port) }
+    }
+    #expect(heldPorts.count == held)
+    #expect(collisions.isEmpty, "fixtures were handed held ports: \(collisions)")
   }
 
   @Test("The UDP responder hands a zero-byte request to its script")

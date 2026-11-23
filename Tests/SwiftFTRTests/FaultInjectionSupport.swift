@@ -79,16 +79,23 @@ func measure<T>(_ body: () async throws -> T) async rethrows -> (T, TimeInterval
 /// Thrown by ``measure(within:_:)`` when the operation outlives its watchdog.
 struct WatchdogExpired: Error, CustomStringConvertible {
   let limit: TimeInterval
-  var description: String { "operation still running after the \(limit)s watchdog" }
+  /// What the caller's `diagnose` reported when the watchdog fired, if it passed one.
+  var diagnosis: String? = nil
+  var description: String {
+    "operation still running after the \(limit)s watchdog"
+      + (diagnosis.map { "; at expiry:\n\($0)" } ?? "")
+  }
 }
 
 /// Seconds elapsed while running `body`, or ``WatchdogExpired`` once `limit` seconds pass.
 ///
 /// The operation runs in its own task and the watchdog does not wait for it to finish, so an
 /// operation that never returns fails the test instead of hanging the run. The abandoned task is
-/// cancelled.
+/// cancelled. `diagnose`, when given, is evaluated as the watchdog fires and its text carried in the
+/// error, so a stuck operation reports what its fixture saw.
 func measure<T: Sendable>(
-  within limit: TimeInterval, _ body: @escaping @Sendable () async throws -> T
+  within limit: TimeInterval, diagnose: @autoclosure @escaping @Sendable () -> String = "",
+  _ body: @escaping @Sendable () async throws -> T
 ) async throws -> (T, TimeInterval) {
   let start = monotonicNow()
   let outcome = WatchdogRace<T>()
@@ -101,7 +108,11 @@ func measure<T: Sendable>(
   }
   let watchdog = Task {
     try? await Task.sleep(nanoseconds: UInt64(limit * 1_000_000_000))
-    outcome.finish(.failure(WatchdogExpired(limit: limit)))
+    // Cancelled only once the operation has finished: nothing to report.
+    if Task.isCancelled { return }
+    let diagnosis = diagnose()
+    outcome.finish(
+      .failure(WatchdogExpired(limit: limit, diagnosis: diagnosis.isEmpty ? nil : diagnosis)))
   }
   let result = await outcome.value
   watchdog.cancel()
@@ -216,11 +227,13 @@ func loopbackAddress(family: Int32, port: UInt16) -> (sockaddr_storage, socklen_
 }
 
 /// Opens a socket bound to loopback on an ephemeral port and returns it with the port.
+///
+/// No `SO_REUSEADDR`: with it, Darwin picks an IPv6 ephemeral port without checking sockets bound
+/// to the unspecified address, so it can hand out a port an unbound probe socket took on its first
+/// send, and the loopback datagrams meant for that socket then arrive here instead.
 func bindLoopback(family: Int32, type: Int32) throws -> (fd: Int32, port: UInt16) {
   let fd = socket(family, type, 0)
   guard fd >= 0 else { throw FixtureError.socket("socket", errno) }
-  var on: Int32 = 1
-  _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
   var (address, length) = loopbackAddress(family: family, port: 0)
   let bound = withUnsafePointer(to: &address) {
     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, length) }
@@ -299,6 +312,9 @@ final class FakeICMPNetwork: @unchecked Sendable {
   private var stopped = false
   private let socketsLock = NSLock()
   private var openedSockets: [Int32] = []
+  /// What the peer received and sent, for a test to print when an operation outlives its
+  /// watchdog. Guarded by `lock`; capped so a long trace cannot grow it without bound.
+  private var events: [String] = []
 
   init(family: Int32 = AF_INET, script: @escaping Script) throws {
     self.family = family
@@ -434,6 +450,8 @@ final class FakeICMPNetwork: @unchecked Sendable {
         sequence: UInt16(bytes[6]) << 8 | UInt16(bytes[7]),
         hopLimit: hopLimit)
       probes.increment()
+      record(
+        "probe id=\(probe.identifier) seq=\(probe.sequence) from port \(Self.port(of: source))")
       for reply in script(probe) {
         if reply.delay <= 0 {
           send(reply.bytes, to: source, hopLimit: reply.hopLimit)
@@ -468,11 +486,36 @@ final class FakeICMPNetwork: @unchecked Sendable {
     return true
   }
 
+  /// What the peer received and sent so far, one event per line.
+  var journal: String {
+    lock.lock()
+    defer { lock.unlock() }
+    return events.joined(separator: "\n")
+  }
+
+  private func record(_ event: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    recordLocked(event)
+  }
+
+  /// Requires `lock`.
+  private func recordLocked(_ event: String) {
+    if events.count < 200 { events.append(event) }
+  }
+
+  private static func port(of address: sockaddr_storage) -> UInt16 {
+    withUnsafeBytes(of: address) { UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self)) }
+  }
+
   private func send(_ bytes: [UInt8], to destination: sockaddr_storage, hopLimit: Int32?) {
     lock.lock()
     defer { lock.unlock() }
     // Closed under the same lock, so a late reply never reaches a recycled descriptor.
-    guard !stopped else { return }
+    guard !stopped else {
+      recordLocked("reply of \(bytes.count) bytes to port \(Self.port(of: destination)): stopped")
+      return
+    }
     if family == AF_INET6 {
       // Set on every send, under the lock, so one reply's hop limit never leaks into the next.
       // -1 restores the system default.
@@ -482,13 +525,15 @@ final class FakeICMPNetwork: @unchecked Sendable {
     }
     var destination = destination
     let length = socklen_t(destination.ss_len)
-    _ = bytes.withUnsafeBytes { raw in
+    let sent = bytes.withUnsafeBytes { raw in
       withUnsafePointer(to: &destination) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
           sendto(fd, raw.baseAddress, raw.count, 0, $0, length)
         }
       }
     }
+    let outcome = sent == bytes.count ? "sent" : "sendto returned \(sent), errno \(errno)"
+    recordLocked("reply of \(bytes.count) bytes to port \(Self.port(of: destination)): \(outcome)")
   }
 
   private static func hopLimit(from msg: msghdr) -> Int? {
