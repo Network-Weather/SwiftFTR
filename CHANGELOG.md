@@ -3,6 +3,38 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Tooling
+
+- **Fixture teardown no longer parks a thread of Swift's cooperative pool** (#129). `stop()` on
+  the loopback test fixtures (`FakeICMPNetwork`, `LoopbackUDPResponder`, `LoopbackTCPServer`,
+  `ScriptedDNSPeer`, `RefusingThenAnsweringUDPPort`, `EndlessReplies`) and
+  `BlockedSendPair.close()` used to wait on a semaphore for the fixture's thread, from `defer` in
+  async tests: 547 calls on cooperative threads per offline run, 2.8 s of parked thread time in
+  all, up to 21 ms each. They now signal and return, and each fixture thread closes its own socket as it
+  exits, under the lock any other sender checks, so a descriptor number is never used after it is
+  closed. `LoopbackTCPServer.stopAndWait()` is added for a test that needs the handlers joined.
+  With `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` the offline suite ran in 7.4 to 8.8 s before and
+  4.6 to 4.9 s after (three runs each, debug, one Mac); with the default pool, 4.05 s against
+  4.03 s.
+- **The DNS wire-hardening tests pass with the cooperative pool limited.** Their fixture blocked
+  in `recvfrom` inside `Task.detached`, and with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` the
+  query it was answering could not run, so a test failed with a timeout. The fixture now
+  receives on a thread of its own.
+- **Tests that wait for a cancellation to land fail at a watchdog instead of hanging** (#135).
+  `cancelActiveTracesInterruptsASNEnrichment` waited forever on its trace when
+  `cancelActiveTraces()` did nothing; it now fails after its 20 s watchdog. The same
+  `measure(within:)` wrap is on every other test that awaited a task only its cancellation, or a
+  deadline under test, could end: in the blocking-I/O bridge, bufferbloat, interface-bound HTTPS,
+  multipath, ping lifecycle, TCP probe and DNS wire-hardening tests.
+- **`cancelledLookupNotCached` covers the stall breaker.** It cancels two reverse-DNS lookups
+  that have each run past the stall threshold and checks that neither opens the breaker, with two
+  uncancelled lookups of the same length as the control that does. The previous version, which
+  cancelled one lookup at once, passed with the cancellation check moved below the breaker
+  update; this one fails.
+
 0.18.1 — 2026-11-22
 -------------------
 
