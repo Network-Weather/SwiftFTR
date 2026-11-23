@@ -304,6 +304,9 @@ final class FakeICMPNetwork: @unchecked Sendable {
   let family: Int32
   let port: UInt16
   let probes = FaultCounter()
+  /// Datagrams this peer has sent, scripted replies and injected ones alike, counted once
+  /// `sendto` has returned.
+  let repliesSent = FaultCounter()
 
   /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
@@ -533,6 +536,7 @@ final class FakeICMPNetwork: @unchecked Sendable {
       }
     }
     let outcome = sent == bytes.count ? "sent" : "sendto returned \(sent), errno \(errno)"
+    if sent == bytes.count { repliesSent.increment() }
     recordLocked("reply of \(bytes.count) bytes to port \(Self.port(of: destination)): \(outcome)")
   }
 
