@@ -663,7 +663,6 @@ final class LoopbackTCPServer: @unchecked Sendable {
       guard poll(&pfd, 1, 20) > 0 else { continue }
       let client = accept(fd, nil, nil)
       guard client >= 0 else { continue }
-      accepted.increment()
       lock.lock()
       // Accepted after `stop()` shut the others down: nothing would wake its handler.
       guard !stopped else {
@@ -672,9 +671,12 @@ final class LoopbackTCPServer: @unchecked Sendable {
         return
       }
       live.insert(client)
-      lock.unlock()
       // Entered before the accept loop leaves, so the group cannot drain while a handler runs.
       threads.enter()
+      // Counted only once the handler is certain to run, and under the lock `stop()` takes, so a
+      // test that has seen the count knows a handler is live for this connection.
+      accepted.increment()
+      lock.unlock()
       let behavior = self.behavior
       Thread.detachNewThread { [self] in
         defer { threads.leave() }
