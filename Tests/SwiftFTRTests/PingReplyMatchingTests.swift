@@ -220,9 +220,12 @@ struct PingReplyMatchingTests {
     defer { ping.stop() }
     ping.afterSend = { seq, fd in
       guard seq == 1 else { return }
-      ping.network.inject(
+      // Probe 1's own reply, still unread behind this hook, would meet a bare "one queued" while
+      // the injected reply is in flight; if probe 2's send ran late enough to follow at once,
+      // that reply would then land after it and be kept. Wait for the injected reply itself.
+      let injected = ping.network.inject(
         Self.reply(family, id: DirectPing.identifier, seq: 2, mark: Self.ignored), to: fd)
-      ping.premise(waitForQueued(fd, atLeast: 1))
+      ping.premise(injected && ping.waitUntilEveryReplyQueuedOrRead(fd))
     }
 
     let config = ping.config

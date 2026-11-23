@@ -48,10 +48,6 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   entered without a substitute. It needs a check on each real path in `Sources/`, so it waits for a
   release that may touch them. Running the suite under `sandbox-exec` with outbound network denied
   catches only leaks whose test then fails: 2 of the 20.
-- **`connectionRefused` and `unreachable` cases on `DNSError`**, so the throwing query methods tell
-  a refused port and an unreachable host from a send failure and from silence, as `dnsProbe`'s
-  `outcome` does. New cases break exhaustive switches in consumers, so this waits for a release
-  where a source break is acceptable.
 
 ### Share the reverse-DNS cache across tracer instances
 **Goal**: Sibling tracers reuse hostname lookups instead of each starting cold, without one
