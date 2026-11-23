@@ -328,10 +328,11 @@ never the caller's address (#153). It is not bound to the tracer's interface eit
   written to the cache.
 - **Per family, and after the family is known.** The cache holds one observation per family, and
   a seed fills only its own family; today one slot holds either, so an IPv6 seed can label the
-  hops of an IPv4 trace. A trace asks for the family it is actually probing, which for the
-  automatic preference is known only once the destination has resolved, so the question moves
-  after resolution. That also means a deadline that expires during it finds the hops measured
-  (decision 5).
+  hops of an IPv4 trace. A trace asks for the family it actually probed, which for the
+  automatic preference is known only once the destination has resolved: `traceClassified` asks
+  after its probes have returned, so an overall deadline that expires during the question finds
+  the hops measured (decision 5). A multipath run is IPv4 by contract and asks in the parent
+  before its first batch; a deadline that expires there is before any probe, and throws.
 - **One question per call.** With no configured or seeded address of that family, a classified
   trace or a multipath run asks once, under `publicIPDiscoveryTimeout`, inside the trace's
   cancellation. Order of precedence: a configured address of the family, then an unexpired seed
@@ -388,12 +389,16 @@ foreign reply; an invalid reply that does carry the transaction ID fails that se
 resolution for STUN servers gets a bounded, cancellable wait here and moves with Resolution Off
 The Actor.
 
-Which answer is believed is decision 16. Until it is made the rule is the conservative one: an
-address is reported when a STUN server reports it and no other reply in hand disagrees.
+Which answer is believed is decision 16. Until it is made the rule is the conservative one. An
+address is reported as soon as two servers have reported the same one. Otherwise the answers are
+compared when every attempt has finished or the deadline passes, whichever is first: one
+distinct address is reported, and two different ones yield none. So a single healthy server
+still answers, at the deadline if another is stalled, and a disagreement is never hidden by
+whichever reply came first.
 
 Tests: the STUN fault battery against the new transport; a refused port does not delay the other
-servers; a healthy endpoint beside a stalled name yields an address; two servers that disagree
-yield none; `getPublicIPs` still returns a partial result when one family answers.
+servers; two servers that agree answer at once; a healthy endpoint beside a stalled name yields
+an address at the deadline; two servers that disagree yield none whichever replies first; `getPublicIPs` still returns a partial result when one family answers.
 
 ### Event-Based Reverse DNS
 
@@ -653,7 +658,6 @@ Still unbounded after this plan, or deliberately deferred. Roadmap, not this pla
   cancellation after the ping phase ends.
 - The `swift-ftr` CLI's own synchronous `reverseDNS` and `getaddrinfo` calls.
 - DNS over TCP on truncation, and EDNS0. A truncated answer is `malformedResponse` today.
-- Ignoring replies with a foreign transaction ID until the deadline, for STUN.
 - The blocking `poll` and `usleep` in `SendRetry.swift`, which can hold the tracer actor or an
   operation's queue for up to the 250 ms burst budget.
 - `discoverPublicIPWithHostname()` not being ended by a network change.
