@@ -6,6 +6,13 @@ import Testing
 
 @Suite("DNS wire hardening", .serialized)
 struct DNSWireHardeningTests {
+  /// The timeout of a query the fixture must answer. The answer ends the query, so this bounds
+  /// only a broken run. It must outlast any delay before the fixture reads the query: its
+  /// responder needs a cooperative-pool thread to start (0.6 s under
+  /// `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` in a loaded run), and loopback can hold a datagram
+  /// for most of a second while other test processes load the host.
+  static let answeredQueryTimeout: TimeInterval = 10
+
   @Test("Compressed HTTPS targets keep SvcParams within RDATA")
   func compressedHTTPSTargetUsesWireBytesConsumed() throws {
     var message = Data(repeating: 0, count: 12)
@@ -59,7 +66,7 @@ struct DNSWireHardeningTests {
       port: fixture.port,
       name: "owner.example.com",
       type: 1,
-      timeout: 0.5
+      timeout: Self.answeredQueryTimeout
     )
     try await responder.value
 
@@ -86,7 +93,7 @@ struct DNSWireHardeningTests {
         port: fixture.port,
         name: "header.example.com",
         type: 1,
-        timeout: 0.5
+        timeout: Self.answeredQueryTimeout
       )
     } throws: { error in
       guard let dnsError = error as? DNSError else { return false }
@@ -152,7 +159,8 @@ struct DNSWireHardeningTests {
       }
     }
     let answers = try await runDNSFixtureQuery(
-      port: fixture.port, name: "stray.example.com", type: 1, timeout: 2)
+      port: fixture.port, name: "stray.example.com", type: 1,
+      timeout: Self.answeredQueryTimeout)
     try await responder.value
     #expect(answers.first?.rdata == Data([192, 0, 2, 43]))
   }
