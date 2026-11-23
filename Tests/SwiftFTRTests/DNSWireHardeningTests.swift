@@ -120,6 +120,42 @@ struct DNSWireHardeningTests {
     try await responder.value
   }
 
+  @Test("The DNS fixture answers its query even after a stray datagram reached its port")
+  func fixtureIgnoresStrayDatagram() async throws {
+    // What a late sender elsewhere in the suite can do to a freshly bound port: a 16-byte echo
+    // reply, queued before the query. The fixture must answer the query, not fail on the stray.
+    let fixture = try DNSUDPFixture()
+    let stray = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    defer { close(stray) }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = fixture.port.bigEndian
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    let echoReply: [UInt8] = [0, 0, 0, 0, 0x12, 0x34, 0, 1] + [UInt8](repeating: 0x61, count: 8)
+    let sent = echoReply.withUnsafeBytes { bytes in
+      withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          sendto(
+            stray, bytes.baseAddress, bytes.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+      }
+    }
+    #expect(sent == echoReply.count)
+    // Queued ahead of the query, so it is the first datagram the fixture reads.
+    try #require(await eventually(within: 10) { fixture.queuedDatagrams == 1 })
+    let responder = Task {
+      try await onOwnThread {
+        try fixture.respond(
+          with: .success(address: [192, 0, 2, 43]), toQueryFor: "stray.example.com")
+      }
+    }
+    let answers = try await runDNSFixtureQuery(
+      port: fixture.port, name: "stray.example.com", type: 1, timeout: 2)
+    try await responder.value
+    #expect(answers.first?.rdata == Data([192, 0, 2, 43]))
+  }
+
   @Test("Production query rejects datagrams from an unexpected source")
   func productionQueryRejectsUnexpectedSource() async throws {
     let fixture = try DNSUDPFixture()
@@ -270,6 +306,9 @@ private final class DNSUDPFixture: @unchecked Sendable {
   deinit {
     close(descriptor)
   }
+
+  /// Datagrams waiting on the fixture's socket.
+  var queuedDatagrams: Int32 { SwiftFTRTests.queuedDatagrams(descriptor) }
 
   /// Answers the query for `name` as `scenario` says, ignoring every other datagram that reaches
   /// the port first.
