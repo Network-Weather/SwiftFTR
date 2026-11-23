@@ -72,7 +72,8 @@ Upgrades within 0.14 through 0.18 are additive at the source level, but read eac
 "Behavior changes" in [CHANGELOG.md](CHANGELOG.md).
 
 From 0.18, work through [Migrating to SwiftFTR 0.19](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo019.md):
-0.19 ignores DNS replies that echo another question, rejects address strings containing a NUL
+0.19 adds two `DNSError` cases, `connectionRefused` and `unreachable`, which an exhaustive
+`switch` must handle (the guide has the edit), ignores DNS replies that echo another question, rejects address strings containing a NUL
 and NAT64 addresses wrapping a private IPv4 address in `seedPublicIP`, and ends a ping with a
 failed send once every sent probe is answered. Each entry has before-and-after code.
 
@@ -478,7 +479,7 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 - [Integration package](IntegrationPackage/README.md): the external-consumer package that imports SwiftFTR by path, what it checks and how CI builds and runs it. (updated 2026-11-21; update when: the package's checks change or a workflow stops building or running it)
 
 ### GitHub configuration
-- [Workflows](.github/WORKFLOWS.md): what each GitHub Actions workflow triggers on, runs and produces, and how they depend on each other. (updated 2026-11-21; update when: a file under `.github/workflows/` is added, removed or changes its triggers or jobs)
+- [Workflows](.github/WORKFLOWS.md): what each GitHub Actions workflow triggers on, runs and produces, and how they depend on each other. (updated 2026-11-22; update when: a file under `.github/workflows/` is added, removed or changes its triggers or jobs)
 - [Pull request template](.github/pull_request_template.md): the summary, change type, testing commands and checklist every PR body starts from. (updated 2026-07-21; update when: the required pre-merge checks change)
 - [Bug report template](.github/ISSUE_TEMPLATE/bug_report.md): the environment, reproduction and log fields requested for bug issues. (updated 2026-11-21; update when: the CLI's options or the information needed to triage a bug change)
 - [Feature request template](.github/ISSUE_TEMPLATE/feature_request.md): the motivation, proposal and alternatives fields requested for feature issues. (updated 2025-09-08; update when: the project changes how it takes feature proposals)

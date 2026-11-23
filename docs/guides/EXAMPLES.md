@@ -701,6 +701,10 @@ do {
   print("Hostname: \(result.hostname ?? "No PTR record")")
 } catch DNSError.timeout {
   print("DNS query timed out")
+} catch DNSError.connectionRefused {
+  print("The host is up, but no DNS server is listening on its port")
+} catch DNSError.unreachable {
+  print("The server's host or network cannot be reached")
 } catch DNSError.invalidIP(let ip) {
   print("Invalid IP address: \(ip)")
 } catch DNSError.invalidHostname(let hostname) {

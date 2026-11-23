@@ -16,8 +16,12 @@ This repository uses GitHub Actions for CI/CD automation. The workflows are desi
   external-consumer fixtures (`IntegrationPackage` and `TestLibraryUsage`)
 - **docs**: Generate DocC with `--warnings-as-errors`, so a broken symbol link fails the PR
   rather than the next release
+- **api**: `swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR` with
+  `--breakage-allowlist-path api-breakage-allowlist.txt`, so any source break the allowlist does
+  not name fails the PR. It checks out full history and tags for the baseline. The allowlist
+  holds one exact diagnostic per line, as the tool prints it after `💔 `, with no comments.
 
-All three jobs run on GitHub-hosted `macos-15`; `macos` and `docs` wait for `format`.
+All four jobs run on GitHub-hosted `macos-15`; `macos`, `docs` and `api` wait for `format`.
 
 **Environment Variables:**
 - `PTR_SKIP_STUN=1` - Skip the public-IP integration-test subset using the legacy gate
@@ -100,7 +104,8 @@ All three jobs run on GitHub-hosted `macos-15`; `macos` and `docs` wait for `for
 ```
 ci.yml (on push to main and PRs against main)
   └─> format check ─┬─> build → isolated test → release build → external-consumer builds
-                    └─> DocC (warnings as errors)
+                    ├─> DocC (warnings as errors)
+                    └─> API breaking changes against v0.18.1, with the allowlist
 
 release.yml (on tag push or manual)
   └─> build release → attestations → GitHub Release
