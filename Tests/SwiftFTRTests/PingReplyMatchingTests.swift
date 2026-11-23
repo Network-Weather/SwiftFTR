@@ -188,9 +188,11 @@ struct PingReplyMatchingTests {
     defer { ping.stop() }
     ping.beforeSend = { seq, fd in
       guard seq == 2 else { return }
-      ping.network.inject(
+      // The premise needs the injected reply itself on the wire: if its send failed, the queue
+      // check would be satisfied by the ordinary replies alone.
+      let injected = ping.network.inject(
         Self.reply(family, id: DirectPing.identifier, seq: 2, mark: Self.ignored), to: fd)
-      ping.premise(ping.waitUntilEveryReplyQueuedOrRead(fd))
+      ping.premise(injected && ping.waitUntilEveryReplyQueuedOrRead(fd))
     }
 
     let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {

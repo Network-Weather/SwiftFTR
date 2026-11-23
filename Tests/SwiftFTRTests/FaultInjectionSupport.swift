@@ -471,7 +471,7 @@ final class FakeICMPNetwork: @unchecked Sendable {
 
   /// Sends `reply` now, from this network's address, to the socket `fd` is bound to, as if it
   /// answered a probe from `fd`. Returns false if `fd` has no local address yet (it binds on its
-  /// first send).
+  /// first send) or the datagram could not be sent.
   @discardableResult
   func inject(_ reply: Reply, to fd: Int32) -> Bool {
     var address = sockaddr_storage()
@@ -485,8 +485,7 @@ final class FakeICMPNetwork: @unchecked Sendable {
     guard named == 0, port != 0 else { return false }
     // A socket bound to the wildcard address is reached on loopback.
     let (destination, _) = loopbackAddress(family: family, port: port)
-    send(reply.bytes, to: destination, hopLimit: reply.hopLimit)
-    return true
+    return send(reply.bytes, to: destination, hopLimit: reply.hopLimit)
   }
 
   /// What the peer received and sent so far, one event per line.
@@ -511,13 +510,15 @@ final class FakeICMPNetwork: @unchecked Sendable {
     withUnsafeBytes(of: address) { UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self)) }
   }
 
-  private func send(_ bytes: [UInt8], to destination: sockaddr_storage, hopLimit: Int32?) {
+  /// Whether the whole datagram was sent.
+  @discardableResult
+  private func send(_ bytes: [UInt8], to destination: sockaddr_storage, hopLimit: Int32?) -> Bool {
     lock.lock()
     defer { lock.unlock() }
     // Closed under the same lock, so a late reply never reaches a recycled descriptor.
     guard !stopped else {
       recordLocked("reply of \(bytes.count) bytes to port \(Self.port(of: destination)): stopped")
-      return
+      return false
     }
     if family == AF_INET6 {
       // Set on every send, under the lock, so one reply's hop limit never leaks into the next.
@@ -538,6 +539,7 @@ final class FakeICMPNetwork: @unchecked Sendable {
     let outcome = sent == bytes.count ? "sent" : "sendto returned \(sent), errno \(errno)"
     if sent == bytes.count { repliesSent.increment() }
     recordLocked("reply of \(bytes.count) bytes to port \(Self.port(of: destination)): \(outcome)")
+    return sent == bytes.count
   }
 
   private static func hopLimit(from msg: msghdr) -> Int? {
