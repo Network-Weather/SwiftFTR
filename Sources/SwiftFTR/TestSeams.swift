@@ -89,6 +89,8 @@ enum TestSeams {
     @Sendable () -> Void
 
   @TaskLocal static var armPublicIPDeadline: ArmPublicIPDeadline?
+  /// Opens the socket a multipath run test-binds its source address on; -1 with `errno` set fails it.
+  @TaskLocal static var validationSocket: (@Sendable () -> Int32)?
 
   /// Awaited by `discoverPaths` once it holds a topology, just before it checks for an
   /// invalidation and returns, so a test can order a network change before or after that step.

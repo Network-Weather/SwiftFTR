@@ -482,12 +482,14 @@ struct PublicIPResolverTests {
     var target = "127.0.0.1"
     var interface: String? = nil
     var sourceIP: String? = nil
+    var socketFails = false
     var testDescription: String { why }
   }
 
   static let rejectedInputs: [RejectedInput] = [
     RejectedInput(why: "malformed source", sourceIP: "not-an-ip"),
     RejectedInput(why: "source this host cannot bind", sourceIP: "192.0.2.77"),
+    RejectedInput(why: "no socket to check the source", sourceIP: "127.0.0.1", socketFails: true),
     RejectedInput(why: "missing interface", interface: "swiftftr-none0"),
     RejectedInput(why: "IPv6 destination literal", target: "::1"),
     RejectedInput(
@@ -504,18 +506,17 @@ struct PublicIPResolverTests {
       SwiftFTRConfig(
         maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, interface: input.interface,
         sourceIP: input.sourceIP, publicIPResolver: .custom(resolver)))
-    let failed: Bool
-    do {
-      if input.multipath {
-        _ = try await tracer.discoverPaths(to: input.target, config: Self.multipathConfig)
-      } else {
-        _ = try await tracer.traceClassified(to: input.target, resolver: EmptyASNResolver())
+    let failing: @Sendable () -> Int32 = { -1 }
+    let noSocket = input.socketFails ? failing : nil
+    await #expect(throws: (any Error).self, "the call accepted the input") {
+      try await TestSeams.$validationSocket.withValue(noSocket) {
+        if input.multipath {
+          _ = try await tracer.discoverPaths(to: input.target, config: Self.multipathConfig)
+        } else {
+          _ = try await tracer.traceClassified(to: input.target, resolver: EmptyASNResolver())
+        }
       }
-      failed = false
-    } catch {
-      failed = true
     }
-    #expect(failed, "the call accepted the input")
     #expect(resolver.asked.value == 0, "asked before rejecting the input")
   }
 
