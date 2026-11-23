@@ -17,8 +17,8 @@ The ``SwiftFTR/SwiftFTR/testBufferbloat(config:)`` API measures:
    HTTP/TLS transactions that the IETF responsiveness test (and Apple's `networkQuality`) measure,
    so the figures are not directly comparable.
 
-By default the download load comes from `speed.cloudflare.com` and the upload load goes to
-`httpbin.org`; set `downloadURL` and `uploadURL` on ``BufferbloatConfig`` to use your own
+By default the download load comes from `speed.cloudflare.com` and the upload load goes to the
+same service's upload endpoint (`https://speed.cloudflare.com/__up`); set `downloadURL` and `uploadURL` on ``BufferbloatConfig`` to use your own
 endpoints.
 
 ## Quick Test

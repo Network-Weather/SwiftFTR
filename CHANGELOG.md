@@ -59,6 +59,13 @@ Unreleased
   a probe whose query was sent and whose receive then failed; it now prints `failed: the probe
   could not complete`.
 
+- **`testBufferbloat` sends its default upload load to Cloudflare's speed test** (#89). With no
+  `uploadURL`, the upload load went to `https://httpbin.org/post`, a free community service that
+  makes no availability promise. It now goes to `https://speed.cloudflare.com/__up`, the same
+  provider as the default download load, which is built for this traffic. The requests are
+  unchanged (256 KiB POSTs on each of `parallelStreams` streams until the load phase ends). A
+  caller that sets `uploadURL` is unaffected.
+
 ### Bug fixes
 
 - **A ping whose send failed ends once every probe that was sent is answered** (#138). Early
