@@ -324,6 +324,12 @@ final class FakeICMPNetwork: @unchecked Sendable {
   private var stopped = false
   private let socketsLock = NSLock()
   private var openedSockets: [Int32] = []
+  /// A duplicate of every socket ``makeSocket(_:)`` opened, held until the serve thread exits, so
+  /// each socket's port stays reserved while this peer can still answer it. Without them, a reply
+  /// scheduled after the operation closed its socket (a late reply a test stages on purpose, say)
+  /// could reach whatever socket was handed that port number next, in another test. Guarded by
+  /// `lock`; datagrams that land on a held socket are never read.
+  private var heldSockets: [Int32] = []
   /// What the peer received and sent, for a test to print when an operation outlives its
   /// watchdog. Guarded by `lock`; capped so a long trace cannot grow it without bound.
   private var events: [String] = []
@@ -363,6 +369,11 @@ final class FakeICMPNetwork: @unchecked Sendable {
     socketsLock.lock()
     openedSockets.append(s)
     socketsLock.unlock()
+    let held = dup(s)
+    lock.lock()
+    // Once stopped, the serve thread may already have released the others: hold nothing more.
+    if held >= 0 { if stopped { close(held) } else { heldSockets.append(held) } }
+    lock.unlock()
     return s
   }
 
@@ -420,6 +431,8 @@ final class FakeICMPNetwork: @unchecked Sendable {
     defer {
       lock.lock()
       close(fd)
+      for held in heldSockets { close(held) }
+      heldSockets = []
       lock.unlock()
     }
     var buffer = [UInt8](repeating: 0, count: 4096)

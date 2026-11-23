@@ -6,6 +6,13 @@ import Testing
 
 @Suite("DNS wire hardening", .serialized)
 struct DNSWireHardeningTests {
+  /// The timeout of a query the fixture must answer. The answer ends the query, so this bounds
+  /// only a broken run. It must outlast any delay before the fixture reads the query: its
+  /// responder needs a cooperative-pool thread to start (0.6 s under
+  /// `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` in a loaded run), and loopback can hold a datagram
+  /// for most of a second while other test processes load the host.
+  static let answeredQueryTimeout: TimeInterval = 10
+
   @Test("Compressed HTTPS targets keep SvcParams within RDATA")
   func compressedHTTPSTargetUsesWireBytesConsumed() throws {
     var message = Data(repeating: 0, count: 12)
@@ -49,14 +56,17 @@ struct DNSWireHardeningTests {
   func productionQueryPreservesOwnerName() async throws {
     let fixture = try DNSUDPFixture()
     let responder = Task {
-      try await onOwnThread { try fixture.respond(with: .success(address: [192, 0, 2, 42])) }
+      try await onOwnThread {
+        try fixture.respond(
+          with: .success(address: [192, 0, 2, 42]), toQueryFor: "owner.example.com")
+      }
     }
 
     let answers = try await runDNSFixtureQuery(
       port: fixture.port,
       name: "owner.example.com",
       type: 1,
-      timeout: 0.5
+      timeout: Self.answeredQueryTimeout
     )
     try await responder.value
 
@@ -73,7 +83,9 @@ struct DNSWireHardeningTests {
   func productionQueryRejectsInvalidHeaders(_ invalidHeader: InvalidDNSHeader) async throws {
     let fixture = try DNSUDPFixture()
     let responder = Task {
-      try await onOwnThread { try fixture.respond(with: invalidHeader.scenario) }
+      try await onOwnThread {
+        try fixture.respond(with: invalidHeader.scenario, toQueryFor: "header.example.com")
+      }
     }
 
     await #expect {
@@ -81,7 +93,7 @@ struct DNSWireHardeningTests {
         port: fixture.port,
         name: "header.example.com",
         type: 1,
-        timeout: 0.5
+        timeout: Self.answeredQueryTimeout
       )
     } throws: { error in
       guard let dnsError = error as? DNSError else { return false }
@@ -95,7 +107,9 @@ struct DNSWireHardeningTests {
   func productionQueryIgnoresMismatchedTransactionID() async throws {
     let fixture = try DNSUDPFixture()
     let responder = Task {
-      try await onOwnThread { try fixture.respond(with: .mismatchedTransactionID) }
+      try await onOwnThread {
+        try fixture.respond(with: .mismatchedTransactionID, toQueryFor: "header.example.com")
+      }
     }
 
     await #expect {
@@ -113,6 +127,51 @@ struct DNSWireHardeningTests {
     try await responder.value
   }
 
+  @Test("The DNS fixture answers its query even after a stray datagram reached its port")
+  func fixtureIgnoresStrayDatagram() async throws {
+    // What a late sender elsewhere in the suite can do to a freshly bound port: an empty datagram
+    // (the UDP probe tests send them) and a 16-byte echo reply, both queued before the query. The
+    // fixture must answer the query, not fail on a stray.
+    let fixture = try DNSUDPFixture()
+    let stray = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    defer { close(stray) }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = fixture.port.bigEndian
+    address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    let sentEmpty = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        sendto(stray, nil, 0, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    #expect(sentEmpty == 0)
+    let echoReply: [UInt8] = [0, 0, 0, 0, 0x12, 0x34, 0, 1] + [UInt8](repeating: 0x61, count: 8)
+    let sent = echoReply.withUnsafeBytes { bytes in
+      withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          sendto(
+            stray, bytes.baseAddress, bytes.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+      }
+    }
+    #expect(sent == echoReply.count)
+    // Queued ahead of the query, so the fixture reads them first. At least two: another test's
+    // stray may be queued too, and the fixture ignores that as well.
+    try #require(await eventually(within: 10) { fixture.queuedDatagrams >= 2 })
+    let responder = Task {
+      try await onOwnThread {
+        try fixture.respond(
+          with: .success(address: [192, 0, 2, 43]), toQueryFor: "stray.example.com")
+      }
+    }
+    let answers = try await runDNSFixtureQuery(
+      port: fixture.port, name: "stray.example.com", type: 1,
+      timeout: Self.answeredQueryTimeout)
+    try await responder.value
+    #expect(answers.first?.rdata == Data([192, 0, 2, 43]))
+  }
+
   @Test("Production query rejects datagrams from an unexpected source")
   func productionQueryRejectsUnexpectedSource() async throws {
     let fixture = try DNSUDPFixture()
@@ -125,7 +184,9 @@ struct DNSWireHardeningTests {
       )
     }
     let responder = Task {
-      try await onOwnThread { try fixture.respond(with: .unexpectedSource) }
+      try await onOwnThread {
+        try fixture.respond(with: .unexpectedSource, toQueryFor: "source.example.com")
+      }
     }
 
     try await responder.value
@@ -253,25 +314,42 @@ private final class DNSUDPFixture: @unchecked Sendable {
     close(descriptor)
   }
 
-  func respond(with scenario: DNSFixtureScenario) throws {
+  /// Datagrams waiting on the fixture's socket.
+  var queuedDatagrams: Int32 { SwiftFTRTests.queuedDatagrams(descriptor) }
+
+  /// Answers the query for `name` as `scenario` says, ignoring every other datagram that reaches
+  /// the port first.
+  ///
+  /// A freshly bound port can receive what was sent to a socket that held its number before, in
+  /// another test (a fake network's late echo reply, say). Answering, or failing on, the first
+  /// datagram would let any late sender in the suite decide this test, so the fixture waits for
+  /// the query it is here for, as its client would match its own reply, until its 5 s receive
+  /// timeout passes with nothing.
+  func respond(with scenario: DNSFixtureScenario, toQueryFor name: String) throws {
+    let question = [UInt8](__dnsEncodeQName(name))
     var buffer = [UInt8](repeating: 0, count: 2048)
     var clientAddress = sockaddr_storage()
     var clientAddressLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
-    let received = buffer.withUnsafeMutableBytes { bytes in
-      withUnsafeMutablePointer(to: &clientAddress) { pointer in
-        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
-          recvfrom(
-            descriptor,
-            bytes.baseAddress,
-            bytes.count,
-            0,
-            sockaddrPointer,
-            &clientAddressLength
-          )
+    var received = 0
+    repeat {
+      clientAddressLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      received = buffer.withUnsafeMutableBytes { bytes in
+        withUnsafeMutablePointer(to: &clientAddress) { pointer in
+          pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+            recvfrom(
+              descriptor,
+              bytes.baseAddress,
+              bytes.count,
+              0,
+              sockaddrPointer,
+              &clientAddressLength
+            )
+          }
         }
       }
-    }
-    guard received > 0 else { throw DNSFixtureError.receiveFailed }
+      // Zero is an empty datagram, which is a stray like any other; only a failed read ends it.
+      guard received >= 0 else { throw DNSFixtureError.receiveFailed }
+    } while !isQuery(buffer.prefix(received), for: question)
 
     let query = Data(buffer.prefix(Int(received)))
     let response = try makeDNSResponse(for: query, scenario: scenario)
@@ -306,6 +384,16 @@ private final class DNSUDPFixture: @unchecked Sendable {
     }
     guard sent == response.count else { throw DNSFixtureError.sendFailed }
   }
+}
+
+/// Whether `datagram` is a standard query (QR clear, opcode 0) with one question, for `question`
+/// (an encoded name).
+private func isQuery(_ datagram: ArraySlice<UInt8>, for question: [UInt8]) -> Bool {
+  let bytes = Array(datagram)
+  guard bytes.count >= 12 + question.count + 4 else { return false }
+  let isStandardQuery = bytes[2] & 0xF8 == 0
+  let oneQuestion = bytes[4] == 0 && bytes[5] == 1
+  return isStandardQuery && oneQuestion && Array(bytes[12..<12 + question.count]) == question
 }
 
 private func makeDNSResponse(for query: Data, scenario: DNSFixtureScenario) throws -> Data {

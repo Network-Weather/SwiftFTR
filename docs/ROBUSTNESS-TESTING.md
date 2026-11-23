@@ -507,3 +507,59 @@ Observations that are not defects of the library:
   21 s steps, and the TCP stop test, starved past both of its 30 s budgets, saw its handler answer
   and exit before `stop()` (2 of 500 strict repetitions, twice). Both loops now run on a thread of
   their own (`onOwnThread`).
+- A fake network's late reply could land in another test's fixture. Tests such as
+  `lateRepliesIgnored` schedule replies for after the operation has closed its probe socket. The
+  reply goes to that socket's port number, and a fixture bound in the meantime can have been
+  handed the same number: `DNSWireHardeningTests.productionQueryRejectsInvalidHeaders` read a
+  16-byte echo reply as its query, failed, and left the query to time out (once in 15 full debug
+  runs; 5 of 5 with the ordering forced). `FakeICMPNetwork` now holds a duplicate of every socket
+  it opens until it stops, so the port number stays taken while it can still send, and the DNS
+  fixture answers only the query for the name its test asked about. The same exposure remains in
+  responders that take the first datagram that arrives, or count every one:
+  `LoopbackUDPResponder` (which counts and answers any datagram; several tests assert its exact
+  request count), `ScriptedDNSPeer`, `RefusingThenAnsweringUDPPort`, and the UDP probe tests'
+  `LoopbackUDPServer`. A late sender that can still reach them is `ScriptedDNSPeer`'s feed, which
+  keeps sending to the client's port from the moment the query ends until its test stops it.
+- **`--repeat-until fail` over several suites at once is not a valid gate: it slows loopback for
+  the whole host.** It repeats every test on its own and in parallel, so the quick ones run flat
+  out together. Run with the filter `DNSWireHardeningTests|FaultInjection|PingReplyMatching`, it
+  raised the worst loopback round trip of an unrelated process (one datagram every 10 ms) from
+  1 to 5 ms to 200 to 750 ms in every second it ran. With
+  `loopbackFixtureKeepsOffWildcardPorts` and `refusingUDPPortKeepsOffDualStack` skipped (about
+  8,000 socket, bind and close calls a repetition), the worst round trip was 60 to 290 ms; with
+  only those two repeating, 10 to 64 ms; with any one suite repeating alone, 8 to 124 ms. A
+  capture on `lo0` showed requests reaching a fixture's port 0.35 s and up to 0.7 s after they
+  were sent, after their 0.3 s fixture had closed. The fixtures' own threads ran on time
+  throughout: they started within 3 ms, read every 20 ms, and found nothing queued. So the
+  climb in "dropped due to no socket" is these late requests, not a separate fault, and every
+  test that needs a loopback answer, or a probe seen, within a sub-second budget failed at its
+  first repetition: about 25 tests in six files, 40 to 50 issues in the first 2 to 3 seconds. A
+  test that fails stops repeating, so the failures look like a short burst although the
+  slowdown lasts the whole run. Main and the branch that holds `FakeICMPNetwork`'s duplicate
+  sockets each failed 10 of 10 such runs; every suite repeated alone passed. The same load from
+  another process is enough without repetition: plain runs of the filter failed 10 of 10 while
+  a second process ran the repeated filter, and 1 of 10 while it ran plain full suites. A valid
+  repetition gate loops whole runs, each a normal load, with nothing else running:
+  `for i in $(seq 30); do SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug --skip-build
+  --filter '<suites>' || break; done` passed 30 of 30 on main and on the branch, and 15 of 15
+  each under `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`. The tests themselves still assume a
+  loopback answer within 0.3 to 0.5 s, a wall-clock bound in disguise that a loaded host breaks.
+  Only the three `DNSWireHardeningTests` queries the fixture must answer have been given a
+  generous timeout so far (below).
+- **A `DNSWireHardeningTests` query timed out because its responder started late.** The fixture's
+  responder starts from a `Task`, so it first needs a cooperative-pool thread. Repeated under
+  `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, 187 of 1,507 responders entered more than 0.1 s late
+  (at most 0.59 s), each with its query already queued, and the two that entered after 0.5 s
+  were the run's two `.timeout` failures of `productionQueryPreservesOwnerName` and
+  `productionQueryRejectsInvalidHeaders`, whose queries had 0.5 s. Delaying the responder by
+  0.6 s failed all four of their cases with that signature. The three queries the fixture must answer now
+  take `answeredQueryTimeout` (10 s); the answer ends them, so a passing run waits no longer.
+- **A short stray datagram crashes the test process through a DNS fault script.**
+  `FaultInjectionWireTests.dnsFaults` builds its replies with `dnsResponse(to:)`, which writes
+  bytes 2, 3, 6 and 7 of whatever datagram reached the responder, so a stray under 8 bytes (a
+  STUN or DNS "garbage" reply, a zero-byte request) traps with "Index out of range" and ends
+  every test in the process. It happened in 4 of about 70 repeated runs, on main and on this
+  branch, while loopback was slow enough that late replies reached recycled ports. Another
+  suite's run on the same machine trapped the same way in
+  `DNSQuestionMatchTests.questionTypeOffset`, reached through `ScriptedDNSPeer` from
+  `DNSQuestionVerdictTests`. Not fixed.
