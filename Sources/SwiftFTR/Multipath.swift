@@ -654,9 +654,7 @@ extension SwiftFTR {
     if let source = config.sourceIP {
       try validateSourceIPFamily(source, destinationFamily: AF_INET)
       let fd = TestSeams.validationSocket?() ?? socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-      guard fd >= 0 else {
-        throw TracerouteError.socketCreateFailed(errno: errno, details: "source validation")
-      }
+      guard fd >= 0 else { throw TracerouteError.socketCreateFailed(errno: errno, details: "bind") }
       defer { close(fd) }
       if let message = bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: source) {
         throw TracerouteError.sourceIPBindFailed(sourceIP: source, errno: errno, details: message)
