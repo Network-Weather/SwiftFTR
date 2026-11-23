@@ -174,8 +174,9 @@ numbers are as of the commit that added this section.
    registers a handle and races discovery inside one task group, which still joins every worker.
    Test: `discoverPathsCancellation`, 10.0 s and a returned topology before, under 0.1 s after.
 3. **`discoverPaths` ignored `publicIPDiscoveryTimeout`.** Confirmed and fixed. Flow workers were
-   built from a configuration that dropped it (`Multipath.swift:618` and `:661` after the fix) and
-   their classifier was not passed it, so each flow paid the 6 s default. Test:
+   built from a configuration that dropped it (now `SwiftFTRConfig.multipathFlowConfig`, which
+   copies every field, in `Multipath.swift`) and their classifier was not passed it, so each flow
+   paid the 6 s default. Test:
    `multipathHonoursPublicIPBudget` with a 0.3 s budget, 12.0 s before, 0.6 s after; it fails if
    discovery outlasts the 6 s default.
 4. **A sub-microsecond STUN timeout waited forever.** Confirmed and fixed. `stunGetPublicIP`

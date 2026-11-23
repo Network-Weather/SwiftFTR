@@ -57,6 +57,25 @@ Unreleased
   that sends them, `received`, `packetLoss` and the RTTs can differ from 0.18.0, which
   misreported them. `PingConfig.timeout` is now documented as what it always was: the reply
   window after the last request, within which a reply to any earlier request still counts.
+- **Multipath flow workers carry every `SwiftFTRConfig` field of the tracer that started them**
+  (#91). The per-flow configuration was rebuilt field by field and left `rdnsCacheTTL`,
+  `rdnsCacheSize`, `rdnsLookupTimeout` and `asnResolverStrategy` at their defaults. Flows did not
+  act on those defaults: they share the caller's reverse-DNS cache and ASN resolver, which are
+  built from those settings, and tests now pin that a flow's reverse DNS stops at the caller's
+  deadline and that it classifies with the caller's resolver. One helper now copies the whole
+  configuration except a flow's hop limit, per-probe wait and forced IPv4 family, and a test fails
+  if a field added later is not carried over. No caller-visible change.
+
+### Behavior changes
+
+- **`seedPublicIP` rejects IPv6 addresses outside the unicast space** (#92). It accepted any IPv6
+  address its special-range checks did not name, including deprecated site-local `fec0::/10`
+  (RFC 3879), IPv4-compatible `::/96` and other blocks the IANA IPv6 Address Space registry
+  reserves, none of which can be a host's public address. It now accepts IPv6 only in `2000::/3`
+  (RFC 4291 section 2.4) or the NAT64 prefix `64:ff9b::/96` (RFC 6052), still minus the
+  special-purpose ranges it already rejected, and returns `false` for the rest, so discovery runs
+  instead. IPv4 checks are unchanged; they already matched the IANA IPv4 registry. Hop
+  classification is unchanged.
 
 0.18.0 — 2026-11-22
 -------------------

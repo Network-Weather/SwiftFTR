@@ -175,11 +175,12 @@ A dynamic, actor-isolated way to provide a known-valid public IP so the next
 classified trace can skip discovery — distinct from the `publicIP` config
 override, which suppresses discovery permanently. The method:
 
-- accepts only syntactically valid addresses outside the special-purpose
-  ranges the library's scope classifier recognizes ("not RFC 1918" is
-  insufficient — CGNAT space is neither private nor publicly routable).
-  Acceptance does not prove global routability: ranges the classifier does not
-  know, such as deprecated IPv6 site-local `fec0::/10`, are accepted;
+- accepts only syntactically valid addresses that the IANA IPv4 and IPv6
+  special-purpose registries do not mark as not globally reachable, and, for
+  IPv6, only addresses in the `2000::/3` unicast space or the NAT64 prefix
+  `64:ff9b::/96` (so deprecated site-local `fec0::/10` is rejected). "Not RFC
+  1918" is insufficient: CGNAT space is neither private nor publicly routable.
+  Acceptance does not prove the address is announced or is the host's own;
 - rejects placeholder strings by construction — there is no way to seed
   `"unknown"`;
 - stores the canonical (`inet_ntop`) form, bumps the cache generation so an
