@@ -47,8 +47,10 @@ struct TCPProbeTests {
 
   @Test("TCP probe to unreachable host")
   func testUnreachableHost() async throws {
-    // Test against TEST-NET-1 (should timeout)
-    let result = try await tcpProbe(host: "192.0.2.1", port: 80, timeout: 2.0)
+    // A loopback port that drops every SYN, so the probe waits out its timeout as it would for a
+    // host that does not answer, without sending anything off the host.
+    let silent = try SilentTCPPort()
+    let result = try await tcpProbe(host: "127.0.0.1", port: Int(silent.port), timeout: 2.0)
 
     #expect(!result.isReachable)
     #expect(result.rtt == nil)
@@ -88,8 +90,11 @@ struct UDPProbeTests {
 
   @Test("UDP probe to unreachable host")
   func testUnreachableHost() async throws {
-    // Test against TEST-NET-1 (should timeout)
-    let result = try await udpProbe(host: "192.0.2.1", port: 53, timeout: 2.0)
+    // A loopback peer that reads every datagram and never answers, so the probe times out as it
+    // would for a host that does not answer, without sending anything off the host.
+    let silent = try LoopbackUDPResponder { _ in nil }
+    defer { silent.stop() }
+    let result = try await udpProbe(host: "127.0.0.1", port: Int(silent.port), timeout: 2.0)
 
     #expect(!result.isReachable)
     #expect(result.rtt == nil)
@@ -239,45 +244,45 @@ struct DNSProbeTests {
 @Suite("HTTP Probe Tests")
 struct HTTPProbeTests {
 
-  @Test(
-    "HTTP probe successful request",
-    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
+  @Test("HTTP probe successful request")
   func testSuccessfulRequest() async throws {
-    let result = try await NetworkTestGate.shared.withPermit {
-      try await httpProbe(url: "https://httpbingo.org/status/200", timeout: 5.0)
-    }
+    let server = try LoopbackTCPServer(
+      behavior: .respond(response: httpResponse(status: 200, reason: "OK"), after: 0))
+    defer { server.stop() }
+    let result = try await httpProbe(
+      url: "http://127.0.0.1:\(server.port)/status/200", timeout: 5.0)
 
     #expect(result.isReachable)
     #expect(result.statusCode != nil)
     #expect(result.statusCode == 200)
     #expect(result.rtt != nil)
     #expect(result.rtt.map { $0 > 0 } == true)
+    #expect(server.accepted.value == 1)
   }
 
+  /// Live HTTPS smoke test: the TLS handshake path cannot be served from a loopback fixture
+  /// without a trusted certificate. Its timeout is generous and nothing it asserts depends on how
+  /// fast the third-party server answers, only that it answers.
   @Test(
-    "HTTPS probe successful request",
+    "HTTPS probe live smoke test",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
   func testHTTPSSuccessfulRequest() async throws {
     let result = try await NetworkTestGate.shared.withPermit {
-      try await httpProbe(url: "https://httpbingo.org/status/200", timeout: 5.0)
+      try await httpProbe(url: "https://example.com/", timeout: 30.0)
     }
 
-    #expect(result.isReachable)
+    #expect(result.isReachable, "\(result.error ?? "no error")")
     #expect(result.statusCode != nil)
-    #expect(result.statusCode == 200)
     #expect(result.rtt != nil)
   }
 
-  @Test(
-    "HTTP probe 404 response",
-    .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")))
+  @Test("HTTP probe 404 response")
   func test404Response() async throws {
-    let result = try await NetworkTestGate.shared.withPermit {
-      try await httpProbe(
-        url: "https://httpbingo.org/status/404",
-        timeout: 5.0
-      )
-    }
+    let server = try LoopbackTCPServer(
+      behavior: .respond(response: httpResponse(status: 404, reason: "Not Found"), after: 0))
+    defer { server.stop() }
+    let result = try await httpProbe(
+      url: "http://127.0.0.1:\(server.port)/status/404", timeout: 5.0)
 
     // 404 still counts as success (server is reachable)
     #expect(result.isReachable)
@@ -295,8 +300,10 @@ struct HTTPProbeTests {
 
   @Test("HTTP probe unreachable host")
   func testUnreachableHost() async throws {
-    // Test against TEST-NET-1
-    let result = try await httpProbe(url: "http://192.0.2.1", timeout: 2.0)
+    // A loopback port that drops every SYN, so the connection never opens, as for a host that
+    // does not answer, without sending anything off the host.
+    let silent = try SilentTCPPort()
+    let result = try await httpProbe(url: "http://127.0.0.1:\(silent.port)", timeout: 2.0)
 
     #expect(!result.isReachable)
     #expect(result.statusCode == nil)

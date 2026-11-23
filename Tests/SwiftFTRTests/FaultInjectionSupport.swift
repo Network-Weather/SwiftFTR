@@ -857,3 +857,45 @@ func offlineTracer(
   SwiftFTR(
     config: config, rdnsCache: rdns, asnResolver: EmptyASNResolver(), cachedPublicIP: publicIP)
 }
+
+// MARK: - Offline substitutes for live dependencies
+
+/// A loopback TCP port that never answers a connection attempt, reserved for the fixture's
+/// lifetime.
+///
+/// The port belongs to a socket that is bound but not listening. Darwin drops a SYN to such a
+/// port rather than resetting it (see ``RefusingTCPPort``), so a client sees what it sees for a
+/// host that does not answer: its connect waits until its own timeout.
+final class SilentTCPPort: @unchecked Sendable {
+  let port: UInt16
+  private let fd: Int32
+
+  init(family: Int32 = AF_INET) throws {
+    (fd, port) = try bindLoopback(family: family, type: SOCK_STREAM)
+  }
+
+  deinit { close(fd) }
+}
+
+/// Public-IP discovery that finds nothing, at once, and counts how often it was asked.
+///
+/// A classification that is given no public address starts discovery, which is live STUN with a
+/// DNS fallback unless a substitute is bound. Run such a call inside ``install(_:)`` so it never
+/// reaches the network, and read ``calls`` to check that discovery reached this substitute.
+final class OfflinePublicIPDiscovery: Sendable {
+  let calls = FaultCounter()
+
+  func install<T>(_ body: () async throws -> T) async rethrows -> T {
+    let calls = self.calls
+    let discover: TestSeams.DiscoverPublicIPv4 = {
+      calls.increment()
+      throw PublicIPError.allMethodsFailed(stunError: "offline test", dnsError: "offline test")
+    }
+    return try await TestSeams.$discoverPublicIPv4.withValue(discover) { try await body() }
+  }
+}
+
+/// A complete HTTP/1.1 response with `status` and an empty body, for ``LoopbackTCPServer``.
+func httpResponse(status: Int, reason: String) -> [UInt8] {
+  Array("HTTP/1.1 \(status) \(reason)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+}
