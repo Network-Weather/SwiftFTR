@@ -273,7 +273,8 @@ public struct ClassifiedHop: Sendable, Codable {
 
 `traceClassified` gets the client's public IP from `config.publicIP`, then the actor cache (which
 `seedPublicIP` populates), then fresh IPv4 discovery (STUN, then a DNS TXT query to
-`whoami.ds.akahelp.net`). Each discovery attempt is bounded by `publicIPDiscoveryTimeout`, and
+`whoami.ds.akahelp.net`). Each discovery attempt is bounded by `publicIPDiscoveryTimeout`, one
+deadline shared by every name lookup, STUN attempt and DNS query in it, and
 there can be two: one before the trace, and, if that one finds no address, a second during
 classification. With an empty cache and stalled discovery, a classified trace can therefore spend
 up to twice `publicIPDiscoveryTimeout` on public-IP discovery. If both fail or time out,
@@ -655,6 +656,7 @@ public struct PublicIPs: Sendable {
     public var any: String? { get }   // v6 ?? v4
 }
 // STUN-only, both families in parallel; failed families are nil. Ignores SwiftFTRConfig.publicIP.
+// stunTimeout is per server. Cancelling the caller ends it at once with what it had found.
 public func getPublicIPs(stunTimeout: TimeInterval = 0.8, interface: String? = nil,
                          sourceIP: String? = nil, enableLogging: Bool = false) async -> PublicIPs
 

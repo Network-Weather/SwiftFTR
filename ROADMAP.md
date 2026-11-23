@@ -22,9 +22,10 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   deadline whose error names the phase that was running is the requested API; a resolution
   budget is what moving `getaddrinfo` onto the executor needs; a way to read executor pressure
   (queued and running operations) is the companion.
-- **`getPublicIPs` blocks Swift's cooperative pool** (finding 9, from code reading): it runs STUN,
-  including `getaddrinfo` for each server, in plain tasks with no deadline. Move it onto the
-  bounded executor under a budget.
+- **Standalone `getPublicIPs` has no overall bound** (finding 9): each STUN attempt is bounded by
+  `stunTimeout`, but resolving the server names has no deadline, so a stalled resolver holds the
+  call for as long as `getaddrinfo` takes unless the caller cancels. Needs a budget the public
+  signature does not have, for example a new overload.
 - **A failed public-IP discovery is paid twice** (finding 6): the classifier rediscovers when
   `traceClassified` hands it no address. Needs an internal way to say "already tried".
 - **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code

@@ -3,6 +3,36 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Behavior changes
+
+- **`getPublicIPs` ends when its caller is cancelled, and no longer blocks Swift's cooperative
+  pool** (finding 9 in `docs/ROBUSTNESS-TESTING.md`). Its IPv4 and IPv6 sweeps are child tasks of
+  the caller, and each STUN server-name lookup and each STUN attempt runs on the bounded executor.
+  A cancelled call returns at once with what it had found, usually both fields `nil`, where it
+  used to run on until every server had answered or timed out. `stunTimeout` is still per server;
+  the call as a whole still has no bound while a server name is resolving. See
+  `MigratingTo019.md`.
+- **Public-IP discovery in `traceClassified` and `discoverPaths` stops at
+  `publicIPDiscoveryTimeout` instead of running on in an executor slot.** Discovery is async: one
+  deadline, `publicIPDiscoveryTimeout` from its start, bounds every STUN name lookup, STUN attempt
+  and whoami DNS query, and is passed down to each. Each STUN attempt is its own executor request,
+  abandoned after twice its per-server timeout or at the deadline, whichever is first, so a
+  stalled attempt keeps one slot but the discovery moves on to the next server and the fallback.
+  A silent server ends its attempt at the socket timeout (2 s in the discovery before the trace,
+  0.8 s in the classifier's), so with the default 6 s budget two silent servers leave the whoami
+  fallback 2 s, or 4.4 s. The whoami fallback uses the event-based DNS transport and needs no
+  slot, so with every slot held it can still find the address where discovery used to find none.
+
+### Tooling
+
+- The blocking DNS query behind the whoami fallback, and its socket-timeout helpers, are removed,
+  with the `@_spi(Test)` function `__dnsApplySocketTimeout`. Every DNS query now uses the
+  event-based transport. The public-IP test seam is async, and new task-local seams point STUN
+  and the whoami fallback at loopback fixtures.
+
 0.18.1 — 2026-11-22
 -------------------
 

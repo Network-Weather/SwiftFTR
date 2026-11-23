@@ -71,7 +71,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
 | Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
-| Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
+| Public-IP discovery | stalls past its budget; fails; result arriving after a network change; STUN attempts against silent loopback servers and a silent whoami server, each able to outlast the watchdog, ended by the one discovery deadline; a name lookup waiting for a slot, abandoned at it; the whoami fallback answering while every executor slot is held; standalone `getPublicIPs` ended by its caller's cancellation, returning the family that answered, and leaving the cooperative pool free with more stalled calls than it has threads | traceClassified, discoverPaths, getPublicIPs | `Enrichment`, `Cancellation`, `AsyncPublicIPDiscoveryTests` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
@@ -209,12 +209,16 @@ numbers are as of the commit that added this section.
    `EventBasedDNSTests.answersWithEveryWorkerHeld`, which waited out its 5 s watchdog before and
    answers while every slot is held after, and `CymruEventBasedTests.resolvesWithEveryWorkerHeld`,
    which returned no ASN data at its 1.5 s queue deadline before.
-9. **`getPublicIPs` runs blocking STUN on Swift's cooperative pool, without a deadline.**
-   Unverified, from reading the code. `STUN.swift:725` wraps `stunGetPublicIPWithFallback`,
-   which calls `getaddrinfo` for each server hostname and blocks in `recv`, in plain `Task`s rather
-   than on the bounded executor. A stalled resolver can hold two cooperative threads for up to
-   30 s per server in the list, and the call cannot be cancelled. Not fixed: the right bound is a
-   budget the public signature does not have.
+9. **`getPublicIPs` ran blocking STUN on Swift's cooperative pool, and ignored cancellation.**
+   Confirmed and fixed. It wrapped the STUN sweeps, which call `getaddrinfo` for each server and
+   block in `recv`, in plain `Task`s. With one more stalled call than the pool has threads, an
+   unrelated task ran only after the STUN server answered; cancelling the caller left the call
+   waiting out every attempt (both measured against loopback fixtures before the fix). The sweeps
+   are now child tasks, every lookup and attempt is its own executor request, and cancellation
+   ends the call at once. Still open: the standalone call as a whole has no bound. Each attempt is
+   bounded by `stunTimeout` (its executor deadline is twice that), but name lookups have no
+   deadline, because the public signature has no budget to take one from. Tests:
+   `AsyncPublicIPDiscoveryTests.standaloneCancellation` and `standaloneLeavesPoolFree`.
 
 10. **A reverse-DNS lookup cut short by cancellation was cached as a miss for 24 hours.**
     Confirmed and fixed; found by the Codex review of fix 1, which made it common. The resolver
