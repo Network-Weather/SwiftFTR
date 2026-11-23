@@ -79,7 +79,7 @@ struct PingReplyMatchingTests {
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: { network.journal }) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: network.journal) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     let s = result.statistics
@@ -124,7 +124,7 @@ struct PingReplyMatchingTests {
     let config = PingConfig(count: 3, interval: 0.05, timeout: 0.5)
 
     let (result, elapsed) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: { network.journal }
+      within: Self.safetyTimer(config) - 1, diagnose: network.journal
     ) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
@@ -161,7 +161,7 @@ struct PingReplyMatchingTests {
     // The reply window outlasts the watchdog, so the ping must end on its third real reply.
     let config = PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: { network.journal }) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: network.journal) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     let s = result.statistics
@@ -193,7 +193,7 @@ struct PingReplyMatchingTests {
       ping.premise(queuedDatagrams(fd) >= 1 || waitForQueued(fd, atLeast: 1))
     }
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: { ping.network.journal }) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
       try await ping.run()
     }
     #expect(ping.premiseHeld, "the early reply was never queued ahead of probe 2's send")
@@ -225,7 +225,7 @@ struct PingReplyMatchingTests {
 
     let config = ping.config
     let (result, elapsed) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: { ping.network.journal }
+      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
     ) {
       try await ping.run()
     }
@@ -266,7 +266,7 @@ struct PingReplyMatchingTests {
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: { network.journal }) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: network.journal) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     let s = result.statistics
@@ -302,7 +302,7 @@ struct PingReplyMatchingTests {
       }
     }
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: { ping.network.journal }) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
       try await ping.run()
     }
     #expect(ping.premiseHeld, "the replies were not queued and read as staged")
@@ -339,7 +339,7 @@ struct PingReplyMatchingTests {
     let config = PingConfig(count: 3, interval: 1.0, timeout: 0.5)
 
     let (result, _) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: { network.journal }
+      within: Self.safetyTimer(config) - 1, diagnose: network.journal
     ) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
@@ -372,7 +372,7 @@ struct PingReplyMatchingTests {
       }
     }
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: { ping.network.journal }) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
       try await ping.run()
     }
     #expect(ping.premiseHeld, "the send loop never finished before the reply was sent")
@@ -399,7 +399,7 @@ struct PingReplyMatchingTests {
       ping.premise(ping.clock.readingCount > 0)
     }
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: { ping.network.journal }) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
       try await ping.run()
     }
     #expect(ping.premiseHeld, "probe 1's reply was not read before probe 2's send")
@@ -421,7 +421,7 @@ struct PingReplyMatchingTests {
     defer { ping.stop() }
     ping.failingSends = [2]
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: { ping.network.journal }) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
       try await ping.run()
     }
     let s = result.statistics
@@ -448,7 +448,7 @@ struct PingReplyMatchingTests {
 
     let config = ping.config
     let (result, elapsed) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: { ping.network.journal }
+      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
     ) {
       try await ping.run()
     }

@@ -41,7 +41,7 @@ struct FaultInjectionFixtureTests {
     defer { gate.open() }
     let finished = FaultCounter()
     do {
-      _ = try await measure(within: 0.2, diagnose: { "fixture state" }) {
+      _ = try await measure(within: 0.2, diagnose: "fixture state") {
         await gate.waitAsync(limit: 20)
         finished.increment()
       }

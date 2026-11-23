@@ -91,10 +91,10 @@ struct WatchdogExpired: Error, CustomStringConvertible {
 ///
 /// The operation runs in its own task and the watchdog does not wait for it to finish, so an
 /// operation that never returns fails the test instead of hanging the run. The abandoned task is
-/// cancelled. `diagnose`, when given, is read as the watchdog fires and its text carried in the
+/// cancelled. `diagnose`, when given, is evaluated as the watchdog fires and its text carried in the
 /// error, so a stuck operation reports what its fixture saw.
 func measure<T: Sendable>(
-  within limit: TimeInterval, diagnose: (@Sendable () -> String)? = nil,
+  within limit: TimeInterval, diagnose: @autoclosure @escaping @Sendable () -> String = "",
   _ body: @escaping @Sendable () async throws -> T
 ) async throws -> (T, TimeInterval) {
   let start = monotonicNow()
@@ -108,7 +108,11 @@ func measure<T: Sendable>(
   }
   let watchdog = Task {
     try? await Task.sleep(nanoseconds: UInt64(limit * 1_000_000_000))
-    outcome.finish(.failure(WatchdogExpired(limit: limit, diagnosis: diagnose?())))
+    // Cancelled only once the operation has finished: nothing to report.
+    if Task.isCancelled { return }
+    let diagnosis = diagnose()
+    outcome.finish(
+      .failure(WatchdogExpired(limit: limit, diagnosis: diagnosis.isEmpty ? nil : diagnosis)))
   }
   let result = await outcome.value
   watchdog.cancel()
