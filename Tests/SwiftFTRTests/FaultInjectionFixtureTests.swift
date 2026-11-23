@@ -58,7 +58,15 @@ struct FaultInjectionFixtureTests {
   }
 
   @Test("A loopback fixture is never handed the port of a socket bound to the unspecified address")
-  func loopbackFixtureKeepsOffWildcardPorts() throws {
+  func loopbackFixtureKeepsOffWildcardPorts() async throws {
+    // Some 4,000 socket calls: on a thread of their own, not the cooperative pool, which a
+    // repeated run of this test would otherwise hold for seconds at a time.
+    let (heldCount, collisions) = try await onOwnThread { try Self.wildcardPortCollisions() }
+    #expect(heldCount == 128)
+    #expect(collisions.isEmpty, "fixtures were handed held ports: \(collisions)")
+  }
+
+  static func wildcardPortCollisions() throws -> (heldCount: Int, collisions: [UInt16]) {
     // A probe socket the library sends on unbound takes an ephemeral port on the unspecified
     // address at its first send. A fixture later handed the same number on ::1 would receive
     // every loopback reply meant for the probe socket, and the operation would wait out its whole
@@ -98,12 +106,18 @@ struct FaultInjectionFixtureTests {
       close(fd)
       if heldPorts.contains(port) { collisions.append(port) }
     }
-    #expect(heldPorts.count == held)
-    #expect(collisions.isEmpty, "fixtures were handed held ports: \(collisions)")
+    return (heldPorts.count, collisions)
   }
 
   @Test("An IPv4 refusing UDP port is never handed to a dual-stack IPv6 socket")
-  func refusingUDPPortKeepsOffDualStack() throws {
+  func refusingUDPPortKeepsOffDualStack() async throws {
+    // On a thread of its own, for the reason given in loopbackFixtureKeepsOffWildcardPorts.
+    let (heldCount, collisions) = try await onOwnThread { try Self.dualStackCollisions() }
+    #expect(heldCount == 64)
+    #expect(collisions.isEmpty, "dual-stack sockets were handed refusing ports: \(collisions)")
+  }
+
+  static func dualStackCollisions() throws -> (heldCount: Int, collisions: [UInt16]) {
     // A dual-stack socket bound to [::] on a refusing port's number would receive the IPv4
     // datagrams meant to be refused, and the operation under test would see silence. Hold
     // `held` refusing ports and bind `binds` dual-stack sockets one at a time: were the kernel
@@ -138,9 +152,8 @@ struct FaultInjectionFixtureTests {
       }
       if heldPorts.contains(port) { collisions.append(port) }
     }
-    #expect(heldPorts.count == held)
-    #expect(collisions.isEmpty, "dual-stack sockets were handed refusing ports: \(collisions)")
     withExtendedLifetime(refusing) {}
+    return (heldPorts.count, collisions)
   }
 
   @Test("The UDP responder hands a zero-byte request to its script")

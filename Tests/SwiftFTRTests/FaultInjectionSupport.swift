@@ -196,6 +196,15 @@ func returnsWithin(_ limit: TimeInterval, _ body: @escaping @Sendable () -> Void
   }
 }
 
+/// Runs `body` on a thread of its own and returns its result, so a blocking call or a burst of
+/// system calls never holds a thread of Swift's cooperative pool. `body` must not record test
+/// issues: it runs outside the test's task.
+func onOwnThread<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T {
+  try await withCheckedThrowingContinuation { continuation in
+    Thread.detachNewThread { continuation.resume(with: Result { try body() }) }
+  }
+}
+
 enum FixtureError: Error {
   case socket(String, Int32)
 }
