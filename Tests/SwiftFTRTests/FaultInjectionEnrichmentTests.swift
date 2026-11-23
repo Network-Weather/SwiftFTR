@@ -27,7 +27,9 @@ struct FaultInjectionEnrichmentTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-stall")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    let budget: TimeInterval = 0.3
+    // Short against the watchdog, long enough that a loaded machine cannot spend it before the
+    // question starts, which would ask nothing.
+    let budget: TimeInterval = 2
     let tracer = offlineTracer(
       SwiftFTRConfig(
         maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, publicIPDiscoveryTimeout: budget))
@@ -66,8 +68,10 @@ struct FaultInjectionEnrichmentTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-once")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
+    // The substitute fails at once, so the budget never ends the question; it is long so that a
+    // loaded machine cannot spend it before the question starts, which would ask nothing at all.
     let tracer = offlineTracer(
-      SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, publicIPDiscoveryTimeout: 0.3)
+      SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, publicIPDiscoveryTimeout: 60)
     )
     let discovery: TestSeams.DiscoverPublicIP = { _ in
       attempts.increment()
@@ -81,7 +85,7 @@ struct FaultInjectionEnrichmentTests {
         }
       }
     }
-    #expect(attempts.value == 1)
+    #expect(attempts.value == 1, "discovery ran \(attempts.value) times")
   }
 
   @Test("Public-IP discovery that finishes after a network change is neither returned nor cached")
@@ -163,7 +167,9 @@ struct FaultInjectionEnrichmentTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 4, name: "test.mp-pip")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    let budget: TimeInterval = 0.3
+    // Short against the watchdog, long enough that a loaded machine cannot spend it before the
+    // question starts, which would ask nothing.
+    let budget: TimeInterval = 2
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, noReverseDNS: true, publicIPDiscoveryTimeout: budget))
     let attempts = FaultCounter()
