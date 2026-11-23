@@ -251,7 +251,7 @@ touch the same code and can be built at the same time; rows in a lane land in or
 | Fixes | DNS Error Cases | `DNSError.connectionRefused` and `DNSError.unreachable`, thrown by the query methods where they throw `sendFailed` today. Source-breaking for an exhaustive switch; allowed by decision 10. `dnsProbe` results do not change. |
 | Public IP | Async Public-IP Discovery | The stage below. |
 | Public IP | Event-Based STUN | The stage below. |
-| Deadline | Deadline State | The deadline clock, the phase bookkeeping and its lock, the deadline error type, the result field naming the phase, and the `SwiftFTRConfig` overload, for `traceClassified`. Lands after Event-Based STUN. |
+| Deadline | Deadline State | The deadline clock, the phase bookkeeping and its lock, the `TracerouteError` deadline case (decision 6), the result field naming the phase, and the `SwiftFTRConfig` overload, for `traceClassified`. Lands after Event-Based STUN. |
 | Deadline | Deadline For Multipath And ASN | `discoverPaths` and its per-flow pipeline, partial paths from finished batches, the remembered public-IP attempt, and cancelling the shared ASN load when its last waiter leaves. |
 | Reverse DNS | Reverse-DNS Lookup | The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test and the gated live comparison. Not yet used by `RDNSCache`, so it can be built beside the Public IP lane. |
 | Reverse DNS | Reverse-DNS Cache | `RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker. Lands after Deadline State, which it shares phase code with. |
@@ -264,9 +264,11 @@ landed are releasable as they stand: none leaves `main` in a half-converted stat
 stage keeps the path it replaces until its own pull request removes it. Whether to release
 without the stopped stage is David's call at that point.
 
+The bufferbloat default upload URL (#89) also ships in 0.19.0, as its own small pull request
+(decision 11).
+
 **Not in 0.19.0**, though related: reporting an HTTP status as soon as the headers arrive (#122),
-which needs its own transport and its own plan; the bufferbloat default upload URL (#89), which
-waits on decision 11; a structured outcome on the TCP, UDP and HTTP probe results, which belongs
+which needs its own transport and its own plan; a structured outcome on the TCP, UDP and HTTP probe results, which belongs
 with the API review before 1.0.
 
 ### Async Public-IP Discovery
@@ -439,7 +441,7 @@ swift package --allow-writing-to-directory docc generate-documentation --target 
 - The release-mode run is there because optimized builds shorten object lifetimes, which is how
   an object kept alive only by a callback context is freed early.
 - The API check runs against `v0.18.1`. The only breakages allowlisted are the ones this plan
-  names: the two `DNSError` cases, and the deadline error if decision 6 is revisited. Any other
+  names: the two `DNSError` cases and the `TracerouteError` deadline case (decision 6). Any other
   reported breakage fails the gate.
 - Each event-based stage adds one more: with every executor slot held by a gated blocker, the
   operation it converts still completes against a healthy loopback fixture reached by a literal
@@ -480,20 +482,16 @@ otherwise. Decided ones say so.
 5. **What happens to the hops when the overall deadline passes after probing?** Decided: return
    the result with enrichment missing and a field naming the phase that ran out, and throw only
    when the deadline passes before the probe window completes (David, 2026-11-22).
-6. **Shape of the deadline error**, for the case that does throw. Decided: a separate error
-   type, not a new `TracerouteError` case (David, 2026-11-22). A new case would break exhaustive
-   switches in consumers; decision 5 makes this error rare. The compatibility gate compiles an
-   exhaustive switch over `TracerouteError` to hold that line, and the documentation says a
-   caller catching only `TracerouteError` will not see the deadline error. Open to revisit
-   (raised by the author, not decided): the reason given was avoiding a source break, and
-   decision 10 now allows breaks in 0.19.0. A `TracerouteError` case would reach a caller that
-   catches only `TracerouteError`, and would make an exhaustive switch fail to compile until it
-   handles the deadline. The separate type stands until David says otherwise.
-7. **Forward-resolution budget.** There is no configuration to derive one from today.
-   Recommended: a new `SwiftFTRConfig` option for traces, defaulting to 10 seconds, with probes
-   spending from their existing `timeout`. The 10 seconds is a proposal, not a measurement.
-   This option is now needed in 0.19.0 (Resolution For Traces) and work proceeds on the 10
-   seconds until David says otherwise.
+6. **Shape of the deadline error**, for the case that does throw. Decided: a new
+   `TracerouteError` case (David, 2026-11-22, replacing his earlier choice of a separate type,
+   which was made to avoid a source break before decision 10 allowed breaks in 0.19.0). A caller
+   that catches `TracerouteError` sees the deadline, and an exhaustive switch over it fails to
+   compile until it handles the case. Decision 5 makes this error rare: it is thrown only when
+   the deadline passes before the probe window completes. It is one of the allowlisted breaks.
+7. **Forward-resolution budget.** There is no configuration to derive one from today. Decided:
+   a new `SwiftFTRConfig` option for traces, defaulting to 20 seconds (David, 2026-11-22), with
+   probes spending from their existing `timeout`. The 20 seconds is a judgement, not a
+   measurement: how long the system resolver itself waits has not been measured.
 8. **Stale DNS replies.** Decided: DNS ignores a datagram whose transaction ID does not match and
    keeps waiting until the deadline, as its own change directly after Event-Based DNS and
    before 0.18.0 (David, 2026-11-22). It closes a gap review found in the event-based
@@ -508,11 +506,12 @@ otherwise. Decided ones say so.
 10. **Source breaks in 0.19.0.** Decided: allowed (David, 2026-11-22). The breaks taken are named
     in Release 0.19.0 and allowlisted in the API gate; each has an upgrade-guide entry with the
     edit that fixes the build.
-11. **Bufferbloat's default upload URL** (#89). Open. `testBufferbloat` sends its upload load to
-    a third-party test site when the caller sets no `uploadURL`. Recommended: no default; the
-    upload load runs only when the caller supplies a URL, and the result says the upload
-    direction was not measured. That drops a measurement existing callers get today, so it is
-    not applied without David's answer.
+11. **Bufferbloat's default upload URL** (#89). Decided: Cloudflare's speed-test upload endpoint,
+    the same provider as the default download (David, 2026-11-22). `testBufferbloat` sends its
+    upload load to a volunteer-run test site today when the caller sets no `uploadURL`.
+    `https://speed.cloudflare.com/__up` accepted a 1 KB and a 1 MB POST with status 200 on
+    2026-11-22; its limits and terms were not checked. Callers who set `uploadURL` are unaffected.
+    This goes in the Small Fixes lane as its own pull request, with an upgrade-guide entry.
 
 ## Out of scope
 

@@ -129,7 +129,11 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 SwiftFTR has production consumers whose integrations depend on contracts that are easy to break silently: single dest-string entry points, canonical `inet_ntop` address form, link-local zone-suffix preservation, family-agnostic errors, concurrent-ping safety, unprivileged sockets only. For non-trivial API changes, surface the relevant constraints up front in your plan, not during PR review.
 
-Never name, link, or path-reference specific downstream applications or their private repositories anywhere in this repository — docs, code comments, commit messages, telemetry excerpts. Refer to them as "downstream consumers" / "the host app", and strip consumer-internal details (source paths, line numbers, commit hashes, infrastructure identifiers) when recording field evidence here.
+A downstream application may be named. Never link or path-reference its private repositories,
+and never disclose private information about a consumer: source paths, line numbers, commit
+hashes, infrastructure identifiers, customer or usage details. Strip those when recording field
+evidence here. (David, 2026-11-22, relaxing the earlier rule that the application itself must not
+be named.)
 
 ## Size the pull request, not just the commits
 
