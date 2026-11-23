@@ -227,6 +227,7 @@ After:
 
 ```sh
 swift-ftr probe dns 192.0.2.53 example.com --json | jq -e '.outcome == "failed"'
+```
 
 ## The default bufferbloat upload target is Cloudflare's speed test
 

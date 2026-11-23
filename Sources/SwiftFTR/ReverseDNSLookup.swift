@@ -111,9 +111,14 @@ enum ReverseDNSLookupOutcome: Sendable, Equatable {
   case noSuchRecord
   /// The lookup could not be made, or the daemon ended it with an error.
   case error(ReverseDNSLookupError)
-  /// The caller's deadline passed with no outcome, or the daemon gave up
-  /// (`kDNSServiceErr_Timeout`).
+  /// The caller's deadline passed after the query was asked (its start call had been entered)
+  /// with no outcome, or the daemon gave up (`kDNSServiceErr_Timeout`). The resolver, or the
+  /// daemon, did not answer in time: evidence of a stall.
   case timedOut
+  /// The caller's deadline passed before the query was asked: while the lookup waited for a
+  /// permit from its limiter, or before its queue ran the start. No question reached the daemon,
+  /// so this says nothing about the resolver and is not a stall.
+  case timedOutBeforeQuery
   /// The calling task was cancelled, or ``ReverseDNSLookup/cancel()`` was called, first.
   case cancelled
 
@@ -208,7 +213,6 @@ struct DNSServiceCalls: Sendable {
 ///   retained when the query starts and released only after the deallocate, so no callback can
 ///   reach a freed context. It refers to this object, which it keeps alive for as long as it
 ///   lives.
-///   deallocate, so no callback can reach a freed object.
 /// - `kDNSServiceFlagsReturnIntermediates` is set, because without it an address with no name
 ///   never calls back. Intermediate records of another type (a CNAME) and remove events (no
 ///   `kDNSServiceFlagsAdd`) are ignored; only an added PTR record or an error is an outcome. The
@@ -220,8 +224,13 @@ struct DNSServiceCalls: Sendable {
 /// means the reference has been deallocated or will never exist.
 ///
 ///     State                  Event                       Rule
-///     created                cancel or deadline          resolve; the start finds it resolved,
-///                                                        makes no query, and tears down
+///     waiting for a permit   cancel or deadline          resolve (timedOutBeforeQuery for the
+///                                                        deadline); the wait is cancelled and
+///                                                        takes no permit; a permit that was
+///                                                        already on its way is handed on
+///     permit held, queued    cancel or deadline          resolve (timedOutBeforeQuery); the
+///                                                        start finds it resolved, makes no
+///                                                        query, tears down, returns the permit
 ///     starting (on queue)    cancel or deadline          resolve now (the caller is released
 ///                                                        while the start call runs); the start
 ///                                                        returns and deallocates at once
@@ -234,10 +243,17 @@ struct DNSServiceCalls: Sendable {
 ///     running                cancel or deadline          resolve; hop to the queue; deallocate
 ///     resolved, torn down    any event                   ignored
 final class ReverseDNSLookup: @unchecked Sendable {
-  /// Lookups in flight at once by default. Each holds one descriptor (its connection to the
-  /// daemon), so this keeps reverse DNS far from the default limit of 256 descriptors however
-  /// many traces run at once; 32 also covers every hop of one trace in a single wave. A
+  /// Lookups in flight at once by default; 32 covers every hop of one trace in a single wave. A
   /// proposed value, not a measurement.
+  ///
+  /// What the limiter bounds is queries, from the start call to the deallocate. Each holds one
+  /// descriptor, its connection to the daemon, but the client library closes that descriptor in
+  /// the cancel handler of its dispatch source, which runs on the lookup's queue after the
+  /// deallocate returns (dnssd_clientstub.c, `DNSServiceSetDispatchQueue`), while the permit is
+  /// handed on as the deallocate returns. So open daemon descriptors can briefly exceed the cap
+  /// by the lookups whose cancel handler has not yet run. Measured: with caps of 1, 4 and 16 and
+  /// a descriptor limit set to what was open plus the cap plus two, thousands of lookups never
+  /// failed for want of a descriptor (`ReverseDNSLookupDaemonTests`).
   static let defaultMaxConcurrentLookups = 32
 
   /// Bounds the lookups in flight in this process, for callers that pass no limiter of their own.
@@ -254,16 +270,18 @@ final class ReverseDNSLookup: @unchecked Sendable {
 
   /// Looks up the PTR name of `address` through the system daemon.
   ///
-  /// Waits for a permit from `limiter` first, without holding a thread; the deadline starts once
-  /// the permit is held, and the permit is returned only when the lookup's reference has been
-  /// deallocated, so `limiter` bounds the descriptors actually open. Cancelling the calling task
-  /// while it waits returns ``ReverseDNSLookupOutcome/cancelled``.
+  /// One deadline, started on entry, covers both the wait for a permit from `limiter` (which
+  /// holds no thread) and the query. A deadline that passes while the lookup still waits ends it
+  /// with ``ReverseDNSLookupOutcome/timedOutBeforeQuery`` and it takes no permit; one that passes
+  /// after the query was asked ends it with ``ReverseDNSLookupOutcome/timedOut``. A permit is
+  /// returned only once the lookup's reference has been deallocated, or will never exist.
+  /// Cancelling the calling task at any point returns ``ReverseDNSLookupOutcome/cancelled``.
   ///
   /// - Parameters:
   ///   - address: An IPv4 or IPv6 literal, with an optional zone.
-  ///   - timeout: Seconds from the start of the query until the caller is released with
-  ///     ``ReverseDNSLookupOutcome/timedOut``. Zero, negative and NaN make no query.
-  ///   - limiter: Bounds the lookups in flight. Defaults to one shared by the process.
+  ///   - timeout: Seconds from the call until the caller is released. Zero, negative and NaN make
+  ///     no query and return ``ReverseDNSLookupOutcome/timedOutBeforeQuery``.
+  ///   - limiter: Bounds the queries in flight. Defaults to one shared by the process.
   static func lookup(
     _ address: String,
     timeout: TimeInterval,
@@ -272,17 +290,10 @@ final class ReverseDNSLookup: @unchecked Sendable {
     guard let question = ReverseDNSQuestion(address: address) else {
       return .error(.invalidAddress)
     }
-    guard timeout > 0 else { return .timedOut }
+    guard timeout > 0 else { return .timedOutBeforeQuery }
     // Read on the async side: the lookup's queue cannot see task-locals.
     let calls = TestSeams.dnsService ?? .system
-    do {
-      try await limiter.wait()
-    } catch {
-      return .cancelled
-    }
-    let lookup = ReverseDNSLookup(question: question, calls: calls) {
-      Task { await limiter.signal() }
-    }
+    let lookup = ReverseDNSLookup(question: question, calls: calls, limiter: limiter)
     return await withTaskCancellationHandler {
       await lookup.run(timeout: timeout)
     } onCancel: {
@@ -293,47 +304,46 @@ final class ReverseDNSLookup: @unchecked Sendable {
   let question: ReverseDNSQuestion
   private let calls: DNSServiceCalls
   private let queue: DispatchQueue
-  /// Called once, on `queue`, when the reference has been deallocated or will never exist.
-  private let onTornDown: @Sendable () -> Void
+  private let limiter: _ConcurrencySemaphore
 
   // Guarded by `lock`; read and written from any thread.
   private let lock = NSLock()
   private var outcome: ReverseDNSLookupOutcome?
   private var continuation: CheckedContinuation<ReverseDNSLookupOutcome, Never>?
   private var timer: DispatchSourceTimer?
+  /// Waits for the permit; cancelled when the lookup resolves first.
+  private var permitWait: Task<Void, Never>?
+  /// Whether the start call has been entered, so the query was asked.
+  private var queryAsked = false
 
   // Confined to `queue`.
   private var ref: DNSServiceRef?
   private var context: Unmanaged<CallbackContext>?
   private var tornDown = false
+  private var holdsPermit = false
 
-  init(
-    question: ReverseDNSQuestion, calls: DNSServiceCalls,
-    onTornDown: @escaping @Sendable () -> Void = {}
-  ) {
+  init(question: ReverseDNSQuestion, calls: DNSServiceCalls, limiter: _ConcurrencySemaphore) {
     self.question = question
     self.calls = calls
-    self.onTornDown = onTornDown
+    self.limiter = limiter
     self.queue = DispatchQueue(label: "com.swiftftr.rdns.lookup")
     queue.setSpecific(key: Self.queueKey, value: ObjectIdentifier(self))
   }
 
-  /// Starts the query and returns its outcome. Call once.
+  /// Arms the deadline, waits for a permit, makes the query, and returns its outcome. Call once.
   func run(timeout: TimeInterval) async -> ReverseDNSLookupOutcome {
     await withCheckedContinuation { continuation in
       lock.lock()
       if let outcome {
-        // Cancelled before the wait began.
+        // Cancelled before the wait began: no permit is asked for and no query made.
         lock.unlock()
         continuation.resume(returning: outcome)
-      } else {
-        self.continuation = continuation
-        lock.unlock()
-        armDeadline(timeout)
+        return
       }
-      // Always hop to the queue: the start makes the query, or finds the lookup resolved and
-      // tears it down without one.
-      queue.async { self.start() }
+      self.continuation = continuation
+      lock.unlock()
+      armDeadline(timeout)
+      waitForPermit()
     }
   }
 
@@ -349,6 +359,27 @@ final class ReverseDNSLookup: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return outcome != nil
+  }
+
+  /// Waits for a permit without holding a thread, then hops to the queue to start. A wait that
+  /// the lookup's resolution cancels takes no permit.
+  private func waitForPermit() {
+    let wait = Task { [self] in
+      do {
+        try await limiter.wait()
+      } catch {
+        return
+      }
+      queue.async { self.permitAcquired() }
+    }
+    lock.lock()
+    if outcome == nil {
+      permitWait = wait
+      lock.unlock()
+    } else {
+      lock.unlock()
+      wait.cancel()
+    }
   }
 
   private func armDeadline(_ timeout: TimeInterval) {
@@ -381,15 +412,21 @@ final class ReverseDNSLookup: @unchecked Sendable {
       lock.unlock()
       return
     }
-    outcome = result
+    // The deadline before the start call was entered asked nothing of the daemon.
+    let final: ReverseDNSLookupOutcome =
+      result == .timedOut && !queryAsked ? .timedOutBeforeQuery : result
+    outcome = final
     let waiter = continuation
     continuation = nil
     let deadline = timer
     timer = nil
+    let wait = permitWait
+    permitWait = nil
     lock.unlock()
 
     deadline?.cancel()
-    waiter?.resume(returning: result)
+    wait?.cancel()
+    waiter?.resume(returning: final)
     if onQueue {
       tearDown()
     } else {
@@ -399,9 +436,32 @@ final class ReverseDNSLookup: @unchecked Sendable {
 
   // MARK: - On `queue`
 
+  private func permitAcquired() {
+    dispatchPrecondition(condition: .onQueue(queue))
+    holdsPermit = true
+    if tornDown {
+      // Resolved, and torn down, while the permit was on its way: hand it straight on.
+      releasePermit()
+    } else {
+      start()
+    }
+  }
+
+  private func releasePermit() {
+    dispatchPrecondition(condition: .onQueue(queue))
+    guard holdsPermit else { return }
+    holdsPermit = false
+    let limiter = self.limiter
+    Task { await limiter.signal() }
+  }
+
   private func start() {
     dispatchPrecondition(condition: .onQueue(queue))
-    guard !isResolved else {
+    lock.lock()
+    let resolved = outcome != nil
+    if !resolved { queryAsked = true }
+    lock.unlock()
+    guard !resolved else {
       tearDown()
       return
     }
@@ -432,7 +492,7 @@ final class ReverseDNSLookup: @unchecked Sendable {
     // just made.
   }
 
-  /// Deallocates the reference, then releases the callback context. Runs once.
+  /// Deallocates the reference, then releases the callback context and the permit. Runs once.
   private func tearDown() {
     dispatchPrecondition(condition: .onQueue(queue))
     guard !tornDown else { return }
@@ -443,7 +503,7 @@ final class ReverseDNSLookup: @unchecked Sendable {
     }
     context?.release()
     context = nil
-    onTornDown()
+    releasePermit()
   }
 
   fileprivate func handleReply(

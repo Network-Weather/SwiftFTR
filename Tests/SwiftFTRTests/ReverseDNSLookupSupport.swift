@@ -66,36 +66,63 @@ final class FakeDNSService: @unchecked Sendable {
   private var unknownDeallocations = 0
   private var doubleDeallocations = 0
 
-  /// - Parameter controlsDeadline: When true, a lookup's deadline passes only when the test calls
-  ///   ``expireDeadlines()``, never by the clock, so a test can order it against every other
-  ///   event. When false, the lookup's real timer runs.
+  /// How a lookup's deadline passes.
+  enum Deadline {
+    /// Only when the test calls ``expireDeadlines()`` or ``expireDeadline(number:)``, never by
+    /// the clock, so a test can order it against every other event.
+    case controlled
+    /// At once, inside the call that arms it: before the lookup has asked for a permit or
+    /// queued its start.
+    case expiresWhenArmed
+    /// By the lookup's real timer.
+    case timer
+  }
+
   init(
     start: Start = .succeed, queueResult: DNSServiceErrorType = DNSServiceStatus.noError,
-    controlsDeadline: Bool = true
+    deadline: Deadline = .controlled
   ) {
     self.start = start
     self.queueResult = queueResult
-    self.controlsDeadline = controlsDeadline
+    self.deadline = deadline
   }
 
-  private let controlsDeadline: Bool
-  private var pendingDeadlines: [@Sendable () -> Void] = []
-  private var armedDeadlines = 0
+  deinit {
+    for ref in order { UnsafeMutableRawPointer(ref).deallocate() }
+  }
 
-  /// Deadlines lookups have armed through this fake, fired or not.
-  var deadlinesArmed: Int { locked { armedDeadlines } }
+  private let deadline: Deadline
+  /// Every deadline armed, in the order lookups armed them; `nil` once it has been made to pass.
+  private var armed: [(@Sendable () -> Void)?] = []
 
-  /// Makes every armed deadline that has not yet been made to pass, pass now, on this thread.
-  /// Returns how many there were.
+  /// Deadlines lookups have armed through this fake, passed or not.
+  var deadlinesArmed: Int { locked { armed.count } }
+
+  /// Makes every armed deadline that has not yet passed pass now, on this thread. Returns how
+  /// many there were.
   @discardableResult
   func expireDeadlines() -> Int {
     let due = locked {
-      let due = pendingDeadlines
-      pendingDeadlines.removeAll()
+      let due = armed.compactMap { $0 }
+      armed = armed.map { _ in nil }
       return due
     }
     for expire in due { expire() }
     return due.count
+  }
+
+  /// Makes the `number`th deadline armed (from 0) pass now, unless it already has. Returns
+  /// whether it was still pending.
+  @discardableResult
+  func expireDeadline(number: Int) -> Bool {
+    let due: (@Sendable () -> Void)? = locked {
+      guard number < armed.count else { return nil }
+      let due = armed[number]
+      armed[number] = nil
+      return due
+    }
+    due?()
+    return due != nil
   }
 
   var calls: DNSServiceCalls {
@@ -149,18 +176,25 @@ final class FakeDNSService: @unchecked Sendable {
         deallocatedOnStartQueue.append(call.queueID != nil && call.queueID == query.startQueue)
         live -= 1
       },
-      armDeadline: controlsDeadline ? armDeadline : nil
+      armDeadline: deadline == .timer ? nil : armDeadline
     )
   }
 
   /// Records a lookup's deadline, to pass only when ``expireDeadlines()`` is called.
+  /// Records a lookup's deadline, to pass when the test says so, or at once.
   private var armDeadline:
     @Sendable (_ timeout: TimeInterval, _ expire: @escaping @Sendable () -> Void) -> Void
   {
     { [self] _, expire in
+      if deadline == .expiresWhenArmed {
+        lock.lock()
+        armed.append(nil)
+        lock.unlock()
+        expire()
+        return
+      }
       lock.lock()
-      pendingDeadlines.append(expire)
-      armedDeadlines += 1
+      armed.append(expire)
       lock.unlock()
     }
   }

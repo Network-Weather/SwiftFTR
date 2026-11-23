@@ -82,12 +82,20 @@ struct BlockingIOStrandingTests {
     try #require(
       await eventually(within: 10) { occupied.value > 0 }, "the worker was never occupied")
 
-    // The marker lives only in the operation's closure, so it dies when the bridge lets go.
+    // The marker lives only in the operation's closure, so it dies when the bridge lets go. The
+    // call runs under a watchdog of its own: the worker stays held until after it returns, so a
+    // deadline that failed to resume the caller would otherwise hang the test.
     do {
       let marker = DeinitMarker { released.increment() }
-      await #expect(throws: BlockingIOTimeout.self) {
-        try await executor.run(priority: .userInitiated, deadline: 0.05) { marker.touch() }
+      let (thrown, _) = try await measure(within: 20) { () -> Error? in
+        do {
+          try await executor.run(priority: .userInitiated, deadline: 0.05) { marker.touch() }
+          return nil
+        } catch {
+          return error
+        }
       }
+      #expect(thrown is BlockingIOTimeout, "\(String(describing: thrown))")
     }
     free.signal()
     await holder.value
