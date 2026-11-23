@@ -260,10 +260,11 @@ struct FaultInjectionCancellationTests {
         : pathScript(destinationTTL: 2)(probe)
     }
     defer { network.stop() }
+    // A stall in a blocking attempt's executor slot, as a STUN `recv` stalls.
     let discovery: TestSeams.DiscoverPublicIPv4 = {
       if phase == .publicIPDiscovery {
         entered.increment()
-        gate.wait(limit: 20)
+        try await runDetachedBlockingIO { gate.wait(limit: 20) }
       }
       return STUNPublicIP(ip: "198.51.100.7")
     }
@@ -356,10 +357,11 @@ struct FaultInjectionCancellationTests {
       phase == .probeWindow ? [] : pathScript(destinationTTL: 2)(probe)
     }
     defer { network.stop() }
+    // A stall in a blocking attempt's executor slot, as a STUN `recv` stalls.
     let discovery: TestSeams.DiscoverPublicIPv4 = {
       if phase == .publicIPDiscovery {
         entered.increment()
-        gate.wait(limit: 20)
+        try await runDetachedBlockingIO { gate.wait(limit: 20) }
       }
       return STUNPublicIP(ip: "198.51.100.7")
     }

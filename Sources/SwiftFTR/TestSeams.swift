@@ -18,8 +18,12 @@ enum TestSeams {
   /// socket for `family`.
   typealias MakeICMPSocket = @Sendable (_ family: Int32) throws -> Int32
 
-  /// IPv4 public-address discovery, in place of STUN with its DNS fallback.
-  typealias DiscoverPublicIPv4 = @Sendable () throws -> STUNPublicIP
+  /// IPv4 public-address discovery for the trace family, in place of STUN with its DNS fallback.
+  /// It runs under the discovery budget, which cancels it when it passes.
+  typealias DiscoverPublicIPv4 = @Sendable () async throws -> STUNPublicIP
+
+  /// The STUN servers to try, in order, for one address family.
+  typealias STUNServers = @Sendable (_ family: Int32) -> [(host: String, port: UInt16)]
 
   /// `fcntl(2)` with an integer argument, in place of the system call a trace, ping, UDP
   /// exchange, TCP probe or UDP probe uses to make its socket non-blocking. Returns what `fcntl` would and sets `errno`
@@ -30,9 +34,8 @@ enum TestSeams {
   /// with. Returns what `send` would and sets `errno` the same way.
   typealias SendDatagram = @Sendable (_ fd: Int32, _ bytes: UnsafeRawBufferPointer) -> Int
 
-  /// `recv(2)` of one datagram into `buffer`, in place of the system call a ``UDPExchange``, and
-  /// the blocking DNS query behind the whoami fallback, read their reply with. Returns what `recv`
-  /// would and sets `errno` the same way.
+  /// `recv(2)` of one datagram into `buffer`, in place of the system call a ``UDPExchange`` reads
+  /// its reply with. Returns what `recv` would and sets `errno` the same way.
   typealias ReceiveDatagram =
     @Sendable (_ fd: Int32, _ buffer: UnsafeMutableRawBufferPointer) -> Int
 
@@ -64,9 +67,20 @@ enum TestSeams {
 
   @TaskLocal static var resolveHost: ResolveHost?
 
+  /// The system DNS daemon calls a ``ReverseDNSLookup`` makes, in place of `dns_sd`.
+  @TaskLocal static var dnsService: DNSServiceCalls?
+
   @TaskLocal static var makeICMPSocket: MakeICMPSocket?
 
   @TaskLocal static var discoverPublicIPv4: DiscoverPublicIPv4?
+
+  /// The STUN servers a sweep of address family `family` tries, in place of the built-in list, so
+  /// a test can point each family at loopback fixtures by numeric address.
+  @TaskLocal static var stunServers: STUNServers?
+
+  /// The DNS servers the IPv4 whoami fallback asks, in place of its built-in ones. Pair with
+  /// ``dnsServerPort`` to reach a loopback fixture.
+  @TaskLocal static var whoamiServers: [String]?
 
   /// Awaited by `discoverPaths` once it holds a topology, just before it checks for an
   /// invalidation and returns, so a test can order a network change before or after that step.
@@ -75,23 +89,4 @@ enum TestSeams {
   /// Awaited by a `traceStream` producer once its trace has ended, just before it unregisters and
   /// finishes the stream, so a test can order `cancelActiveTraces()` before or after that step.
   @TaskLocal static var beforeStreamCommit: (@Sendable () async -> Void)?
-}
-
-/// The IPv4 public-address discovery to submit to the blocking-I/O executor: the test substitute
-/// when one is bound, otherwise STUN with its DNS fallback.
-///
-/// Call from async context so the task-local is visible; the returned closure runs anywhere.
-func publicIPv4Discovery(
-  stunTimeout: TimeInterval,
-  dnsTimeout: TimeInterval,
-  interface: String?,
-  sourceIP: String?,
-  enableLogging: Bool
-) -> @Sendable () throws -> STUNPublicIP {
-  if let substitute = TestSeams.discoverPublicIPv4 { return substitute }
-  return {
-    try getPublicIPv4(
-      stunTimeout: stunTimeout, dnsTimeout: dnsTimeout, interface: interface,
-      sourceIP: sourceIP, enableLogging: enableLogging)
-  }
 }

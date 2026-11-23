@@ -1,6 +1,6 @@
 # Migrating to SwiftFTR 0.19
 
-Handle the two new DNSError cases and the DNS, address-validation, ping, bufferbloat and CLI changes introduced in SwiftFTR 0.19.
+Handle the two new DNSError cases and the DNS, address-validation, ping, bufferbloat, public-IP discovery and CLI changes introduced in SwiftFTR 0.19.
 
 ## Overview
 
@@ -13,8 +13,8 @@ person or a coding agent can work through a consumer one change at a time:
 
 To find the call sites to review, search the consumer for `switch` over `DNSError`,
 `DNSError.sendFailed`, `dnsProbe(`, `DNSError.timeout`,
-`.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, and any script that reads the
-output of `swift-ftr probe dns`.
+`.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, `getPublicIPs(`, `publicIPDiscoveryTimeout`, and any script
+that reads the output of `swift-ftr probe dns`.
 
 ## Update the package
 
@@ -256,4 +256,71 @@ After, to keep sending the upload load to httpbin.org:
 ```swift
 let result = try await tracer.testBufferbloat(
   config: BufferbloatConfig(loadType: .upload, uploadURL: "https://httpbin.org/post"))
+```
+
+## getPublicIPs ends when its caller is cancelled
+
+**What changed.** ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` runs its IPv4
+and IPv6 sweeps as child tasks of the calling task. Cancelling the calling task now ends both
+sweeps at once. In 0.18 the sweeps ran in tasks of their own that did not see the cancellation, so
+the call went on until every STUN server had answered or timed out.
+
+**What a caller sees.** A cancelled call returns at once with whatever it had found by then:
+usually `PublicIPs(v4: nil, v6: nil)`, or one family if that sweep had already finished. In 0.18
+the same call returned later with both families filled in where the network allowed. The call
+still never throws.
+
+**What to change.** Code that cancels the task around `getPublicIPs` and still uses the result
+should treat `nil` fields after cancellation as "not measured", not as "this family has no public
+address". Check for cancellation before reporting a family as missing.
+
+Before:
+
+```swift
+let ips = await getPublicIPs()
+show(v4: ips.v4 ?? "no IPv4 path", v6: ips.v6 ?? "no IPv6 path")
+```
+
+After:
+
+```swift
+let ips = await getPublicIPs()
+guard !Task.isCancelled else { return }  // nil fields here mean "not measured"
+show(v4: ips.v4 ?? "no IPv4 path", v6: ips.v6 ?? "no IPv6 path")
+```
+
+## Public-IP discovery in a classified trace stops at its budget
+
+**What changed.** In ``SwiftFTR/SwiftFTR/traceClassified(to:vpnContext:resolver:)`` and
+``SwiftFTR/SwiftFTR/discoverPaths(to:config:)``, public-IP discovery is bounded by one deadline:
+``SwiftFTRConfig/publicIPDiscoveryTimeout`` (6 s by default) from the moment discovery starts.
+Every STUN server-name lookup, STUN attempt and whoami DNS query is cut at that deadline, and the
+discovery stops there. In 0.18 the caller was released at the budget while the discovery ran on
+in a slot of the blocking-I/O executor. STUN also ends at its own share of the budget (the number
+of servers times the per-server timeout), so the whoami fallback always has time to run, and that
+fallback no longer needs an executor slot.
+
+**What a caller sees.** No signature changes and no new errors: a discovery that finds nothing
+still leaves `publicIP` as `nil` in the classified result. Two results differ:
+
+- With every executor slot held (for example by stalled reverse-DNS lookups), discovery can now
+  return an address from the whoami fallback where 0.18 returned `nil`.
+- With a budget smaller than STUN's share plus the fallback's DNS timeout, STUN gets less time
+  than in 0.18, because the fallback is reserved at least half its DNS timeout (or half the
+  budget, if that is smaller). With the default 6 s budget nothing is cut.
+
+**What to change.** Nothing for a caller using the default budget. A caller that sets
+`publicIPDiscoveryTimeout` below about 4 s and relies on STUN answering should check the value
+still leaves STUN the time it needs, or leave the budget at its default.
+
+Before:
+
+```swift
+let config = SwiftFTRConfig(publicIPDiscoveryTimeout: 1.0)  // STUN had the whole second
+```
+
+After:
+
+```swift
+let config = SwiftFTRConfig(publicIPDiscoveryTimeout: 4.0)  // STUN and the fallback both fit
 ```

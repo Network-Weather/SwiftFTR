@@ -22,9 +22,10 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   deadline whose error names the phase that was running is the requested API; a resolution
   budget is what moving `getaddrinfo` onto the executor needs; a way to read executor pressure
   (queued and running operations) is the companion.
-- **`getPublicIPs` blocks Swift's cooperative pool** (finding 9, from code reading): it runs STUN,
-  including `getaddrinfo` for each server, in plain tasks with no deadline. Move it onto the
-  bounded executor under a budget.
+- **Standalone `getPublicIPs` has no overall bound** (finding 9): each STUN attempt is bounded by
+  `stunTimeout`, but resolving the server names has no deadline, so a stalled resolver holds the
+  call for as long as `getaddrinfo` takes unless the caller cancels. Needs a budget the public
+  signature does not have, for example a new overload.
 - **A failed public-IP discovery is paid twice** (finding 6): the classifier rediscovers when
   `traceClassified` hands it no address. Needs an internal way to say "already tried".
 - **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code
@@ -85,6 +86,22 @@ instance's network change evicting another's entries.
   measuring from more than one vantage point first.
 - **Shape if adopted**: literal addresses as the fast path, hostnames as fallback, and a comment
   on the pin stating the condition under which it should be revisited.
+
+### A direct DNS echo for public-IP discovery
+**Goal**: Find the public address on networks that block STUN, without trusting a resolver.
+
+- **What it is**: a query sent straight to an operator's authoritative server, which answers with
+  the address it saw the query come from (for example a TXT query for `o-o.myaddr.l.google.com`
+  to Google's name servers, or a class CH TXT query for `whoami.cloudflare` to 1.1.1.1). It does
+  not go through the resolver the network handed out, whose own address can differ from the
+  user's.
+- **Why it is not in the library's resolver** (David, 2026-11-23, decision 16 in
+  [docs/BLOCKING-IO.md](docs/BLOCKING-IO.md)): a gateway, captive portal or DNS proxy that
+  intercepts port 53 can forge the reply, and nothing in the packet shows it. The library's
+  resolver is STUN only; a host app can supply its own.
+- **What it needs**: class CH support in the DNS client, strict reply checks, a decision on
+  pinning operator addresses, and a rule for when an echo is believed (two independent operators
+  agreeing, or only alongside a STUN answer).
 
 ### IPv6 hardening
 Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner. Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).

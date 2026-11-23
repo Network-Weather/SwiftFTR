@@ -82,7 +82,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - `Ping.swift`: ICMP echo with statistics (min/avg/max RTT, jitter, packet loss)
 - `TCPProbe.swift`: Port state detection (open/closed/filtered)
 - `UDPProbe.swift`: Connected-socket with ICMP unreachable detection
-- `DNS.swift`: Direct server queries with 11 record types over `UDPExchange`; `@_spi(Test)` exposes `__dnsQuery` and `__dnsEncodeQName`. A blocking query remains only for the whoami fallback in `getPublicIPv4ViaDNS`
+- `DNS.swift`: Direct server queries with 11 record types over `UDPExchange`; `@_spi(Test)` exposes `__dnsQuery` and `__dnsEncodeQName`. Every query, the whoami fallback in `getPublicIPv4ViaDNS` included, is event-based
 - `UDPExchange.swift`: One UDP request/response on a non-blocking connected socket, waited on by Dispatch sources and a deadline timer; holds no thread
 - `HTTPProbe.swift`: Web server reachability via URLSession
 - `StreamingTrace.swift`: `AsyncThrowingStream`-based real-time hop delivery
@@ -90,6 +90,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 **Caching Infrastructure**
 - `RDNSCache` (`RDNSCache.swift`): Reverse DNS with 86400s TTL
+- `ReverseDNSLookup` (`ReverseDNSLookup.swift`): one PTR query through `DNSServiceQueryRecord`, holding no thread, with typed outcomes and a cap on lookups in flight; not yet used by `RDNSCache`, which still calls `getnameinfo` on the executor
 - `SwiftFTR.cachedPublicIP`: Public-address enrichment for classified trace/multipath, invalidated on network change
 - `_ASNMemoryCache` (in `ASN.swift`): LRU-style IP-to-ASN cache
 
@@ -100,7 +101,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 3. **Dependency Injection**: Resolvers (ASN, DNS) are injectable via `SwiftFTRConfig` for testing
 4. **Per-Operation Interface Binding**: Override global interface on individual operations (ping, trace, etc.)
 5. **Resource Management**: Single socket per trace, buffer reuse, minimal allocations
-6. **Blocking I/O**: `BlockingIOExecutor` (`Utils.swift`, eight workers) carries reverse DNS (`getnameinfo`) and public-IP discovery for classified traces (STUN, with its blocking whoami DNS fallback). DNS queries, DNS probes and Team Cymru lookups do not use it
+6. **Blocking I/O**: `BlockingIOExecutor` (`Utils.swift`, eight workers) carries reverse DNS (`getnameinfo`), STUN server-name resolution (`getaddrinfo`, one request per name) and each STUN exchange (one request per attempt, for classified traces and standalone `getPublicIPs` alike). Public-IP discovery itself is async and holds no slot between those requests; the whoami fallback, DNS queries, DNS probes and Team Cymru lookups do not use it
 
 ## Environment Variables
 
@@ -111,6 +112,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 | `SKIP_IPV6_TESTS=1` / `FORCE_IPV6_TESTS=1` | Force-skip or force-run the IPv6 integration tests instead of probing for a v6 path |
 | `SWIFTFTR_VERBOSE_HTTP_TIMING=1` | Verbose HTTP probe timing logs |
 | `SWIFTFTR_DEBUG_MULTIPATH` | Debug output for multipath discovery |
+| `SWIFTFTR_RDNS_DESCRIPTOR_STRESS=1` | Also run the reverse-lookup descriptor experiment: the child process lowers its descriptor limit to what is open plus the cap plus two. A measurement that can fail on a valid ordering, so off by default |
 
 ## Swift 6 Compliance
 
