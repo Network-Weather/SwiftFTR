@@ -597,16 +597,20 @@ Observations that are not defects of the library:
   within it; a hook at the accept would remove that. The compression-loop reply is now required
   to be `malformedResponse`, not any `DNSError`.
 - **Ping reply-matching tests needed replies inside a 0.5 s window** (#103). Under that load
-  `unsentSequencesCannotEndPingEarly`, `futureSequenceIsNotCounted` and
-  `failedSendStillWaitsForUnansweredProbe` counted fewer replies than were sent, because the
+  ping's tests recorded issues in 9 of 10 runs on main (116 issues), 3 of 10 strict:
+  `unsentSequencesCannotEndPingEarly`, `futureSequenceIsNotCounted`,
+  `failedSendStillWaitsForUnansweredProbe` and `lateReplyWithinPingIsCounted` counted fewer
+  replies than were sent, because the
   replies crossed loopback after the last probe's window had closed, and
   `failedSendEndsWhenSendLoopFinishes` found probe 1's reply still unread at probe 2's send. Ping
   arms its last window at the last send's time and drops what it has not read when the window
-  closes, so a reply's crossing has to finish before then. The first and third now hold probe 3's
+  closes, so a reply's crossing has to finish before then. The first, third and fourth now hold probe 3's
   send, on the ping's queue, until the network has sent the earlier replies and they are queued
   (`DirectPing.waitUntilReplied`); the send time is taken after the hold, so the queued replies
-  are read inside the window. The second answers every probe with a window past the watchdog and
-  tells the early reply for sequence 2 apart by its mark. The fourth cannot be held that way: the
+  are read inside the window. In the late-reply test probe 3 is no longer answered, so the ping reads
+  probe 1's late reply after its own probe's timeout and before its own end. The second answers
+  every probe with a window past the watchdog and tells the early reply for sequence 2 apart by
+  its mark. `failedSendEndsWhenSendLoopFinishes` cannot be held that way: the
   send loop enqueues each send and sleeps on its own, so a hook cannot keep probe 2 back until a
   reply is read. Its reply is now injected (one loopback crossing, not two) and its interval is
   2 s, which still has to outlast delivery; a seam on the send loop's sleep would remove that.
