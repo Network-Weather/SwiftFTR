@@ -342,9 +342,10 @@ struct PublicIPResolverTests {
 
     let trace = try await Self.classify(tracer, on: network)
 
-    #expect(resolver.asked.value == 1)
     #expect(trace.publicIP == nil)
     #expect(trace.hops.count == 2)
+    // The resolver's task can start after the deadline has already decided the race.
+    #expect(await eventually(within: Self.watchdog) { resolver.asked.value == 1 })
     let cancelled = await eventually(within: Self.watchdog) { resolver.cancelled.value == 1 }
     #expect(cancelled, "the abandoned resolver's task was not cancelled")
   }
