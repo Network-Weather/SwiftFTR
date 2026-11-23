@@ -490,3 +490,9 @@ Observations that are not defects of the library:
   handler and waits until the responding handler has read its own, and saw no reset in 1,000
   runs. `stop()` documents the rule, and `tcpServerStopDiscardsUnreadRequest` pins the
   end-of-file half; the reset is not certain enough to pin.
+- Two fixture tests starved the cooperative pool when repeated. `loopbackFixtureKeepsOffWildcardPorts`
+  and `refusingUDPPortKeepsOffDualStack` made about 4,000 socket calls each on a pool thread.
+  Repeated 500 times with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, they stalled the run in 7 to
+  21 s steps, and the TCP stop test, starved past both of its 30 s budgets, saw its handler answer
+  and exit before `stop()` (2 of 500 strict repetitions, twice). Both loops now run on a thread of
+  their own (`onOwnThread`).
