@@ -359,7 +359,7 @@ Options:
 - `-p, --payload-size N`: ICMP payload size in bytes (default 56)
 - `--json`: Emit JSON with ASN categories and public IP
 - `--no-rdns`: Disable reverse DNS lookups
-- `--public-ip IP`: Override public IP (bypasses STUN)
+- `--public-ip IP`: Public IP to classify with; nothing is sent to discover one. Ignored unless it is a globally routable address of the trace's family
 - `--verbose`: Enable debug logging
 
 ### Ping

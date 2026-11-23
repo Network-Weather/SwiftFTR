@@ -1369,7 +1369,10 @@ public actor SwiftFTR {
     if let cached = publicIPCache[family] { return cached }
 
     let generation = publicIPGenerations[family, default: 0]
-    let sourceIP = config.sourceIP.flatMap { IPAddressFamily(address: $0) == family ? $0 : nil }
+    // A source address that cannot be bound for this family is not a request for system routing:
+    // ask nothing rather than let a resolver send from another address.
+    if let source = config.sourceIP, IPAddressFamily(address: source) != family { return nil }
+    let sourceIP = config.sourceIP
     let request = PublicIPRequest(
       family: family, interface: config.interface, sourceIP: sourceIP,
       deadline: .now + .seconds(config.publicIPDiscoveryTimeoutForOperation))
@@ -1566,9 +1569,7 @@ public actor SwiftFTR {
     _ address: String,
     source: PublicIPSource
   ) -> Bool {
-    guard isGloballyRoutablePublicIP(address), let canonical = canonicalIPAddress(address),
-      let family = IPAddressFamily(address: canonical)
-    else {
+    guard let (canonical, family) = publicAddress(address) else {
       return false
     }
     // A new generation of this family, so an older question in flight cannot overwrite the seed.

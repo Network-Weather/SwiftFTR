@@ -645,6 +645,29 @@ extension SwiftFTR {
     return try outcome.get()
   }
 
+  /// Rejects, before a public-IP question, every input a flow would reject only after it:
+  /// the interface, the source address (its form, its family, and whether this host can bind it),
+  /// and a numeric destination of the wrong family. So an unusable binding never sends discovery
+  /// traffic. A destination name that does not resolve is found only by the flows.
+  private func validateBeforeQuestion(target: String) throws {
+    if let name = config.interface { _ = try validateInterface(name) }
+    if let source = config.sourceIP {
+      try validateSourceIPFamily(source, destinationFamily: AF_INET)
+      let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+      if fd >= 0 {
+        defer { close(fd) }
+        if let message = bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: source) {
+          throw TracerouteError.sourceIPBindFailed(
+            sourceIP: source, errno: errno, details: message)
+        }
+      }
+    }
+    // Literals resolve without `getaddrinfo` under a forced family.
+    if containsNUL(target) || detectAddressFamily(target) != -1 {
+      _ = try resolveHost(host: target, prefer: .v4)
+    }
+  }
+
   /// Runs flow workers that reuse caches without escaping the caller's task group.
   struct MultipathWorkerSpawner: MultipathFlowRunning {
     let baseConfig: SwiftFTRConfig
@@ -722,6 +745,7 @@ extension SwiftFTR {
       _ = try validateInterface(interfaceName)
     }
 
+    try validateBeforeQuestion(target: host)
     let observation = try await publicIPObservation(for: .v4, handle: handle)
     let effectivePublicIP = observation?.address
     // Do not start resolving a destination for a flow whose question was cancelled.

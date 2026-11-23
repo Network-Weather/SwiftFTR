@@ -18,6 +18,8 @@ final class ScriptedPublicIPResolver: PublicIPResolver, @unchecked Sendable {
     case never
     /// Waits for `gate` whatever happens to its task, then answers.
     case ignoringCancellation(StallGate, PublicIPObservation)
+    /// Answers once the clock has passed the request's deadline, whatever happens to its task.
+    case afterDeadline(PublicIPObservation)
   }
 
   struct Failure: Error {}
@@ -69,6 +71,11 @@ final class ScriptedPublicIPResolver: PublicIPResolver, @unchecked Sendable {
     case .ignoringCancellation(let gate, let observation):
       await gate.waitAsync(limit: 60)
       return observation
+    case .afterDeadline(let observation):
+      while ContinuousClock.now < request.deadline {
+        try? await Task.sleep(nanoseconds: 5_000_000)
+      }
+      return observation
     }
   }
 }
@@ -101,11 +108,13 @@ struct PublicIPResolverTests {
         publicIPDiscoveryTimeout: budget, sourceIP: sourceIP, publicIPResolver: resolver))
   }
 
-  /// One classified trace through `network`, under the watchdog.
-  static func classify(_ tracer: SwiftFTR, on network: FakeICMPNetwork) async throws
+  /// One classified trace through `network`, or a fresh two-hop one, under the watchdog.
+  static func classify(_ tracer: SwiftFTR, on given: FakeICMPNetwork? = nil) async throws
     -> ClassifiedTrace
   {
-    try await network.install {
+    let network = try given ?? FakeICMPNetwork(script: pathScript(destinationTTL: 2))
+    defer { if given == nil { network.stop() } }
+    return try await network.install {
       try await measure(within: Self.watchdog) {
         try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
       }.0
@@ -192,13 +201,11 @@ struct PublicIPResolverTests {
 
   @Test("An IPv6 seed does not label an IPv4 trace")
   func ipv6SeedThenIPv4Trace() async throws {
-    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
-    defer { network.stop() }
     let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9")))
     let tracer = Self.tracer(.custom(resolver))
     #expect(await tracer.seedPublicIP("2606:4700::1111", source: .gatewayReported))
 
-    let trace = try await Self.classify(tracer, on: network)
+    let trace = try await Self.classify(tracer)
 
     #expect(resolver.requests.map(\.family) == [.v4])
     #expect(trace.publicIP == "9.9.9.9")
@@ -207,13 +214,11 @@ struct PublicIPResolverTests {
 
   @Test("A seed of the trace's family answers it without asking, and names its source")
   func seedAnswersWithoutAsking() async throws {
-    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
-    defer { network.stop() }
     let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9")))
     let tracer = Self.tracer(.custom(resolver))
     #expect(await tracer.seedPublicIP("8.8.8.8", source: .gatewayReported))
 
-    let trace = try await Self.classify(tracer, on: network)
+    let trace = try await Self.classify(tracer)
 
     #expect(resolver.asked.value == 0)
     #expect(trace.publicIP == "8.8.8.8")
@@ -222,14 +227,12 @@ struct PublicIPResolverTests {
 
   @Test("A configured address answers only traces of its family, and only if it is public")
   func configuredAddressPrecedence() async throws {
-    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
-    defer { network.stop() }
     for (configured, expectAsked) in [
       ("9.9.9.9", false), ("2606:4700::1111", true), ("10.0.0.1", true),
     ] {
       let resolver = ScriptedPublicIPResolver(.answer(Self.observation("8.8.8.8")))
       let tracer = Self.tracer(.custom(resolver), publicIP: configured)
-      let trace = try await Self.classify(tracer, on: network)
+      let trace = try await Self.classify(tracer)
       #expect(resolver.asked.value == (expectAsked ? 1 : 0), "configured \(configured)")
       #expect(trace.publicIP == (expectAsked ? "8.8.8.8" : configured), "configured \(configured)")
       let source = expectAsked ? Self.hostApp : PublicIPObservationSource.configured
@@ -239,12 +242,10 @@ struct PublicIPResolverTests {
 
   @Test("With the strategy disabled nothing is asked and the trace classifies without an address")
   func disabledStrategy() async throws {
-    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
-    defer { network.stop() }
     let discovery = OfflinePublicIPDiscovery()
     let tracer = Self.tracer(.disabled)
 
-    let trace = try await discovery.install { try await Self.classify(tracer, on: network) }
+    let trace = try await discovery.install { try await Self.classify(tracer) }
 
     #expect(discovery.calls.value == 0, "the library's discovery ran")
     #expect(trace.publicIP == nil)
@@ -300,14 +301,12 @@ struct PublicIPResolverTests {
     "An answer that is not a public address of the family asked for is refused",
     arguments: refusedAnswers)
   func refusedAnswer(answer: RefusedAnswer) async throws {
-    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
-    defer { network.stop() }
     let resolver = ScriptedPublicIPResolver(
       .answer(
         PublicIPObservation(address: answer.address, family: answer.family, source: Self.hostApp)))
     let tracer = Self.tracer(.custom(resolver))
 
-    let trace = try await Self.classify(tracer, on: network)
+    let trace = try await Self.classify(tracer)
 
     #expect(resolver.asked.value == 1)
     #expect(trace.publicIP == nil)
@@ -318,12 +317,10 @@ struct PublicIPResolverTests {
 
   @Test("A resolver that throws costs the trace its public address, not its result")
   func throwingResolver() async throws {
-    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
-    defer { network.stop() }
     let resolver = ScriptedPublicIPResolver(.fail)
     let tracer = Self.tracer(.custom(resolver))
 
-    let trace = try await Self.classify(tracer, on: network)
+    let trace = try await Self.classify(tracer)
 
     #expect(resolver.asked.value == 1)
     #expect(trace.publicIP == nil)
@@ -334,13 +331,11 @@ struct PublicIPResolverTests {
 
   @Test("A resolver that never returns is abandoned at the deadline and cancelled")
   func neverReturns() async throws {
-    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
-    defer { network.stop() }
     let resolver = ScriptedPublicIPResolver(.never)
     // The resolver never answers, so only the 0.3 s budget can end the question in time.
     let tracer = Self.tracer(.custom(resolver), budget: 0.3)
 
-    let trace = try await Self.classify(tracer, on: network)
+    let trace = try await Self.classify(tracer)
 
     #expect(trace.publicIP == nil)
     #expect(trace.hops.count == 2)
@@ -354,13 +349,11 @@ struct PublicIPResolverTests {
   func lateAnswerDropped() async throws {
     let gate = StallGate()
     defer { gate.open() }
-    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
-    defer { network.stop() }
     let resolver = ScriptedPublicIPResolver(
       .ignoringCancellation(gate, Self.observation("9.9.9.9")))
     let tracer = Self.tracer(.custom(resolver), budget: 0.3)
 
-    let trace = try await Self.classify(tracer, on: network)
+    let trace = try await Self.classify(tracer)
     let stillWaiting = resolver.returned.value == 0
     #expect(stillWaiting, "the trace returned only once the resolver had answered")
     #expect(trace.publicIP == nil)
@@ -369,6 +362,41 @@ struct PublicIPResolverTests {
     let answered = await eventually(within: Self.watchdog) { resolver.returned.value == 1 }
     #expect(answered)
     #expect(await tracer.publicIP(for: .v4) == nil, "the late answer was cached")
+  }
+
+  @Test("An answer given once the clock has passed the deadline is refused, woken or not")
+  func answerPastDeadlineRefused() async throws {
+    let resolver = ScriptedPublicIPResolver(.afterDeadline(Self.observation("9.9.9.9")))
+    let tracer = Self.tracer(.custom(resolver), budget: 0.2)
+    // No wake-up at all, so the answer is the only event: the commit rule alone must refuse it.
+    let neverWake: TestSeams.ArmPublicIPDeadline = { _, _ in {} }
+
+    let trace = try await TestSeams.$armPublicIPDeadline.withValue(neverWake) {
+      try await Self.classify(tracer)
+    }
+
+    #expect(resolver.returned.value == 1, "the resolver never answered")
+    #expect(trace.publicIP == nil, "a late answer was accepted")
+    #expect(await tracer.publicIP(for: .v4) == nil, "a late answer was cached")
+  }
+
+  @Test("A wake-up that runs before the deadline does not end the question")
+  func earlyWakeIgnored() async throws {
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
+    defer { network.stop() }
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9")))
+    let tracer = Self.tracer(.custom(resolver))
+    // Wakes the race at once, long before the deadline, as a timer firing early would.
+    let wakeAtOnce: TestSeams.ArmPublicIPDeadline = { _, wake in
+      wake()
+      return {}
+    }
+
+    let trace = try await TestSeams.$armPublicIPDeadline.withValue(wakeAtOnce) {
+      try await Self.classify(tracer, on: network)
+    }
+
+    #expect(trace.publicIP == "9.9.9.9", "an early wake-up ended the question")
   }
 
   /// Who ends a classified trace while its question is outstanding.
@@ -421,6 +449,84 @@ struct PublicIPResolverTests {
     #expect(await tracer.publicIP(for: .v4) == nil, "the abandoned answer was cached")
   }
 
+  // MARK: Validation
+
+  static let multipathConfig = MultipathConfig(
+    flowVariations: 7, maxPaths: 16, earlyStopThreshold: 7, timeoutMs: 2000, maxHops: 4)
+
+  @Test("An IPv4-mapped address is an IPv4 observation, from every origin; NAT64 stays IPv6")
+  func ipv4MappedIsIPv4() async throws {
+    let seeded = Self.tracer(.disabled)
+    #expect(await seeded.seedPublicIP("::ffff:8.8.8.8", source: .gatewayReported))
+    #expect(await seeded.publicIP(for: .v4)?.address == "8.8.8.8")
+    #expect(await seeded.publicIP(for: .v6) == nil)
+    #expect(await seeded.seedPublicIP("64:ff9b::8.8.4.4", source: .gatewayReported))
+    #expect(await seeded.publicIP(for: .v6)?.address == "64:ff9b::808:404")
+
+    let configured = Self.tracer(.disabled, publicIP: "::ffff:9.9.9.9")
+    #expect(await configured.publicIP(for: .v4)?.address == "9.9.9.9")
+    #expect(await configured.publicIP(for: .v6) == nil)
+
+    let mapped = PublicIPObservation(address: "::ffff:9.9.9.9", family: .v4, source: Self.hostApp)
+    #expect(validatedPublicIP(mapped, for: .v4)?.address == "9.9.9.9")
+    let mappedAsV6 = PublicIPObservation(
+      address: "::ffff:9.9.9.9", family: .v6, source: Self.hostApp)
+    #expect(validatedPublicIP(mappedAsV6, for: .v6) == nil)
+  }
+
+  /// An input the operation rejects, and the call that must reject it before asking.
+  struct RejectedInput: CustomTestStringConvertible, Sendable {
+    let why: String
+    var multipath = true
+    var target = "127.0.0.1"
+    var interface: String? = nil
+    var sourceIP: String? = nil
+    var testDescription: String { why }
+  }
+
+  static let rejectedInputs: [RejectedInput] = [
+    RejectedInput(why: "malformed source", sourceIP: "not-an-ip"),
+    RejectedInput(why: "source this host cannot bind", sourceIP: "192.0.2.77"),
+    RejectedInput(why: "missing interface", interface: "swiftftr-none0"),
+    RejectedInput(why: "IPv6 destination literal", target: "::1"),
+    RejectedInput(
+      why: "classified trace, malformed source", multipath: false, sourceIP: "not-an-ip"),
+  ]
+
+  @Test(
+    "An input the call rejects is rejected before the question is asked",
+    arguments: rejectedInputs)
+  func rejectedBeforeQuestion(input: RejectedInput) async throws {
+    // Nothing is probed either: each input fails before a socket sends.
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9")))
+    let tracer = offlineTracer(
+      SwiftFTRConfig(
+        maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, interface: input.interface,
+        sourceIP: input.sourceIP, publicIPResolver: .custom(resolver)))
+    let failed: Bool
+    do {
+      if input.multipath {
+        _ = try await tracer.discoverPaths(to: input.target, config: Self.multipathConfig)
+      } else {
+        _ = try await tracer.traceClassified(to: input.target, resolver: EmptyASNResolver())
+      }
+      failed = false
+    } catch {
+      failed = true
+    }
+    #expect(failed, "the call accepted the input")
+    #expect(resolver.asked.value == 0, "asked before rejecting the input")
+  }
+
+  @Test("A source address of the other family means no question, not one from another address")
+  func sourceOfOtherFamilyAsksNothing() async throws {
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9")))
+    let tracer = offlineTracer(SwiftFTRConfig(sourceIP: "::1", publicIPResolver: .custom(resolver)))
+    let observation = try await tracer.publicIPObservation(for: .v4, handle: nil)
+    #expect(observation == nil)
+    #expect(resolver.asked.value == 0)
+  }
+
   // MARK: Results
 
   @Test("The source is encoded beside the address, and JSON without it still decodes")
@@ -437,5 +543,6 @@ struct PublicIPResolverTests {
     let roundTripped = try JSONDecoder().decode(
       ClassifiedTrace.self, from: try JSONEncoder().encode(trace))
     #expect(roundTripped.publicIPSource == .stun)
+
   }
 }

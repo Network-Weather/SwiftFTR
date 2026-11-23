@@ -1089,7 +1089,7 @@ swift build -c release --product swift-ftr
 
 # trace is the default subcommand
 .build/release/swift-ftr example.com
-.build/release/swift-ftr trace 1.1.1.1 -m 20 -t 2.0 --json --no-rdns --public-ip 203.0.113.7
+.build/release/swift-ftr trace 1.1.1.1 -m 20 -t 2.0 --json --no-rdns --public-ip 9.9.9.9
 .build/release/swift-ftr trace -i en0 -s 192.168.1.10 -p 64 --verbose google.com
 
 .build/release/swift-ftr stream 1.1.1.1 --retry-after 3      # or --no-retry
@@ -1105,7 +1105,7 @@ swift build -c release --product swift-ftr
 
 Trace flags: `--json`, `--no-rdns`, `--public-ip IP`, `-i/--interface`, `-s/--source`,
 `-p/--payload-size` (default 56), `--verbose`, `-m/--max-hops` (default 40), `-t/--timeout`
-seconds (default 1.0). `--public-ip` bypasses discovery for classified-trace enrichment. Run
+seconds (default 1.0). `--public-ip` disables discovery (`publicIPResolver: .disabled`) and classifies with the address if it is a globally routable address of the trace's family, otherwise with none. Run
 `swift-ftr <subcommand> --help` for the rest.
 
 ## Testing
