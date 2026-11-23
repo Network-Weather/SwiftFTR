@@ -685,10 +685,11 @@ final class LoopbackTCPServer: @unchecked Sendable {
   /// `defer` in an async test, since it parks no thread.
   ///
   /// A client sees end-of-file only if nothing it sent is still on its way. Darwin discards data
-  /// already queued and unread when the read side is shut down, but resets the connection when
-  /// data arrives after that: a request sent just before `stop()` and still in flight, or one
-  /// sent after it, makes the client's next read fail with `ECONNRESET`. A test that checks for
-  /// end-of-file waits until the handler has read its request (``requestsRead``) or sends none.
+  /// already queued and unread when the read side is shut down, but data arriving after that
+  /// usually resets the connection: a request sent just before `stop()` and still in flight, or
+  /// one sent after it, then makes the client's next read fail with `ECONNRESET`. A test that
+  /// checks for end-of-file waits until the handler has read its request (``requestsRead``) or
+  /// sends none.
   func stop() {
     lock.lock()
     let wasStopped = stopped

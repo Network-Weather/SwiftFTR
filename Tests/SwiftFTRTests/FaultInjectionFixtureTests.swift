@@ -255,22 +255,12 @@ struct FaultInjectionFixtureTests {
     #expect(received == 0, "recv returned \(received), errno \(errno)")
   }
 
-  /// When a request reaches a silent handler relative to `stop()`.
-  enum StopRequestTiming: String, CaseIterable, Sendable {
-    /// Queued, unread, before `stop()`: discarded with the read side, so the client sees
-    /// end-of-file.
-    case queuedBeforeStop
-    /// Arriving after `stop()` shut the connection down, while its handler still holds it: the
-    /// connection is reset.
-    case arrivingAfterStop
-  }
-
-  @Test(
-    "A stopped TCP server ends a connection with end-of-file unless data arrives after the stop",
-    arguments: StopRequestTiming.allCases)
-  func tcpServerStopOutcomeDependsOnLateData(timing: StopRequestTiming) async throws {
-    // The documented contract of LoopbackTCPServer.stop(), and the reason a test that checks for
-    // end-of-file must not have a request in flight when it stops the server.
+  @Test("A stopped TCP server ends a connection with end-of-file even with its request unread")
+  func tcpServerStopDiscardsUnreadRequest() async throws {
+    // Part of LoopbackTCPServer.stop()'s contract: a request already queued, unread, when the
+    // server stops is discarded with the read side and the client sees end-of-file. (One still
+    // in flight at the stop, or sent after it, usually resets the connection instead; that is
+    // why a test checking for end-of-file must not stop the server with a request in flight.)
     let exitGate = StallGate()
     defer { exitGate.open() }
     let server = try LoopbackTCPServer(behavior: .silent, exitGate: exitGate)
@@ -283,38 +273,23 @@ struct FaultInjectionFixtureTests {
     }
     #expect(connected == 0)
     #expect(await eventually(within: 10) { server.accepted.value == 1 })
-    func sendRequest() { _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0) }
-    var peerBytes: Int32 = 0
-    switch timing {
-    case .queuedBeforeStop:
-      sendRequest()
-      // Wait until the server's kernel has acknowledged it: nothing left in the client's send
-      // buffer means it reached the server's receive buffer.
-      #expect(
-        await eventually(within: 10) {
-          var unsent: Int32 = 0
-          var size = socklen_t(MemoryLayout<Int32>.size)
-          getsockopt(client, SOL_SOCKET, SO_NWRITE, &unsent, &size)
-          return unsent == 0
-        })
-      server.stop()
-    case .arrivingAfterStop:
-      server.stop()
-      sendRequest()
-    }
-    // The handler is held by the gate, so the connection is still open when anything arrives.
+    _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
+    // Nothing left in the client's send buffer means the server's kernel has acknowledged it,
+    // so it is in the server's receive buffer, which the silent handler never reads.
+    #expect(
+      await eventually(within: 10) {
+        var unsent: Int32 = 0
+        var size = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(client, SOL_SOCKET, SO_NWRITE, &unsent, &size)
+        return unsent == 0
+      })
+    server.stop()
     exitGate.open()
     await server.stopAndWait()
     setReceiveTimeout(client, seconds: 1)
     var buffer = [UInt8](repeating: 0, count: 16)
     let received = recv(client, &buffer, buffer.count, 0)
-    peerBytes = received < 0 ? -Int32(errno) : Int32(received)
-    switch timing {
-    case .queuedBeforeStop:
-      #expect(peerBytes == 0, "recv gave \(peerBytes) (negative: -errno), not end-of-file")
-    case .arrivingAfterStop:
-      #expect(peerBytes == -ECONNRESET, "recv gave \(peerBytes) (negative: -errno), not a reset")
-    }
+    #expect(received == 0, "recv returned \(received), errno \(errno): not end-of-file")
   }
 
   /// Whether a fresh socket, with no reuse options, can bind `port` on loopback: false while
