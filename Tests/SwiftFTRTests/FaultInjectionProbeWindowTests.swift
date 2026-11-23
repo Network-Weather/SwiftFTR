@@ -224,20 +224,28 @@ struct FaultInjectionProbeWindowTests {
 
   @Test("Unreachable replies are reported per hop and do not end the trace early")
   func unreachableReported() async throws {
+    // Hops 1 and 2 answer host-unreachable and hop 3 is the destination. The window outlasts the
+    // watchdog, so only the destination's reply can end the trace in time: a trace that stopped
+    // at an unreachable reply would miss hop 3, and none waits on how fast loopback delivers.
     let network = try FakeICMPNetwork { probe in
-      [
-        .init(
-          ICMPWire.unreachable(family: AF_INET, code: 1, id: probe.identifier, seq: probe.sequence))
-      ]
+      let ttl = probe.hopLimit ?? Int(probe.sequence)
+      let bytes =
+        ttl < 3
+        ? ICMPWire.unreachable(family: AF_INET, code: 1, id: probe.identifier, seq: probe.sequence)
+        : ICMPWire.echoReply(family: AF_INET, id: probe.identifier, seq: probe.sequence)
+      return [.init(bytes)]
     }
     defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 3, maxWaitMs: 300, noReverseDNS: true))
+    let tracer = offlineTracer(
+      SwiftFTRConfig(maxHops: 3, maxWaitMs: Int(3 * Self.watchdog * 1000), noReverseDNS: true))
 
     let result = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }.0
-    #expect(!result.reached)
-    #expect(result.hops.allSatisfy { $0.outcome == .unreachable(code: 1) })
+    #expect(result.reached)
+    #expect(result.hops.count == 3)
+    #expect(result.hops.prefix(2).allSatisfy { $0.outcome == .unreachable(code: 1) })
+    #expect(result.hops.last?.reachedDestination == true)
   }
 
   // MARK: The socket
