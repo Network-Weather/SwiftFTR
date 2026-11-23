@@ -67,6 +67,9 @@ enum TestSeams {
 
   @TaskLocal static var resolveHost: ResolveHost?
 
+  /// The system DNS daemon calls a ``ReverseDNSLookup`` makes, in place of `dns_sd`.
+  @TaskLocal static var dnsService: DNSServiceCalls?
+
   @TaskLocal static var makeICMPSocket: MakeICMPSocket?
 
   @TaskLocal static var discoverPublicIPv4: DiscoverPublicIPv4?

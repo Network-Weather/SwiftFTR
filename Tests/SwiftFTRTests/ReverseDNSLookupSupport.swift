@@ -1,0 +1,335 @@
+import Foundation
+import Testing
+import dnssd
+
+@testable import SwiftFTR
+
+/// A substitute for the DNS daemon behind ``ReverseDNSLookup``, through `TestSeams.dnsService`.
+///
+/// It hands out fake references, records every call with the queue it ran on, and delivers
+/// replies through the lookup's real callback, on the queue the reference was scheduled on, as
+/// the daemon does. Like the daemon, it delivers nothing to a reference once it is deallocated.
+final class FakeDNSService: @unchecked Sendable {
+  enum Start {
+    /// Return success and a reference.
+    case succeed
+    /// Return this error and no reference.
+    case fail(DNSServiceErrorType)
+    /// Block the calling thread (the lookup's queue) until the gate opens, then succeed.
+    case gated(StallGate)
+    /// Block until the gate opens, then return this error and no reference.
+    case gatedFail(StallGate, DNSServiceErrorType)
+  }
+
+  struct Call {
+    /// Whether the call ran on a lookup's own queue.
+    let onLookupQueue: Bool
+    /// The lookup queue's identity, when it ran on one.
+    let queueID: ObjectIdentifier?
+  }
+
+  private final class Query: @unchecked Sendable {
+    let name: String
+    let interfaceIndex: UInt32
+    let flags: DNSServiceFlags
+    let context: UnsafeMutableRawPointer
+    let startQueue: ObjectIdentifier?
+    var queue: DispatchQueue?
+    var deallocated = false
+    /// The context object, held weakly, so a deallocate can see whether it is still alive.
+    weak var contextObject: ReverseDNSLookup.CallbackContext?
+
+    init(
+      name: String, interfaceIndex: UInt32, flags: DNSServiceFlags,
+      context: UnsafeMutableRawPointer, startQueue: ObjectIdentifier?
+    ) {
+      self.name = name
+      self.interfaceIndex = interfaceIndex
+      self.flags = flags
+      self.context = context
+      self.startQueue = startQueue
+      self.contextObject = Unmanaged<ReverseDNSLookup.CallbackContext>.fromOpaque(context)
+        .takeUnretainedValue()
+    }
+  }
+
+  private let lock = NSLock()
+  private let start: Start
+  private let queueResult: DNSServiceErrorType
+  private var queries: [OpaquePointer: Query] = [:]
+  private var order: [OpaquePointer] = []
+  private var startCalls: [Call] = []
+  private var deallocations: [Call] = []
+  private var deallocatedOnStartQueue: [Bool] = []
+  private var contextAliveAtDeallocate: [Bool] = []
+  private var callbacks = 0
+  private var live = 0
+  private var maxLive = 0
+  private var unknownDeallocations = 0
+  private var doubleDeallocations = 0
+
+  /// How a lookup's deadline passes, and when the lookup is woken for it.
+  enum Deadline {
+    /// Only when the test says: ``passDeadline(number:)`` makes it pass without waking the
+    /// lookup, ``expireDeadline(number:)`` and ``expireDeadlines()`` make it pass and wake it.
+    /// Never by the clock, so a test can order it against every other event.
+    case controlled
+    /// Passed, and the lookup woken, inside the call that arms it: before the lookup has asked
+    /// for a permit or queued its start.
+    case expiresWhenArmed
+    /// Passed from the start, with no wake-up: only the lookup's own checks can see it.
+    case passedWhenArmed
+    /// The lookup's own clock and timer.
+    case timer
+  }
+
+  init(
+    start: Start = .succeed, queueResult: DNSServiceErrorType = DNSServiceStatus.noError,
+    deadline: Deadline = .controlled
+  ) {
+    self.start = start
+    self.queueResult = queueResult
+    self.deadline = deadline
+  }
+
+  deinit {
+    for ref in order { UnsafeMutableRawPointer(ref).deallocate() }
+  }
+
+  private let deadline: Deadline
+
+  /// One lookup's deadline as this fake defines it.
+  private final class Armed: @unchecked Sendable {
+    let wake: @Sendable () -> Void
+    var passed = false
+    var woken = false
+    init(wake: @escaping @Sendable () -> Void) { self.wake = wake }
+  }
+
+  /// Every deadline armed, in the order lookups armed them.
+  private var armed: [Armed] = []
+
+  /// Deadlines lookups have armed through this fake, passed or not.
+  var deadlinesArmed: Int { locked { armed.count } }
+
+  /// Makes the `number`th deadline armed (from 0) pass, without waking its lookup. Returns
+  /// whether there was such a deadline.
+  @discardableResult
+  func passDeadline(number: Int) -> Bool {
+    locked {
+      guard number < armed.count else { return false }
+      armed[number].passed = true
+      return true
+    }
+  }
+
+  /// Makes the `number`th deadline armed pass and wakes its lookup, on this thread, unless it was
+  /// already woken. Returns whether it woke the lookup.
+  @discardableResult
+  func expireDeadline(number: Int) -> Bool {
+    let wake: (@Sendable () -> Void)? = locked {
+      guard number < armed.count, !armed[number].woken else { return nil }
+      armed[number].passed = true
+      armed[number].woken = true
+      return armed[number].wake
+    }
+    wake?()
+    return wake != nil
+  }
+
+  /// Makes every armed deadline pass and wakes every lookup not yet woken. Returns how many it
+  /// woke.
+  @discardableResult
+  func expireDeadlines() -> Int {
+    let count = deadlinesArmed
+    return (0..<count).filter { expireDeadline(number: $0) }.count
+  }
+
+  var calls: DNSServiceCalls {
+    return DNSServiceCalls(
+      queryRecord: { [self] flags, interfaceIndex, name, context in
+        let call = Self.currentCall()
+        lock.lock()
+        startCalls.append(call)
+        lock.unlock()
+        switch start {
+        case .fail(let status):
+          return (status, nil)
+        case .gated(let gate):
+          gate.wait(limit: 60)
+        case .gatedFail(let gate, let status):
+          gate.wait(limit: 60)
+          return (status, nil)
+        case .succeed:
+          break
+        }
+        let ref = OpaquePointer(UnsafeMutableRawPointer.allocate(byteCount: 1, alignment: 1))
+        lock.lock()
+        queries[ref] = Query(
+          name: name, interfaceIndex: interfaceIndex, flags: flags, context: context,
+          startQueue: call.queueID)
+        order.append(ref)
+        live += 1
+        maxLive = max(maxLive, live)
+        lock.unlock()
+        return (DNSServiceStatus.noError, ref)
+      },
+      setDispatchQueue: { [self] ref, queue in
+        lock.lock()
+        defer { lock.unlock() }
+        guard queueResult == DNSServiceStatus.noError else { return queueResult }
+        queries[ref]?.queue = queue
+        return queueResult
+      },
+      deallocate: { [self] ref in
+        let call = Self.currentCall()
+        lock.lock()
+        defer { lock.unlock() }
+        deallocations.append(call)
+        guard let query = queries[ref] else {
+          unknownDeallocations += 1
+          return
+        }
+        if query.deallocated {
+          doubleDeallocations += 1
+          return
+        }
+        query.deallocated = true
+        contextAliveAtDeallocate.append(query.contextObject != nil)
+        deallocatedOnStartQueue.append(call.queueID != nil && call.queueID == query.startQueue)
+        live -= 1
+      },
+      armDeadline: deadline == .timer ? nil : armDeadline
+    )
+  }
+
+  /// Records a lookup's deadline, which passes, and wakes the lookup, when the test says so, or
+  /// at once.
+  private var armDeadline:
+    @Sendable (_ timeout: TimeInterval, _ wake: @escaping @Sendable () -> Void) ->
+      ReverseDNSDeadline
+  {
+    { [self] _, wake in
+      let entry = Armed(wake: wake)
+      entry.passed = deadline != .controlled
+      entry.woken = deadline == .expiresWhenArmed
+      lock.lock()
+      armed.append(entry)
+      lock.unlock()
+      if deadline == .expiresWhenArmed { wake() }
+      return ReverseDNSDeadline(
+        hasPassed: { [self] in locked { entry.passed } },
+        cancel: {})
+    }
+  }
+
+  /// Runs `body` with this fake in place of the daemon.
+  func install<T>(_ body: () async throws -> T) async rethrows -> T {
+    try await TestSeams.$dnsService.withValue(calls) { try await body() }
+  }
+
+  /// Delivers one reply to the `index`th query started, on its queue, unless it has been
+  /// deallocated by the time the queue runs it. Returns `false` when there is no such scheduled
+  /// query.
+  @discardableResult
+  func deliver(
+    to index: Int = 0,
+    flags: DNSServiceFlags = DNSServiceFlags(kDNSServiceFlagsAdd),
+    error: DNSServiceErrorType = DNSServiceStatus.noError,
+    rrtype: UInt16 = UInt16(kDNSServiceType_PTR),
+    rdata: [UInt8] = []
+  ) -> Bool {
+    lock.lock()
+    guard index < order.count, let query = queries[order[index]], let queue = query.queue else {
+      lock.unlock()
+      return false
+    }
+    let refAddress = UnsafeMutableRawPointer(order[index])
+    lock.unlock()
+    queue.async { [self] in
+      let ref = OpaquePointer(refAddress)
+      lock.lock()
+      let gone = query.deallocated
+      if !gone { callbacks += 1 }
+      lock.unlock()
+      guard !gone else { return }
+      rdata.withUnsafeBytes { bytes in
+        ReverseDNSLookup.reply(
+          ref, flags, 0, error, query.name, rrtype, UInt16(kDNSServiceClass_IN),
+          UInt16(bytes.count), bytes.baseAddress, 60, query.context)
+      }
+    }
+    return true
+  }
+
+  /// Queues a block on the `index`th query's queue that waits for `gate`, so whatever is queued
+  /// after it runs only once the gate opens, in the order it was queued. Returns `false` when
+  /// there is no such scheduled query.
+  @discardableResult
+  func blockQueue(of index: Int = 0, until gate: StallGate) -> Bool {
+    lock.lock()
+    guard index < order.count, let queue = queries[order[index]]?.queue else {
+      lock.unlock()
+      return false
+    }
+    lock.unlock()
+    queue.async { gate.wait(limit: 60) }
+    return true
+  }
+
+  /// Returns once everything queued so far on the `index`th query's queue has run.
+  func drainQueue(of index: Int = 0) async {
+    let queue = locked { index < order.count ? queries[order[index]]?.queue : nil }
+    guard let queue else { return }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      queue.async { continuation.resume() }
+    }
+  }
+
+  var starts: [Call] { locked { startCalls } }
+  var deallocs: [Call] { locked { deallocations } }
+  /// For each deallocated reference, whether it was deallocated on the queue its start ran on.
+  var deallocatedOnOwnQueue: [Bool] { locked { deallocatedOnStartQueue } }
+  /// For each deallocated reference, whether its callback context was still alive at the call.
+  var contextAliveAtEachDeallocate: [Bool] { locked { contextAliveAtDeallocate } }
+  var maxConcurrent: Int { locked { maxLive } }
+  /// Replies handed to the lookup's callback (a reply queued after the deallocate is dropped, as
+  /// the daemon drops it).
+  var callbacksDelivered: Int { locked { callbacks } }
+  var liveCount: Int { locked { live } }
+  var misuse: (unknown: Int, double: Int) { locked { (unknownDeallocations, doubleDeallocations) } }
+  var startedCount: Int { locked { order.count } }
+  var scheduledCount: Int { locked { order.filter { queries[$0]?.queue != nil }.count } }
+
+  func question(_ index: Int = 0) -> (name: String, interfaceIndex: UInt32, flags: DNSServiceFlags)?
+  {
+    locked {
+      guard index < order.count, let query = queries[order[index]] else { return nil }
+      return (query.name, query.interfaceIndex, query.flags)
+    }
+  }
+
+  private func locked<T>(_ body: () -> T) -> T {
+    lock.lock()
+    defer { lock.unlock() }
+    return body()
+  }
+
+  private static func currentCall() -> Call {
+    let id = DispatchQueue.getSpecific(key: ReverseDNSLookup.queueKey)
+    return Call(onLookupQueue: id != nil, queueID: id)
+  }
+}
+
+/// Wire-form domain names for PTR data.
+enum PTRData {
+  static func name(_ dotted: String) -> [UInt8] {
+    var bytes: [UInt8] = []
+    for label in dotted.split(separator: ".") {
+      bytes.append(UInt8(label.utf8.count))
+      bytes.append(contentsOf: label.utf8)
+    }
+    bytes.append(0)
+    return bytes
+  }
+}
