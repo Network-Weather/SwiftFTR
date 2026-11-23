@@ -421,14 +421,9 @@ let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))
 After:
 
 ```swift
-struct GatewayResolver: PublicIPResolver {
-  func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation? {
-    guard let wan = await gatewayWANAddress(family: request.family) else { return nil }  // yours
-    return PublicIPObservation(address: wan, family: request.family, source: .gatewayReported)
-  }
-}
+// `myResolver` conforms to PublicIPResolver (an example is in docs/guides/EXAMPLES.md).
 let tracer = SwiftFTR(
-  config: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(GatewayResolver())))
+  config: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(myResolver)))
 // or: SwiftFTRConfig(interface: "en0", publicIPResolver: .disabled)
 ```
 
@@ -446,7 +441,10 @@ used. A seed's ``PublicIPSource`` is kept and reported as ``ClassifiedTrace/publ
   longer reports it: it asks the strategy for an IPv6 address, which by default sends IPv6 STUN.
 - A configured private or documentation address, which 0.18 reported and classified with, is
   ignored, and the trace asks the strategy instead.
-- An IPv6 seed no longer labels an IPv4 trace, and the reverse.
+- An IPv6 seed no longer labels an IPv4 trace, and the reverse. An IPv4-mapped address
+  (`::ffff:8.8.8.8`) is IPv4: it is kept as `8.8.8.8` and answers IPv4 traces only.
+- `swift-ftr trace` and `multipath` with `--public-ip` still send no discovery traffic, but report
+  no public address where the given one is refused or of the other family.
 
 **What to change.** Configure a public address, seed each family you know, and disable the strategy
 if no discovery traffic may be sent:

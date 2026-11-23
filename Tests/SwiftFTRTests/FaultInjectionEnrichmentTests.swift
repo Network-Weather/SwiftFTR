@@ -27,8 +27,7 @@ struct FaultInjectionEnrichmentTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-stall")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    // Short against the watchdog, long enough that a loaded machine cannot spend it before the
-    // question starts, which would ask nothing.
+    // Short against the watchdog; long enough that load cannot spend it before the question.
     let budget: TimeInterval = 2
     let tracer = offlineTracer(
       SwiftFTRConfig(
@@ -68,8 +67,7 @@ struct FaultInjectionEnrichmentTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-once")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    // The substitute fails at once, so the budget never ends the question; it is long so that a
-    // loaded machine cannot spend it before the question starts, which would ask nothing at all.
+    // The substitute fails at once; the budget is long so load cannot spend it before the question.
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, publicIPDiscoveryTimeout: 60)
     )
@@ -167,8 +165,7 @@ struct FaultInjectionEnrichmentTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 4, name: "test.mp-pip")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    // Short against the watchdog, long enough that a loaded machine cannot spend it before the
-    // question starts, which would ask nothing.
+    // Short against the watchdog; long enough that load cannot spend it before the question.
     let budget: TimeInterval = 2
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, noReverseDNS: true, publicIPDiscoveryTimeout: budget))

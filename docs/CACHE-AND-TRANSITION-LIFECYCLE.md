@@ -48,11 +48,9 @@ As of 0.18.0, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
   globally routable address, classified traces of its family bypass public-IP
   discovery entirely. It is configuration, not a cache.
 - A classified trace asks the `SwiftFTRConfig.publicIPResolver` strategy at most
-  once, after its probes, for the family they used. The question is
-  generation-guarded: an answer that arrives after an invalidation or a seed of
-  that family is neither returned nor cached (`effectivePublicIP(for:ask:)`), and
-  a caller's resolver that answers after the request deadline is not waited for
-  and never cached.
+  once, after its probes. An answer that arrives after an invalidation or a seed of
+  its family, or after the request deadline, is neither returned nor cached
+  (`effectivePublicIP(for:ask:)`, `askWithinDeadline`).
 - `RDNSCache` holds entries for 86400 s, evicting the oldest-inserted entry at 1000 entries
   (both configurable through `SwiftFTRConfig`), caches negative results, and
   has a stall breaker: after two consecutive lookups that take at least 90% of their

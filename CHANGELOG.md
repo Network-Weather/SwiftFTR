@@ -27,10 +27,12 @@ Unreleased
   `PublicIPResolverStrategy`: `.library` (the default, the discovery 0.18 ran), `.disabled` (send
   nothing) or `.custom(_:)` (the caller's resolver). A resolver answers a `PublicIPRequest` (one
   `IPAddressFamily`, the tracer's interface and source address, and a `ContinuousClock` deadline)
-  with a `PublicIPObservation` or `nil`. The tracer holds a caller's resolver to the deadline with
-  a single-resume race: one that never returns or ignores cancellation is abandoned there and its
-  task cancelled, and an answer that arrives later is never cached. The option comes as a further
-  `SwiftFTRConfig` initializer, so existing calls resolve as before.
+  with a `PublicIPObservation` or `nil`. The tracer holds a caller's resolver to the deadline: one
+  that never returns or ignores cancellation is abandoned there and its task cancelled, and an
+  answer handled once the clock has reached the deadline is a miss, never used or cached, whatever
+  else happened first. A tracer whose `sourceIP` cannot be bound for the family asked asks
+  nothing. The option comes as a further `SwiftFTRConfig` initializer, so existing calls resolve
+  as before.
 - **`ClassifiedTrace.publicIPSource`** (`PublicIPObservationSource?`) says where `publicIP` came
   from: `.configured`, `.validatedCallerCache` or `.gatewayReported` (a seed), `.stun` or
   `.dnsWhoami` (the library's resolver), or whatever a caller's resolver names. It is encoded
@@ -126,7 +128,10 @@ Unreleased
   traces of its own family (a trace of the other family asks the strategy, which by default sends
   STUN). An address that is not globally routable, whether configured, returned by a resolver or
   found by the library's discovery, is not used: a configured private or documentation address is
-  ignored where 0.18 used it, and the trace asks the strategy instead.
+  ignored where 0.18 used it, and the trace asks the strategy instead. An IPv4-mapped address
+  (`::ffff:a.b.c.d`) from any of them is IPv4, kept as `a.b.c.d`.
+- **`swift-ftr trace` and `multipath` with `--public-ip` send no discovery traffic** whatever the
+  address; one the library refuses, or of the other family, means no public address.
 - **A multipath run asks for its public address once** (decision 12). `discoverPaths` asks for
   IPv4 in the parent, after registering for cancellation and before its first batch of flows, and
   hands the answer, or its absence, to every flow. Each flow used to discover on its own when
@@ -135,8 +140,6 @@ Unreleased
   classified trace does, where flows never wrote theirs back, and `NetworkTopology.publicIP` is
   that answer rather than the first path's. A network change during the question ends the run
   with `TracerouteError.cancelled` before any flow probes.
-- **A seed's `PublicIPSource` is kept**, and reported as `ClassifiedTrace.publicIPSource` by the
-  traces that use it.
 
 ### Bug fixes
 

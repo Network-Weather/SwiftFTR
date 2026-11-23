@@ -388,13 +388,9 @@ public struct SwiftFTRConfig: Sendable {
       preferredFamily: preferredFamily, publicIPResolver: .library)
   }
 
-  /// Creates a new SwiftFTR configuration with a public-IP resolver strategy.
-  ///
-  /// The parameters are those of
-  /// ``init(maxHops:maxWaitMs:payloadSize:publicIP:enableLogging:noReverseDNS:rdnsCacheTTL:rdnsCacheSize:rdnsLookupTimeout:publicIPDiscoveryTimeout:interface:sourceIP:asnResolverStrategy:preferredFamily:)``,
-  /// plus:
-  ///   - publicIPResolver: How a classified trace or multipath run finds its public address
-  ///     (default: ``PublicIPResolverStrategy/library``).
+  /// Creates a new SwiftFTR configuration: the parameters of the initializer above, plus
+  /// `publicIPResolver`, how a classified trace or multipath run finds its public address
+  /// (default: ``PublicIPResolverStrategy/library``).
   public init(
     maxHops: Int = 40,
     maxWaitMs: Int = 1000,

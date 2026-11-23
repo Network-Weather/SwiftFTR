@@ -213,8 +213,9 @@ seeded address lasts only until the next invalidation. Both apply only to traces
 address family: an IPv4 seed does not label an IPv6 trace.
 
 To answer the public-address question yourself, for example from what the gateway reports, give
-the tracer a `PublicIPResolver`. It is asked at most once per classified trace, after the probes,
-for the family they used, and held to `publicIPDiscoveryTimeout`:
+the tracer a `PublicIPResolver` (or `.disabled` to send nothing). It is asked at most once per
+classified trace, after the probes, for the family they used, and held to
+`publicIPDiscoveryTimeout`:
 
 ```swift
 struct GatewayResolver: PublicIPResolver {
@@ -231,9 +232,6 @@ let tracer = SwiftFTR(config: SwiftFTRConfig(
 let trace = try await tracer.traceClassified(to: "example.com")
 print(trace.publicIP ?? "none", trace.publicIPSource?.rawValue ?? "")
 ```
-
-`SwiftFTRConfig(publicIPResolver: .disabled)` sends nothing: a trace with no configured or
-seeded address of its family classifies without one.
 
 ## Streaming Traceroute (v0.11.0+)
 

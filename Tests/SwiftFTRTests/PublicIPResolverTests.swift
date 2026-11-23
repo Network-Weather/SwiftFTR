@@ -3,10 +3,6 @@ import Testing
 
 @testable import SwiftFTR
 
-#if canImport(Darwin)
-  import Darwin
-#endif
-
 /// A caller's public-IP resolver whose answer each test scripts, recording every request.
 final class ScriptedPublicIPResolver: PublicIPResolver, @unchecked Sendable {
   enum Behavior: Sendable {
@@ -38,16 +34,10 @@ final class ScriptedPublicIPResolver: PublicIPResolver, @unchecked Sendable {
     self.onAsk = onAsk
   }
 
-  var requests: [PublicIPRequest] {
-    lock.lock()
-    defer { lock.unlock() }
-    return recorded
-  }
+  var requests: [PublicIPRequest] { lock.withLock { recorded } }
 
   private func record(_ request: PublicIPRequest) {
-    lock.lock()
-    recorded.append(request)
-    lock.unlock()
+    lock.withLock { recorded.append(request) }
   }
 
   func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation? {
@@ -568,30 +558,20 @@ struct PublicIPResolverTests {
   /// An input the operation rejects, and the call that must reject it before asking.
   struct RejectedInput: CustomTestStringConvertible, Sendable {
     let why: String
-    let config: SwiftFTRConfig
-    let multipath: Bool
-    let target: String
+    var multipath = true
+    var target = "127.0.0.1"
+    var interface: String? = nil
+    var sourceIP: String? = nil
     var testDescription: String { why }
   }
 
-  static func rejecting(
-    _ why: String, multipath: Bool = true, target: String = "127.0.0.1",
-    interface: String? = nil, sourceIP: String? = nil
-  ) -> RejectedInput {
-    RejectedInput(
-      why: why,
-      config: SwiftFTRConfig(
-        maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, interface: interface,
-        sourceIP: sourceIP),
-      multipath: multipath, target: target)
-  }
-
   static let rejectedInputs: [RejectedInput] = [
-    rejecting("malformed source", sourceIP: "not-an-ip"),
-    rejecting("source this host cannot bind", sourceIP: "192.0.2.77"),
-    rejecting("missing interface", interface: "swiftftr-none0"),
-    rejecting("IPv6 destination literal", target: "::1"),
-    rejecting("classified trace, malformed source", multipath: false, sourceIP: "not-an-ip"),
+    RejectedInput(why: "malformed source", sourceIP: "not-an-ip"),
+    RejectedInput(why: "source this host cannot bind", sourceIP: "192.0.2.77"),
+    RejectedInput(why: "missing interface", interface: "swiftftr-none0"),
+    RejectedInput(why: "IPv6 destination literal", target: "::1"),
+    RejectedInput(
+      why: "classified trace, malformed source", multipath: false, sourceIP: "not-an-ip"),
   ]
 
   @Test(
@@ -602,9 +582,8 @@ struct PublicIPResolverTests {
     let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9")))
     let tracer = offlineTracer(
       SwiftFTRConfig(
-        maxHops: input.config.maxHops, maxWaitMs: input.config.maxWaitMs, noReverseDNS: true,
-        interface: input.config.interface, sourceIP: input.config.sourceIP,
-        publicIPResolver: .custom(resolver)))
+        maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, interface: input.interface,
+        sourceIP: input.sourceIP, publicIPResolver: .custom(resolver)))
     let failed: Bool
     do {
       if input.multipath {
