@@ -8,7 +8,8 @@ import Testing
 #endif
 
 /// A loopback UDP server that answers nothing until ``release()``, and from then on answers every
-/// request, past and future, with a datagram no STUN client accepts.
+/// STUN binding request, past and future, with a datagram no STUN client accepts. Any other
+/// datagram is a stray (``DatagramFilter``): counted in ``ignored``, never answered.
 ///
 /// A client blocked in `recv` on its connected socket returns once released, so a stalled STUN
 /// attempt gives its executor slot back when the test is done with it.
@@ -16,6 +17,7 @@ final class HeldUDPServer: @unchecked Sendable {
   let port: UInt16
   let family: Int32
   let requests = FaultCounter()
+  let ignored = FaultCounter()
 
   /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
@@ -25,14 +27,25 @@ final class HeldUDPServer: @unchecked Sendable {
   private var releasedAt: TimeInterval?
   private var clients: [(sockaddr_storage, socklen_t)] = []
 
-  init(family: Int32 = AF_INET) throws {
+  /// - Parameter gate: when given, the serve thread reads nothing until it opens.
+  init(family: Int32 = AF_INET, readsAfter gate: StallGate? = nil) throws {
     self.family = family
     (fd, port) = try bindLoopback(family: family, type: SOCK_DGRAM)
     setReceiveTimeout(fd, seconds: 0.02)
-    Thread { [self] in self.serve() }.start()
+    Thread { [self] in
+      gate?.wait(limit: 60)
+      self.serve()
+    }.start()
   }
 
   deinit { stop() }
+
+  /// Datagrams waiting on the socket (`SO_NUMRCVPKT`), or -1 once stopped.
+  var queued: Int32 {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopped ? -1 : queuedDatagrams(fd)
+  }
 
   var host: String { family == AF_INET6 ? "::1" : "127.0.0.1" }
 
@@ -102,6 +115,10 @@ final class HeldUDPServer: @unchecked Sendable {
         }
       }
       guard n >= 0 else { continue }
+      guard DatagramFilter.stunBindingRequest.accepts(Array(buffer.prefix(n))) else {
+        ignored.increment()
+        continue
+      }
       lock.lock()
       // A request that arrives after `stop()` is neither counted nor answered.
       guard !stopped else {
@@ -154,6 +171,9 @@ struct AsyncPublicIPDiscoveryTests {
       [0xC0, 0x0C, 0, 16, 0, 1, 0, 0, 0, 60, 0, UInt8(rdata.count)] + rdata
     return FaultInjectionWireTests.dnsResponse(to: query, answers: record)
   }
+
+  /// The fallback's TXT query, the only datagram a whoami fixture answers or counts.
+  static let whoamiQuery = DatagramFilter.dnsQuery(named: "whoami.ds.akahelp.net")
 
   static func servers(
     v4: [(host: String, port: UInt16)] = [], v6: [(host: String, port: UInt16)] = []
@@ -213,7 +233,8 @@ struct AsyncPublicIPDiscoveryTests {
     let mapped: [UInt8] =
       answering == AF_INET6
       ? [0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x07] : [198, 51, 100, 7]
-    let answer = try LoopbackUDPResponder(family: answering) { request in
+    let answer = try LoopbackUDPResponder(family: answering, accepts: .stunBindingRequest) {
+      request in
       Self.stunSuccess(for: request, ip: mapped).map { ($0, 0) }
     }
     defer { answer.stop() }
@@ -280,6 +301,31 @@ struct AsyncPublicIPDiscoveryTests {
     #expect(ran < released, "the unrelated task ran \(ran - released)s after the server answered")
   }
 
+  @Test("A held STUN server counts only binding requests, after strays queued ahead of one")
+  func heldServerIgnoresStrays() async throws {
+    // Several tests assert this server's exact request count.
+    let gate = StallGate()
+    defer { gate.open() }
+    let silent = try HeldUDPServer(family: AF_INET, readsAfter: gate)
+    defer { silent.stop() }
+    #expect(Strays.send(to: silent.port))
+    try #require(await eventually(within: 10) { silent.queued >= 2 }, "queued: \(silent.queued)")
+    gate.open()
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-strays")
+
+    let lookup = await Self.withFixtures(
+      servers: Self.servers(v4: [(silent.host, silent.port)]), executor: executor
+    ) {
+      Task { await getPublicIPs(stunTimeout: Self.longSTUNTimeout) }
+    }
+    #expect(await eventually(within: Self.watchdog) { silent.requests.value > 0 })
+    #expect(silent.requests.value == 1)
+    #expect(silent.ignored.value >= 2, "ignored: \(silent.ignored.value)")
+    silent.release()
+    let (ips, _) = try await measure(within: Self.watchdog) { await lookup.value }
+    #expect(ips.v4 == nil, "the held server's garbage was taken as an answer")
+  }
+
   // MARK: Classified discovery
 
   @Test("The whoami fallback answers while every executor slot is held")
@@ -302,7 +348,7 @@ struct AsyncPublicIPDiscoveryTests {
     // slot. The budget and the DNS timeout both outlive the watchdog.
     let silent = try HeldUDPServer(family: AF_INET)
     defer { silent.stop() }
-    let whoami = try LoopbackUDPResponder { query in
+    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { query in
       (Self.whoamiAnswer(to: query, ip: "198.51.100.42"), 0)
     }
     defer { whoami.stop() }
@@ -331,7 +377,7 @@ struct AsyncPublicIPDiscoveryTests {
       first.stop()
       second.stop()
     }
-    let whoami = try LoopbackUDPResponder { _ in nil }
+    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { _ in nil }
     defer { whoami.stop() }
     // One slot, so a call queued after the stalled attempt runs only once that attempt returns.
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-budget")
@@ -386,7 +432,7 @@ struct AsyncPublicIPDiscoveryTests {
       first.stop()
       second.stop()
     }
-    let whoami = try LoopbackUDPResponder { _ in nil }
+    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { _ in nil }
     defer { whoami.stop() }
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-deadline")
     let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
@@ -462,7 +508,7 @@ struct AsyncPublicIPDiscoveryTests {
     // Host names, as the built-in servers are, so each lookup queues for the held slot. Their
     // 64-character labels are rejected by the resolver without a query, should a lookup run.
     let names = ["a", "b"].map { String(repeating: $0, count: 64) + ".example" }
-    let whoami = try LoopbackUDPResponder { query in
+    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { query in
       (Self.whoamiAnswer(to: query, ip: "198.51.100.43"), 0)
     }
     defer { whoami.stop() }
@@ -608,7 +654,7 @@ struct AsyncPublicIPDiscoveryTests {
     "A whoami server that refuses or cannot be reached is passed over at once for the next",
     arguments: WhoamiFailure.allCases)
   func whoamiFailurePassedOver(failure: WhoamiFailure) async throws {
-    let whoami = try LoopbackUDPResponder { query in
+    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { query in
       (Self.whoamiAnswer(to: query, ip: "198.51.100.44"), 0)
     }
     defer { whoami.stop() }
