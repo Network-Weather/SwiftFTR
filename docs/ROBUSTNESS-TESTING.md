@@ -482,10 +482,11 @@ Observations that are not defects of the library:
   forced right behind it the old check failed 100 of 100 runs. It now waits the same way.
 - A client of a stopped `LoopbackTCPServer` saw a reset instead of end-of-file.
   `stop()` shuts each connection down for reading and writing. Darwin then discards data already
-  queued and unread, but resets the connection if data arrives afterwards, so a request still in
+  queued and unread, but data arriving afterwards usually resets the connection (997 of 1,000
+  runs; the rest saw end-of-file), so a request still in
   flight when the server stopped turned the end-of-file
   `FaultInjectionFixtureTests.tcpServerStopDoesNotWaitAndStopAndWaitJoins` checks into
   `ECONNRESET` (about 1 run in 100 under load). That test now sends no request to its silent
   handler and waits until the responding handler has read its own, and saw no reset in 1,000
-  runs. `stop()` documents the rule, and `tcpServerStopOutcomeDependsOnLateData` pins both
-  outcomes.
+  runs. `stop()` documents the rule, and `tcpServerStopDiscardsUnreadRequest` pins the
+  end-of-file half; the reset is not certain enough to pin.
