@@ -382,6 +382,35 @@ struct ReverseDNSLookupTests {
     try await Self.expectTornDown(blocked, references: 3)
   }
 
+  @Test("A lookup released at its deadline keeps its permit until its reference is gone")
+  func permitHeldUntilTornDown() async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let fake = FakeDNSService(start: .gated(gate))
+    let limiter = _ConcurrencySemaphore(maxConcurrent: 1)
+    let (first, _) = try await measure(within: Self.watchdog) {
+      await fake.install {
+        await ReverseDNSLookup.lookup("192.0.2.1", timeout: 0.1, limiter: limiter)
+      }
+    }
+    #expect(first == .timedOut)
+
+    // The stalled start call will still make a reference, so the next lookup must wait.
+    let next = Task {
+      await fake.install {
+        await ReverseDNSLookup.lookup("192.0.2.1", timeout: 0.1, limiter: limiter)
+      }
+    }
+    try? await Task.sleep(nanoseconds: 200_000_000)
+    let waitedForPermit = fake.starts.count == 1
+    #expect(waitedForPermit)
+
+    gate.open()
+    let (second, _) = try await measure(within: Self.watchdog) { await next.value }
+    #expect(second == .timedOut)
+    try await Self.expectTornDown(fake, references: 2)
+  }
+
   // MARK: - Helpers
 
   /// Starts a lookup of `address` through `fake`, waits until its query is scheduled, runs
