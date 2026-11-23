@@ -214,8 +214,12 @@ struct CacheGenerationTests {
     #expect(await tracer.publicIP == "192.0.0.9")
     #expect(await tracer.seedPublicIP("192.0.0.10", source: .validatedCallerCache))
     #expect(await tracer.publicIP == "192.0.0.10")
-    #expect(await tracer.seedPublicIP("64:ff9b::1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "64:ff9b::1")
+    // NAT64 well-known prefix, accepted only for a public embedded IPv4 address (RFC 6052 3.1):
+    // 64:ff9b::1 embeds 0.0.0.1, in 0.0.0.0/8, and is rejected with the cache left as it was.
+    #expect(await tracer.seedPublicIP("64:ff9b::101:101", source: .validatedCallerCache))
+    #expect(await tracer.publicIP == "64:ff9b::101:101")
+    #expect(await tracer.seedPublicIP("64:ff9b::1", source: .validatedCallerCache) == false)
+    #expect(await tracer.publicIP == "64:ff9b::101:101")
     #expect(await tracer.seedPublicIP("2001:1::1", source: .validatedCallerCache))
     #expect(await tracer.publicIP == "2001:1::1")
     #expect(await tracer.seedPublicIP("2001:3::1", source: .validatedCallerCache))
