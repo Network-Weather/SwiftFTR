@@ -142,8 +142,9 @@ struct DNSWireHardeningTests {
       }
     }
     #expect(sent == echoReply.count)
-    // Queued ahead of the query, so it is the first datagram the fixture reads.
-    try #require(await eventually(within: 10) { fixture.queuedDatagrams == 1 })
+    // Queued ahead of the query, so the fixture reads it first. At least one: another test's
+    // stray may be queued too, and the fixture ignores that as well.
+    try #require(await eventually(within: 10) { fixture.queuedDatagrams >= 1 })
     let responder = Task {
       try await onOwnThread {
         try fixture.respond(
