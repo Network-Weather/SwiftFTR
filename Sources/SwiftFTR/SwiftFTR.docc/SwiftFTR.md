@@ -15,6 +15,7 @@ Massively parallel, async/await traceroute for macOS using ICMP datagram sockets
   bufferbloat test.
 - STUN-based public IP discovery and configurable classified-trace enrichment.
 
+Upgrading from 0.18? Review <doc:MigratingTo019> for the behavior changes introduced in 0.19.
 Upgrading from 0.17? Review <doc:MigratingTo018> for the behavior changes introduced in 0.18.
 Upgrading from 0.13 or earlier? Review <doc:MigratingTo014> for the source-level and behavior
 changes introduced in 0.14. See the project's CHANGELOG for the releases in between.
@@ -112,6 +113,7 @@ network state changed, call the individual controls instead:
 
 ### Migration Guides
 
+- <doc:MigratingTo019>
 - <doc:MigratingTo018>
 - <doc:MigratingTo014>
 

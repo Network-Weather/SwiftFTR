@@ -46,7 +46,9 @@ public struct PingConfig: Sendable {
   /// How long to wait for replies after the last echo request is sent, in seconds (default: 2.0).
   ///
   /// A reply to an earlier request still counts if it arrives within that window, so its RTT can
-  /// exceed `timeout`. Only the first reply to each request sent is counted.
+  /// exceed `timeout`. Only the first reply to each request sent is counted. The ping ends before
+  /// the window closes once every request that was sent has been answered; a request whose send
+  /// failed is not waited for.
   public let timeout: TimeInterval
 
   /// ICMP payload size in bytes (default: 56)
@@ -338,6 +340,11 @@ struct PingExecutor: Sendable {
     }
 
     if let sourceIPStr = effectiveSourceIP {
+      // `inet_pton` would read only the text before a NUL and bind that address instead.
+      guard !containsNUL(sourceIPStr) else {
+        throw TracerouteError.sourceIPBindFailed(
+          sourceIP: sourceIPStr, errno: EINVAL, details: "Invalid source IP: contains a NUL")
+      }
       switch family {
       case AF_INET:
         var addr = sockaddr_in()
@@ -478,6 +485,8 @@ final class PingOperation: @unchecked Sendable {
   private var sentTimes: [Int: TimeInterval] = [:]
   private var receiveTimes: [Int: TimeInterval] = [:]
   private var ttls: [Int: Int] = [:]
+  /// Set once the send loop has attempted every send; from then on `sentTimes` is final.
+  private var sendLoopFinished = false
 
   // Queue-owned receive buffers, used only by the serialized read handler.
   private var recvBuffer = [UInt8](repeating: 0, count: 1500)
@@ -689,7 +698,10 @@ final class PingOperation: @unchecked Sendable {
       return
     }
 
-    guard let lastSendTime = sentTimes.values.max() else {
+    sendLoopFinished = true
+    // Every probe that left may already be answered; with a failed send that is fewer than
+    // `count`, and no later reply would end the ping.
+    guard let lastSendTime = sentTimes.values.max(), !everySentProbeAnswered else {
       finishNormally()
       return
     }
@@ -809,14 +821,23 @@ final class PingOperation: @unchecked Sendable {
           }
         // Do not record a receive time for Destination Unreachable.
         }
-        // Every entry in receiveTimes is a sent sequence answered once, so this is the number of
-        // distinct probes answered.
-        if receiveTimes.count >= config.count {
+        if everySentProbeAnswered {
           finishNormally()
           return
         }
       }
     }
+  }
+
+  /// Whether the ping has nothing left to wait for. Every entry in `receiveTimes` is a sent
+  /// sequence answered once, so its count is the number of distinct probes answered. Until the
+  /// send loop has finished, more probes are still to leave, so that count must reach `count`;
+  /// after it, it must reach the number of sends that succeeded. Queue-owned, like its inputs.
+  private var everySentProbeAnswered: Bool {
+    if sendLoopFinished {
+      return !sentTimes.isEmpty && receiveTimes.count >= sentTimes.count
+    }
+    return receiveTimes.count >= config.count
   }
 
   /// Called only on `queue` by the deadline timer or read handler.
