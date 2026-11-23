@@ -129,8 +129,9 @@ struct DNSWireHardeningTests {
 
   @Test("The DNS fixture answers its query even after a stray datagram reached its port")
   func fixtureIgnoresStrayDatagram() async throws {
-    // What a late sender elsewhere in the suite can do to a freshly bound port: a 16-byte echo
-    // reply, queued before the query. The fixture must answer the query, not fail on the stray.
+    // What a late sender elsewhere in the suite can do to a freshly bound port: an empty datagram
+    // (the UDP probe tests send them) and a 16-byte echo reply, both queued before the query. The
+    // fixture must answer the query, not fail on a stray.
     let fixture = try DNSUDPFixture()
     let stray = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
     defer { close(stray) }
@@ -139,6 +140,12 @@ struct DNSWireHardeningTests {
     address.sin_family = sa_family_t(AF_INET)
     address.sin_port = fixture.port.bigEndian
     address.sin_addr.s_addr = inet_addr("127.0.0.1")
+    let sentEmpty = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        sendto(stray, nil, 0, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    #expect(sentEmpty == 0)
     let echoReply: [UInt8] = [0, 0, 0, 0, 0x12, 0x34, 0, 1] + [UInt8](repeating: 0x61, count: 8)
     let sent = echoReply.withUnsafeBytes { bytes in
       withUnsafePointer(to: &address) {
@@ -149,9 +156,9 @@ struct DNSWireHardeningTests {
       }
     }
     #expect(sent == echoReply.count)
-    // Queued ahead of the query, so the fixture reads it first. At least one: another test's
+    // Queued ahead of the query, so the fixture reads them first. At least two: another test's
     // stray may be queued too, and the fixture ignores that as well.
-    try #require(await eventually(within: 10) { fixture.queuedDatagrams >= 1 })
+    try #require(await eventually(within: 10) { fixture.queuedDatagrams >= 2 })
     let responder = Task {
       try await onOwnThread {
         try fixture.respond(
@@ -340,7 +347,8 @@ private final class DNSUDPFixture: @unchecked Sendable {
           }
         }
       }
-      guard received > 0 else { throw DNSFixtureError.receiveFailed }
+      // Zero is an empty datagram, which is a stray like any other; only a failed read ends it.
+      guard received >= 0 else { throw DNSFixtureError.receiveFailed }
     } while !isQuery(buffer.prefix(received), for: question)
 
     let query = Data(buffer.prefix(Int(received)))
