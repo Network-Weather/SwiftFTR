@@ -4,15 +4,22 @@ import Testing
 @testable import SwiftFTR
 
 /// Where the bufferbloat upload load goes, observed offline: a `URLProtocol` registered for the
-/// shared session answers every request to the load hosts itself, so nothing leaves the machine,
+/// shared session answers the test's own upload requests itself, so nothing leaves the machine,
 /// and records what was asked for.
+///
+/// The shared session is process-wide. The recorder claims only POST requests, and lets every
+/// other request (a download load's GETs included) through untouched. The upload load is the only
+/// code that POSTs on the shared session: no other code in the library or the tests uses
+/// `URLSession.shared` or registers a `URLProtocol`, and the HTTP probe builds its own sessions.
+/// Claiming every POST rather than only the expected URL keeps a regression that posts elsewhere
+/// offline too. The whole registration is held under ``NetworkTestGate``, which the live
+/// bufferbloat tests also hold, so a live load never runs while the recorder is installed.
 @Suite("Bufferbloat upload target", .serialized)
 struct BufferbloatUploadTargetTests {
-  /// The hosts the recorder answers for: the default upload target, the former one, and the one
-  /// the custom-URL control uses.
-  static let interceptedHosts: Set<String> = [
-    "speed.cloudflare.com", "httpbin.org", "upload.example.test",
-  ]
+  static let watchdog: TimeInterval = 20
+
+  /// A load duration past the watchdog: a load that ends inside it was ended by the test.
+  static let loadDuration: TimeInterval = 60
 
   struct Request: Sendable {
     let method: String?
@@ -25,8 +32,12 @@ struct BufferbloatUploadTargetTests {
     private var recording = false
     private var requests: [Request] = []
 
-    var isRecording: Bool { lock.withLock { recording } }
     var recorded: [Request] { lock.withLock { requests } }
+
+    /// Whether the recorder answers `request`: a POST, while a test is recording.
+    func claims(_ request: URLRequest) -> Bool {
+      lock.withLock { recording && request.httpMethod == "POST" }
+    }
 
     func start() { lock.withLock { (recording, requests) = (true, []) } }
     func stop() { lock.withLock { recording = false } }
@@ -37,10 +48,7 @@ struct BufferbloatUploadTargetTests {
 
   final class InterceptingProtocol: URLProtocol, @unchecked Sendable {
     override class func canInit(with request: URLRequest) -> Bool {
-      guard BufferbloatUploadTargetTests.recorder.isRecording, let host = request.url?.host else {
-        return false
-      }
-      return BufferbloatUploadTargetTests.interceptedHosts.contains(host)
+      BufferbloatUploadTargetTests.recorder.claims(request)
     }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -72,21 +80,31 @@ struct BufferbloatUploadTargetTests {
     override func stopLoading() {}
   }
 
-  /// Runs the upload load for a moment with the recorder installed and returns what it sent.
-  static func uploads(_ config: BufferbloatConfig) async -> [Request] {
-    recorder.start()
-    URLProtocol.registerClass(InterceptingProtocol.self)
-    defer {
-      URLProtocol.unregisterClass(InterceptingProtocol.self)
-      recorder.stop()
+  /// Runs the upload load until the recorder has seen a request, then cancels it, and returns
+  /// what was recorded. A load that never posts records nothing and is cancelled at the watchdog.
+  static func uploads(_ config: BufferbloatConfig) async throws -> [Request] {
+    try await NetworkTestGate.shared.withPermit {
+      recorder.start()
+      URLProtocol.registerClass(InterceptingProtocol.self)
+      defer {
+        URLProtocol.unregisterClass(InterceptingProtocol.self)
+        recorder.stop()
+      }
+      let load = Task {
+        await LoadGenerator(config: config).startLoad(duration: loadDuration, type: .upload)
+      }
+      defer { load.cancel() }
+      _ = await eventually(within: watchdog) { !recorder.recorded.isEmpty }
+      load.cancel()
+      // The load ends on cancellation, well before its own duration.
+      _ = try await measure(within: watchdog) { await load.value }
+      return recorder.recorded
     }
-    await LoadGenerator(config: config).startLoad(duration: 0.3, type: .upload)
-    return recorder.recorded
   }
 
   @Test("The default upload load posts to Cloudflare's speed-test upload endpoint")
   func defaultUploadTarget() async throws {
-    let requests = await Self.uploads(BufferbloatConfig(loadType: .upload, parallelStreams: 1))
+    let requests = try await Self.uploads(BufferbloatConfig(loadType: .upload, parallelStreams: 1))
     try #require(!requests.isEmpty, "no upload request was made")
     let urls = Set(requests.map { $0.url?.absoluteString ?? "nil" })
     #expect(urls == ["https://speed.cloudflare.com/__up"], "\(requests.count) requests to \(urls)")
@@ -96,7 +114,7 @@ struct BufferbloatUploadTargetTests {
 
   @Test("A caller's upload URL is used instead of the default")
   func customUploadTarget() async throws {
-    let requests = await Self.uploads(
+    let requests = try await Self.uploads(
       BufferbloatConfig(
         loadType: .upload, parallelStreams: 1, uploadURL: "https://upload.example.test/sink"))
     try #require(!requests.isEmpty, "no upload request was made")
