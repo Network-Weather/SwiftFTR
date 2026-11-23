@@ -4,8 +4,10 @@ Sequenced plan for the ROADMAP item "Robustness under network and DNS failure, p
 Stage: product. Status: the four stages before the release have landed and shipped in 0.18.0:
 Independent Fixes (#100), Receive Loop Bounds (#108), Consistent Cancellation (#110) and
 Event-Based DNS (#111, #112), with the structured DNS probe outcome (#114) and foreign-reply
-handling (#116). Async Public-IP Discovery is next. The plan was reviewed twice (see Review
-record). Completed stages are struck through.
+handling (#116). 0.18.1 followed with fixes from the open issues. The five remaining stages are
+the content of 0.19.0 (David, 2026-11-22); see Release 0.19.0 for the order, the pull-request
+slices and what else ships with them. The plan was reviewed twice, and the 0.19.0 sequencing
+once (see Review record). Completed stages are struck through.
 
 ## Why
 
@@ -223,6 +225,50 @@ once; with every executor slot held, a query to a healthy loopback server still 
 The four stages above, with the changelog's 0.18.0 section and the upgrade guide
 (`MigratingTo018.md`) covering every behavior change in it.
 
+### Release 0.19.0
+
+The five remaining stages, the open defects that are cheap to fix beside them, and the
+source-breaking error cases this plan had deferred. David's decisions for this release
+(2026-11-22): the whole remaining plan ships in 0.19.0; the overall deadline is on by default
+(decision 4); a deadline that passes after probing returns the hops and names the phase
+(decision 5); source breaks are allowed in 0.19.0 (decision 10).
+
+**Order, and why.** The stages keep the risk order above, with Overall Deadline moved ahead of
+reverse DNS: it is the answer to #84, the one production report behind this plan, and it should
+not wait on the stage most likely to slip. It comes after the two public-IP stages because they
+are small, and with them done an expired deadline stops discovery instead of abandoning a thread
+in it. Until Event-Based Reverse DNS lands, a deadline that expires during reverse DNS releases
+the caller while `getnameinfo` runs on in its executor slot, as the per-lookup deadline does
+today.
+
+Each row is one pull request under about 2,000 changed lines. Rows in different lanes do not
+touch the same code and can be built at the same time; rows in a lane land in order.
+
+| Lane | Slice | Contents |
+|---|---|---|
+| Fixes | Small Fixes | #138 (a ping whose send failed ends once every sent probe is answered), #139 (`seedPublicIP`: a NAT64 address wrapping a non-global IPv4 address, and a string with an embedded NUL), #128 (a DNS reply's question is compared with the query), #140 (CLI wording for a failed receive), #136 (README). Each caller-visible change gets an upgrade-guide entry. |
+| Fixes | Test Hygiene | #135 (a watchdog on the ASN-enrichment cancellation test), #129 (fixture teardown that does not block an async test), the tripwire that fails an offline test entering a real network path (ROADMAP), and the stronger `cancelledLookupNotCached` (ROADMAP). Tests and test seams only. |
+| Fixes | DNS Error Cases | `DNSError.connectionRefused` and `DNSError.unreachable`, thrown by the query methods where they throw `sendFailed` today. Source-breaking for an exhaustive switch; allowed by decision 10. `dnsProbe` results do not change. |
+| Public IP | Async Public-IP Discovery | The stage below. |
+| Public IP | Event-Based STUN | The stage below. |
+| Deadline | Deadline State | The deadline clock, the phase bookkeeping and its lock, the deadline error type, the result field naming the phase, and the `SwiftFTRConfig` overload, for `traceClassified`. Lands after Event-Based STUN. |
+| Deadline | Deadline For Multipath And ASN | `discoverPaths` and its per-flow pipeline, partial paths from finished batches, the remembered public-IP attempt, and cancelling the shared ASN load when its last waiter leaves. |
+| Reverse DNS | Reverse-DNS Lookup | The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test and the gated live comparison. Not yet used by `RDNSCache`, so it can be built beside the Public IP lane. |
+| Reverse DNS | Reverse-DNS Cache | `RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker. Lands after Deadline State, which it shares phase code with. |
+| Resolution | Resolution For Traces | The async adapter and its deadline, for trace, streaming trace and `discoverPaths`, with the forward-resolution budget option (decision 7). Lands after Reverse-DNS Cache, when nothing else uses the executor. |
+| Resolution | Resolution For Probes | Ping, the TCP and UDP probes and STUN server names on the adapter. |
+| Release | Release 0.19.0 | Version, changelog section, `MigratingTo019.md` complete, release notes. |
+
+**Stopping short.** If a stage stops under the second-pass rule in Gates, the stages already
+landed are releasable as they stand: none leaves `main` in a half-converted state, because each
+stage keeps the path it replaces until its own pull request removes it. Whether to release
+without the stopped stage is David's call at that point.
+
+**Not in 0.19.0**, though related: reporting an HTTP status as soon as the headers arrive (#122),
+which needs its own transport and its own plan; the bufferbloat default upload URL (#89), which
+waits on decision 11; a structured outcome on the TCP, UDP and HTTP probe results, which belongs
+with the API review before 1.0.
+
 ### Async Public-IP Discovery
 
 Make the orchestration awaitable before changing STUN's transport. `getPublicIPv4`,
@@ -382,7 +428,8 @@ A stage is done when these pass on its branch, with the output in the PR body:
 swift format lint --strict -r Sources Tests
 SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug          # twice in a row
 SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c release
-swift package diagnose-api-breaking-changes v0.17.1 --products SwiftFTR
+swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
+  --breakage-allowlist-path <the allowlist the DNS Error Cases slice adds>
 swift package --allow-writing-to-directory docc generate-documentation --target SwiftFTR \
   --output-path docc --transform-for-static-hosting --warnings-as-errors
 ~/.claude/bin/orphan-audit
@@ -391,7 +438,9 @@ swift package --allow-writing-to-directory docc generate-documentation --target 
 
 - The release-mode run is there because optimized builds shorten object lifetimes, which is how
   an object kept alive only by a callback context is freed early.
-- After 0.18.0 the API check also runs against `v0.18.0`. No breakage is allowlisted.
+- The API check runs against `v0.18.1`. The only breakages allowlisted are the ones this plan
+  names: the two `DNSError` cases, and the deadline error if decision 6 is revisited. Any other
+  reported breakage fails the gate.
 - Each event-based stage adds one more: with every executor slot held by a gated blocker, the
   operation it converts still completes against a healthy loopback fixture reached by a literal
   address.
@@ -401,15 +450,16 @@ to David.
 
 ## Upgrade guide
 
-`Sources/SwiftFTR/SwiftFTR.docc/MigratingTo018.md`, a DocC article like `MigratingTo014.md`,
-written for both people and coding agents updating a consumer from 0.17.
+`Sources/SwiftFTR/SwiftFTR.docc/MigratingTo018.md` covers 0.17 to 0.18. The 0.19.0 stages get
+`MigratingTo019.md`, a DocC article of the same kind, written for both people and coding agents
+updating a consumer from 0.18.
 
-- It starts in Independent Fixes and each later pull request that changes behavior adds its
-  entry in the same change.
+- The first 0.19.0 pull request that changes behavior creates it, and each later one adds its
+  entry in the same change. A source-breaking change gets the code edit that fixes the build.
 - Each entry has the same shape: what changed, what a caller sees, and what to change, with
   before-and-after code an agent can apply mechanically.
 - Release gate: every line under "Behavior changes" in the changelog section being released has
-  a matching entry. Stages that ship after 0.18.0 get their own guide for that release.
+  a matching entry.
 
 ## Decisions for David
 
@@ -424,20 +474,26 @@ otherwise. Decided ones say so.
    RFC 6724 and document that the choice can differ from the system's (Gemini); or resolve
    through the event-based API to warm the daemon's cache and then call `getaddrinfo`, which
    answered in 1 to 7 ms from cache in one measurement (Fable, as an untested idea).
-4. **Overall deadline on by default?** Recommended: yes, with the default equal to the sum of
-   the active phase caps plus an allowance, and a caller-supplied total that replaces it.
-5. **What happens to the hops when the overall deadline passes after probing?** Recommended:
-   return the result with enrichment missing and a field naming the phase that ran out, and
-   throw only when the deadline passes before the probe window completes. The alternative is to
-   throw and carry the partial result in the error.
+4. **Overall deadline on by default?** Decided: yes (David, 2026-11-22), with the default equal
+   to the sum of the active phase caps plus an allowance, and a caller-supplied total that
+   replaces it.
+5. **What happens to the hops when the overall deadline passes after probing?** Decided: return
+   the result with enrichment missing and a field naming the phase that ran out, and throw only
+   when the deadline passes before the probe window completes (David, 2026-11-22).
 6. **Shape of the deadline error**, for the case that does throw. Decided: a separate error
    type, not a new `TracerouteError` case (David, 2026-11-22). A new case would break exhaustive
-   switches in consumers; decision 5's default makes this error rare. The compatibility gate
-   compiles an exhaustive switch over `TracerouteError` to hold that line, and the documentation
-   says a caller catching only `TracerouteError` will not see the deadline error.
+   switches in consumers; decision 5 makes this error rare. The compatibility gate compiles an
+   exhaustive switch over `TracerouteError` to hold that line, and the documentation says a
+   caller catching only `TracerouteError` will not see the deadline error. Open to revisit
+   (raised by the author, not decided): the reason given was avoiding a source break, and
+   decision 10 now allows breaks in 0.19.0. A `TracerouteError` case would reach a caller that
+   catches only `TracerouteError`, and would make an exhaustive switch fail to compile until it
+   handles the deadline. The separate type stands until David says otherwise.
 7. **Forward-resolution budget.** There is no configuration to derive one from today.
    Recommended: a new `SwiftFTRConfig` option for traces, defaulting to 10 seconds, with probes
    spending from their existing `timeout`. The 10 seconds is a proposal, not a measurement.
+   This option is now needed in 0.19.0 (Resolution For Traces) and work proceeds on the 10
+   seconds until David says otherwise.
 8. **Stale DNS replies.** Decided: DNS ignores a datagram whose transaction ID does not match and
    keeps waiting until the deadline, as its own change directly after Event-Based DNS and
    before 0.18.0 (David, 2026-11-22). It closes a gap review found in the event-based
@@ -447,7 +503,16 @@ otherwise. Decided ones say so.
    event-based and the blocking path; a datagram too short to carry an ID is ignored too.
 9. **Structured DNS probe outcome.** Decided: add an additive `outcome` field to
    `DNSProbeResult`; `isReachable` stays false for a refused port; the throwing query methods keep
-   `DNSError.sendFailed` for a refusal (David, 2026-11-22).
+   `DNSError.sendFailed` for a refusal (David, 2026-11-22). Superseded for the throwing methods
+   by decision 10: 0.19.0 adds the two cases.
+10. **Source breaks in 0.19.0.** Decided: allowed (David, 2026-11-22). The breaks taken are named
+    in Release 0.19.0 and allowlisted in the API gate; each has an upgrade-guide entry with the
+    edit that fixes the build.
+11. **Bufferbloat's default upload URL** (#89). Open. `testBufferbloat` sends its upload load to
+    a third-party test site when the caller sets no `uploadURL`. Recommended: no default; the
+    upload load runs only when the caller supplies a URL, and the result says the upload
+    direction was not measured. That drops a measurement existing callers get today, so it is
+    not applied without David's answer.
 
 ## Out of scope
 
@@ -468,8 +533,6 @@ Still unbounded after this plan, or deliberately deferred. Roadmap, not this pla
 - Collapsing the multipath per-flow pipeline onto the shared classified-trace implementation.
 - Coalescing identical in-flight forward lookups.
 - Thread Sanitizer and Address Sanitizer jobs, scheduled soak runs, DNS and STUN parser fuzzing.
-- Adding `connectionRefused` and `unreachable` cases to `DNSError`, which would break exhaustive
-  switches; for the next release where a source break is acceptable.
 - Root cause of the production timeouts in #84. This plan gives the means to find it; 56 of 59
   reported calls returned within five seconds of cancellation, so a blocked resolver is not
   established as the cause.
@@ -516,8 +579,12 @@ Declined, with the reason:
   three as a choice to make). Kept out of that stage; decision 8 then made it its own change
   before 0.18.0.
 
-No third review round: this version adopts the reviewers' recommendations and does not introduce
-a new approach.
+**0.19.0 sequencing, 2026-11-22.** The Release 0.19.0 section (order, slices, the breaks taken)
+was reviewed once by Codex; see the pull request that added it for what was folded in and what
+was declined. The stages' designs are unchanged from the second version.
+
+No third review round on the design: the second version adopts the reviewers' recommendations
+and does not introduce a new approach.
 
 Unverified claims this plan repeats: that a stalled `getnameinfo` holds a slot for about 30
 seconds (repo comments and an earlier measurement, not re-measured); behavior on NAT64, on a
