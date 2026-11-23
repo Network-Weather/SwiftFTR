@@ -102,18 +102,16 @@ public struct PublicIPRequest: Sendable {
   }
 }
 
-/// Finds the public address a classified trace or a multipath run labels its hops with.
-///
-/// Set one with ``PublicIPResolverStrategy/custom(_:)`` when the host app knows more than the
-/// library can find out: which interface is the hardline and which the VPN, what the gateway
-/// reports, what it observed a minute ago.
+/// Finds the public address a classified trace or a multipath run labels its hops with. Set one
+/// with ``PublicIPResolverStrategy/custom(_:)`` when the host app knows more than the library can
+/// find out: which interface is the hardline and which the VPN, what the gateway reports.
 ///
 /// The tracer asks once per call, for the family the trace probed, and only when no configured,
-/// seeded or cached address of that family exists. It waits until ``PublicIPRequest/deadline``
-/// and no longer, and stops waiting at once when its caller is cancelled, ``SwiftFTR/networkChanged()``
-/// runs or ``SwiftFTR/cancelActiveTraces()`` runs; the resolver's task is cancelled then, and
-/// whatever it returns afterwards is dropped. An answer is used only if it is a globally routable
-/// address of the family asked for. Returning `nil` or throwing means no address for this call.
+/// seeded or cached address of that family exists. It waits until ``PublicIPRequest/deadline``,
+/// or until its caller is cancelled or ``SwiftFTR/networkChanged()`` or
+/// ``SwiftFTR/cancelActiveTraces()`` runs, then cancels the resolver's task and drops what it
+/// returns. Only a globally routable address of the family asked for is used; `nil` or a throw
+/// means no address for this call.
 public protocol PublicIPResolver: Sendable {
   /// The public address of `request.family`, or `nil` if there is none to report.
   func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation?
@@ -178,15 +176,12 @@ struct LibraryPublicIPResolver: PublicIPResolver {
 /// Asks a caller's `resolver`, and returns its answer, or `nil` if it does not answer before
 /// `request.deadline`.
 ///
-/// The deadline rule: `request.deadline` is the one deadline, and the one place an outcome is
-/// committed reads the clock first. An answer, or a failure, committed once the clock has reached
-/// the deadline is `nil`, whichever event arrived first; so nothing late is accepted, however late
-/// the deadline's wake-up runs. The wake-up only commits that `nil` when no answer comes, and does
-/// nothing if it runs early. Cancellation of the calling task wins whenever it comes.
-///
-/// The resolver runs in a task of its own that this does not wait for, so one that never returns,
-/// or ignores cancellation, cannot hold the caller; it is cancelled once the outcome is committed,
-/// and what it returns afterwards goes nowhere.
+/// The deadline rule: the one place an outcome is committed reads the clock first, and an answer
+/// or failure committed once it has reached `request.deadline` is `nil`, whatever arrived first, so
+/// nothing late is accepted however late the wake-up runs. The wake-up only commits that `nil`, and
+/// does nothing if it runs early. Cancellation of the calling task wins whenever it comes. The
+/// resolver runs in a task this does not wait for, so one that never returns or ignores
+/// cancellation cannot hold the caller; it is cancelled once the outcome is committed.
 ///
 /// - Throws: `CancellationError` when the calling task is cancelled first, or the resolver's own
 ///   error when it throws in time.
@@ -217,8 +212,7 @@ func askWithinDeadline(_ resolver: any PublicIPResolver, _ request: PublicIPRequ
   }
 }
 
-/// The default wake-up for ``askWithinDeadline(_:_:)``: a task that sleeps until `deadline` and
-/// wakes the race. Returns the call that stops it.
+/// The default wake-up for ``askWithinDeadline(_:_:)``: a task sleeping until `deadline`.
 @Sendable func sleepUntilDeadline(
   _ deadline: ContinuousClock.Instant, wake: @escaping @Sendable () -> Void
 ) -> @Sendable () -> Void {
@@ -233,8 +227,7 @@ func askWithinDeadline(_ resolver: any PublicIPResolver, _ request: PublicIPRequ
 }
 
 /// The race behind ``askWithinDeadline(_:_:)``: resumes one continuation with the first outcome
-/// committed, from any thread, however the commit and the attachment are ordered, then runs the
-/// cleanup once.
+/// committed, from any thread and in any order, then runs the cleanup once.
 final class DeadlineRace: @unchecked Sendable {
   enum Event {
     case answer(Result<PublicIPObservation?, Error>)

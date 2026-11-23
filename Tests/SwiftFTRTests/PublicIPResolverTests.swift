@@ -311,10 +311,21 @@ struct PublicIPResolverTests {
     let tracer = Self.tracer(.custom(resolver))
 
     let trace = try await Self.classify(tracer)
-
     #expect(resolver.asked.value == 1)
     #expect(trace.publicIP == nil)
     #expect(trace.hops.count == 2)
+    // A miss lasts for its call only: the next trace asks again.
+    _ = try await Self.classify(tracer)
+    #expect(resolver.asked.value == 2)
+  }
+
+  @Test("The library's own answer is checked as a caller's is")
+  func libraryAnswerChecked() async throws {
+    let privateAnswer: TestSeams.DiscoverPublicIP = { _ in STUNPublicIP(ip: "192.168.1.1") }
+    let trace = try await TestSeams.$discoverPublicIP.withValue(privateAnswer) {
+      try await Self.classify(Self.tracer(.library))
+    }
+    #expect(trace.publicIP == nil)
   }
 
   // MARK: The deadline

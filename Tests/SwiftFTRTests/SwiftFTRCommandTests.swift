@@ -16,8 +16,7 @@ struct SwiftFTRCommandTests {
       if case .disabled = config.publicIPResolver { return true }
       return false
     }
-    // A public address, a refused documentation address and one of the other family all mean
-    // "do not discover"; no flag keeps the library's discovery.
+    // Public, refused and other-family addresses all mean "do not discover"; no flag keeps it.
     for address in ["9.9.9.9", "203.0.113.7", "2606:4700::1111"] {
       let trace = try SwiftFTRCommand.Trace.parse(["--public-ip", address, "example.com"])
       #expect(disabled(trace.config), "trace --public-ip \(address)")

@@ -237,8 +237,7 @@ public struct SwiftFTRConfig: Sendable {
   /// for the lifetime of the actor, for traces of its own address family. A trace of the other
   /// family asks the ``publicIPResolver`` strategy as if nothing were configured; use
   /// ``PublicIPResolverStrategy/disabled`` to send nothing. An address that is not globally
-  /// routable is not used. It is not a cache-seeding mechanism. To provide a known-valid public IP
-  /// dynamically across network transitions without disabling discovery permanently, use
+  /// routable is not used. To supply an address that a network change should discard, use
   /// ``SwiftFTR/seedPublicIP(_:source:)`` instead.
   ///
   /// The standalone ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` function
