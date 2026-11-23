@@ -120,9 +120,11 @@ enum ReverseDNSLookupOutcome: Sendable, Equatable {
   case noSuchRecord
   /// The lookup could not be made, or the daemon ended it with an error.
   case error(ReverseDNSLookupError)
-  /// The caller's deadline passed after the query was asked (its start call had been entered)
-  /// with no outcome, or the daemon gave up (`kDNSServiceErr_Timeout`). The resolver, or the
-  /// daemon, did not answer in time: evidence of a stall.
+  /// No outcome was committed before the caller's deadline, and the query had been asked (its
+  /// start call had been entered), or the daemon gave up (`kDNSServiceErr_Timeout`). The
+  /// resolver, or the daemon, did not answer in time: evidence of a stall. This includes a reply
+  /// the daemon delivered in time whose callback ran on the lookup's queue only after the
+  /// deadline: the bound is on when the outcome is committed.
   case timedOut
   /// The caller's deadline passed before the query was asked: while the lookup waited for a
   /// permit from its limiter, or before its queue ran the start. No question reached the daemon,
@@ -183,12 +185,16 @@ struct DNSServiceCalls: Sendable {
   var setDispatchQueue:
     @Sendable (_ ref: DNSServiceRef, _ queue: DispatchQueue) -> DNSServiceErrorType
   var deallocate: @Sendable (_ ref: DNSServiceRef) -> Void
-  /// When set, arms the lookup's deadline in place of its Dispatch timer: it receives the timeout
-  /// and the action that ends the lookup with ``ReverseDNSLookupOutcome/timedOut``, which a test
-  /// calls, from any thread, at the point it wants the deadline to pass. `nil`, as in
-  /// ``system``, uses the timer.
+  /// When set, supplies the lookup's deadline in place of the monotonic clock and its Dispatch
+  /// timer: it receives the timeout and the action that wakes the lookup, and returns the
+  /// ``ReverseDNSDeadline`` the lookup consults. A test decides when the deadline has passed and
+  /// whether, and when, the lookup is woken. `nil`, as in ``system``, uses the clock and a timer.
   var armDeadline:
-    (@Sendable (_ timeout: TimeInterval, _ expire: @escaping @Sendable () -> Void) -> Void)? = nil
+    (
+      @Sendable (_ timeout: TimeInterval, _ wake: @escaping @Sendable () -> Void) ->
+        ReverseDNSDeadline
+    )? =
+      nil
 
   /// The system daemon.
   static let system = DNSServiceCalls(
@@ -204,6 +210,15 @@ struct DNSServiceCalls: Sendable {
   )
 }
 
+/// A lookup's one deadline: whether it has passed, and how to stop the wake-up armed for it.
+struct ReverseDNSDeadline: Sendable {
+  /// Whether the deadline has passed. Consulted under the lookup's lock before every outcome but
+  /// cancellation is committed.
+  let hasPassed: @Sendable () -> Bool
+  /// Stops the wake-up, once the lookup has its outcome.
+  let cancel: @Sendable () -> Void
+}
+
 /// One PTR lookup through the system's DNS daemon (`DNSServiceQueryRecord`), which holds no
 /// thread while it waits and is stopped, not abandoned, when the caller stops waiting.
 ///
@@ -214,8 +229,7 @@ struct DNSServiceCalls: Sendable {
 ///   `DNSServiceSetDispatchQueue`, so every callback runs on it; and `DNSServiceRefDeallocate`
 ///   runs only on it. The results of both calls are checked.
 /// - The deadline timer runs on a different queue, so a start call stalled in the daemon cannot
-///   delay it. The caller is released at the deadline; when the start call finally returns, the
-///   reference it made is deallocated at once.
+///   delay it. When the start call finally returns, the reference it made is deallocated at once.
 /// - Cancellation from any thread resolves the caller where it is and hops to the queue to
 ///   deallocate.
 /// - The callback context is a ``CallbackContext`` that only the daemon's reference holds,
@@ -226,31 +240,46 @@ struct DNSServiceCalls: Sendable {
 ///   never calls back. Intermediate records of another type (a CNAME) and remove events (no
 ///   `kDNSServiceFlagsAdd`) are ignored; only an added PTR record or an error is an outcome. The
 ///   query would stay active until deallocated, so the first outcome deallocates it.
-/// - The caller is resumed exactly once, with the first of: an outcome from the daemon, the
-///   deadline, or cancellation.
+/// - The caller is resumed exactly once, with the first outcome committed.
 ///
-/// States, and what each event does. "Resolved" means the caller has its outcome; "torn down"
-/// means the reference has been deallocated or will never exist.
+/// The deadline rule. The lookup records one absolute deadline, on the monotonic clock, when it
+/// is called. Every outcome except cancellation is committed in one place, under the lock, and
+/// that place first asks whether the deadline has passed: if it has, the outcome is a timeout,
+/// whatever the event was. So the contract is that an outcome is committed before the deadline,
+/// and an event's time is when the lookup handles it: a reply the daemon delivered in time whose
+/// callback ran on the lookup's queue only after the deadline is a timeout. The start call checks
+/// the same deadline before it asks the daemon anything. The timer does nothing but wake the
+/// lookup when no other event does. Cancellation does not consult the deadline: it wins whenever
+/// it is the first event handled.
 ///
-///     State                  Event                       Rule
-///     waiting for a permit   cancel or deadline          resolve (timedOutBeforeQuery for the
-///                                                        deadline); the wait is cancelled and
-///                                                        takes no permit; a permit that was
-///                                                        already on its way is handed on
-///     permit held, queued    cancel or deadline          resolve (timedOutBeforeQuery); the
-///                                                        start finds it resolved, makes no
-///                                                        query, tears down, returns the permit
-///     starting (on queue)    cancel or deadline          resolve now (the caller is released
-///                                                        while the start call runs); the start
-///                                                        returns and deallocates at once
-///     starting               start call fails            resolve with startFailed; no reference
-///     starting               queue call fails            resolve with dispatchQueueFailed;
-///                                                        deallocate
-///     running                added PTR, error            resolve with the outcome; deallocate
-///                                                        in the callback
-///     running                CNAME, remove event         ignored
-///     running                cancel or deadline          resolve; hop to the queue; deallocate
-///     resolved, torn down    any event                   ignored
+/// Every event, and the outcome it commits before and after the deadline ("asked" means the
+/// start call had been entered):
+///
+///     Event                          Before the deadline         After the deadline
+///     permit granted, start runs     asks the daemon             no query: timedOutBeforeQuery
+///     start call fails               error(startFailed)          timedOut
+///     queue call fails               error(dispatchQueueFailed)  timedOut
+///     added PTR record               answer                      timedOut
+///     added PTR, not a name          error(malformedRecord)      timedOut
+///     no such record, no such name   noSuchRecord                timedOut
+///     daemon error                   error(daemon)               timedOut
+///     daemon timeout                 timedOut                    timedOut
+///     CNAME, remove event            ignored                     ignored
+///     wake-up (the timer)            (cannot happen)             timedOut if asked, else
+///                                                                timedOutBeforeQuery
+///     cancellation                   cancelled                   cancelled
+///     any event once committed       ignored                     ignored
+///
+/// A failed start or queue call after the deadline is a timeout, not the error, for the same
+/// reason as a late reply: the outcome a caller sees must not depend on whether the wake-up ran
+/// before the failure was handled, and once the deadline has passed the wake-up may already have
+/// released the caller with a timeout.
+///
+/// What else holds the outcome and teardown together, by state rather than by which handler has
+/// run: a permit wait that the outcome ends takes no permit, and a permit that arrives after the
+/// lookup was torn down is handed straight on; the teardown runs once, on the queue, keyed on its
+/// own flag, and deallocates the reference, releases the context and returns the permit, in that
+/// order.
 final class ReverseDNSLookup: @unchecked Sendable {
   /// Lookups in flight at once by default; 32 covers every hop of one trace in a single wave. A
   /// proposed value, not a measurement.
@@ -319,15 +348,12 @@ final class ReverseDNSLookup: @unchecked Sendable {
   private let lock = NSLock()
   private var outcome: ReverseDNSLookupOutcome?
   private var continuation: CheckedContinuation<ReverseDNSLookupOutcome, Never>?
-  private var timer: DispatchSourceTimer?
   /// Waits for the permit; cancelled when the lookup resolves first.
   private var permitWait: Task<Void, Never>?
   /// Whether the start call has been entered, so the query was asked.
   private var queryAsked = false
-  /// When the real deadline passes, in `DispatchTime` uptime nanoseconds; `nil` while a
-  /// substitute arms the deadline. The start checks it, because the timer's handler can run
-  /// after the instant it was scheduled for.
-  private var deadlineUptime: UInt64?
+  /// The one deadline; `nil` only before `run` arms it.
+  private var deadline: ReverseDNSDeadline?
 
   // Confined to `queue`.
   private var ref: DNSServiceRef?
@@ -363,7 +389,7 @@ final class ReverseDNSLookup: @unchecked Sendable {
   /// Ends the lookup with ``ReverseDNSLookupOutcome/cancelled`` unless it already has an outcome.
   /// Safe from any thread.
   func cancel() {
-    resolve(.cancelled)
+    commit(.cancellation)
   }
 
   // MARK: - Any thread
@@ -396,51 +422,77 @@ final class ReverseDNSLookup: @unchecked Sendable {
   }
 
   private func armDeadline(_ timeout: TimeInterval) {
+    let wake: @Sendable () -> Void = { [weak self] in self?.commit(.deadline) }
+    let armed: ReverseDNSDeadline
     if let substitute = calls.armDeadline {
-      substitute(timeout) { [weak self] in self?.resolve(.timedOut) }
-      return
+      armed = substitute(timeout, wake)
+    } else {
+      armed = Self.timerDeadline(timeout, wake: wake)
     }
-    let timer = DispatchSource.makeTimerSource(queue: Self.timerQueue)
+    lock.lock()
+    deadline = armed
+    let resolved = outcome != nil
+    lock.unlock()
+    if resolved { armed.cancel() }
+  }
+
+  /// The deadline `timeout` from now on the monotonic clock, with a timer on ``timerQueue`` that
+  /// wakes the lookup at it. The timer is scheduled on the same clock `hasPassed` reads, and a
+  /// Dispatch timer does not fire before its deadline.
+  private static func timerDeadline(
+    _ timeout: TimeInterval, wake: @escaping @Sendable () -> Void
+  ) -> ReverseDNSDeadline {
     // Capped so the conversion to nanoseconds cannot overflow.
     let nanoseconds = UInt64(max(0, min(timeout, 365 * 86400)) * 1_000_000_000)
-    let deadline = DispatchTime.now().uptimeNanoseconds + nanoseconds
-    timer.schedule(deadline: DispatchTime(uptimeNanoseconds: deadline))
-    timer.setEventHandler { [weak self] in self?.resolve(.timedOut) }
+    let at = DispatchTime.now().uptimeNanoseconds + nanoseconds
+    let timer = DispatchSource.makeTimerSource(queue: timerQueue)
+    timer.schedule(deadline: DispatchTime(uptimeNanoseconds: at))
+    timer.setEventHandler(handler: wake)
     // Activated before it can be cancelled: libdispatch traps on releasing a source that was
     // never activated.
     timer.activate()
-    lock.lock()
-    deadlineUptime = deadline
-    if outcome == nil {
-      self.timer = timer
-      lock.unlock()
-    } else {
-      lock.unlock()
-      timer.cancel()
-    }
+    return ReverseDNSDeadline(
+      hasPassed: { DispatchTime.now().uptimeNanoseconds >= at },
+      cancel: { timer.cancel() })
   }
 
-  /// Records the first outcome and resumes the caller with it; later calls do nothing. Off the
-  /// queue, hops to it to deallocate.
-  private func resolve(_ result: ReverseDNSLookupOutcome, onQueue: Bool = false) {
+  /// What a lookup can commit, before the deadline rule maps it.
+  private enum Event {
+    /// An outcome from the start, the queue call or the daemon.
+    case outcome(ReverseDNSLookupOutcome)
+    /// The wake-up at the deadline, or the start finding the deadline passed.
+    case deadline
+    case cancellation
+  }
+
+  /// The one place an outcome is committed: records the first, resumes the caller with it and
+  /// tears down; later calls do nothing. Every event but cancellation becomes a timeout once the
+  /// deadline has passed (see the table on the type). Off the queue, hops to it to tear down.
+  private func commit(_ event: Event, onQueue: Bool = false) {
     lock.lock()
     guard outcome == nil else {
       lock.unlock()
       return
     }
-    // The deadline before the start call was entered asked nothing of the daemon.
-    let final: ReverseDNSLookupOutcome =
-      result == .timedOut && !queryAsked ? .timedOutBeforeQuery : result
+    let timeout: ReverseDNSLookupOutcome = queryAsked ? .timedOut : .timedOutBeforeQuery
+    let final: ReverseDNSLookupOutcome
+    switch event {
+    case .cancellation:
+      final = .cancelled
+    case .deadline:
+      final = timeout
+    case .outcome(let proposed):
+      final = deadline?.hasPassed() == true ? timeout : proposed
+    }
     outcome = final
     let waiter = continuation
     continuation = nil
-    let deadline = timer
-    timer = nil
+    let armed = deadline
     let wait = permitWait
     permitWait = nil
     lock.unlock()
 
-    deadline?.cancel()
+    armed?.cancel()
     wait?.cancel()
     waiter?.resume(returning: final)
     if onQueue {
@@ -473,11 +525,11 @@ final class ReverseDNSLookup: @unchecked Sendable {
 
   private func start() {
     dispatchPrecondition(condition: .onQueue(queue))
+    // The deadline itself, not whether its wake-up has run yet: a lookup with no time left
+    // makes no query and does not keep the permit through a start call.
     lock.lock()
     let resolved = outcome != nil
-    // The deadline itself, not whether its timer's handler has run yet: a lookup with no time
-    // left makes no query and does not keep the permit through a start call.
-    let expired = deadlineUptime.map { DispatchTime.now().uptimeNanoseconds >= $0 } ?? false
+    let expired = deadline?.hasPassed() == true
     if !resolved && !expired { queryAsked = true }
     lock.unlock()
     guard !resolved else {
@@ -485,8 +537,8 @@ final class ReverseDNSLookup: @unchecked Sendable {
       return
     }
     guard !expired else {
-      // Not asked, so this resolves as `.timedOutBeforeQuery`, and tears down.
-      resolve(.timedOut, onQueue: true)
+      // Not asked, so this commits `.timedOutBeforeQuery`, and tears down.
+      commit(.deadline, onQueue: true)
       return
     }
     let retained = Unmanaged.passRetained(CallbackContext(lookup: self))
@@ -495,9 +547,10 @@ final class ReverseDNSLookup: @unchecked Sendable {
     guard status == DNSServiceStatus.noError, let newRef else {
       // No reference, so the daemon will never call back with this context.
       retained.release()
-      resolve(
-        .error(
-          .startFailed(status == DNSServiceStatus.noError ? DNSServiceStatus.unknown : status)),
+      commit(
+        .outcome(
+          .error(
+            .startFailed(status == DNSServiceStatus.noError ? DNSServiceStatus.unknown : status))),
         onQueue: true)
       tearDown()
       return
@@ -507,7 +560,7 @@ final class ReverseDNSLookup: @unchecked Sendable {
 
     let queued = calls.setDispatchQueue(newRef, queue)
     guard queued == DNSServiceStatus.noError else {
-      resolve(.error(.dispatchQueueFailed(queued)), onQueue: true)
+      commit(.outcome(.error(.dispatchQueueFailed(queued))), onQueue: true)
       tearDown()
       return
     }
@@ -555,7 +608,7 @@ final class ReverseDNSLookup: @unchecked Sendable {
     default:
       result = .error(.daemon(errorCode))
     }
-    resolve(result, onQueue: true)
+    commit(.outcome(result), onQueue: true)
   }
 
   /// The hostname a PTR record's data names, in DNS presentation form without the trailing dot,

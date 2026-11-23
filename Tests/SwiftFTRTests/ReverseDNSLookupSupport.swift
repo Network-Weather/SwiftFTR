@@ -17,6 +17,8 @@ final class FakeDNSService: @unchecked Sendable {
     case fail(DNSServiceErrorType)
     /// Block the calling thread (the lookup's queue) until the gate opens, then succeed.
     case gated(StallGate)
+    /// Block until the gate opens, then return this error and no reference.
+    case gatedFail(StallGate, DNSServiceErrorType)
   }
 
   struct Call {
@@ -66,15 +68,18 @@ final class FakeDNSService: @unchecked Sendable {
   private var unknownDeallocations = 0
   private var doubleDeallocations = 0
 
-  /// How a lookup's deadline passes.
+  /// How a lookup's deadline passes, and when the lookup is woken for it.
   enum Deadline {
-    /// Only when the test calls ``expireDeadlines()`` or ``expireDeadline(number:)``, never by
-    /// the clock, so a test can order it against every other event.
+    /// Only when the test says: ``passDeadline(number:)`` makes it pass without waking the
+    /// lookup, ``expireDeadline(number:)`` and ``expireDeadlines()`` make it pass and wake it.
+    /// Never by the clock, so a test can order it against every other event.
     case controlled
-    /// At once, inside the call that arms it: before the lookup has asked for a permit or
-    /// queued its start.
+    /// Passed, and the lookup woken, inside the call that arms it: before the lookup has asked
+    /// for a permit or queued its start.
     case expiresWhenArmed
-    /// By the lookup's real timer.
+    /// Passed from the start, with no wake-up: only the lookup's own checks can see it.
+    case passedWhenArmed
+    /// The lookup's own clock and timer.
     case timer
   }
 
@@ -92,37 +97,52 @@ final class FakeDNSService: @unchecked Sendable {
   }
 
   private let deadline: Deadline
-  /// Every deadline armed, in the order lookups armed them; `nil` once it has been made to pass.
-  private var armed: [(@Sendable () -> Void)?] = []
+
+  /// One lookup's deadline as this fake defines it.
+  private final class Armed: @unchecked Sendable {
+    let wake: @Sendable () -> Void
+    var passed = false
+    var woken = false
+    init(wake: @escaping @Sendable () -> Void) { self.wake = wake }
+  }
+
+  /// Every deadline armed, in the order lookups armed them.
+  private var armed: [Armed] = []
 
   /// Deadlines lookups have armed through this fake, passed or not.
   var deadlinesArmed: Int { locked { armed.count } }
 
-  /// Makes every armed deadline that has not yet passed pass now, on this thread. Returns how
-  /// many there were.
+  /// Makes the `number`th deadline armed (from 0) pass, without waking its lookup. Returns
+  /// whether there was such a deadline.
   @discardableResult
-  func expireDeadlines() -> Int {
-    let due = locked {
-      let due = armed.compactMap { $0 }
-      armed = armed.map { _ in nil }
-      return due
+  func passDeadline(number: Int) -> Bool {
+    locked {
+      guard number < armed.count else { return false }
+      armed[number].passed = true
+      return true
     }
-    for expire in due { expire() }
-    return due.count
   }
 
-  /// Makes the `number`th deadline armed (from 0) pass now, unless it already has. Returns
-  /// whether it was still pending.
+  /// Makes the `number`th deadline armed pass and wakes its lookup, on this thread, unless it was
+  /// already woken. Returns whether it woke the lookup.
   @discardableResult
   func expireDeadline(number: Int) -> Bool {
-    let due: (@Sendable () -> Void)? = locked {
-      guard number < armed.count else { return nil }
-      let due = armed[number]
-      armed[number] = nil
-      return due
+    let wake: (@Sendable () -> Void)? = locked {
+      guard number < armed.count, !armed[number].woken else { return nil }
+      armed[number].passed = true
+      armed[number].woken = true
+      return armed[number].wake
     }
-    due?()
-    return due != nil
+    wake?()
+    return wake != nil
+  }
+
+  /// Makes every armed deadline pass and wakes every lookup not yet woken. Returns how many it
+  /// woke.
+  @discardableResult
+  func expireDeadlines() -> Int {
+    let count = deadlinesArmed
+    return (0..<count).filter { expireDeadline(number: $0) }.count
   }
 
   var calls: DNSServiceCalls {
@@ -137,6 +157,9 @@ final class FakeDNSService: @unchecked Sendable {
           return (status, nil)
         case .gated(let gate):
           gate.wait(limit: 60)
+        case .gatedFail(let gate, let status):
+          gate.wait(limit: 60)
+          return (status, nil)
         case .succeed:
           break
         }
@@ -180,22 +203,23 @@ final class FakeDNSService: @unchecked Sendable {
     )
   }
 
-  /// Records a lookup's deadline, to pass only when ``expireDeadlines()`` is called.
-  /// Records a lookup's deadline, to pass when the test says so, or at once.
+  /// Records a lookup's deadline, which passes, and wakes the lookup, when the test says so, or
+  /// at once.
   private var armDeadline:
-    @Sendable (_ timeout: TimeInterval, _ expire: @escaping @Sendable () -> Void) -> Void
+    @Sendable (_ timeout: TimeInterval, _ wake: @escaping @Sendable () -> Void) ->
+      ReverseDNSDeadline
   {
-    { [self] _, expire in
-      if deadline == .expiresWhenArmed {
-        lock.lock()
-        armed.append(nil)
-        lock.unlock()
-        expire()
-        return
-      }
+    { [self] _, wake in
+      let entry = Armed(wake: wake)
+      entry.passed = deadline != .controlled
+      entry.woken = deadline == .expiresWhenArmed
       lock.lock()
-      armed.append(expire)
+      armed.append(entry)
       lock.unlock()
+      if deadline == .expiresWhenArmed { wake() }
+      return ReverseDNSDeadline(
+        hasPassed: { [self] in locked { entry.passed } },
+        cancel: {})
     }
   }
 

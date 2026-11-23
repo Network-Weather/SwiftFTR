@@ -261,42 +261,6 @@ struct ReverseDNSLookupTests {
     try await Self.expectTornDown(fake, references: 1)
   }
 
-  @Test(
-    "No such record or no such name is noSuchRecord, which is not cacheable",
-    arguments: [DNSServiceStatus.noSuchRecord, DNSServiceStatus.noSuchName])
-  func noSuchRecord(code: DNSServiceErrorType) async throws {
-    let fake = FakeDNSService()
-    let outcome = try await Self.run(fake, "192.0.2.1") {
-      fake.deliver(flags: DNSServiceFlags(kDNSServiceFlagsAdd), error: code)
-    }
-    #expect(outcome == .noSuchRecord)
-    #expect(!outcome.isCacheable)
-    try await Self.expectTornDown(fake, references: 1)
-  }
-
-  @Test(
-    "A daemon error ends the lookup with that error",
-    arguments: [DNSServiceStatus.serviceNotRunning, DNSServiceStatus.defunctConnection])
-  func daemonError(code: DNSServiceErrorType) async throws {
-    let fake = FakeDNSService()
-    let outcome = try await Self.run(fake, "192.0.2.1") {
-      fake.deliver(flags: 0, error: code)
-    }
-    #expect(outcome == .error(.daemon(code)))
-    #expect(!outcome.isCacheable)
-    try await Self.expectTornDown(fake, references: 1)
-  }
-
-  @Test("The daemon's own timeout is timedOut")
-  func daemonTimeout() async throws {
-    let fake = FakeDNSService()
-    let outcome = try await Self.run(fake, "192.0.2.1") {
-      fake.deliver(error: DNSServiceStatus.timeout)
-    }
-    #expect(outcome == .timedOut)
-    try await Self.expectTornDown(fake, references: 1)
-  }
-
   @Test("An answer whose label holds a dot reaches the caller escaped")
   func escapedAnswer() async throws {
     let fake = FakeDNSService()
@@ -312,56 +276,104 @@ struct ReverseDNSLookupTests {
     try await Self.expectTornDown(fake, references: 1)
   }
 
-  @Test("PTR data that is not a name is malformedRecord")
-  func malformedRecord() async throws {
-    let fake = FakeDNSService()
-    let outcome = try await Self.run(fake, "192.0.2.1") {
-      fake.deliver(rdata: [9, 0x61])
-    }
-    #expect(outcome == .error(.malformedRecord))
-    try await Self.expectTornDown(fake, references: 1)
-  }
+  // MARK: - The deadline rule, event by event
 
-  @Test("Intermediate CNAMEs and remove events are ignored; the PTR after them answers")
-  func intermediatesIgnored() async throws {
-    let fake = FakeDNSService()
-    let outcome = try await Self.run(fake, "192.0.2.1") {
-      // A CNAME (RFC 2317 delegation), then the PTR going away, then the PTR. All three are
-      // queued on the lookup's queue in this order.
-      fake.deliver(rrtype: UInt16(kDNSServiceType_CNAME), rdata: PTRData.name("1.0/25.2.0.192"))
-      fake.deliver(flags: 0, rdata: PTRData.name("old.example"))
-      fake.deliver(rdata: PTRData.name("host.example"))
-    }
-    #expect(outcome == .answer("host.example"))
-    try await Self.expectTornDown(fake, references: 1)
-  }
+  /// The events of the deadline table on ``ReverseDNSLookup``, one row each.
+  enum DeadlineEvent: String, CaseIterable, Sendable {
+    case start, startFails, queueFails, answer, intermediate, malformed, noSuchRecord, noSuchName
+    case daemonError, daemonTimeout, cancellation
 
-  @Test("A start call that fails is an error, with nothing to deallocate")
-  func startFails() async throws {
-    let fake = FakeDNSService(start: .fail(DNSServiceStatus.serviceNotRunning))
-    let (outcome, _) = try await measure(within: Self.watchdog) {
-      await fake.install {
-        await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout)
+    /// What the event commits before the deadline.
+    var beforeDeadline: ReverseDNSLookupOutcome {
+      switch self {
+      case .start, .answer, .intermediate: return .answer("host.example")
+      case .startFails: return .error(.startFailed(DNSServiceStatus.serviceNotRunning))
+      case .queueFails:
+        return .error(.dispatchQueueFailed(DNSServiceErrorType(kDNSServiceErr_BadParam)))
+      case .malformed: return .error(.malformedRecord)
+      case .noSuchRecord, .noSuchName: return .noSuchRecord
+      case .daemonError: return .error(.daemon(DNSServiceStatus.defunctConnection))
+      case .daemonTimeout: return .timedOut
+      case .cancellation: return .cancelled
       }
     }
-    #expect(outcome == .error(.startFailed(DNSServiceStatus.serviceNotRunning)))
-    #expect(fake.starts.count == 1)
-    let startedOnQueue = fake.starts.allSatisfy { $0.onLookupQueue }
-    #expect(startedOnQueue)
-    #expect(fake.deallocs.isEmpty)
-  }
 
-  @Test("A queue call that fails is an error, and the reference is deallocated on its queue")
-  func queueCallFails() async throws {
-    let code = DNSServiceErrorType(kDNSServiceErr_BadParam)
-    let fake = FakeDNSService(queueResult: code)
-    let (outcome, _) = try await measure(within: Self.watchdog) {
-      await fake.install {
-        await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout)
+    /// What the event commits once the deadline has passed, with no wake-up having run.
+    var afterDeadline: ReverseDNSLookupOutcome {
+      switch self {
+      case .start: return .timedOutBeforeQuery
+      case .cancellation: return .cancelled
+      default: return .timedOut
       }
     }
-    #expect(outcome == .error(.dispatchQueueFailed(code)))
-    try await Self.expectTornDown(fake, references: 1)
+  }
+
+  /// Each row of the table, before and after the deadline. The fake's deadline passes only when
+  /// the test says, and here never wakes the lookup, so the outcome after the deadline shows the
+  /// lookup's own check, not the wake-up.
+  @Test(
+    "Every event commits the table's outcome, before and after the deadline",
+    arguments: DeadlineEvent.allCases, [false, true])
+  func deadlineTable(event: DeadlineEvent, afterDeadline: Bool) async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let fake: FakeDNSService
+    switch event {
+    case .start:
+      fake = FakeDNSService(deadline: afterDeadline ? .passedWhenArmed : .controlled)
+    case .startFails:
+      fake = FakeDNSService(start: .gatedFail(gate, DNSServiceStatus.serviceNotRunning))
+    case .queueFails:
+      fake = FakeDNSService(
+        start: .gated(gate), queueResult: DNSServiceErrorType(kDNSServiceErr_BadParam))
+    default:
+      fake = FakeDNSService()
+    }
+    let task = Task {
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout) }
+    }
+    let host = PTRData.name("host.example")
+    var references = 1
+    switch event {
+    case .start:
+      if afterDeadline {
+        references = 0
+      } else {
+        try await Self.waitScheduled(fake, 1)
+        fake.deliver(rdata: host)
+      }
+    case .startFails, .queueFails:
+      // The start call is in the daemon when the deadline passes, and fails after it.
+      try await waitBounded("the start call", within: Self.watchdog) {
+        _ = await eventually(within: 60) { fake.starts.count == 1 }
+      }
+      if afterDeadline { #expect(fake.passDeadline(number: 0)) }
+      gate.open()
+      if event == .startFails { references = 0 }
+    default:
+      try await Self.waitScheduled(fake, 1)
+      if afterDeadline { #expect(fake.passDeadline(number: 0)) }
+      switch event {
+      case .answer: fake.deliver(rdata: host)
+      case .intermediate:
+        fake.deliver(rrtype: UInt16(kDNSServiceType_CNAME), rdata: PTRData.name("1.0/25.2.0.192"))
+        fake.deliver(flags: 0, rdata: PTRData.name("old.example"))
+        fake.deliver(rdata: host)
+      case .malformed: fake.deliver(rdata: [9, 0x61])
+      case .noSuchRecord: fake.deliver(error: DNSServiceStatus.noSuchRecord)
+      case .noSuchName: fake.deliver(error: DNSServiceStatus.noSuchName)
+      case .daemonError: fake.deliver(flags: 0, error: DNSServiceStatus.defunctConnection)
+      case .daemonTimeout: fake.deliver(error: DNSServiceStatus.timeout)
+      default: task.cancel()
+      }
+    }
+    let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
+    let expected = afterDeadline ? event.afterDeadline : event.beforeDeadline
+    #expect(outcome == expected, "\(event) after deadline: \(afterDeadline)")
+    let cacheable = outcome.isCacheable
+    #expect(cacheable == (expected == .answer("host.example")))
+    try await Self.expectTornDown(fake, references: references)
+    if event == .start && afterDeadline { #expect(fake.starts.isEmpty) }
   }
 
   @Test("With no reply, the lookup times out at its deadline, not before")
@@ -663,23 +675,6 @@ struct ReverseDNSLookupTests {
       await fake.drainQueue()
     }
     #expect(fake.callbacksDelivered == 0)
-  }
-
-  @Test("Order: the reply runs before the deadline, and the deadline then does nothing")
-  func orderReplyThenDeadline() async throws {
-    let fake = FakeDNSService()
-    let task = Task {
-      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout) }
-    }
-    try await Self.waitScheduled(fake, 1)
-    fake.deliver(rdata: PTRData.name("host.example"))
-    let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
-    #expect(outcome == .answer("host.example"))
-    try await Self.expectTornDown(fake, references: 1)
-    // The deadline passes after the outcome: nothing more happens.
-    #expect(fake.expireDeadlines() == 1)
-    await fake.drainQueue()
-    #expect(fake.deallocs.count == 1)
   }
 
   @Test("Order: the deadline resolves while a reply waits behind it in the queue")
