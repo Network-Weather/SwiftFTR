@@ -21,8 +21,8 @@ enum TestSeams {
   /// IPv4 public-address discovery, in place of STUN with its DNS fallback.
   typealias DiscoverPublicIPv4 = @Sendable () throws -> STUNPublicIP
 
-  /// `fcntl(2)` with an integer argument, in place of the system call a trace, ping or UDP
-  /// exchange uses to make its socket non-blocking. Returns what `fcntl` would and sets `errno`
+  /// `fcntl(2)` with an integer argument, in place of the system call a trace, ping, UDP
+  /// exchange, TCP probe or UDP probe uses to make its socket non-blocking. Returns what `fcntl` would and sets `errno`
   /// the same way.
   typealias FileControl = @Sendable (_ fd: Int32, _ command: Int32, _ argument: Int32) -> Int32
 

@@ -398,9 +398,9 @@ private func performUDPProbe(
 
   try Task.checkCancellation()
 
-  var flags = fcntl(sockfd, F_GETFL, 0)
-  flags |= O_NONBLOCK
-  _ = fcntl(sockfd, F_SETFL, flags)
+  if let error = makeProbeSocketNonBlocking(sockfd: sockfd) {
+    return UDPProbeResultInternal(isReachable: false, rtt: nil, responseType: nil, error: error)
+  }
 
   // Build the destination sockaddr from the resolved family + port.
   var destAddr = resolved.address
