@@ -34,6 +34,8 @@ final class FakeDNSService: @unchecked Sendable {
     let startQueue: ObjectIdentifier?
     var queue: DispatchQueue?
     var deallocated = false
+    /// The context object, held weakly, so a deallocate can see whether it is still alive.
+    weak var contextObject: ReverseDNSLookup.CallbackContext?
 
     init(
       name: String, interfaceIndex: UInt32, flags: DNSServiceFlags,
@@ -44,6 +46,8 @@ final class FakeDNSService: @unchecked Sendable {
       self.flags = flags
       self.context = context
       self.startQueue = startQueue
+      self.contextObject = Unmanaged<ReverseDNSLookup.CallbackContext>.fromOpaque(context)
+        .takeUnretainedValue()
     }
   }
 
@@ -55,6 +59,8 @@ final class FakeDNSService: @unchecked Sendable {
   private var startCalls: [Call] = []
   private var deallocations: [Call] = []
   private var deallocatedOnStartQueue: [Bool] = []
+  private var contextAliveAtDeallocate: [Bool] = []
+  private var callbacks = 0
   private var live = 0
   private var maxLive = 0
   private var unknownDeallocations = 0
@@ -112,6 +118,7 @@ final class FakeDNSService: @unchecked Sendable {
           return
         }
         query.deallocated = true
+        contextAliveAtDeallocate.append(query.contextObject != nil)
         deallocatedOnStartQueue.append(call.queueID != nil && call.queueID == query.startQueue)
         live -= 1
       }
@@ -145,6 +152,7 @@ final class FakeDNSService: @unchecked Sendable {
       let ref = OpaquePointer(refAddress)
       lock.lock()
       let gone = query.deallocated
+      if !gone { callbacks += 1 }
       lock.unlock()
       guard !gone else { return }
       rdata.withUnsafeBytes { bytes in
@@ -156,11 +164,40 @@ final class FakeDNSService: @unchecked Sendable {
     return true
   }
 
+  /// Queues a block on the `index`th query's queue that waits for `gate`, so whatever is queued
+  /// after it runs only once the gate opens, in the order it was queued. Returns `false` when
+  /// there is no such scheduled query.
+  @discardableResult
+  func blockQueue(of index: Int = 0, until gate: StallGate) -> Bool {
+    lock.lock()
+    guard index < order.count, let queue = queries[order[index]]?.queue else {
+      lock.unlock()
+      return false
+    }
+    lock.unlock()
+    queue.async { gate.wait(limit: 60) }
+    return true
+  }
+
+  /// Returns once everything queued so far on the `index`th query's queue has run.
+  func drainQueue(of index: Int = 0) async {
+    let queue = locked { index < order.count ? queries[order[index]]?.queue : nil }
+    guard let queue else { return }
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      queue.async { continuation.resume() }
+    }
+  }
+
   var starts: [Call] { locked { startCalls } }
   var deallocs: [Call] { locked { deallocations } }
   /// For each deallocated reference, whether it was deallocated on the queue its start ran on.
   var deallocatedOnOwnQueue: [Bool] { locked { deallocatedOnStartQueue } }
+  /// For each deallocated reference, whether its callback context was still alive at the call.
+  var contextAliveAtEachDeallocate: [Bool] { locked { contextAliveAtDeallocate } }
   var maxConcurrent: Int { locked { maxLive } }
+  /// Replies handed to the lookup's callback (a reply queued after the deallocate is dropped, as
+  /// the daemon drops it).
+  var callbacksDelivered: Int { locked { callbacks } }
   var liveCount: Int { locked { live } }
   var misuse: (unknown: Int, double: Int) { locked { (unknownDeallocations, doubleDeallocations) } }
   var startedCount: Int { locked { order.count } }
@@ -189,7 +226,16 @@ final class FakeDNSService: @unchecked Sendable {
 /// Wraps the real daemon calls, recording what ``FakeDNSService`` records about queues and
 /// counting live references, so a test against the real daemon can check the same rules.
 final class CountingDNSService: @unchecked Sendable {
-  private let lock = NSLock()
+  private let lock = NSCondition()
+  /// Each successful start waits, on its lookup's queue, until this many references are open at
+  /// once (or 30 seconds pass), so a test can make overlap certain. Zero waits for nothing.
+  private let holdUntilLive: Int
+  private var reachedHold = false
+
+  init(holdUntilLive: Int = 0) {
+    self.holdUntilLive = holdUntilLive
+  }
+
   private var live = 0
   private var maxLive = 0
   private var started = 0
@@ -210,6 +256,10 @@ final class CountingDNSService: @unchecked Sendable {
           live += 1
           maxLive = max(maxLive, live)
           if DNSServiceRefSockFD(ref) >= 0 { descriptorsSeen += 1 }
+          if live >= holdUntilLive { reachedHold = true }
+          lock.broadcast()
+          let giveUp = Date().addingTimeInterval(30)
+          while !reachedHold && lock.wait(until: giveUp) {}
         }
         lock.unlock()
         return (status, ref)

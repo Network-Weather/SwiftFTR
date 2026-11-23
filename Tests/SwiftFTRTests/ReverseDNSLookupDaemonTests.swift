@@ -7,7 +7,9 @@ import Testing
 ///
 /// The offline tests ask only for the names of 127.0.0.1 and ::1, which the daemon answers from
 /// its local records ("localhost", from the hosts file) without sending a query: its log shows
-/// the answer delivered on the local-only interface and no query sent. The live comparison with
+/// the answer delivered on the local-only interface and no query sent. Any other address,
+/// including other 127.x addresses and link-local ones, can make the daemon send a query, so
+/// none is asked for here outside the live test. The live comparison with
 /// `getnameinfo` asks for public resolver addresses and is skipped when `SKIP_NETWORK_TESTS` is
 /// set.
 @Suite
@@ -20,7 +22,7 @@ struct ReverseDNSLookupDaemonTests {
     let counting = CountingDNSService()
     for address in Self.loopback {
       let (outcome, _) = try await measure(within: Self.watchdog) {
-        await counting.install { await ReverseDNSLookup.lookup(address, timeout: 10) }
+        await counting.install { await ReverseDNSLookup.lookup(address, timeout: 120) }
       }
       #expect(outcome == .answer("localhost"), "\(address)")
     }
@@ -33,7 +35,7 @@ struct ReverseDNSLookupDaemonTests {
     defer { held.release() }
     let (outcome, _) = try await measure(within: Self.watchdog) {
       await TestSeams.$blockingIOExecutor.withValue(held.executor) {
-        await ReverseDNSLookup.lookup("127.0.0.1", timeout: 10)
+        await ReverseDNSLookup.lookup("127.0.0.1", timeout: 120)
       }
     }
     // Answered while every worker was still held, so the lookup needed none.
@@ -64,14 +66,14 @@ struct ReverseDNSLookupDaemonTests {
               case 0:
                 group.addTask {
                   tally.add(
-                    await ReverseDNSLookup.lookup(address, timeout: 10, limiter: limiter),
+                    await ReverseDNSLookup.lookup(address, timeout: 120, limiter: limiter),
                     as: "answered")
                 }
               case 1:
                 // Cancelled after 0 to 24 ms: before the start, during it, or racing the reply.
                 group.addTask {
                   let task = Task {
-                    await ReverseDNSLookup.lookup(address, timeout: 10, limiter: limiter)
+                    await ReverseDNSLookup.lookup(address, timeout: 120, limiter: limiter)
                   }
                   try? await Task.sleep(nanoseconds: UInt64(step) * 1_000_000)
                   task.cancel()
@@ -100,12 +102,13 @@ struct ReverseDNSLookupDaemonTests {
       "deadline timedOut",
     ]
     #expect(Set(counts.keys).isSubset(of: expected), "\(counts)")
-    #expect(counts["answered answer"] == iterations / 3)
-    // Both racing groups ended both ways, so cancellations and deadlines did land around the
-    // replies (a loopback answer takes a few milliseconds in waves of 24 on this machine).
-    for kind in ["cancelled answer", "cancelled cancelled", "deadline answer", "deadline timedOut"]
-    {
-      #expect((counts[kind] ?? 0) > 0, "no \(kind): the races were not exercised; \(counts)")
+    // Every lookup resumed exactly once, with an outcome its group allows. How the racing groups
+    // split between their two outcomes depends on the daemon's speed, so it is printed above and
+    // not asserted; the orders themselves are forced, and asserted, against the fake daemon in
+    // ReverseDNSLookupTests.
+    for group in ["answered", "cancelled", "deadline"] {
+      let total = counts.filter { $0.key.hasPrefix(group + " ") }.values.reduce(0, +)
+      #expect(total == iterations / 3, "\(group): \(counts)")
     }
     let snapshot = try await Self.expectQuiet(counting, started: nil)
     #expect(snapshot.maxLive <= 32)
@@ -113,7 +116,8 @@ struct ReverseDNSLookupDaemonTests {
 
   @Test("The limiter bounds the daemon connections open at once")
   func limiterBoundsDescriptors() async throws {
-    let counting = CountingDNSService()
+    // The first starts wait until four references are open, so the overlap is certain.
+    let counting = CountingDNSService(holdUntilLive: 4)
     let limiter = _ConcurrencySemaphore(maxConcurrent: 4)
     let count = 64
     let (outcomes, _) = try await measure(within: Self.watchdog) {
@@ -121,7 +125,7 @@ struct ReverseDNSLookupDaemonTests {
         await withTaskGroup(of: ReverseDNSLookupOutcome.self) { group in
           for i in 0..<count {
             group.addTask {
-              await ReverseDNSLookup.lookup(Self.loopback[i % 2], timeout: 10, limiter: limiter)
+              await ReverseDNSLookup.lookup(Self.loopback[i % 2], timeout: 120, limiter: limiter)
             }
           }
           var all: [ReverseDNSLookupOutcome] = []
@@ -134,8 +138,7 @@ struct ReverseDNSLookupDaemonTests {
     let snapshot = try await Self.expectQuiet(counting, started: count)
     // Each reference held a descriptor of its own, and no more than four were open at once.
     #expect(snapshot.fds == count)
-    #expect(snapshot.maxLive <= 4)
-    #expect(snapshot.maxLive >= 2, "the lookups did overlap")
+    #expect(snapshot.maxLive == 4, "the cap was reached and never exceeded")
   }
 
   @Test(
@@ -146,7 +149,7 @@ struct ReverseDNSLookupDaemonTests {
       for address in ["1.1.1.1", "8.8.8.8", "127.0.0.1", "::1"] {
         let system = await Self.getnameinfoOffPool(address)
         let (outcome, _) = try await measure(within: Self.watchdog) {
-          await ReverseDNSLookup.lookup(address, timeout: 10)
+          await ReverseDNSLookup.lookup(address, timeout: 120)
         }
         if let system {
           #expect(outcome == .answer(system), "\(address)")

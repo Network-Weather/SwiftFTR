@@ -367,6 +367,135 @@ struct ReverseDNSLookupTests {
     try await Self.expectTornDown(fake, references: 1)
   }
 
+  // MARK: - Event orders forced by the test
+  //
+  // The fake holds the lookup's queue with a blocker, so a reply can be queued behind it and the
+  // cancellation or deadline made to resolve the caller first, or the reply let through first.
+  // What it cannot force is which of two resolutions that happen off the queue at the same
+  // instant (a cancellation and the deadline timer) takes the lock first; that is the lock's job,
+  // and the racing loops below and the stress loop cover it.
+
+  @Test("Order: the reply runs first, then the cancellation does nothing")
+  func orderReplyThenCancel() async throws {
+    let fake = FakeDNSService()
+    let task = Task {
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout) }
+    }
+    try await Self.waitScheduled(fake, 1)
+    fake.deliver(rdata: PTRData.name("host.example"))
+    try await Self.expectTornDown(fake, references: 1)
+    task.cancel()
+    let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
+    #expect(outcome == .answer("host.example"))
+    #expect(fake.callbacksDelivered == 1)
+  }
+
+  @Test("Order: a reply queued behind the cancellation's resolve is ignored")
+  func orderCancelThenQueuedReply() async throws {
+    let fake = FakeDNSService()
+    let gate = StallGate()
+    defer { gate.open() }
+    let task = Task {
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout) }
+    }
+    try await Self.waitScheduled(fake, 1)
+    #expect(fake.blockQueue(until: gate))
+    // Queued in this order on the lookup's queue: blocker, reply, then the teardown hop.
+    fake.deliver(rdata: PTRData.name("host.example"))
+    task.cancel()
+    let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
+    let releasedWhileQueueHeld = fake.deallocs.isEmpty
+    #expect(releasedWhileQueueHeld)
+    #expect(outcome == .cancelled)
+    gate.open()
+    try await Self.expectTornDown(fake, references: 1)
+    // The reply reached the callback before the deallocate and was ignored.
+    #expect(fake.callbacksDelivered == 1)
+  }
+
+  @Test("Order: a reply queued after the cancellation's teardown is never delivered")
+  func orderCancelHopThenReply() async throws {
+    let fake = FakeDNSService()
+    let gate = StallGate()
+    defer { gate.open() }
+    let task = Task {
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout) }
+    }
+    try await Self.waitScheduled(fake, 1)
+    #expect(fake.blockQueue(until: gate))
+    // Queued: blocker, the teardown hop, then the reply.
+    task.cancel()
+    let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
+    #expect(outcome == .cancelled)
+    fake.deliver(rdata: PTRData.name("host.example"))
+    gate.open()
+    try await Self.expectTornDown(fake, references: 1)
+    try await waitBounded("the reply block ran", within: Self.watchdog) {
+      await fake.drainQueue()
+    }
+    #expect(fake.callbacksDelivered == 0)
+  }
+
+  @Test("Order: the reply runs before the deadline, and the deadline then does nothing")
+  func orderReplyThenDeadline() async throws {
+    let fake = FakeDNSService()
+    let timeout: TimeInterval = 0.2
+    let task = Task {
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: timeout) }
+    }
+    try await Self.waitScheduled(fake, 1)
+    fake.deliver(rdata: PTRData.name("host.example"))
+    let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
+    #expect(outcome == .answer("host.example"))
+    try await Self.expectTornDown(fake, references: 1)
+    // Past the deadline, nothing more happened: the timer was cancelled with the outcome.
+    try? await Task.sleep(nanoseconds: UInt64(timeout * 3 * 1_000_000_000))
+    #expect(fake.deallocs.count == 1)
+  }
+
+  @Test("Order: the deadline resolves while a reply waits behind it in the queue")
+  func orderDeadlineThenQueuedReply() async throws {
+    let fake = FakeDNSService()
+    let gate = StallGate()
+    defer { gate.open() }
+    let task = Task {
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: 0.2) }
+    }
+    try await Self.waitScheduled(fake, 1)
+    #expect(fake.blockQueue(until: gate))
+    fake.deliver(rdata: PTRData.name("host.example"))
+    let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
+    // The deadline ran on its own queue while the lookup's queue was held with the reply in it.
+    let releasedWhileQueueHeld = fake.deallocs.isEmpty
+    #expect(releasedWhileQueueHeld)
+    #expect(outcome == .timedOut)
+    gate.open()
+    try await Self.expectTornDown(fake, references: 1)
+    #expect(fake.callbacksDelivered == 1)
+  }
+
+  @Test("Order: reply, cancellation and deadline all pending together give one outcome")
+  func orderAllPending() async throws {
+    let fake = FakeDNSService()
+    let gate = StallGate()
+    defer { gate.open() }
+    let timeout: TimeInterval = 0.2
+    let task = Task {
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: timeout) }
+    }
+    try await Self.waitScheduled(fake, 1)
+    #expect(fake.blockQueue(until: gate))
+    fake.deliver(rdata: PTRData.name("host.example"))
+    task.cancel()
+    let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
+    #expect(outcome == .cancelled)
+    // Let the deadline pass while the queue is still held; it must not resolve again.
+    try? await Task.sleep(nanoseconds: UInt64(timeout * 2 * 1_000_000_000))
+    gate.open()
+    try await Self.expectTornDown(fake, references: 1)
+    #expect(fake.callbacksDelivered == 1)
+  }
+
   @Test("Cancellation racing a reply: one outcome, one deallocate, on the lookup's queue")
   func cancellationRacesReply() async throws {
     for _ in 0..<200 {
@@ -531,6 +660,11 @@ struct ReverseDNSLookupTests {
     #expect(fake.deallocatedOnOwnQueue.count == references)
     let deallocatedOnQueue = fake.deallocatedOnOwnQueue.allSatisfy { $0 }
     #expect(deallocatedOnQueue)
+    // The callback context outlives every deallocate, so no callback can reach a freed one.
+    let contextAlive = fake.contextAliveAtEachDeallocate
+    let contextOutlivedDeallocate =
+      contextAlive.count == references && contextAlive.allSatisfy { $0 }
+    #expect(contextOutlivedDeallocate, "\(contextAlive)")
     let startedOnQueue = fake.starts.allSatisfy { $0.onLookupQueue }
     #expect(startedOnQueue)
     let misuse = fake.misuse

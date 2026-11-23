@@ -173,7 +173,10 @@ struct DNSServiceCalls: Sendable {
 ///   reference it made is deallocated at once.
 /// - Cancellation from any thread resolves the caller where it is and hops to the queue to
 ///   deallocate.
-/// - The callback context is a retained reference to this object, released only after the
+/// - The callback context is a ``CallbackContext`` that only the daemon's reference holds,
+///   retained when the query starts and released only after the deallocate, so no callback can
+///   reach a freed context. It refers to this object, which it keeps alive for as long as it
+///   lives.
 ///   deallocate, so no callback can reach a freed object.
 /// - `kDNSServiceFlagsReturnIntermediates` is set, because without it an address with no name
 ///   never calls back. Intermediate records of another type (a CNAME) and remove events (no
@@ -270,7 +273,7 @@ final class ReverseDNSLookup: @unchecked Sendable {
 
   // Confined to `queue`.
   private var ref: DNSServiceRef?
-  private var context: Unmanaged<ReverseDNSLookup>?
+  private var context: Unmanaged<CallbackContext>?
   private var tornDown = false
 
   init(
@@ -367,7 +370,7 @@ final class ReverseDNSLookup: @unchecked Sendable {
       tearDown()
       return
     }
-    let retained = Unmanaged.passRetained(self)
+    let retained = Unmanaged.passRetained(CallbackContext(lookup: self))
     let (status, newRef) = calls.queryRecord(
       Self.flags, question.interfaceIndex, question.name, retained.toOpaque())
     guard status == DNSServiceStatus.noError, let newRef else {
@@ -483,11 +486,23 @@ final class ReverseDNSLookup: @unchecked Sendable {
     return labels.joined(separator: ".")
   }
 
-  /// The callback `DNSServiceQueryRecord` is given. Its context is the lookup, retained.
+  /// What the daemon's callback is given: the lookup, held only through the query's reference.
+  ///
+  /// A separate object rather than the lookup itself, so its lifetime is exactly the context's:
+  /// the retain made when the query starts is its only owner.
+  final class CallbackContext {
+    let lookup: ReverseDNSLookup
+    init(lookup: ReverseDNSLookup) { self.lookup = lookup }
+  }
+
+  /// The callback `DNSServiceQueryRecord` is given. Its context is a retained ``CallbackContext``.
   static let reply: DNSServiceQueryRecordReply = {
     _, flags, _, errorCode, _, rrtype, _, rdlen, rdata, _, context in
     guard let context else { return }
-    let lookup = Unmanaged<ReverseDNSLookup>.fromOpaque(context).takeUnretainedValue()
+    // Borrowed, not retained, so the callback adds no owner of its own.
+    let lookup = Unmanaged<CallbackContext>.fromOpaque(context)._withUnsafeGuaranteedRef {
+      $0.lookup
+    }
     let bytes = UnsafeRawBufferPointer(start: rdata, count: rdata == nil ? 0 : Int(rdlen))
     lookup.handleReply(flags: flags, errorCode: errorCode, rrtype: rrtype, rdata: bytes)
   }
