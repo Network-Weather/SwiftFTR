@@ -317,6 +317,34 @@ struct FaultInjectionFixtureTests {
     } == 0
   }
 
+  @Test("A fake network keeps a closed probe socket's port taken until it stops")
+  func fakeNetworkHoldsProbePorts() async throws {
+    // A reply the network sends after the operation closed its probe socket goes to that port
+    // number; while the network can still send, no other socket may be handed it.
+    let network = try FakeICMPNetwork { _ in [] }
+    defer { network.stop() }
+    let probe = try network.makeSocket(AF_INET)
+    var (any, anyLength) = loopbackAddress(family: AF_INET, port: 0)
+    let bound = withUnsafePointer(to: &any) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(probe, $0, anyLength) }
+    }
+    #expect(bound == 0)
+    var actual = sockaddr_storage()
+    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    _ = withUnsafeMutablePointer(to: &actual) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(probe, $0, &length) }
+    }
+    let port = withUnsafeBytes(of: actual) {
+      UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+    }
+    close(probe)
+    #expect(!Self.canBind(type: SOCK_DGRAM, port: port), "the closed probe socket's port was free")
+    network.stop()
+    #expect(
+      await eventually(within: 10) { Self.canBind(type: SOCK_DGRAM, port: port) },
+      "the port stayed taken after the network stopped")
+  }
+
   @Test("A stopped UDP fixture's own thread closes its socket")
   func udpFixtureThreadClosesItsSocket() async throws {
     let responder = try LoopbackUDPResponder { _ in nil }
