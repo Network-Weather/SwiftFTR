@@ -266,7 +266,7 @@ struct PingExecutor: Sendable {
 
   // MARK: - Socket Operations
 
-  private func createICMPSocket(family: Int32) throws -> Int32 {
+  internal func createICMPSocket(family: Int32) throws -> Int32 {
     #if canImport(Darwin)
       let sockfd: Int32
       if let substitute = TestSeams.makeICMPSocket {
@@ -309,6 +309,7 @@ struct PingExecutor: Sendable {
           // Non-fatal — ttl will just be nil in responses.
         }
       }
+      enablePingArrivalTimestamps(sockfd)
       return sockfd
     #else
       throw TracerouteError.platformNotSupported(details: "Ping requires ICMP datagram sockets")
@@ -414,10 +415,7 @@ struct PingExecutor: Sendable {
   // here so that RTTs subtract two readings of the same clock; `monotonicNow()`
   // reads `CLOCK_MONOTONIC` and has a different epoch.
   internal func monotonicTime() -> TimeInterval {
-    var info = mach_timebase_info_data_t()
-    mach_timebase_info(&info)
-    let rawTime = TimeInterval(mach_absolute_time())
-    return (rawTime * TimeInterval(info.numer) / TimeInterval(info.denom)) / 1_000_000_000.0
+    pingClockSeconds(machAbsoluteTime: mach_absolute_time())
   }
 
   // MARK: - Identifier generation
@@ -713,54 +711,46 @@ final class PingOperation: @unchecked Sendable {
         return
       }
       var fromAddr = sockaddr_storage()
-      var fromLen = socklen_t(MemoryLayout<sockaddr_storage>.size)
       var hopLimit: Int? = nil
-      let received: ssize_t
+      // When the kernel queued the datagram, on ping's clock; nil if it did not say.
+      var arrivalTime: TimeInterval? = nil
+      let readsHopLimit = family == AF_INET6
 
-      if family == AF_INET6 {
-        // v6: use recvmsg so we can recover the hop limit from cmsg ancillary data.
-        // The kernel strips the IPv6 header for SOCK_DGRAM ICMPV6 (verified via
-        // icmpv6probe spike), so hop limit is unrecoverable from the buffer itself.
-        received = recvBuffer.withUnsafeMutableBytes { bufPtr -> ssize_t in
-          cmsgBuffer.withUnsafeMutableBufferPointer { cb -> ssize_t in
-            withUnsafeMutablePointer(to: &fromAddr) { faPtr -> ssize_t in
-              var iov = iovec(
-                iov_base: bufPtr.baseAddress, iov_len: bufPtr.count)
-              return withUnsafeMutablePointer(to: &iov) { iovPtr -> ssize_t in
-                var msg = msghdr()
-                msg.msg_name = UnsafeMutableRawPointer(faPtr)
-                msg.msg_namelen = socklen_t(MemoryLayout<sockaddr_storage>.size)
-                msg.msg_iov = iovPtr
-                msg.msg_iovlen = 1
-                msg.msg_control = UnsafeMutableRawPointer(cb.baseAddress)
-                msg.msg_controllen = socklen_t(cb.count)
-                msg.msg_flags = 0
-                let n = recvmsg(sockfd, &msg, 0)
-                if n >= 0 {
-                  fromLen = msg.msg_namelen
-                  // If the kernel had to truncate the ancillary buffer (extra cmsgs
-                  // we didn't account for), our hop-limit reading would be unreliable.
-                  // Skip the cmsg walk and let ttl be nil so callers see that as a
-                  // real condition rather than a silently lost field.
-                  if (msg.msg_flags & MSG_CTRUNC) == 0 {
-                    hopLimit = extractIPv6HopLimit(msg: msg)
+      // recvmsg for both families, for the kernel's arrival stamp (`SCM_TIMESTAMP_MONOTONIC`),
+      // and on v6 the hop limit. The kernel strips the IPv6 header for SOCK_DGRAM ICMPV6
+      // (verified via icmpv6probe spike), so hop limit is unrecoverable from the buffer itself.
+      let received: ssize_t = recvBuffer.withUnsafeMutableBytes { bufPtr -> ssize_t in
+        cmsgBuffer.withUnsafeMutableBufferPointer { cb -> ssize_t in
+          withUnsafeMutablePointer(to: &fromAddr) { faPtr -> ssize_t in
+            var iov = iovec(
+              iov_base: bufPtr.baseAddress, iov_len: bufPtr.count)
+            return withUnsafeMutablePointer(to: &iov) { iovPtr -> ssize_t in
+              var msg = msghdr()
+              msg.msg_name = UnsafeMutableRawPointer(faPtr)
+              msg.msg_namelen = socklen_t(MemoryLayout<sockaddr_storage>.size)
+              msg.msg_iov = iovPtr
+              msg.msg_iovlen = 1
+              msg.msg_control = UnsafeMutableRawPointer(cb.baseAddress)
+              msg.msg_controllen = socklen_t(cb.count)
+              msg.msg_flags = 0
+              let n = recvmsg(sockfd, &msg, 0)
+              if n >= 0 {
+                // If the kernel had to truncate the ancillary buffer (extra cmsgs
+                // we didn't account for), our readings would be unreliable.
+                // Skip the cmsg walk and leave ttl and the arrival stamp nil so callers
+                // see that as a real condition rather than a silently wrong field.
+                if (msg.msg_flags & MSG_CTRUNC) == 0 {
+                  if readsHopLimit { hopLimit = extractIPv6HopLimit(msg: msg) }
+                  arrivalTime = extractArrivalMachTime(msg: msg).map {
+                    pingClockSeconds(machAbsoluteTime: $0)
                   }
                 }
-                return n
               }
-            }
-          }
-        }
-      } else {
-        received = recvBuffer.withUnsafeMutableBytes { bufPtr in
-          withUnsafeMutablePointer(to: &fromAddr) { addrPtr in
-            addrPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-              recvfrom(sockfd, bufPtr.baseAddress, 1500, 0, $0, &fromLen)
+              return n
             }
           }
         }
       }
-
       if received < 0 { break }  // EAGAIN
 
       // Extra defensive check for negative count to prevent crash
@@ -788,8 +778,15 @@ final class PingOperation: @unchecked Sendable {
           // the first one's RTT. Either would also count toward ending the ping early. Such
           // replies are dropped like ones for another identifier. Sends are recorded on this
           // queue, so a reply to a request already sent always finds its send time here.
+          //
+          // A send time recorded before this read does not show the reply came after the send:
+          // it may have been queued while the send was still retrying buffer pressure on this
+          // queue. The kernel's arrival stamp settles it. The send time is taken before the
+          // successful `sendto`, so a reply to it always arrives later; one that arrived earlier
+          // answered nothing this ping sent. Without a stamp the reply is judged as before.
           let seq = Int(sequence)
-          guard sentTimes[seq] != nil, receiveTimes[seq] == nil else { break }
+          guard let sentAt = sentTimes[seq], receiveTimes[seq] == nil else { break }
+          if let arrivalTime, arrivalTime < sentAt { break }
           receiveTimes[seq] = receiveTime
           if let ttl = ttl { ttls[seq] = ttl }
         case .timeExceeded(let originalSequence, let ttl, _):
@@ -973,6 +970,50 @@ final class PingOperation: @unchecked Sendable {
     return swiftftrParsePingMessage(buffer: buffer, expectedIdentifier: expectedIdentifier)
   }
 
+}
+
+/// Ping's clock: `mach_absolute_time` ticks in seconds. Send stamps, receive stamps and the
+/// kernel's arrival stamps (`SCM_TIMESTAMP_MONOTONIC`, also `mach_absolute_time`) all go through
+/// here, so they can be compared.
+internal func pingClockSeconds(machAbsoluteTime ticks: UInt64) -> TimeInterval {
+  var info = mach_timebase_info_data_t()
+  mach_timebase_info(&info)
+  return (TimeInterval(ticks) * TimeInterval(info.numer) / TimeInterval(info.denom))
+    / 1_000_000_000.0
+}
+
+/// Asks the kernel to attach each received datagram's arrival time (`SCM_TIMESTAMP_MONOTONIC`,
+/// `mach_absolute_time` ticks) as ancillary data. Non-fatal: without it, replies carry no
+/// arrival stamp. Measured on macOS 26 for unprivileged ICMP and ICMPv6 datagram sockets and for
+/// UDP: the stamp is the time the datagram was queued, not the time it was read.
+internal func enablePingArrivalTimestamps(_ sockfd: Int32) {
+  var on: Int32 = 1
+  _ = setsockopt(
+    sockfd, SOL_SOCKET, SO_TIMESTAMP_MONOTONIC, &on, socklen_t(MemoryLayout<Int32>.size))
+}
+
+/// The `SCM_TIMESTAMP_MONOTONIC` value in a `msghdr`'s ancillary data, or nil if absent. Same
+/// layout rules as ``extractIPv6HopLimit(msg:)``; the 8-byte value may be unaligned.
+internal func extractArrivalMachTime(msg: msghdr) -> UInt64? {
+  guard msg.msg_controllen >= socklen_t(MemoryLayout<cmsghdr>.size),
+    let base = msg.msg_control
+  else { return nil }
+  let alignedHeader = (MemoryLayout<cmsghdr>.size + 3) & ~3
+  let end = base.advanced(by: Int(msg.msg_controllen))
+  var cursor = base
+  while cursor.advanced(by: MemoryLayout<cmsghdr>.size) <= end {
+    let hdr = cursor.loadUnaligned(as: cmsghdr.self)
+    if hdr.cmsg_level == SOL_SOCKET && hdr.cmsg_type == SCM_TIMESTAMP_MONOTONIC
+      && Int(hdr.cmsg_len) >= alignedHeader + MemoryLayout<UInt64>.size
+      && cursor.advanced(by: alignedHeader + MemoryLayout<UInt64>.size) <= end
+    {
+      return cursor.advanced(by: alignedHeader).loadUnaligned(as: UInt64.self)
+    }
+    let advance = (Int(hdr.cmsg_len) + 3) & ~3
+    guard advance > 0 else { break }
+    cursor = cursor.advanced(by: advance)
+  }
+  return nil
 }
 
 /// Walks the cmsg ancillary buffer attached to a `msghdr` to find an IPv6

@@ -168,39 +168,70 @@ struct PingReplyMatchingTests {
     #expect(result.responses.allSatisfy { $0.ttl == Int(Self.kept) }, "\(Self.summary(result))")
   }
 
-  // MARK: Sequences not yet sent
+  // MARK: Replies queued before their request left
+
+  @Test(
+    "A reply queued while its request is still being sent does not displace the real reply",
+    arguments: families)
+  func replyQueuedBeforeSendIsIgnored(family: Int32) async throws {
+    // Probe 2's send stands for one retrying buffer pressure: before the attempt that reaches the
+    // wire, a reply for sequence 2 reaches the probe socket and is confirmed queued there. The read
+    // handler shares the send's queue, so it reads that reply only after probe 2's send time is
+    // recorded. The network then answers every probe, probe 2 included.
+    let ping = try DirectPing(
+      family: family, config: PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
+    ) { probe in
+      [Self.reply(family, id: probe.identifier, seq: probe.sequence)]
+    }
+    defer { ping.stop() }
+    ping.beforeSend = { seq, fd in
+      guard seq == 2 else { return }
+      ping.network.inject(
+        Self.reply(family, id: DirectPing.identifier, seq: 2, mark: Self.ignored), to: fd)
+      ping.premise(queuedDatagrams(fd) >= 1 || waitForQueued(fd, atLeast: 1))
+    }
+
+    let (result, _) = try await measure(within: Self.watchdog) { try await ping.run() }
+    #expect(ping.premiseHeld, "the early reply was never queued ahead of probe 2's send")
+    let s = result.statistics
+    #expect(s.sent == 3 && s.received == 3 && s.packetLoss == 0, "\(Self.summary(result))")
+    #expect(result.responses.allSatisfy { ($0.rtt ?? -1) >= 0 }, "\(Self.summary(result))")
+    #expect(
+      result.responses.allSatisfy { $0.ttl == Int(Self.kept) },
+      "a reply queued before probe 2 left was kept: \(Self.summary(result))")
+  }
 
   @Test("A reply to a sequence not yet sent is not counted for it", arguments: families)
   func futureSequenceIsNotCounted(family: Int32) async throws {
-    // Probe 1's answer comes with a reply for sequence 2, a second before probe 2 leaves. Probe 2
-    // itself is never answered; probe 3 is.
-    let network = try FakeICMPNetwork(family: family) { probe in
-      let id = probe.identifier
-      switch probe.sequence {
-      case 1:
-        return [
-          Self.reply(family, id: id, seq: 1),
-          Self.reply(family, id: id, seq: 2, mark: Self.ignored),
-        ]
-      case 3: return [Self.reply(family, id: id, seq: 3)]
-      default: return []
-      }
+    // Right after probe 1 leaves, a reply for sequence 2 is queued on the probe socket, before
+    // probe 2 can be sent (both happen on the ping's queue). Probe 2 itself is never answered.
+    // Whether the ping reads that reply before or after probe 2 leaves, it answered nothing sent.
+    let ping = try DirectPing(
+      family: family, config: PingConfig(count: 3, interval: 0.05, timeout: 0.5)
+    ) { probe in
+      probe.sequence == 2 ? [] : [Self.reply(family, id: probe.identifier, seq: probe.sequence)]
     }
-    defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig())
-    let config = PingConfig(count: 3, interval: 1.0, timeout: 0.5)
+    defer { ping.stop() }
+    ping.afterSend = { seq, fd in
+      guard seq == 1 else { return }
+      ping.network.inject(
+        Self.reply(family, id: DirectPing.identifier, seq: 2, mark: Self.ignored), to: fd)
+      ping.premise(waitForQueued(fd, atLeast: 1))
+    }
 
+    let config = ping.config
     let (result, elapsed) = try await measure(within: Self.safetyTimer(config) - 1) {
-      try await network.install { try await tracer.ping(to: "fake.test", config: config) }
+      try await ping.run()
     }
+    #expect(ping.premiseHeld, "the early reply was never queued ahead of probe 2's send")
     let s = result.statistics
     #expect(s.sent == 3 && s.received == 2, "\(Self.summary(result))")
     #expect(
       result.responses.map { $0.rtt != nil } == [true, false, true], "\(Self.summary(result))")
     #expect((s.minRTT ?? -1) >= 0, "\(Self.summary(result))")
     #expect(result.responses.compactMap(\.ttl).allSatisfy { $0 == Int(Self.kept) })
-    // Probe 2 is unanswered, so the ping waits out probe 3's window: about 2.5 s.
-    #expect(elapsed >= 2.4, "the ping ended after \(elapsed)s: \(Self.summary(result))")
+    // Probe 2 is unanswered, so the ping waits out probe 3's window: about 0.6 s.
+    #expect(elapsed >= 0.55, "the ping ended after \(elapsed)s: \(Self.summary(result))")
   }
 
   // MARK: Duplicates
@@ -209,9 +240,7 @@ struct PingReplyMatchingTests {
   func firstReplyWins(family: Int32) async throws {
     // Probe 1 is answered, then answered again at once and once more when probe 3 arrives, just
     // ahead of probe 3's own reply.
-    let arrivals = ProbeArrivals()
     let network = try FakeICMPNetwork(family: family) { probe in
-      arrivals.record(probe.sequence)
       let id = probe.identifier
       switch probe.sequence {
       case 1:
@@ -229,7 +258,7 @@ struct PingReplyMatchingTests {
     }
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig())
-    let config = PingConfig(count: 3, interval: 0.5, timeout: Self.windowPastWatchdog)
+    let config = PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
 
     let (result, _) = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
@@ -239,12 +268,45 @@ struct PingReplyMatchingTests {
     #expect(
       result.responses.allSatisfy { $0.ttl == Int(Self.kept) },
       "a duplicate replaced the first reply: \(Self.summary(result))")
-    // The last duplicate is sent only after the network has seen probe 3, so an RTT measured to it
-    // is longer than the time between the network seeing probes 1 and 3 (about 1 s). Probe 1's
-    // first reply leaves at once.
-    let gap = try #require(arrivals.gap(from: 1, to: 3))
+  }
+
+  @Test("A duplicate does not replace the first reply's RTT", arguments: families)
+  func firstReplyKeepsItsRTT(family: Int32) async throws {
+    // Right after probe 1 leaves, its reply and a duplicate are both queued on the probe socket,
+    // so the ping reads them back to back in one read callback. Each receive stamp is recorded
+    // with the number of datagrams still queued when it was taken: the first reply's stamp is the
+    // one taken with the duplicate still waiting. Probe 2 is answered only once both are read.
+    let ping = try DirectPing(
+      family: family, config: PingConfig(count: 2, interval: 0.05, timeout: Self.windowPastWatchdog)
+    ) { _ in [] }
+    defer { ping.stop() }
+    ping.afterSend = { seq, fd in
+      if seq == 1 {
+        ping.network.inject(Self.reply(family, id: DirectPing.identifier, seq: 1), to: fd)
+        ping.network.inject(
+          Self.reply(family, id: DirectPing.identifier, seq: 1, mark: Self.ignored), to: fd)
+        ping.premise(waitForQueued(fd, atLeast: 2))
+      } else {
+        // Delivered from another thread once the first two are read: this closure runs on the
+        // ping's queue, which must stay free to read them.
+        Thread.detachNewThread {
+          ping.premise(waitForQueued(fd, atMost: 0))
+          ping.network.inject(Self.reply(family, id: DirectPing.identifier, seq: 2), to: fd)
+        }
+      }
+    }
+
+    let (result, _) = try await measure(within: Self.watchdog) { try await ping.run() }
+    #expect(ping.premiseHeld, "the replies were not queued and read as staged")
+    let s = result.statistics
+    #expect(s.sent == 2 && s.received == 2, "\(Self.summary(result))")
+    let firstStamps = ping.clock.stamps(withQueued: 1)
+    #expect(firstStamps.count == 1, "stamps taken with one datagram queued: \(firstStamps)")
+    let sentAt = try #require(ping.sendTimes[1])
     let rtt = try #require(result.responses.first?.rtt)
-    #expect(rtt < gap, "probe 1's RTT \(rtt)s is a duplicate's (probes 1 to 3: \(gap)s)")
+    #expect(
+      rtt == (firstStamps.first ?? .nan) - sentAt,
+      "probe 1's RTT \(rtt)s is not its first reply's (\(firstStamps.map { $0 - sentAt }))")
   }
 
   // MARK: Late replies
@@ -276,22 +338,135 @@ struct PingReplyMatchingTests {
   }
 }
 
-/// When the fake network saw each probe, on its own thread.
-private final class ProbeArrivals: @unchecked Sendable {
+/// A ``PingOperation`` driven directly, on a probe socket from ``FakeICMPNetwork`` configured by
+/// ping's own socket setup, sending through ping's real send path.
+///
+/// `beforeSend` and `afterSend` run on the ping's queue around each request's real send, where the
+/// read handler cannot run, so a datagram they queue on the probe socket is read only after the
+/// send's time is recorded (`beforeSend`) or after the request has left (`afterSend`). The clock
+/// is ping's, and records each reading with how many datagrams were still queued.
+final class DirectPing: @unchecked Sendable {
+  static let identifier: UInt16 = 0x4242
+
+  typealias Hook = @Sendable (_ sequence: UInt16, _ fd: Int32) -> Void
+
+  let network: FakeICMPNetwork
+  let config: PingConfig
+  let clock: RecordingClock
+  private let state = State()
+  private let operation: PingOperation
+
+  /// Hooks and observations, shared with the send path on the ping's queue.
+  private final class State: @unchecked Sendable {
+    let lock = NSLock()
+    var before: Hook?
+    var after: Hook?
+    var premises: [Bool] = []
+    var sent: [UInt16: TimeInterval] = [:]
+  }
+
+  var beforeSend: Hook? {
+    get { state.lock.withLock { state.before } }
+    set { state.lock.withLock { state.before = newValue } }
+  }
+  var afterSend: Hook? {
+    get { state.lock.withLock { state.after } }
+    set { state.lock.withLock { state.after = newValue } }
+  }
+
+  /// Each request's send time, as ping recorded it.
+  var sendTimes: [UInt16: TimeInterval] { state.lock.withLock { state.sent } }
+
+  /// Whether every staged condition the hooks checked held.
+  var premiseHeld: Bool {
+    state.lock.withLock { !state.premises.isEmpty && state.premises.allSatisfy { $0 } }
+  }
+
+  func premise(_ held: Bool) { state.lock.withLock { state.premises.append(held) } }
+
+  init(family: Int32, config: PingConfig, script: @escaping FakeICMPNetwork.Script) throws {
+    let network = try FakeICMPNetwork(family: family, script: script)
+    let executor = PingExecutor(config: SwiftFTRConfig())
+    let makeSocket: TestSeams.MakeICMPSocket = { try network.makeSocket($0) }
+    let fd = try TestSeams.$makeICMPSocket.withValue(makeSocket) {
+      try executor.createICMPSocket(family: family)
+    }
+    try setProbeSocketNonBlocking(fd)
+    let clock = RecordingClock(fd: fd) { executor.monotonicTime() }
+    let state = self.state
+    self.network = network
+    self.config = config
+    self.clock = clock
+    operation = PingOperation(
+      sockfd: fd, target: "fake.test", resolved: network.resolved, config: config,
+      identifier: Self.identifier,
+      sendPacket: { fd, packet, resolved in
+        let seq = UInt16(packet[6]) << 8 | UInt16(packet[7])
+        let (before, after) = state.lock.withLock { (state.before, state.after) }
+        before?(seq, fd)
+        let time = try executor.sendPacket(sockfd: fd, packet: packet, to: resolved)
+        state.lock.withLock { state.sent[seq] = time }
+        after?(seq, fd)
+        return time
+      },
+      monotonicTime: { clock.now() },
+      closeSocket: { _ = close($0) })
+  }
+
+  func run() async throws -> PingResult { try await operation.run() }
+
+  func stop() { network.stop() }
+}
+
+/// Ping's clock, recording each reading with the number of datagrams queued on `fd` at the time.
+final class RecordingClock: @unchecked Sendable {
+  private let fd: Int32
+  private let read: @Sendable () -> TimeInterval
   private let lock = NSLock()
-  private var times: [UInt16: TimeInterval] = [:]
+  private var readings: [(time: TimeInterval, queued: Int32)] = []
 
-  func record(_ sequence: UInt16) {
-    let now = monotonicNow()
-    lock.lock()
-    defer { lock.unlock() }
-    if times[sequence] == nil { times[sequence] = now }
+  init(fd: Int32, read: @escaping @Sendable () -> TimeInterval) {
+    self.fd = fd
+    self.read = read
   }
 
-  func gap(from first: UInt16, to last: UInt16) -> TimeInterval? {
-    lock.lock()
-    defer { lock.unlock() }
-    guard let start = times[first], let end = times[last] else { return nil }
-    return end - start
+  func now() -> TimeInterval {
+    let time = read()
+    let queued = queuedDatagrams(fd)
+    lock.withLock { readings.append((time, queued)) }
+    return time
   }
+
+  func stamps(withQueued queued: Int32) -> [TimeInterval] {
+    lock.withLock { readings.filter { $0.queued == queued }.map(\.time) }
+  }
+}
+
+/// Datagrams waiting on `fd`, from `SO_NUMRCVPKT`; -1 if it cannot be read.
+func queuedDatagrams(_ fd: Int32) -> Int32 {
+  var count: Int32 = 0
+  var length = socklen_t(MemoryLayout<Int32>.size)
+  guard getsockopt(fd, SOL_SOCKET, SO_NUMRCVPKT, &count, &length) == 0 else { return -1 }
+  return count
+}
+
+/// Waits, blocking this thread for at most `limit` seconds, until at least `atLeast` (or at most
+/// `atMost`) datagrams are queued on `fd`. Returns whether that happened. Never call it from the
+/// cooperative pool.
+func waitForQueued(
+  _ fd: Int32, atLeast: Int32? = nil, atMost: Int32? = nil, limit: TimeInterval = 10
+) -> Bool {
+  let giveUp = monotonicNow() + limit
+  func met() -> Bool {
+    let n = queuedDatagrams(fd)
+    guard n >= 0 else { return false }
+    if let atLeast, n < atLeast { return false }
+    if let atMost, n > atMost { return false }
+    return true
+  }
+  while !met() {
+    if monotonicNow() >= giveUp { return false }
+    usleep(500)
+  }
+  return true
 }

@@ -436,6 +436,26 @@ final class FakeICMPNetwork: @unchecked Sendable {
     }
   }
 
+  /// Sends `reply` now, from this network's address, to the socket `fd` is bound to, as if it
+  /// answered a probe from `fd`. Returns false if `fd` has no local address yet (it binds on its
+  /// first send).
+  @discardableResult
+  func inject(_ reply: Reply, to fd: Int32) -> Bool {
+    var address = sockaddr_storage()
+    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let named = withUnsafeMutablePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+    }
+    let port = withUnsafeBytes(of: address) {
+      UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+    }
+    guard named == 0, port != 0 else { return false }
+    // A socket bound to the wildcard address is reached on loopback.
+    let (destination, _) = loopbackAddress(family: family, port: port)
+    send(reply.bytes, to: destination, hopLimit: reply.hopLimit)
+    return true
+  }
+
   private func send(_ bytes: [UInt8], to destination: sockaddr_storage, hopLimit: Int32?) {
     lock.lock()
     defer { lock.unlock() }
