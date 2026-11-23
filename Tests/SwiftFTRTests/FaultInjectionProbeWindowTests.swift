@@ -73,7 +73,10 @@ struct FaultInjectionProbeWindowTests {
     #expect(result.hops.count == 6)
     #expect(result.hops.allSatisfy { $0.ipAddress == nil && $0.outcome == .timedOut })
     #expect(elapsed >= 0.35, "silent trace returned after \(elapsed)s, before its 0.4s window")
-    #expect(network.probes.value == 6, "every TTL should have been sent")
+    // The network counts each probe as it reads it, which can be after the trace has returned.
+    #expect(
+      await eventually(within: 10) { network.probes.value == 6 },
+      "every TTL should have been sent: \(network.probes.value) probes")
   }
 
   @Test("Replies that arrive after the deadline are ignored, not fatal", arguments: families)
@@ -523,7 +526,10 @@ struct FaultInjectionProbeWindowTests {
     #expect(result.statistics.sent == 3)
     #expect(result.statistics.received == 0)
     #expect(result.statistics.packetLoss == 1)
-    #expect(network.probes.value == 3, "the network saw \(network.probes.value) probes")
+    // The network counts each probe as it reads it, which can be after the ping has returned.
+    #expect(
+      await eventually(within: 10) { network.probes.value == 3 },
+      "the network saw \(network.probes.value) probes")
     // The last probe leaves at about 0.1 s and is owed its 0.3 s reply window, so a ping that
     // gives up after its last send returns too early.
     #expect(elapsed >= 0.35, "silent ping took \(elapsed)s")

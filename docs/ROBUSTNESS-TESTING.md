@@ -638,4 +638,6 @@ Observations that are not defects of the library:
   still in flight as read, so on a loaded host it can overstate what the operation read.
   `FaultInjectionProbeWindowTests.unreachableReported` needed three unreachable replies inside
   0.3 s; hops 1 and 2 now answer unreachable and hop 3 is the destination, with a window past the
-  watchdog, so only the destination's reply ends the trace.
+  watchdog, so only the destination's reply ends the trace. Two counts of the probes the fake
+  network saw, read as the trace or ping returned, are now awaited. Under that load these two files
+  recorded issues in 9 of 10 runs on main (20 issues), 2 of 10 strict.
