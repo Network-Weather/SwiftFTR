@@ -164,7 +164,10 @@ struct ReverseDNSLookupDaemonTests {
       return
     }
     // The same runner and bundle, with only the child suite selected, once.
-    let dropped: Set<String> = ["--filter", "--skip", "--maximum-repetitions", "--repeat-until"]
+    // The runner passes a repeated run on as `--repetitions`.
+    let dropped: Set<String> = [
+      "--filter", "--skip", "--maximum-repetitions", "--repeat-until", "--repetitions",
+    ]
     var childArguments: [String] = []
     var index = 1
     while index < arguments.count {
