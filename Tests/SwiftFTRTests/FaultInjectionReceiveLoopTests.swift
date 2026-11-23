@@ -26,8 +26,9 @@ import Testing
 /// a held loop ends after the test.
 ///
 /// ``install(_:descriptors:_:)`` routes the operation's sockets through ``socketFactory(_:)``,
-/// which binds each to loopback so replies can be addressed to it, sets the timeout, and keeps a
-/// duplicate so the port cannot be handed to another socket while replies still go to it. It also
+/// which connects each to the network, so only the network's replies can reach it, sets the
+/// timeout, and keeps a duplicate so the port cannot be handed to another socket while replies
+/// still go to it. It also
 /// substitutes `fcntl` so the operation's switch to non-blocking reports success and changes
 /// nothing. Replies start as the socket is made, before the operation sends anything, and the
 /// socket is handed over only once ``primed`` of them are queued on it, so the socket is already
@@ -52,6 +53,7 @@ final class EndlessReplies: @unchecked Sendable {
   private var longestGap: TimeInterval = 0
   /// The network whose socket the replies leave from, set by ``socketFactory(_:)``.
   private var network: FakeICMPNetwork?
+  private var handedOverAt: TimeInterval?
 
   init(family: Int32 = AF_INET) {
     self.family = family
@@ -74,7 +76,7 @@ final class EndlessReplies: @unchecked Sendable {
     }
   }
 
-  /// Opens a probe socket through `network`, bound to loopback and with the receive timeout set.
+  /// Opens a probe socket through `network`, connected to it and with the receive timeout set.
   func socketFactory(_ network: FakeICMPNetwork) -> TestSeams.MakeICMPSocket {
     { [self] requestedFamily in
       let fd = try network.makeSocket(requestedFamily)
@@ -107,6 +109,9 @@ final class EndlessReplies: @unchecked Sendable {
         throw FixtureError.socket("only \(queuedDatagrams(fd)) replies queued before handover", 0)
       }
       handedOver = true
+      lock.lock()
+      handedOverAt = handedOverAt ?? monotonicNow()
+      lock.unlock()
       return fd
     }
   }
@@ -187,6 +192,15 @@ final class EndlessReplies: @unchecked Sendable {
       + "read \(mark.read) -> \(read), longest gap \(longestGap)s, "
       + "since last send \(sinceLastSend.map { "\($0)s" } ?? "never")"
     return (ok, detail)
+  }
+
+  /// Seconds from the moment the socket was handed to the operation, after the replies were
+  /// primed, until `end`; `nil` if it never was. Stamped in the socket factory, which runs inside
+  /// the operation's call, so a "not early" bound measured from it excludes the priming wait.
+  func sinceHandover(until end: TimeInterval) -> TimeInterval? {
+    lock.lock()
+    defer { lock.unlock() }
+    return handedOverAt.map { end - $0 }
   }
 
   /// Replies sent so far.
@@ -350,10 +364,13 @@ struct FaultInjectionReceiveLoopTests {
         try await tracer.trace(to: "fake.test")
       }
     }
+    let ended = monotonicNow()
     let flow = replies.fedAndRead(since: before)
 
     #expect(flow.ok, "the socket was not kept fed and read while the trace ran: \(flow.detail)")
-    #expect(elapsed >= window * 0.9, "the trace ended before its \(window)s window: \(elapsed)s")
+    // From the handover, not the run's start, which includes priming the socket.
+    let ran = try #require(replies.sinceHandover(until: ended))
+    #expect(ran >= window * 0.9, "the trace ended \(ran)s after its socket, \(elapsed)s in all")
     #expect(!result.reached)
     #expect(result.hops.count == 4)
     #expect(result.hops.allSatisfy { $0.outcome == .timedOut })
@@ -511,10 +528,15 @@ struct FaultInjectionReceiveLoopTests {
         return hops
       }
     }
+    let ended = monotonicNow()
     let flow = replies.fedAndRead(since: before)
 
     #expect(flow.ok, "the socket was not kept fed and read while the stream ran: \(flow.detail)")
-    #expect(elapsed >= config.probeTimeout * 0.9, "the stream ended early: \(elapsed)s")
+    // From the handover, not the run's start, which includes priming the socket.
+    let ran = try #require(replies.sinceHandover(until: ended))
+    #expect(
+      ran >= config.probeTimeout * 0.9,
+      "the stream ended \(ran)s after its socket, \(elapsed)s in all")
     #expect(hops.map(\.ttl).sorted() == Array(1...4), "one placeholder per TTL")
     #expect(hops.allSatisfy { $0.ipAddress == nil })
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
@@ -634,6 +656,7 @@ struct FaultInjectionReceiveLoopTests {
         try await tracer.ping(to: "fake.test", config: config)
       }
     }
+    let ended = monotonicNow()
     let flow = replies.fedAndRead(since: before)
 
     #expect(flow.ok, "the socket was not kept fed and read while the ping ran: \(flow.detail)")
@@ -644,8 +667,12 @@ struct FaultInjectionReceiveLoopTests {
       await eventually(within: 5) { network.probes.value == 3 },
       "the network saw \(network.probes.value) probes")
     #expect(result.statistics.received == 0)
-    // The last probe is owed its full reply window.
-    #expect(elapsed >= 2 * config.interval + config.timeout * 0.9, "returned after \(elapsed)s")
+    // The last probe is owed its full reply window, measured from the handover, not the run's
+    // start, which includes priming the socket.
+    let ran = try #require(replies.sinceHandover(until: ended))
+    #expect(
+      ran >= 2 * config.interval + config.timeout * 0.9,
+      "returned \(ran)s after its socket, \(elapsed)s in all")
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
   }
 

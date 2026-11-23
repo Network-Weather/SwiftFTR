@@ -632,7 +632,10 @@ Observations that are not defects of the library:
   0.3 s window had closed. The two strict failures reported earlier (294 replies sent, 4 read) are
   the same start, landing just before the window closed; the sent count is read after the trace
   returns, while the feed runs on. The replies now start as the probe socket is made, and the
-  socket is handed over only once ten are queued, so it is fed when the window opens. They are
+  socket is handed over only once ten are queued, so it is fed when the window opens. The
+  priming wait sits inside the operation's call, so the "not early" bounds of the trace, stream
+  and ping deadline tests are measured from the handover, stamped in the socket factory, rather
+  than from the start of the run. They are
   echo replies for sequence 0, which no trace, stream or ping sends, so they need no identifier
   from the operation. The read count stays an estimate (sent minus queued), which counts replies
   still in flight as read, so on a loaded host it can overstate what the operation read.
