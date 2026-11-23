@@ -48,8 +48,8 @@ struct DNSWireHardeningTests {
   @Test("Production query preserves compressed answer owner names")
   func productionQueryPreservesOwnerName() async throws {
     let fixture = try DNSUDPFixture()
-    let responder = Task.detached {
-      try fixture.respond(with: .success(address: [192, 0, 2, 42]))
+    let responder = Task {
+      try await onOwnThread { try fixture.respond(with: .success(address: [192, 0, 2, 42])) }
     }
 
     let answers = try await runDNSFixtureQuery(
@@ -72,8 +72,8 @@ struct DNSWireHardeningTests {
   )
   func productionQueryRejectsInvalidHeaders(_ invalidHeader: InvalidDNSHeader) async throws {
     let fixture = try DNSUDPFixture()
-    let responder = Task.detached {
-      try fixture.respond(with: invalidHeader.scenario)
+    let responder = Task {
+      try await onOwnThread { try fixture.respond(with: invalidHeader.scenario) }
     }
 
     await #expect {
@@ -94,8 +94,8 @@ struct DNSWireHardeningTests {
   @Test("Production query ignores a response with another transaction ID and times out")
   func productionQueryIgnoresMismatchedTransactionID() async throws {
     let fixture = try DNSUDPFixture()
-    let responder = Task.detached {
-      try fixture.respond(with: .mismatchedTransactionID)
+    let responder = Task {
+      try await onOwnThread { try fixture.respond(with: .mismatchedTransactionID) }
     }
 
     await #expect {
@@ -124,13 +124,15 @@ struct DNSWireHardeningTests {
         timeout: 1.0
       )
     }
-    let responder = Task.detached {
-      try fixture.respond(with: .unexpectedSource)
+    let responder = Task {
+      try await onOwnThread { try fixture.respond(with: .unexpectedSource) }
     }
 
     try await responder.value
     await #expect {
-      try await query.value
+      // The query's own timeout is what ends it, so a query that ignores it fails the watchdog
+      // instead of hanging the run.
+      try await measure(within: 10) { try await query.value }.0
     } throws: { error in
       guard let dnsError = error as? DNSError else { return false }
       if case .timeout = dnsError { return true }
@@ -189,6 +191,15 @@ private enum DNSFixtureError: Error {
   case receiveFailed
   case malformedQuery
   case sendFailed
+}
+
+/// Runs `body` on a thread of its own and returns its result, so the fixture's blocking receive
+/// never parks a thread of Swift's cooperative pool, which the query it answers needs.
+private func onOwnThread<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T
+{
+  try await withCheckedThrowingContinuation { continuation in
+    Thread.detachNewThread { continuation.resume(with: Result { try body() }) }
+  }
 }
 
 private final class DNSUDPFixture: @unchecked Sendable {

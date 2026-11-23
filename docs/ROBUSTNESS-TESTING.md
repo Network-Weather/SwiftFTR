@@ -73,7 +73,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
-| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
+| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached and, though it ran past the stall threshold, does not count toward the breaker | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
 | DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage without the query's transaction ID (ignored, so a timeout), oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
 | DNS transport | refused port (IPv4 and IPv6); empty datagram (ignored, so a timeout); `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
@@ -87,16 +87,24 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails; for the probes, the result, nothing sent or connected, and the socket closed, against a pass-through control | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ReceiveLoop`, `ProbeNonBlockingSetupTests` |
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
-| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
+| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP `stop()` returns without waiting for its handlers and `stopAndWait()` joins them; a stopped UDP fixture's thread closes its own socket | fixtures | `Fixture` |
 
-Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`
-and `DNSForeignReplyTests` for the event-based DNS transport, `CymruEventBasedTests` for the
-Team Cymru lookups on it, and `ProbeNonBlockingSetupTests` for the TCP and UDP probes' socket
-setup. Every timed operation runs under a watchdog
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`,
-`DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport, and `CymruEventBasedTests` for the
-Team Cymru lookups on it. Every timed operation runs under a watchdog
+`DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport,
+`CymruEventBasedTests` for the Team Cymru lookups on it, and `ProbeNonBlockingSetupTests` for the
+TCP and UDP probes' socket setup. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
+
+Fixture teardown parks no thread. A fixture's `stop()` sets a flag under the fixture's lock and
+returns; the fixture's own thread notices within its 20 ms receive timeout or poll and closes its
+socket as it exits. Every other path that sends on that socket (a delayed reply, an injected one)
+checks the flag under the same lock, and the close happens under that lock after the flag is set,
+so no descriptor number is used after it is closed and perhaps handed to another test's socket.
+A fixture with more than one thread closes its socket in the last one to exit; `EndlessReplies`
+keeps the reply port reserved until its sender's last reply has gone. A test that needs a fixture
+joined awaits it without a thread (`LoopbackTCPServer.stopAndWait()`). The suite passes with
+`LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, which limits the cooperative pool and so exposes a
+blocking call made from an async test.
 
 Not covered, and why:
 
@@ -384,7 +392,9 @@ Observations that are not defects of the library:
   by `.timeLimit`, whose task group still joins the stuck child. Waits for a fixture to start,
   become ready or be cancelled go through `waitBounded`, and polls for one to run through
   `eventually`, each failing the test after ten seconds. A test that gives up does not join the
-  operation it was waiting on. Waits that cannot fail to end are left unbounded: a fixture's stop
-  path, a stall the test itself releases, a call with its own timeout.
+  operation it was waiting on. A wait for a task that only the behaviour under test can end, a
+  cancellation or a deadline the test is checking, runs under `measure(within:)`. Waits that
+  cannot fail to end are left unbounded: a stall the test itself releases, a call with its own
+  timeout that is not the one under test.
 - `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
   identifies a socket by its bound local address when checking that the library closed it.

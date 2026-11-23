@@ -209,6 +209,9 @@ struct TraceLifecycleTests {
     let task = Task {
       try await tracer.traceClassified(to: "127.0.0.1", resolver: resolver)
     }
+    // A trace still waiting when the test gives up must not outlive it; the resolver ends when
+    // cancelled.
+    defer { task.cancel() }
 
     // Wait until the resolver is actively invoked during the enrichment phase. Bounded: a trace
     // that fails before classification never invokes it, and must fail this test, not hang it.
@@ -225,16 +228,21 @@ struct TraceLifecycleTests {
     }
     #expect(await !tracer.activeTraces.isEmpty, "the trace was no longer running in enrichment")
 
-    // Cancel while classifier.classify() is actively awaiting the suspended resolver
-    await tracer.cancelActiveTraces()
-
-    do {
-      _ = try await task.value
-      Issue.record("traceClassified should have thrown cancelled during ASN enrichment")
-    } catch TracerouteError.cancelled {
-      // Expected: immediately interrupted rather than waiting on hanging resolver
-    } catch {
+    // Cancel while classifier.classify() is actively awaiting the suspended resolver. The resolver
+    // never returns, so a trace that ends was ended by the cancellation. The watchdog covers the
+    // cancellation request and the trace's end, so a cancellation that does not reach the trace
+    // fails the test instead of hanging the run.
+    let (outcome, _) = try await measure(within: lifecycleWatchdog) {
+      await tracer.cancelActiveTraces()
+      return await task.result
+    }
+    switch outcome {
+    case .failure(TracerouteError.cancelled):
+      break  // Interrupted rather than waiting on the hanging resolver.
+    case .failure(let error):
       Issue.record("Unexpected error from cancelled traceClassified: \(error)")
+    case .success:
+      Issue.record("traceClassified should have thrown cancelled during ASN enrichment")
     }
 
     let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }
