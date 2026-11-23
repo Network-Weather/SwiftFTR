@@ -385,10 +385,6 @@ actor _ConcurrencySemaphore {
     }
   }
 
-  /// Tasks waiting for a permit now. For tests, which wait on it to know a caller has reached
-  /// the wait.
-  var waitingCount: Int { waiters.count }
-
   func signal() {
     if !waiters.isEmpty {
       let waiter = waiters.removeFirst()
