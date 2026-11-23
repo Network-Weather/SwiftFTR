@@ -58,7 +58,15 @@ struct FaultInjectionFixtureTests {
   }
 
   @Test("A loopback fixture is never handed the port of a socket bound to the unspecified address")
-  func loopbackFixtureKeepsOffWildcardPorts() throws {
+  func loopbackFixtureKeepsOffWildcardPorts() async throws {
+    // Some 4,000 socket calls: on a thread of their own, not the cooperative pool, which a
+    // repeated run of this test would otherwise hold for seconds at a time.
+    let (heldCount, collisions) = try await onOwnThread { try Self.wildcardPortCollisions() }
+    #expect(heldCount == 128)
+    #expect(collisions.isEmpty, "fixtures were handed held ports: \(collisions)")
+  }
+
+  static func wildcardPortCollisions() throws -> (heldCount: Int, collisions: [UInt16]) {
     // A probe socket the library sends on unbound takes an ephemeral port on the unspecified
     // address at its first send. A fixture later handed the same number on ::1 would receive
     // every loopback reply meant for the probe socket, and the operation would wait out its whole
@@ -98,12 +106,18 @@ struct FaultInjectionFixtureTests {
       close(fd)
       if heldPorts.contains(port) { collisions.append(port) }
     }
-    #expect(heldPorts.count == held)
-    #expect(collisions.isEmpty, "fixtures were handed held ports: \(collisions)")
+    return (heldPorts.count, collisions)
   }
 
   @Test("An IPv4 refusing UDP port is never handed to a dual-stack IPv6 socket")
-  func refusingUDPPortKeepsOffDualStack() throws {
+  func refusingUDPPortKeepsOffDualStack() async throws {
+    // On a thread of its own, for the reason given in loopbackFixtureKeepsOffWildcardPorts.
+    let (heldCount, collisions) = try await onOwnThread { try Self.dualStackCollisions() }
+    #expect(heldCount == 64)
+    #expect(collisions.isEmpty, "dual-stack sockets were handed refusing ports: \(collisions)")
+  }
+
+  static func dualStackCollisions() throws -> (heldCount: Int, collisions: [UInt16]) {
     // A dual-stack socket bound to [::] on a refusing port's number would receive the IPv4
     // datagrams meant to be refused, and the operation under test would see silence. Hold
     // `held` refusing ports and bind `binds` dual-stack sockets one at a time: were the kernel
@@ -138,9 +152,8 @@ struct FaultInjectionFixtureTests {
       }
       if heldPorts.contains(port) { collisions.append(port) }
     }
-    #expect(heldPorts.count == held)
-    #expect(collisions.isEmpty, "dual-stack sockets were handed refusing ports: \(collisions)")
     withExtendedLifetime(refusing) {}
+    return (heldPorts.count, collisions)
   }
 
   @Test("The UDP responder hands a zero-byte request to its script")
@@ -253,6 +266,43 @@ struct FaultInjectionFixtureTests {
     var buffer = [UInt8](repeating: 0, count: 16)
     let received = recv(client, &buffer, buffer.count, 0)
     #expect(received == 0, "recv returned \(received), errno \(errno)")
+  }
+
+  @Test("A stopped TCP server ends a connection with end-of-file even with its request unread")
+  func tcpServerStopDiscardsUnreadRequest() async throws {
+    // Part of LoopbackTCPServer.stop()'s contract: a request already queued, unread, when the
+    // server stops is discarded with the read side and the client sees end-of-file. (One still
+    // in flight at the stop, or sent after it, usually resets the connection instead; that is
+    // why a test checking for end-of-file must not stop the server with a request in flight.)
+    let exitGate = StallGate()
+    defer { exitGate.open() }
+    let server = try LoopbackTCPServer(behavior: .silent, exitGate: exitGate)
+    defer { server.stop() }
+    let client = socket(AF_INET, SOCK_STREAM, 0)
+    defer { close(client) }
+    var (address, length) = loopbackAddress(family: AF_INET, port: server.port)
+    let connected = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(client, $0, length) }
+    }
+    #expect(connected == 0)
+    #expect(await eventually(within: 10) { server.accepted.value == 1 })
+    _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
+    // Nothing left in the client's send buffer means the server's kernel has acknowledged it,
+    // so it is in the server's receive buffer, which the silent handler never reads.
+    #expect(
+      await eventually(within: 10) {
+        var unsent: Int32 = 0
+        var size = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(client, SOL_SOCKET, SO_NWRITE, &unsent, &size)
+        return unsent == 0
+      })
+    server.stop()
+    exitGate.open()
+    await server.stopAndWait()
+    setReceiveTimeout(client, seconds: 1)
+    var buffer = [UInt8](repeating: 0, count: 16)
+    let received = recv(client, &buffer, buffer.count, 0)
+    #expect(received == 0, "recv returned \(received), errno \(errno): not end-of-file")
   }
 
   /// Whether a fresh socket, with no reuse options, can bind `port` on loopback: false while

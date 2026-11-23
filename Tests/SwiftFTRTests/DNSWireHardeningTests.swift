@@ -193,15 +193,6 @@ private enum DNSFixtureError: Error {
   case sendFailed
 }
 
-/// Runs `body` on a thread of its own and returns its result, so the fixture's blocking receive
-/// never parks a thread of Swift's cooperative pool, which the query it answers needs.
-private func onOwnThread<T: Sendable>(_ body: @escaping @Sendable () throws -> T) async throws -> T
-{
-  try await withCheckedThrowingContinuation { continuation in
-    Thread.detachNewThread { continuation.resume(with: Result { try body() }) }
-  }
-}
-
 private final class DNSUDPFixture: @unchecked Sendable {
   let port: UInt16
 

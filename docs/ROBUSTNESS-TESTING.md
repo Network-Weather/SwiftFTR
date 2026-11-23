@@ -461,4 +461,22 @@ Observations that are not defects of the library:
   that its injected early reply had landed before probe 2 left, but probe 1's own reply, still
   unread, met that while the injected one was in flight on loopback. Landing after the send, the
   injected reply was rightly kept. The test now waits until every datagram the fake network sent
-  to the socket is queued or read.
+  to the socket is queued or read. `futureSequenceIsNotCounted` had the same check; its 50 ms
+  send interval hides the race only while probe 1's send runs on time, and with probe 2's send
+  forced right behind it the old check failed 100 of 100 runs. It now waits the same way.
+- A client of a stopped `LoopbackTCPServer` saw a reset instead of end-of-file.
+  `stop()` shuts each connection down for reading and writing. Darwin then discards data already
+  queued and unread, but data arriving afterwards usually resets the connection (997 of 1,000
+  runs; the rest saw end-of-file), so a request still in
+  flight when the server stopped turned the end-of-file
+  `FaultInjectionFixtureTests.tcpServerStopDoesNotWaitAndStopAndWaitJoins` checks into
+  `ECONNRESET` (about 1 run in 100 under load). That test now sends no request to its silent
+  handler and waits until the responding handler has read its own, and saw no reset in 1,000
+  runs. `stop()` documents the rule, and `tcpServerStopDiscardsUnreadRequest` pins the
+  end-of-file half; the reset is not certain enough to pin.
+- Two fixture tests starved the cooperative pool when repeated. `loopbackFixtureKeepsOffWildcardPorts`
+  and `refusingUDPPortKeepsOffDualStack` made about 4,000 socket calls each on a pool thread.
+  Repeated 500 times with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, they stalled the run in 7 to
+  21 s steps, and the TCP stop test, starved past both of its 30 s budgets, saw its handler answer
+  and exit before `stop()` (2 of 500 strict repetitions, twice). Both loops now run on a thread of
+  their own (`onOwnThread`).
