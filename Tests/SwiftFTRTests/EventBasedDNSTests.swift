@@ -170,7 +170,7 @@ struct EventBasedDNSTests {
       probe.error
         == "Connection refused - the host is up but no DNS server is listening on this port",
       "\(probe.error ?? "nil")")
-    #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
+    #expect(Self.isConnectionRefused(thrown), "\(String(describing: thrown))")
   }
 
   @Test("An empty datagram carries no transaction ID: it is ignored, and the query times out")
@@ -524,7 +524,7 @@ struct EventBasedDNSTests {
     switch exit {
     case .answered: #expect(thrown == nil, "\(String(describing: thrown))")
     case .timedOut: #expect(Self.isTimeout(thrown), "\(String(describing: thrown))")
-    case .refused: #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
+    case .refused: #expect(Self.isConnectionRefused(thrown), "\(String(describing: thrown))")
     case .malformed: #expect(Self.isMalformed(thrown), "\(String(describing: thrown))")
     case .cancelled, .cancelledWhileWaitingToWrite, .cancelledWhileBackingOff:
       #expect(thrown is CancellationError, "\(String(describing: thrown))")
@@ -561,6 +561,16 @@ struct EventBasedDNSTests {
 
   static func isSendFailed(_ error: Error?) -> Bool {
     if case DNSError.sendFailed? = error { return true }
+    return false
+  }
+
+  static func isConnectionRefused(_ error: Error?) -> Bool {
+    if case DNSError.connectionRefused? = error { return true }
+    return false
+  }
+
+  static func isUnreachable(_ error: Error?) -> Bool {
+    if case DNSError.unreachable? = error { return true }
     return false
   }
 
