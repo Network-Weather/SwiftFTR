@@ -22,6 +22,18 @@ Unreleased
   and an `Elapsed:` line when something came back without a round trip, such as a refusal. An
   answer prints as before. `--json` output, the flags and the exit status are unchanged: exit 1
   when the server is not reachable (refused, timed out, unreachable, failed), 0 otherwise.
+### Behavior changes
+
+- **`httpProbe` reports a server that sent its headers and then stalled its body as reachable**
+  (#122). URLSession tells the probe about a response only once body bytes follow the headers, so
+  such a server reached the timeout and was reported as `isReachable == false`,
+  `statusCode == nil`, error `"Timeout"`. When the timeout fires after the first response byte
+  arrived, the result is now `isReachable == true`, `rtt` is the time to that byte, and `error`
+  begins `"Timeout: "` and says whether the headers were complete. `statusCode` is set when
+  URLSession had parsed the headers, which it does once some body bytes have arrived; with none,
+  complete headers cannot be told from a partial status line, so it stays `nil`. A timeout before
+  any response byte is unchanged. The probe still reports these only at its timeout, not when the
+  headers arrive.
 
 0.18.0 — 2026-11-22
 -------------------

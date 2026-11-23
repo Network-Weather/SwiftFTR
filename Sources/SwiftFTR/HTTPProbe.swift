@@ -40,6 +40,8 @@ public struct HTTPProbeResult: Sendable, Codable {
   public let statusCode: Int?
 
   /// The elapsed time through receipt of the response headers, including connection setup.
+  ///
+  /// For a response the timeout ended after it began, the elapsed time to its first byte.
   public let rtt: TimeInterval?
 
   /// The elapsed time from completing the request to receiving the response headers.
@@ -110,6 +112,12 @@ public func httpProbe(
 ///
 /// Any HTTP response, including a 4xx or 5xx response, indicates reachability. The probe stops
 /// downloading after the response headers arrive.
+///
+/// URLSession hands the probe a response only once some body bytes have followed the headers, so
+/// a server that sends its headers and then stalls its body is reported when the timeout fires:
+/// reachable, with an `error` that begins `"Timeout: "`, and with the status code only if
+/// URLSession had parsed the headers by then. A timeout before any response byte arrived is
+/// reported as unreachable, with the error `"Timeout"`.
 ///
 /// - Parameter config: The probe configuration.
 /// - Returns: The probe result.
@@ -201,6 +209,10 @@ private func resultForHTTPProbeError(
   config: HTTPProbeConfig,
   startedAt: Date
 ) -> HTTPProbeResult {
+  if let stalled = error as? HTTPResponseIncomplete {
+    return resultForIncompleteResponse(stalled, config: config, startedAt: startedAt)
+  }
+
   if error is CancellationError {
     return failedHTTPProbe(
       config: config,
@@ -233,6 +245,59 @@ private func resultForHTTPProbeError(
       rtt: Date().timeIntervalSince(startedAt),
       error: error.localizedDescription)
   }
+}
+
+/// The timeout ended a request after the server had begun to answer, before URLSession told the
+/// delegate about the response.
+///
+/// URLSession calls `urlSession(_:dataTask:didReceive:completionHandler:)` only once it has the
+/// first body bytes (more, for a response without a usable `Content-Type`, which it reads ahead
+/// to sniff a type from), so a server that sends its headers and then stalls the body reaches the
+/// timeout without the delegate having seen a response. The task's metrics still record when the
+/// first response byte arrived, and the parsed response once body bytes have followed it.
+private struct HTTPResponseIncomplete: Error {
+  /// The status from the response URLSession parsed but had not delivered, if it had one.
+  let statusCode: Int?
+  /// When the first byte of the response arrived.
+  let responseStartedAt: Date
+  let networkRTT: TimeInterval?
+  let tcpHandshakeRTT: TimeInterval?
+
+  /// The incomplete response the metrics describe, or `nil` if no response byte arrived.
+  init?(metrics: URLSessionTaskMetrics?) {
+    guard let transaction = metrics?.transactionMetrics.last,
+      let responseStart = transaction.responseStartDate
+    else { return nil }
+    let timing = extractTimingMetrics(from: metrics)
+    statusCode = (transaction.response as? HTTPURLResponse)?.statusCode
+    responseStartedAt = responseStart
+    networkRTT = timing.networkRTT
+    tcpHandshakeRTT = timing.tcpHandshakeRTT
+  }
+}
+
+/// A response the timeout ended after it began. The server answered, so the result is reachable;
+/// the status is reported only if URLSession had parsed the headers, which it exposes only after
+/// some body bytes have arrived. Without it, complete headers cannot be told from a partial
+/// status line, so neither is claimed.
+private func resultForIncompleteResponse(
+  _ stalled: HTTPResponseIncomplete,
+  config: HTTPProbeConfig,
+  startedAt: Date
+) -> HTTPProbeResult {
+  let error =
+    stalled.statusCode != nil
+    ? "Timeout: response headers arrived but the body did not complete"
+    : "Timeout: the server began responding but the response did not complete"
+  return HTTPProbeResult(
+    url: config.url,
+    isReachable: true,
+    statusCode: stalled.statusCode,
+    rtt: stalled.responseStartedAt.timeIntervalSince(startedAt),
+    networkRTT: stalled.networkRTT,
+    tcpHandshakeRTT: stalled.tcpHandshakeRTT,
+    error: error,
+    timestamp: startedAt)
 }
 
 private struct HTTPHeaderProbeResponse: Sendable {
@@ -380,7 +445,13 @@ private final class HTTPHeaderProbeDelegate: NSObject, URLSessionDataDelegate,
           networkRTT: timing.networkRTT,
           tcpHandshakeRTT: timing.tcpHandshakeRTT))
     } else if let error {
-      continuation.resume(throwing: error)
+      if (error as? URLError)?.code == .timedOut,
+        let stalled = HTTPResponseIncomplete(metrics: metrics)
+      {
+        continuation.resume(throwing: stalled)
+      } else {
+        continuation.resume(throwing: error)
+      }
     } else {
       continuation.resume(throwing: URLError(.badServerResponse))
     }

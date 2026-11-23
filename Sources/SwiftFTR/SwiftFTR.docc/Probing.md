@@ -75,6 +75,8 @@ if let tcpRTT = result.tcpHandshakeRTT {
 Any HTTP response (even 4xx/5xx) counts as reachable — the probe tests network connectivity, not content availability.
 The probe stops the transfer after receiving response headers, so large or streaming response bodies are not buffered.
 
+URLSession hands the probe a response only after some body bytes have followed the headers (more of them when the response has no usable `Content-Type`, since it reads ahead to sniff one). A server that sends its headers and then stalls its body is therefore reported only when the timeout fires: `isReachable` is `true`, `error` begins `"Timeout: "`, `rtt` is the time to the response's first byte, and `statusCode` is set only if URLSession had parsed the headers by then, which it does once body bytes have arrived. With no body bytes at all, complete headers cannot be told from a partial status line, so the status is `nil`. A timeout before any response byte is unreachable, with the error `"Timeout"`.
+
 ## DNS Probe
 
 Test DNS server reachability by sending a query:
