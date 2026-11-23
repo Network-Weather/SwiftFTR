@@ -3,6 +3,18 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
+Unreleased
+----------
+
+### Behavior changes
+
+- **`testBufferbloat` sends its default upload load to Cloudflare's speed test** (#89). With no
+  `uploadURL`, the upload load went to `https://httpbin.org/post`, a free community service that
+  makes no availability promise. It now goes to `https://speed.cloudflare.com/__up`, the same
+  provider as the default download load, which is built for this traffic. The requests are
+  unchanged (256 KiB POSTs on each of `parallelStreams` streams until the load phase ends). A
+  caller that sets `uploadURL` is unaffected.
+
 0.18.1 — 2026-11-22
 -------------------
 
