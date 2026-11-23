@@ -539,8 +539,13 @@ Observations that are not defects of the library:
   --filter '<suites>' || break; done` passed 30 of 30 on main and on the branch, and 15 of 15
   each under `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`. The tests themselves still assume a
   loopback answer within 0.3 to 0.5 s, a wall-clock bound in disguise that a loaded host breaks.
-  Only the three `DNSWireHardeningTests` queries the fixture must answer have been given a
-  generous timeout so far (below).
+  The rule they now follow, file by file (#103): a call the fixture must answer gets a generous
+  timeout that the answer ends; a count of what a fixture saw is awaited, not read when the call
+  returns; a ping or trace whose result depends on which replies land inside a short window is
+  restaged so that it does not. A call whose own timeout is the thing tested keeps it short.
+  Measured by running `DNSWireHardeningTests|FaultInjection|PingReplyMatching|TCPProbeTests|
+  AsyncPublicIP|UDPProbeBinding` as whole runs while a second process runs the repeated filter
+  from a main worktree, and counting the issues in the files a change touched.
 - **A `DNSWireHardeningTests` query timed out because its responder started late.** The fixture's
   responder starts from a `Task`, so it first needs a cooperative-pool thread. Repeated under
   `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, 187 of 1,507 responders entered more than 0.1 s late
@@ -578,3 +583,16 @@ Observations that are not defects of the library:
   attempts have 0.2 s asserts that none reached the server. Receivers no longer act on such
   datagrams, and a DNS filter given no name still takes another test's late query: the tests
   that assert an exact request count name their query.
+- **The wire tests waited on loopback inside sub-second budgets** (#103). Under that load
+  `FaultInjectionWireTests` recorded issues in 9 of 10 runs on main (93 issues), 3 of 10 with
+  `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`: DNS error replies, the open TCP port and the refusing
+  UDP port arrived after their 0.3 to 1 s timeouts and were reported as timeouts, and request
+  and connection counts were read before the fixture's thread had counted. Every call the
+  fixture answers now has a 10 s timeout its answer ends; an HTTP fault the server itself ends
+  (refusal, reset, close) has a timeout past the watchdog, so a probe that missed it trips the
+  watchdog; counts are awaited. A silent DNS or STUN server keeps 0.3 s. An HTTP server that
+  accepts and stays silent, or answers after the watchdog, keeps a timeout the test is about, and
+  that timeout starts before URLSession has connected: at 0.5 s the server had not accepted when
+  the probe gave up in 3 of 20 loaded runs (6 cases), so it is 3 s, which still depends on connecting
+  within it; a hook at the accept would remove that. The compression-loop reply is now required
+  to be `malformedResponse`, not any `DNSError`.
