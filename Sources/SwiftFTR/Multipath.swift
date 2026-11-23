@@ -82,6 +82,39 @@ internal func validateMultipathAddressFamily(_ config: SwiftFTRConfig) throws {
   }
 }
 
+extension SwiftFTRConfig {
+  /// Fields a multipath flow worker sets itself rather than taking from the caller's
+  /// configuration: the flow's own hop limit and per-probe wait (from `MultipathConfig`), and the
+  /// address family, forced to IPv4 because flows vary IPv4 ICMP identifiers (see
+  /// ``validateMultipathAddressFamily(_:)``).
+  static let multipathFlowOverrides: Set<String> = ["maxHops", "maxWaitMs", "preferredFamily"]
+
+  /// The configuration one multipath flow runs with: this one, field for field, except
+  /// ``multipathFlowOverrides``.
+  ///
+  /// `SwiftFTRConfig`'s stored properties are constants, so the copy is spelled out here.
+  /// `MultipathWorkerConfigTests` compares every stored property of the result with the caller's
+  /// and fails when a field is added to `SwiftFTRConfig` without being carried over.
+  func multipathFlowConfig(maxHops: Int, timeoutMs: Int) -> SwiftFTRConfig {
+    SwiftFTRConfig(
+      maxHops: maxHops,
+      maxWaitMs: timeoutMs,
+      payloadSize: payloadSize,
+      publicIP: publicIP,
+      enableLogging: enableLogging,
+      noReverseDNS: noReverseDNS,
+      rdnsCacheTTL: rdnsCacheTTL,
+      rdnsCacheSize: rdnsCacheSize,
+      rdnsLookupTimeout: rdnsLookupTimeout,
+      publicIPDiscoveryTimeout: publicIPDiscoveryTimeout,
+      interface: interface,
+      sourceIP: sourceIP,
+      asnResolverStrategy: asnResolverStrategy,
+      preferredFamily: .v4
+    )
+  }
+}
+
 // MARK: - Network Topology
 
 /// Network topology with discovered paths
@@ -624,36 +657,26 @@ extension SwiftFTR {
       timeoutMs: Int
     ) async throws -> (FlowIdentifier, ClassifiedTrace) {
       try Task.checkCancellation()
-
-      let workerConfig = SwiftFTRConfig(
-        maxHops: maxHops,
-        maxWaitMs: timeoutMs,
-        payloadSize: baseConfig.payloadSize,
-        publicIP: baseConfig.publicIP,
-        enableLogging: baseConfig.enableLogging,
-        noReverseDNS: baseConfig.noReverseDNS,
-        publicIPDiscoveryTimeout: baseConfig.publicIPDiscoveryTimeout,
-        interface: baseConfig.interface,
-        sourceIP: baseConfig.sourceIP,
-        preferredFamily: .v4
-      )
-
-      let cachedIP = baseConfig.publicIP ?? cachedPublicIP
-      let rdns = rdnsCache
-      let resolver = asnResolver
-
-      let worker = SwiftFTR(
-        config: workerConfig,
-        rdnsCache: rdns,
-        asnResolver: resolver,
-        cachedPublicIP: cachedIP
-      )
+      let worker = makeFlowTracer(maxHops: maxHops, timeoutMs: timeoutMs)
       let trace = try await worker.performClassifiedTraceWithFlowID(
         to: target,
         flowIdentifier: flowID.icmpID
       )
       try Task.checkCancellation()
       return (flowID, trace)
+    }
+
+    /// The tracer one flow runs on: the caller's configuration with the flow's overrides, and the
+    /// caller's reverse-DNS cache and ASN resolver. Those two carry the settings `SwiftFTR(config:)`
+    /// consumes when it builds them (`rdnsCacheTTL`, `rdnsCacheSize`, `rdnsLookupTimeout`,
+    /// `asnResolverStrategy`), so sharing them is how a flow honours those settings.
+    func makeFlowTracer(maxHops: Int, timeoutMs: Int) -> SwiftFTR {
+      SwiftFTR(
+        config: baseConfig.multipathFlowConfig(maxHops: maxHops, timeoutMs: timeoutMs),
+        rdnsCache: rdnsCache,
+        asnResolver: asnResolver,
+        cachedPublicIP: baseConfig.publicIP ?? cachedPublicIP
+      )
     }
   }
 
@@ -667,26 +690,12 @@ extension SwiftFTR {
     maxHops: Int,
     timeoutMs: Int
   ) async throws -> ClassifiedTrace {
-    // Create temporary SwiftFTR instance with multipath config
-    let multipathConfig = SwiftFTRConfig(
-      maxHops: maxHops,
-      maxWaitMs: timeoutMs,
-      payloadSize: self.config.payloadSize,
-      publicIP: self.config.publicIP,
-      enableLogging: self.config.enableLogging,
-      noReverseDNS: self.config.noReverseDNS,
-      publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeout,
-      interface: self.config.interface,
-      sourceIP: self.config.sourceIP,
-      preferredFamily: .v4
-    )
-
-    let tempTracer = SwiftFTR(
-      config: multipathConfig,
+    let tempTracer = MultipathWorkerSpawner(
+      baseConfig: self.config,
       rdnsCache: self.rdnsCache,
       asnResolver: self.asnResolver,
       cachedPublicIP: self.cachedPublicIP
-    )
+    ).makeFlowTracer(maxHops: maxHops, timeoutMs: timeoutMs)
 
     return try await tempTracer.performClassifiedTraceWithFlowID(
       to: target,

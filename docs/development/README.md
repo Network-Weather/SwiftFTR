@@ -8,7 +8,7 @@ Contributor guides and release-process records. The project-level index is in th
 - [Code style](CODE_STYLE.md): swift-format usage and the intentional naming exceptions for CLI JSON fields, libFuzzer and SPI test helpers. (updated 2026-11-21; update when: a naming exception is added or removed, or format enforcement changes)
 
 ## Plans
-- [HTTP probe production roadmap](HTTPProbe-Production-Roadmap.md): the product boundary, compatibility contract and six-PR sequence for exact-route HTTP probing over Network.framework. (updated 2026-11-21; update when: one of its PRs lands or exact-route HTTP becomes public API)
+- [HTTP probe production roadmap](HTTPProbe-Production-Roadmap.md): the product boundary, compatibility contract and six-PR sequence for exact-route HTTP probing over Network.framework. (updated 2026-11-22; update when: one of its PRs lands or exact-route HTTP becomes public API)
 - [Concurrency unblocking plan](Concurrency-Unblocking-Plan.md): the 0.8.0-era plan for moving blocking work off the `SwiftFTR` actor and making ping, multipath and bufferbloat truly parallel. (updated 2026-11-21; update when: someone audits its deliverables against the code or archives it)
 
 ## Release records

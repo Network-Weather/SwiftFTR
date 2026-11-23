@@ -110,12 +110,9 @@ struct VPNClassificationTests {
 
     // Classify with VPN context
     let classifier = TraceClassifier()
-    let classified = try await classifier.classify(
-      trace: trace,
-      destinationIP: "73.1.2.3",
-      resolver: VPNTestASNResolver(mapping: [:]),
-      vpnContext: vpnContext
-    )
+    let classified = try await classifyWithoutPublicIP(
+      classifier, trace: trace, destinationIP: "73.1.2.3",
+      resolver: VPNTestASNResolver(mapping: [:]), vpnContext: vpnContext)
 
     // First hop (CGNAT) should be VPN when VPN context is active
     #expect(classified.hops[0].category == .vpn)
@@ -137,12 +134,9 @@ struct VPNClassificationTests {
 
     // Classify without VPN context
     let classifier = TraceClassifier()
-    let classified = try await classifier.classify(
-      trace: trace,
-      destinationIP: "73.1.2.3",
-      resolver: VPNTestASNResolver(mapping: [:]),
-      vpnContext: nil
-    )
+    let classified = try await classifyWithoutPublicIP(
+      classifier, trace: trace, destinationIP: "73.1.2.3",
+      resolver: VPNTestASNResolver(mapping: [:]), vpnContext: nil)
 
     // First hop (CGNAT) should be ISP
     #expect(classified.hops[0].category == .isp)
@@ -167,12 +161,9 @@ struct VPNClassificationTests {
     let vpnContext = VPNContext(traceInterface: "utun16", isVPNTrace: true, vpnLocalIPs: [])
 
     let classifier = TraceClassifier()
-    let classified = try await classifier.classify(
-      trace: trace,
-      destinationIP: "93.184.216.34",
-      resolver: VPNTestASNResolver(mapping: [:]),
-      vpnContext: vpnContext
-    )
+    let classified = try await classifyWithoutPublicIP(
+      classifier, trace: trace, destinationIP: "93.184.216.34",
+      resolver: VPNTestASNResolver(mapping: [:]), vpnContext: vpnContext)
 
     // First hop should be VPN
     #expect(classified.hops[0].category == .vpn)
@@ -209,12 +200,9 @@ struct VPNClassificationTests {
     let vpnContext = VPNContext(traceInterface: "utun17", isVPNTrace: true, vpnLocalIPs: [])
 
     let classifier = TraceClassifier()
-    let classified = try await classifier.classify(
-      trace: trace,
-      destinationIP: "1.1.1.1",
-      resolver: VPNTestASNResolver(mapping: [:]),
-      vpnContext: vpnContext
-    )
+    let classified = try await classifyWithoutPublicIP(
+      classifier, trace: trace, destinationIP: "1.1.1.1",
+      resolver: VPNTestASNResolver(mapping: [:]), vpnContext: vpnContext)
 
     // Private/CGNAT IPs = VPN infrastructure
     #expect(classified.hops[0].category == .vpn)  // CGNAT (100.x) = VPN
@@ -248,12 +236,9 @@ struct VPNClassificationTests {
 
     // No VPN context
     let classifier = TraceClassifier()
-    let classified = try await classifier.classify(
-      trace: trace,
-      destinationIP: "8.8.8.8",
-      resolver: VPNTestASNResolver(mapping: [:]),
-      vpnContext: nil
-    )
+    let classified = try await classifyWithoutPublicIP(
+      classifier, trace: trace, destinationIP: "8.8.8.8",
+      resolver: VPNTestASNResolver(mapping: [:]), vpnContext: nil)
 
     // Local gateway
     #expect(classified.hops[0].category == .local)
@@ -279,12 +264,9 @@ struct VPNClassificationTests {
     let vpnContext = VPNContext(traceInterface: "utun3", isVPNTrace: true, vpnLocalIPs: [])
 
     let classifier = TraceClassifier()
-    let classified = try await classifier.classify(
-      trace: trace,
-      destinationIP: "10.0.0.50",
-      resolver: VPNTestASNResolver(mapping: [:]),
-      vpnContext: vpnContext
-    )
+    let classified = try await classifyWithoutPublicIP(
+      classifier, trace: trace, destinationIP: "10.0.0.50",
+      resolver: VPNTestASNResolver(mapping: [:]), vpnContext: vpnContext)
 
     // All intermediate hops are VPN
     #expect(classified.hops[0].category == .vpn)
@@ -292,6 +274,23 @@ struct VPNClassificationTests {
     // Final hop is destination (even if private IP)
     #expect(classified.hops[2].category == .destination)
   }
+}
+
+// MARK: - Offline classification
+
+/// Classifies `trace` with no public address, as these tests intend. Discovery is substituted by
+/// one that finds nothing, so the classifier never reaches live STUN.
+private func classifyWithoutPublicIP(
+  _ classifier: TraceClassifier, trace: TraceResult, destinationIP: String,
+  resolver: ASNResolver, vpnContext: VPNContext?
+) async throws -> ClassifiedTrace {
+  let discovery = OfflinePublicIPDiscovery()
+  let classified = try await discovery.install {
+    try await classifier.classify(
+      trace: trace, destinationIP: destinationIP, resolver: resolver, vpnContext: vpnContext)
+  }
+  #expect(discovery.calls.value == 1, "classification did not ask for a public address")
+  return classified
 }
 
 // MARK: - Mock ASN Resolver

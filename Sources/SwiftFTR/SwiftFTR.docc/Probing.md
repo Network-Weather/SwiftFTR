@@ -75,6 +75,8 @@ if let tcpRTT = result.tcpHandshakeRTT {
 Any HTTP response (even 4xx/5xx) counts as reachable — the probe tests network connectivity, not content availability.
 The probe stops the transfer after receiving response headers, so large or streaming response bodies are not buffered.
 
+URLSession hands the probe a response only after some body bytes have followed the headers (more of them when the response has no usable `Content-Type`, since it reads ahead to sniff one). A server that sends its headers and then stalls its body is therefore reported only when the timeout fires: `isReachable` is `true`, `error` begins `"Timeout: "`, `rtt` is the time to the response's first byte, and `statusCode` is set only if URLSession had parsed the headers by then, which it does once body bytes have arrived. With no body bytes at all, complete headers cannot be told from a partial status line, so the status is `nil`. A timeout before any response byte is unreachable, with the error `"Timeout"`.
+
 ## DNS Probe
 
 Test DNS server reachability by sending a query:
@@ -91,7 +93,7 @@ if let rcode = result.responseCode {
 }
 ```
 
-Any DNS response (even NXDOMAIN) means the server is reachable, and so does a malformed reply, which carries no `responseCode` and says so in `error`. Only a datagram that carries the query's transaction ID counts as a reply: one with another ID, or too short to carry one, is ignored and the probe keeps waiting. Silence until the timeout, a refused port (the host is up but nothing listens on the DNS port), and local or network errors indicate unreachability. The round-trip time runs from sending the query to reading the reply, and the wait for it holds no thread. Cancelling the calling task throws `CancellationError`.
+Any DNS response (even NXDOMAIN) means the server is reachable, and so does a malformed reply, which carries no `responseCode` and says so in `error`. A reply is only read for its response code once the question and answer records its header declares are all there, so an error reply that declares records it does not carry is malformed, not that error; one that declares none, as some REFUSED replies are sent, keeps its code. Only a datagram that carries the query's transaction ID counts as a reply: one with another ID, or too short to carry one, is ignored and the probe keeps waiting. Silence until the timeout, a refused port (the host is up but nothing listens on the DNS port), and local or network errors indicate unreachability. The round-trip time runs from sending the query to reading the reply, and the wait for it holds no thread. Cancelling the calling task throws `CancellationError`.
 
 ``DNSProbeResult/outcome`` says how the probe ended, so a refusal can be told from silence without reading `error`, which is a message for people. ``DNSProbeOutcome`` is a struct with static members rather than an enum, so a later release can add an outcome without breaking your `switch`; keep a `default` arm:
 
@@ -114,8 +116,8 @@ default:
 
 | What happened | `outcome` | `isReachable` | `rtt` | `elapsed` |
 |---|---|---|---|---|
-| A DNS response, any response code | `answered` | true | set | = `rtt` |
-| A reply with the query's transaction ID that is not otherwise valid DNS (not a response, truncated, cut short) | `malformedReply` | true | set | = `rtt` |
+| A DNS response carrying the question and answer records its header declares, any response code | `answered` | true | set | = `rtt` |
+| A reply with the query's transaction ID that is not otherwise valid DNS (not a response, truncated, cut short, or missing question or answer records its header declares, whatever its response code) | `malformedReply` | true | set | = `rtt` |
 | ICMP port unreachable: nothing listens on the port | `refused` | false | nil | set |
 | ICMP host or network unreachable after the send | `unreachable` | false | nil | set |
 | `connect` or `send` fails with `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or `ENETDOWN` | `unreachable` | false | nil | nil |

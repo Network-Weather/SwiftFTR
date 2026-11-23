@@ -70,6 +70,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Probe socket | creation fails the way `socket(2)` does; every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `ProbeWindow` |
 | Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
+| Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
@@ -78,8 +79,10 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | DNS transport | refused port (IPv4 and IPv6); empty datagram (ignored, so a timeout); `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
 | DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; a short datagram with the query's transaction ID (`malformedReply`); `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` from `connect` (connect seam) and `send`; other connect and send errors, an unclassified receive error and an invalid server; a stall inside the read excluded from the round trip; an unreachable error read before the send ignored; no read once the exchange has finished and closed its socket, with a second reply still queued (answered, timed out, cancelled); cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
 | DNS foreign replies | a reply with another transaction ID, then the real one, which answers with its own round trip (IPv4 and IPv6); empty and one-byte datagrams, then the real reply; only foreign replies, read while the query still waits, then a timeout and `timedOut`; a datagram with the query's ID but no valid header, still `malformedResponse` at once; a stale reply queued before the send and read after it; after a foreign datagram, a reply or refusal that comes only after the deadline, which is a timeout because each read event judges at most one datagram (query and dnsProbe); foreign replies that never stop, on a socket that never runs dry, with the deadline (IPv4 and IPv6) and cancellation still ending the query; a Team Cymru lookup answered foreign first; the blocking TXT path: a foreign and an empty datagram before the reply, a wait bounded by the time left after a foreign reply, a reply returned after the deadline (as the first read, or after a foreign one) taken as a timeout and the next server tried, and an endless feed | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, CymruDNSResolver, `DNSClient.queryTXTBlocking` | `DNSForeignReplyTests` |
+| DNS error replies | well-formed NXDOMAIN (SOA in authority; CNAME chain), SERVFAIL and REFUSED (question echoed; header only) keep their response code; the same codes with a declared answer record missing or cut short, or a declared question missing or cut short, are `malformedResponse` and `malformedReply` | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe | `DNSErrorReplyValidationTests` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
+| HTTP headers then a stalled body | `Content-Length` or chunked, with and without `Content-Type`; `Connection: close`; a small first body chunk, with and without `Content-Type`; no body on a kept-alive connection; a partial status line | httpProbe | `Wire` |
 | Cancellation | task cancellation, `networkChanged()`, `cancelActiveTraces()`, and the caller and the tracer together, across each operation and in each stalled phase, with the exact error checked per source; a stream consumer that cancels sees a normal end and the producer closes its socket; an invalidation either side of `discoverPaths` committing its result | trace, traceClassified, traceStream, ping, discoverPaths | `Cancellation` |
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails; for the probes, the result, nothing sent or connected, and the socket closed, against a pass-through control | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ReceiveLoop`, `ProbeNonBlockingSetupTests` |
@@ -90,6 +93,9 @@ Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProb
 and `DNSForeignReplyTests` for the event-based DNS transport, `CymruEventBasedTests` for the
 Team Cymru lookups on it, and `ProbeNonBlockingSetupTests` for the TCP and UDP probes' socket
 setup. Every timed operation runs under a watchdog
+Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`,
+`DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport, and `CymruEventBasedTests` for the
+Team Cymru lookups on it. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
 Not covered, and why:
@@ -102,11 +108,10 @@ Not covered, and why:
   a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which is shared
   with every other user of SwiftIP2ASN on the machine, and the cache location cannot be redirected
   from SwiftFTR. A test would have to delete that cache.
-- **An incomplete reply with a non-zero response code** (#119). The response code is checked
-  before the answer section is parsed, so a truncated or malformed reply whose header carries
-  NXDOMAIN or SERVFAIL throws `serverError`, and `dnsProbe` reports it as
-  `outcome == .answered` with that `responseCode`, not as `.malformedReply`. This predates the
-  outcome field and is a known limitation of it; no test pins it either way.
+- **Missing authority or additional records.** A reply is checked for the question and answer
+  records its header declares, and an NXDOMAIN reply's SOA lives in the authority section, so an
+  NXDOMAIN reply whose header declares an authority record it does not carry is still reported as
+  NXDOMAIN. No response code has those sections checked, so no test stages it.
 - **The `finished` check at the top of the read handler.** Every path that finishes the exchange
   returns from the handler, and Dispatch invokes no event handler once the source is cancelled,
   so no test can enter the handler after `finish`: removing the check fails nothing.
@@ -169,8 +174,9 @@ numbers are as of the commit that added this section.
    registers a handle and races discovery inside one task group, which still joins every worker.
    Test: `discoverPathsCancellation`, 10.0 s and a returned topology before, under 0.1 s after.
 3. **`discoverPaths` ignored `publicIPDiscoveryTimeout`.** Confirmed and fixed. Flow workers were
-   built from a configuration that dropped it (`Multipath.swift:618` and `:661` after the fix) and
-   their classifier was not passed it, so each flow paid the 6 s default. Test:
+   built from a configuration that dropped it (now `SwiftFTRConfig.multipathFlowConfig`, which
+   copies every field, in `Multipath.swift`) and their classifier was not passed it, so each flow
+   paid the 6 s default. Test:
    `multipathHonoursPublicIPBudget` with a 0.3 s budget, 12.0 s before, 0.6 s after; it fails if
    discovery outlasts the 6 s default.
 4. **A sub-microsecond STUN timeout waited forever.** Confirmed and fixed. `stunGetPublicIP`
@@ -327,6 +333,39 @@ numbers are as of the commit that added this section.
     report a failure as their other socket-setup failures are reported: not reachable, no round
     trip, `.error` for TCP and no response type for UDP, with a message naming the failed step
     and errno, before anything is sent, with the socket closed. Tests: `ProbeNonBlockingSetupTests`.
+
+27. **A server that sent its headers and stalled its body was reported unreachable** (#122).
+    Confirmed, partly fixed. URLSession calls the delegate's `didReceive response` only once body
+    bytes follow the headers: one byte when the response declares `Content-Type:
+    application/octet-stream`, otherwise enough to sniff a type from (600 bytes was enough, 10
+    was not). `X-Content-Type-Options: nosniff`, chunked encoding, `Connection: close`,
+    `prefersIncrementalDelivery` and the `bytes(from:)` API made no difference. So the probe ran to
+    its timeout and said `isReachable == false`, `statusCode == nil`, `"Timeout"`. Now, when the
+    task's metrics record a response start, the probe reports the server as reachable with an
+    error beginning `"Timeout: "`, and with the status when the metrics carry the parsed response
+    (they do once body bytes have arrived). With no body bytes the metrics hold only
+    `responseStartDate`, the same as for a partial status line, so the status stays `nil`.
+    Reporting the status as soon as the headers arrive needs a transport that reads the status
+    line itself. Test: `FaultInjectionWireTests.httpHeadersThenStall`, whose prompt-status
+    expectations are recorded with `withKnownIssue`.
+28. **Ping counted echo replies it had not asked for.** Confirmed and fixed. Any echo reply with
+    the ping's identifier was recorded under its sequence number, and the ping ended once it had
+    as many as it sends. A reply to a sequence never sent ended a three-probe ping after its first
+    probe, reporting one sent, one received and no loss; with each probe answered behind a stray,
+    the ping ended before the second probe's reply and reported 50 percent loss on a path that
+    lost nothing. A reply to a sequence not yet sent was kept as that probe's reply, with an RTT
+    of -1.0 s and the unanswered probe counted as received. A duplicate replaced the first reply's
+    RTT and TTL (0.104 s for a 0.2 ms reply). Ping now counts only the first reply to a request it
+    has sent and drops the rest like replies for another identifier. A send time recorded before a
+    read does not prove the reply came after the send: a reply queued while the send was still
+    retrying buffer pressure on the ping's queue was read after the send time was set, kept, and
+    the genuine reply dropped as its duplicate (TTLs 9, 7, 9 for three genuine replies marked 9).
+    Ping now reads the kernel's arrival stamp (`SO_TIMESTAMP_MONOTONIC`, delivered on this macOS
+    for unprivileged ICMP and ICMPv6 datagram sockets and on the clock ping stamps its sends with)
+    and ignores a reply that arrived before its request's successful send. Without a stamp the
+    reply is judged as before. A reply to an earlier probe
+    that arrives after `timeout` but before the ping's last reply window ends still counts, as
+    `PingConfig.timeout` documents. Tests: `PingReplyMatchingTests`, IPv4 and IPv6.
 
 Observations that are not defects of the library:
 

@@ -363,6 +363,88 @@ struct FaultInjectionWireTests {
     }
     #expect(!result.isReachable)
   }
+
+  /// A response whose server sends `head` and then nothing more, holding the connection open
+  /// until the test stops it (#122).
+  enum HeadersThenStall: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case contentLength, contentLengthAndType, chunked, chunkedAndType, connectionClose
+    case smallFirstChunk, smallFirstChunkAndType, noBody, partialStatusLine
+    var testDescription: String { rawValue }
+
+    var head: String {
+      let ok = "HTTP/1.1 200 OK\r\n"
+      let length = "Content-Length: 100000\r\n"
+      let type = "Content-Type: application/octet-stream\r\n"
+      let chunked = "Transfer-Encoding: chunked\r\n"
+      switch self {
+      case .contentLength: return ok + length + "\r\n"
+      case .contentLengthAndType: return ok + length + type + "\r\n"
+      case .chunked: return ok + chunked + "\r\n"
+      case .chunkedAndType: return ok + chunked + type + "\r\n"
+      case .connectionClose: return ok + length + "Connection: close\r\n\r\n"
+      case .smallFirstChunk: return ok + length + "\r\n0123456789"
+      case .smallFirstChunkAndType: return ok + length + type + "\r\n0123456789"
+      // What a server sends for a HEAD request, or a GET with an empty body, on a kept-alive
+      // connection: the response is complete, and the connection stays open.
+      case .noBody: return ok + "Content-Length: 0\r\n\r\n"
+      case .partialStatusLine: return "HTTP/1.1 200 O"
+      }
+    }
+
+    /// Whether URLSession hands the response to the delegate as soon as `head` arrives. It
+    /// does so only once it has body bytes, and, without a usable `Content-Type`, enough of them
+    /// to sniff a type from (measured with a delegate that logged every callback), so every
+    /// other case is still waiting when the probe's timeout fires.
+    var deliveredPromptly: Bool { self == .smallFirstChunkAndType || self == .noBody }
+
+    /// The status the probe can report once its timeout fires: URLSession's metrics carry the
+    /// parsed response only after body bytes have followed the headers.
+    var statusAtTimeout: Int? { self == .smallFirstChunk ? 200 : nil }
+
+    /// Whether `head` holds complete response headers, which the probe should report at once.
+    var headersComplete: Bool { self != .partialStatusLine }
+  }
+
+  @Test(
+    "HTTP probe against a server that stalls after its headers",
+    arguments: HeadersThenStall.allCases)
+  func httpHeadersThenStall(stall: HeadersThenStall) async throws {
+    // Stopping the server, after the probe has returned, is what ends the stall.
+    let server = try LoopbackTCPServer(behavior: .respondThenHold(response: Array(stall.head.utf8)))
+    defer { server.stop() }
+    let url = "http://127.0.0.1:\(server.port)/"
+
+    if stall.deliveredPromptly {
+      // The timeout outlasts the watchdog, so a probe that returns was ended by the headers.
+      let timeout = 4 * Self.watchdog
+      let (result, _) = try await measure(within: Self.watchdog) {
+        try await httpProbe(url: url, timeout: timeout)
+      }
+      #expect(result.isReachable)
+      #expect(result.statusCode == 200)
+      #expect(result.error == nil)
+      return
+    }
+
+    // URLSession has not told the delegate, so only the timeout can end the probe. It is long
+    // enough for loopback bytes to arrive first; the result must still say the server answered.
+    let (result, _) = try await measure(within: Self.watchdog) {
+      try await httpProbe(url: url, timeout: 3)
+    }
+    #expect(result.isReachable, "\(result.error ?? "no error")")
+    #expect(result.statusCode == stall.statusAtTimeout)
+    #expect(result.error?.hasPrefix("Timeout: ") == true, "\(result.error ?? "no error")")
+    #expect(result.rtt != nil)
+    #expect(server.accepted.value == 1)
+
+    guard stall.headersComplete else { return }
+    // What the probe should report, and cannot while it reads responses through URLSession: the
+    // status, as soon as the headers arrive.
+    withKnownIssue("#122: URLSession withholds the response until body bytes arrive") {
+      #expect(result.statusCode == 200)
+      #expect(result.error == nil)
+    }
+  }
 }
 
 extension Result where Failure == Error {

@@ -2104,13 +2104,18 @@ struct DNSClient {
       throw DNSError.malformedResponse
     }
 
+    // The question and answer records the header declares must all be present before the
+    // response code is believed, whatever it is: an error reply that declares records it does
+    // not carry is as malformed as a NOERROR one. A reply that declares none (QDCOUNT 0, as some
+    // REFUSED and FORMERR replies are sent) passes. The authority and additional sections are
+    // not checked, for any response code.
+    guard let answers = parseAnswers(message: message) else {
+      throw DNSError.malformedResponse
+    }
+
     let responseCode = Int(flags & 0x000F)
     guard responseCode == 0 else {
       throw DNSError.serverError(rcode: responseCode)
-    }
-
-    guard let answers = parseAnswers(message: message) else {
-      throw DNSError.malformedResponse
     }
     return answers
   }

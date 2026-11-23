@@ -376,8 +376,11 @@ struct PingIntegrationTests {
     let tracer = SwiftFTR(config: SwiftFTRConfig())
     let config = PingConfig(count: 2, interval: 0.5, timeout: 1.0)
 
+    // A 64-character label cannot be encoded in DNS, so the resolver rejects the name without
+    // sending a query; a well-formed nonexistent name would go to the configured DNS server.
+    let unresolvable = String(repeating: "a", count: 64) + ".example"
     await #expect(throws: TracerouteError.self) {
-      try await tracer.ping(to: "invalid.host.that.does.not.exist.example", config: config)
+      try await tracer.ping(to: unresolvable, config: config)
     }
   }
 

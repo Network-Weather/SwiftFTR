@@ -74,7 +74,7 @@ public actor SwiftFTR {
     public func preloadASNDatabase() async
 
     // Network-transition lifecycle and caches
-    public func networkChanged() async            // cancel traces + clear public IP + clear rDNS
+    public func networkChanged() async            // cancel operations + clear public IP + clear rDNS
     public func cancelActiveTraces() async        // cancel only; caches preserved
     public func invalidateNetworkScopedRDNS() async  // evict non-global rDNS entries only
     @discardableResult
@@ -88,10 +88,17 @@ public actor SwiftFTR {
 Notes:
 - `ping(to:config:)` is `nonisolated` (and `@concurrent` on Swift 6.2+ compilers), so concurrent
   pings from one instance run in parallel, each on its own socket.
+- `networkChanged()` and `cancelActiveTraces()` end every `trace`, `traceClassified`,
+  `traceStream` and `discoverPaths` in flight with `TracerouteError.cancelled`. For `trace`,
+  `traceClassified` and `discoverPaths` that holds even if the caller cancelled too; a stream
+  throws it only if the tracer ends the stream first, and otherwise a consumer that cancelled sees
+  iteration end normally. `ping` and the probe functions are not tied to the tracer and keep
+  running.
 - `networkChanged()` does not clear the ASN cache; ASN data is not network-scoped.
 - `seedPublicIP` accepts only syntactically valid, globally routable IPv4/IPv6 addresses and
   returns `false` otherwise (private, CGNAT, link-local, loopback, multicast, documentation and
-  benchmark ranges, and zone-suffixed strings are rejected). A seed is discarded by the next `invalidatePublicIP()`,
+  benchmark ranges, IPv6 outside `2000::/3` other than `64:ff9b::/96` (including site-local
+  `fec0::/10`), and zone-suffixed strings are rejected). A seed is discarded by the next `invalidatePublicIP()`,
   `clearCaches()` or `networkChanged()`. `PublicIPSource` has cases `.validatedCallerCache` and
   `.gatewayReported`; the library does not retain the source.
 - `discoverPublicIPWithHostname()` discovers IPv4 via STUN through the configured interface, with
@@ -430,6 +437,8 @@ public struct PingConfig: Sendable {
     public init(count: Int = 5, interval: TimeInterval = 1.0, timeout: TimeInterval = 2.0,
                 payloadSize: Int = 56, interface: String? = nil, sourceIP: String? = nil,
                 preferredFamily: PreferredFamily = .auto)
+    // timeout: reply window after the last request; an earlier request's reply counts until then.
+    // Only the first reply to each request sent counts; strays and duplicates are ignored.
 }
 public struct PingResult: Sendable, Codable {
     public let target: String
@@ -470,6 +479,9 @@ public func httpProbe(url: String, timeout: TimeInterval = 2.0) async throws -> 
 public func httpProbe(config: HTTPProbeConfig) async throws -> HTTPProbeResult
 // HTTPProbeConfig(url:timeout:followRedirects:)  (no interface binding; uses URLSession)
 // HTTPProbeResult: url, isReachable, statusCode, rtt, networkRTT, tcpHandshakeRTT, error, timestamp
+// Headers then a stalled body: reported at the timeout as isReachable == true, error starting
+//   "Timeout: ", rtt to the first response byte, statusCode only if body bytes followed the
+//   headers (URLSession withholds the response until then). No response byte: "Timeout", unreachable.
 
 public func dnsProbe(server: String, query: String = "example.com", timeout: TimeInterval = 2.0) async throws -> DNSProbeResult
 public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult
@@ -477,6 +489,8 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult
 //   elapsed, responseCode, error, timestamp
 //   isReachable: any DNS answer (responseCode set, NXDOMAIN included), or responseCode nil with
 //   error for a malformed reply; false for silence, a refused port and local errors
+//   A reply missing question or answer records its header declares is malformed whatever its
+//   RCODE (checked before the RCODE); authority and additional sections are not checked
 //   Only a datagram carrying the query's transaction ID is a reply; others (wrong ID, under
 //   2 bytes, empty) are ignored until the timeout, so only such datagrams -> .timedOut
 //   outcome: DNSProbeOutcome, a struct with static members (switch needs `default`):
@@ -993,14 +1007,15 @@ struct TraceView: View {
   does not grow with hop count. The burst itself can take up to 250 ms more when sends hit
   transient buffer pressure, and that time is not counted against `maxWaitMs`.
 - **rDNS phase**: lookups run concurrently, each bounded by `rdnsLookupTimeout` (default 5 s).
-  Results are cached per instance (TTL 86400 s, 1000 entries by default).
+  Results are cached per instance (TTL 86400 s, 1000 entries by default). Multipath flows use
+  the instance's rDNS cache and ASN resolver, so they follow the same settings.
 - **Public IP** (classified trace and multipath only): each discovery attempt is bounded by
   `publicIPDiscoveryTimeout` (default 6 s), and a classified trace makes up to two attempts (before
   the trace, then again during classification if the first found nothing). An address found by
   the first attempt is cached per instance until invalidated; one found only by the second is
   returned in that result and not cached, so the next trace discovers again. Multipath reuses an existing cached value but does not
-  write its own discoveries back; with no cached value, each flow discovers on its own, and those
-  attempts use the 6 s default regardless of the instance's `publicIPDiscoveryTimeout`.
+  write its own discoveries back; with no cached value, each flow discovers on its own, each
+  attempt bounded by the instance's `publicIPDiscoveryTimeout`.
 - **ASN**: the embedded database answers locally (microseconds per lookup once loaded; it reloads
   if every resolver holding it has been released). DNS-based results are cached process-wide with
   a soft cap of 2048 entries. ASN caches

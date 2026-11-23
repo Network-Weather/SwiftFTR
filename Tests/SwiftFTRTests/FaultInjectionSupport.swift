@@ -274,10 +274,15 @@ final class FakeICMPNetwork: @unchecked Sendable {
   struct Reply: Sendable {
     let bytes: [UInt8]
     let delay: TimeInterval
+    /// The IPv6 hop limit to send this reply with, which the receiver reads from ancillary data.
+    /// `nil` sends with the system default. Ignored on IPv4, whose receive loop reads the TTL
+    /// from an IP header carried in `bytes` instead.
+    let hopLimit: Int32?
 
-    init(_ bytes: [UInt8], after delay: TimeInterval = 0) {
+    init(_ bytes: [UInt8], after delay: TimeInterval = 0, hopLimit: Int32? = nil) {
       self.bytes = bytes
       self.delay = delay
+      self.hopLimit = hopLimit
     }
   }
 
@@ -419,23 +424,50 @@ final class FakeICMPNetwork: @unchecked Sendable {
       probes.increment()
       for reply in script(probe) {
         if reply.delay <= 0 {
-          send(reply.bytes, to: source)
+          send(reply.bytes, to: source, hopLimit: reply.hopLimit)
         } else {
           // Captured by value: `source` is a `var` (the receive writes into it), though nothing
           // writes it once this datagram has been read.
           DispatchQueue.global().asyncAfter(deadline: .now() + reply.delay) { [source] in
-            self.send(reply.bytes, to: source)
+            self.send(reply.bytes, to: source, hopLimit: reply.hopLimit)
           }
         }
       }
     }
   }
 
-  private func send(_ bytes: [UInt8], to destination: sockaddr_storage) {
+  /// Sends `reply` now, from this network's address, to the socket `fd` is bound to, as if it
+  /// answered a probe from `fd`. Returns false if `fd` has no local address yet (it binds on its
+  /// first send).
+  @discardableResult
+  func inject(_ reply: Reply, to fd: Int32) -> Bool {
+    var address = sockaddr_storage()
+    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let named = withUnsafeMutablePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+    }
+    let port = withUnsafeBytes(of: address) {
+      UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+    }
+    guard named == 0, port != 0 else { return false }
+    // A socket bound to the wildcard address is reached on loopback.
+    let (destination, _) = loopbackAddress(family: family, port: port)
+    send(reply.bytes, to: destination, hopLimit: reply.hopLimit)
+    return true
+  }
+
+  private func send(_ bytes: [UInt8], to destination: sockaddr_storage, hopLimit: Int32?) {
     lock.lock()
     defer { lock.unlock() }
     // Closed under the same lock, so a late reply never reaches a recycled descriptor.
     guard !stopped else { return }
+    if family == AF_INET6 {
+      // Set on every send, under the lock, so one reply's hop limit never leaks into the next.
+      // -1 restores the system default.
+      var hops: Int32 = hopLimit ?? -1
+      _ = setsockopt(
+        fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops, socklen_t(MemoryLayout<Int32>.size))
+    }
     var destination = destination
     let length = socklen_t(destination.ss_len)
     _ = bytes.withUnsafeBytes { raw in
@@ -537,6 +569,9 @@ final class LoopbackTCPServer: @unchecked Sendable {
     case respond(response: [UInt8], after: TimeInterval)
     /// Accept and close at once, without writing.
     case closeImmediately
+    /// Accept, read the request, write `response`, then hold the connection open, sending
+    /// nothing more, until `stop()`.
+    case respondThenHold(response: [UInt8])
   }
 
   let port: UInt16
@@ -631,6 +666,10 @@ final class LoopbackTCPServer: @unchecked Sendable {
       readRequest(client)
       waitForStop(limit: delay)
       write(response, to: client)
+    case .respondThenHold(let response):
+      readRequest(client)
+      write(response, to: client)
+      waitForStop(limit: .infinity)
     }
     // A test can hold the handler here to prove stop() waits for it.
     exitGate?.wait(limit: 30)
@@ -856,4 +895,46 @@ func offlineTracer(
 ) -> SwiftFTR {
   SwiftFTR(
     config: config, rdnsCache: rdns, asnResolver: EmptyASNResolver(), cachedPublicIP: publicIP)
+}
+
+// MARK: - Offline substitutes for live dependencies
+
+/// A loopback TCP port that never answers a connection attempt, reserved for the fixture's
+/// lifetime.
+///
+/// The port belongs to a socket that is bound but not listening. Darwin drops a SYN to such a
+/// port rather than resetting it (see ``RefusingTCPPort``), so a client sees what it sees for a
+/// host that does not answer: its connect waits until its own timeout.
+final class SilentTCPPort: @unchecked Sendable {
+  let port: UInt16
+  private let fd: Int32
+
+  init(family: Int32 = AF_INET) throws {
+    (fd, port) = try bindLoopback(family: family, type: SOCK_STREAM)
+  }
+
+  deinit { close(fd) }
+}
+
+/// Public-IP discovery that finds nothing, at once, and counts how often it was asked.
+///
+/// A classification that is given no public address starts discovery, which is live STUN with a
+/// DNS fallback unless a substitute is bound. Run such a call inside ``install(_:)`` so it never
+/// reaches the network, and read ``calls`` to check that discovery reached this substitute.
+final class OfflinePublicIPDiscovery: Sendable {
+  let calls = FaultCounter()
+
+  func install<T>(_ body: () async throws -> T) async rethrows -> T {
+    let calls = self.calls
+    let discover: TestSeams.DiscoverPublicIPv4 = {
+      calls.increment()
+      throw PublicIPError.allMethodsFailed(stunError: "offline test", dnsError: "offline test")
+    }
+    return try await TestSeams.$discoverPublicIPv4.withValue(discover) { try await body() }
+  }
+}
+
+/// A complete HTTP/1.1 response with `status` and an empty body, for ``LoopbackTCPServer``.
+func httpResponse(status: Int, reason: String) -> [UInt8] {
+  Array("HTTP/1.1 \(status) \(reason)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
 }

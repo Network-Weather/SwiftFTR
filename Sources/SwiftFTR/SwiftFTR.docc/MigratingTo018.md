@@ -39,9 +39,10 @@ too, so a call that returns a topology returned it before `networkChanged()` or
 `cancelActiveTraces()` started.
 
 **What a caller sees.** `discoverPaths` throws `TracerouteError.cancelled` where 0.17 returned a
-topology measured on the old network. Cancelling the calling task still throws
-`CancellationError`, so the two sources can be told apart; when both happened, the tracer's
-`TracerouteError.cancelled` is reported.
+topology measured on the old network. Cancelling the calling task now always throws
+`CancellationError`, where 0.17 threw `TracerouteError.cancelled` if the cancellation landed during
+a flow's probe receive window, so the two sources can be told apart; when both happened, the
+tracer's `TracerouteError.cancelled` is reported.
 
 **What to change.** Catch `TracerouteError.cancelled` wherever `discoverPaths` is called and treat
 it as "this measurement was abandoned", not as a failure of the network being diagnosed. Do not
@@ -77,6 +78,11 @@ do {
   reportFailure(error)
 }
 ```
+
+In 0.17 a caller that cancelled its own `discoverPaths` task while a flow was waiting for probe
+replies received `TracerouteError.cancelled`, which the "Before" code reported as a failure; at
+other points it received `CancellationError`. With the "After" code both errors arrive in a
+handler that returns.
 
 Keep any check the consumer already makes before it displays or stores a result, such as
 comparing a network generation counter of its own. The tracer orders its own return against
@@ -118,12 +124,16 @@ startTracing()
 caller cancelled its own task. `TracerouteError.cancelled`: the tracer ended the operation, through
 `networkChanged()` or `cancelActiveTraces()`; when both happened, this one is reported. `ping` threw
 `TracerouteError.cancelled` for its own task's cancellation, and `trace` and `traceClassified`
-threw it in most phases and `CancellationError` in one. `ping` is still not ended by
+threw it in most phases and `CancellationError` at some checkpoints between phases. `ping` is still not ended by
 `networkChanged()` or `cancelActiveTraces()`, so it now only ever throws `CancellationError` for a
-cancellation. `discoverPaths` already followed the rule. A `traceStream` consumer that cancels its
-task sees iteration end normally, unless the tracer had already ended the stream; a stream the
-tracer ends before it finishes throws `TracerouteError.cancelled`, even after its last hop has
-been delivered. Breaking out of a loop over a
+cancellation. `discoverPaths` follows the same rule: in 0.17 a caller's cancellation threw
+`TracerouteError.cancelled` during a flow's probe receive window and `CancellationError` at the
+task-cancellation checkpoints inside and between flows, and 0.18 always throws
+`CancellationError`. A `traceStream` consumer that cancels its task
+sees iteration end normally, as in 0.17, unless the tracer had already ended the stream; the
+cancellation prompts the stream to stop probing and close its socket. A stream the tracer ends
+before it finishes throws `TracerouteError.cancelled`, even after its last hop has been
+delivered. Breaking out of a loop over a
 stream held in a variable cancels nothing: the trace runs until it finishes or the stream is
 released.
 
@@ -219,9 +229,11 @@ let topology = try await multipathTracer.discoverPaths(to: target)
 
 **What changed.** Every DNS query (`dnsProbe`, the `tracer.dns` queries, `reverseDNS`,
 `reverseIPv6`, `queryA`, `queryAAAA`) checks its timeout, name, server address and the family of
-its source address before it opens a socket. In 0.17 the source-address family was checked only
-once one of the shared blocking-I/O workers ran the query, so behind busy workers the error was
-late.
+its source address before it opens a socket. In 0.17 some of these checks ran only once one
+of the shared blocking-I/O workers picked up the query, so behind busy workers the error could be
+late. Which ones depended on the entry point: `dnsProbe` checked the timeout and name first, the
+query functions checked less up front, and the server address and the source-address family
+always waited for a worker.
 
 **What a caller sees.** The same `DNSError` case as 0.17 (`invalidTimeout`, `invalidHostname`,
 `invalidIP`, or `bindFailed` for a source address of the wrong family), at once. `dnsProbe` throws
@@ -313,13 +325,11 @@ refusal has no `rtt`; ``DNSProbeResult/elapsed`` is how long it took.
 Before:
 
 ```swift
+// 0.17 reported a refused port as "Timeout - no response", so a refusal and silence could not be
+// told apart and every unreachable result was handled alike.
 let result = try await dnsProbe(server: resolver)
 if !result.isReachable {
-  if result.error?.hasPrefix("Connection refused") == true {
-    showNoDNSServer(at: resolver)
-  } else {
-    showDNSServerDown(resolver, reason: result.error)
-  }
+  showDNSServerDown(resolver, reason: result.error)
 }
 ```
 
@@ -480,7 +490,8 @@ default:
   unreachable)" or a similar "Host unreachable - …"/"Network unreachable - …" message.
   ``DNSProbeResult/elapsed`` is `nil`, because nothing came back. 0.17 said "Failed to send query".
   Any other `connect` or `send` failure still starts "Failed to send query", now followed by the
-  errno.
+  failing call and its errno where there is one, for example "Failed to send query - send failed
+  (errno=1: Operation not permitted)".
 - A socket error while waiting for the reply that is neither a refusal nor an unreachable report
   is `outcome == .failed` with "Receive failed - the socket reported an error while waiting for
   the reply (errno=…)". 0.17 said "Timeout - no response".
@@ -555,8 +566,9 @@ do {
 
 ## A trace whose socket cannot be made non-blocking throws
 
-**What changed.** `trace`, `traceClassified` and `traceStream` check the two `fcntl` calls that
-make their probe socket non-blocking, as `ping` already did. In 0.17 a failure was ignored and the
+**What changed.** `trace`, `traceClassified` and `traceStream` (and `discoverPaths`, whose flows
+run the same trace) check the two `fcntl` calls that make their probe socket non-blocking, as
+`ping` already did. In 0.17 a failure was ignored and the
 trace ran on a blocking socket, where its receive loop could wait for a reply past its deadline.
 
 **What a caller sees.** `TracerouteError.socketCreateFailed(errno:details:)`, with `details` of

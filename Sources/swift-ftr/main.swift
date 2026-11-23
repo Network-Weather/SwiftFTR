@@ -27,6 +27,63 @@ func resolveCLIHostnames(
   return hostnames
 }
 
+/// The lines `swift-ftr probe dns` prints for `result` without `--json`.
+///
+/// An answer prints as it always has. Any other outcome adds an `Outcome:` line saying in words
+/// how the probe ended, and a reply that came back without a round trip (a refusal, or an
+/// unreachable report from the network) adds `Elapsed:`, the time until it came back.
+func dnsProbePrettyLines(_ result: DNSProbeResult) -> [String] {
+  func milliseconds(_ seconds: TimeInterval) -> String {
+    "\(String(format: "%.3f", seconds * 1000)) ms"
+  }
+  var lines = [
+    "DNS probe to \(result.server)",
+    "  Query: \(result.query)",
+    "  Status: \(result.isReachable ? "✓ Reachable" : "✗ Unreachable")",
+  ]
+  if result.outcome != .answered {
+    lines.append("  Outcome: \(dnsProbeOutcomeDescription(result.outcome))")
+  }
+  if let responseCode = result.responseCode {
+    lines.append("  Response Code: \(dnsResponseCodeName(responseCode)) (\(responseCode))")
+  }
+  if let rtt = result.rtt {
+    lines.append("  RTT: \(milliseconds(rtt))")
+  } else if let elapsed = result.elapsed {
+    lines.append("  Elapsed: \(milliseconds(elapsed))")
+  }
+  if let error = result.error {
+    lines.append("  Error: \(error)")
+  }
+  return lines
+}
+
+/// How a DNS probe ended, in plain words. An outcome a later SwiftFTR adds prints its raw value.
+func dnsProbeOutcomeDescription(_ outcome: DNSProbeOutcome) -> String {
+  switch outcome {
+  case .answered: return "answered"
+  case .refused: return "refused: host is up, nothing listening on the port"
+  case .timedOut: return "timed out: no reply"
+  case .unreachable: return "unreachable: host or network unreachable"
+  case .malformedReply: return "malformed reply: the server answered, but not with valid DNS"
+  case .failed: return "failed: the probe could not run"
+  default: return outcome.rawValue
+  }
+}
+
+/// The mnemonic for a DNS response code (RFC 1035 §4.1.1), or "UNKNOWN".
+func dnsResponseCodeName(_ rcode: Int) -> String {
+  switch rcode {
+  case 0: return "NOERROR"
+  case 1: return "FORMERR"
+  case 2: return "SERVFAIL"
+  case 3: return "NXDOMAIN"
+  case 4: return "NOTIMP"
+  case 5: return "REFUSED"
+  default: return "UNKNOWN"
+  }
+}
+
 @main
 struct SwiftFTRCommand: AsyncParsableCommand {
   static let configuration = CommandConfiguration(
@@ -961,19 +1018,7 @@ extension SwiftFTRCommand {
     }
 
     private func printPretty(_ result: DNSProbeResult) {
-      let status = result.isReachable ? "✓ Reachable" : "✗ Unreachable"
-      print("DNS probe to \(result.server)")
-      print("  Query: \(result.query)")
-      print("  Status: \(status)")
-      if let responseCode = result.responseCode {
-        print("  Response Code: \(rcodeToString(responseCode)) (\(responseCode))")
-      }
-      if let rtt = result.rtt {
-        print("  RTT: \(String(format: "%.3f", rtt * 1000)) ms")
-      }
-      if let error = result.error {
-        print("  Error: \(error)")
-      }
+      for line in dnsProbePrettyLines(result) { print(line) }
     }
 
     private func printJSON(_ result: DNSProbeResult) {
@@ -981,18 +1026,6 @@ extension SwiftFTRCommand {
       encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
       let data = try! encoder.encode(result)
       print(String(data: data, encoding: .utf8)!)
-    }
-
-    private func rcodeToString(_ rcode: Int) -> String {
-      switch rcode {
-      case 0: return "NOERROR"
-      case 1: return "FORMERR"
-      case 2: return "SERVFAIL"
-      case 3: return "NXDOMAIN"
-      case 4: return "NOTIMP"
-      case 5: return "REFUSED"
-      default: return "UNKNOWN"
-      }
     }
   }
 }
