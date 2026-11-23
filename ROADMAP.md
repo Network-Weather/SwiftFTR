@@ -87,6 +87,22 @@ instance's network change evicting another's entries.
 - **Shape if adopted**: literal addresses as the fast path, hostnames as fallback, and a comment
   on the pin stating the condition under which it should be revisited.
 
+### A direct DNS echo for public-IP discovery
+**Goal**: Find the public address on networks that block STUN, without trusting a resolver.
+
+- **What it is**: a query sent straight to an operator's authoritative server, which answers with
+  the address it saw the query come from (for example a TXT query for `o-o.myaddr.l.google.com`
+  to Google's name servers, or a class CH TXT query for `whoami.cloudflare` to 1.1.1.1). It does
+  not go through the resolver the network handed out, whose own address can differ from the
+  user's.
+- **Why it is not in the library's resolver** (David, 2026-11-23, decision 16 in
+  [docs/BLOCKING-IO.md](docs/BLOCKING-IO.md)): a gateway, captive portal or DNS proxy that
+  intercepts port 53 can forge the reply, and nothing in the packet shows it. The library's
+  resolver is STUN only; a host app can supply its own.
+- **What it needs**: class CH support in the DNS client, strict reply checks, a decision on
+  pinning operator addresses, and a rule for when an echo is believed (two independent operators
+  agreeing, or only alongside a STUN answer).
+
 ### IPv6 hardening
 Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner. Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).
 

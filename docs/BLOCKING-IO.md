@@ -23,7 +23,7 @@ Four kinds of work are written as blocking calls instead:
 
 | Work | How it waits today | Where it runs |
 |---|---|---|
-| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket; since Event-Based DNS, a Dispatch read source (`UDPExchange.swift`), with the blocking query kept only for the whoami fallback | `BlockingIOExecutor`; since Event-Based DNS, no thread |
+| DNS probes and Team Cymru ASN lookups | a blocking `recv` on a UDP socket; since Event-Based DNS, a Dispatch read source (`UDPExchange.swift`), and the whoami fallback's query on the same transport since Async Public-IP Discovery | `BlockingIOExecutor`; since Event-Based DNS, no thread |
 | Public-IP discovery (STUN, with a DNS fallback for IPv4) | blocking `recv`, plus `getaddrinfo` per server name | the executor in a classified trace; plain `Task` closures and `DispatchQueue.concurrentPerform` in standalone `getPublicIPs` |
 | Reverse DNS | `getnameinfo` | the executor |
 | Forward resolution of a destination | `getaddrinfo` | inline in the caller |
@@ -194,10 +194,9 @@ The transport contract (it is shared with STUN later, so it is one small type):
 - **Truncation stays an error.** There is no TCP fallback today and none is added here.
 - **Timing.** RTT is stamped at `send` and in the read handler.
 
-Synchronous callers. `getPublicIPv4ViaDNS` (the IPv4 whoami fallback in `STUN.swift`) calls the
-blocking TXT query from inside the blocking public-IP closure. That blocking implementation
-stays, used by the fallback and by tests that call it directly, until Async Public-IP Discovery
-removes its last caller and moves or removes those tests.
+Synchronous callers. None remain: Async Public-IP Discovery moved `getPublicIPv4ViaDNS` (the IPv4
+whoami fallback in `STUN.swift`) onto the event-based TXT query and deleted the blocking
+implementation, with its tests converted.
 
 The limit on concurrent Cymru queries stays (it now bounds sockets, not slots) and its wait
 becomes cancellation-aware.
@@ -258,7 +257,7 @@ overlap in time; the "After" column is what must have landed first.
 | ~~Upload Default~~ | | ~~Bufferbloat's default upload URL (decision 11, #89).~~ Landed. |
 | ~~Test Hygiene~~ | | ~~#135 (a watchdog on the ASN-enrichment cancellation test), #129 (fixture teardown that does not block an async test), the stronger `cancelledLookupNotCached` (ROADMAP). Tests only.~~ Landed. |
 | ~~DNS Error Cases~~ | Small Fixes | ~~`DNSError.connectionRefused` and `DNSError.unreachable`, mapped by where the failure came from: a refusal received after the send (`sendFailed` today), an unreachable received after the send (`timeout` today), and a local routing failure on connect or send (`sendFailed` today). `dnsProbe`'s result for each origin does not change. Adds the API allowlist and runs the API check in CI.~~ Landed. |
-| Async Public-IP Discovery | Small Fixes | The stage below. STUN server names and each STUN attempt run as executor requests under one absolute discovery deadline; nothing moves onto the cooperative pool. Deletes the blocking DNS path, so it lands after Small Fixes has touched it. |
+| ~~Async Public-IP Discovery~~ | Small Fixes | ~~The stage below. STUN server names and each STUN attempt run as executor requests under one absolute discovery deadline; nothing moves onto the cooperative pool. Deletes the blocking DNS path, so it lands after Small Fixes has touched it.~~ Landed. |
 | Resolver Seam | Async Public-IP Discovery | First half of the stage below: the `PublicIPResolver` protocol and strategy, a per-family cache, the tracer-enforced deadline, one question per call asked after the family is known, no discovery in the classifier or in flows, the source reported on results, and the source breaks. |
 | Library Resolver | Resolver Seam | Second half: the library's STUN-only resolver in its own file, bound before anything is sent (#151), the whoami query through recursive resolvers deleted (#153), `getPublicIPs` and `discoverPublicIPWithHostname()` on it. |
 | Event-Based STUN | Library Resolver | The stage below: STUN on the event-based transport, servers tried at once, foreign replies ignored, a cancellable, bounded wait on each server-name lookup, and the rule for which answer is believed (decision 16). |
@@ -638,17 +637,17 @@ otherwise. Decided ones say so.
     David in those words.
 15. **Reporting every method's answer.** Open. Recommended: not in 0.19.0. The observation that
     is believed names its source; a caller who wants every reply supplies a resolver. ROADMAP.
-16. **Which answer the library's resolver believes, and whether it has a DNS echo at all.** Open.
-    Both reviewers found that "first valid answer wins" with a DNS echo beside STUN is unsafe: a
-    gateway, captive portal or DNS proxy that intercepts port 53 can answer a query sent to a
-    literal address with a well-formed reply carrying its own or its resolver's address, faster
-    than STUN, and nothing in the packet shows it. Options: **STUN Only** (recommended for
-    0.19.0): no DNS echo; where STUN is blocked the trace classifies without an address, or the
-    host app supplies one. **STUN Leads**: an echo answer is used only when no STUN server
-    answered and two independent echo operators agree. **Agreement Required**: no address unless
-    two operators agree and one of them is STUN. The echo itself (class CH is unsupported by the
-    DNS client today; strict reply checks; whether to pin Google's addresses) is ROADMAP unless
-    this decision brings it in.
+16. **Which answer the library's resolver believes, and whether it has a DNS echo at all.**
+    Decided: **STUN Only** (David, 2026-11-23). The library's resolver has no DNS echo in
+    0.19.0. Where STUN is blocked the trace classifies without an address, or the host app
+    supplies one through its own resolver. Both reviewers had found "first valid answer wins"
+    with a DNS echo beside STUN unsafe: a gateway, captive portal or DNS proxy that intercepts
+    port 53 can answer a query sent to a literal address with a well-formed reply carrying its
+    own or its resolver's address, faster than STUN, and nothing in the packet shows it. The
+    options not taken were STUN Leads (an echo used only when no STUN server answered and two
+    independent echo operators agree) and Agreement Required (no address unless two operators
+    agree and one is STUN). A direct echo (class CH support in the DNS client, strict reply
+    checks, whether to pin Google's addresses) is ROADMAP.
 
 ## Out of scope
 
