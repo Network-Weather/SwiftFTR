@@ -465,7 +465,9 @@ struct FaultInjectionReceiveLoopTests {
         usleep(1000)
       } while monotonicNow() < giveUp
       queuedAtHandover.set(Int(queued))
-      guard queued == datagramCount else {
+      // More is a stray another test's late sender queued too, which the trace ignores like the
+      // foreign replies (docs/ROBUSTNESS-TESTING.md); the backlog is still all there.
+      guard queued >= datagramCount else {
         throw FixtureError.socket("backlog: \(queued) of \(datagramCount) datagrams queued", 0)
       }
       handedOver = true
@@ -480,7 +482,7 @@ struct FaultInjectionReceiveLoopTests {
       }
     }
     #expect(
-      queuedAtHandover.value == datagramCount,
+      queuedAtHandover.value >= datagramCount,
       "\(queuedAtHandover.value) of \(datagramCount) datagrams were queued before the trace read")
     #expect(datagramCount > receiveBatchLimit, "the backlog fits in one read callback")
     #expect(

@@ -20,7 +20,8 @@ import Testing
     )
     func emptyDatagramPreservesPayloadAndRoute(family: LoopbackFamily) async throws {
       let route = try await discoverLoopbackRoute(for: family)
-      let server = try LoopbackUDPServer(route: route, reply: Data())
+      // Takes only an empty datagram, so a reply proves the probe sent its payload as empty.
+      let server = try LoopbackUDPServer(route: route, reply: Data(), accepts: .payload([]))
       var datagrams = server.datagrams.makeAsyncIterator()
 
       let result = try await udpProbe(
@@ -45,6 +46,31 @@ import Testing
       #expect(result.isReachable)
       #expect(result.resolvedIP == route.address)
       #expect(result.error == nil)
+    }
+
+    @Test(
+      "The loopback server yields and answers only the probe's datagram, after strays queued ahead",
+      .timeLimit(.minutes(1)))
+    func serverIgnoresStrays() async throws {
+      let route = try await discoverLoopbackRoute(for: .ipv4)
+      try #require(route.address == "127.0.0.1", "route address \(route.address)")
+      let payload = Data("stray-proof".utf8)
+      let server = try LoopbackUDPServer(
+        route: route, reply: Data("ok".utf8), accepts: .payload(Array(payload)),
+        startReading: false)
+      #expect(Strays.send(to: UInt16(server.port)))
+      try #require(
+        await eventually(within: 10) { server.queued >= 2 }, "queued: \(server.queued)")
+      server.start()
+      var datagrams = server.datagrams.makeAsyncIterator()
+
+      let result = try await udpProbe(
+        config: UDPProbeConfig(
+          host: route.address, port: server.port, timeout: 10, payload: payload,
+          preferredFamily: .v4))
+      #expect(result.responseType == "udp_reply", "\(result.error ?? "no error")")
+      #expect(await datagrams.next() == payload, "the first datagram yielded was not the probe's")
+      #expect(server.ignored.value >= 2, "ignored: \(server.ignored.value)")
     }
 
     @Test("Reports an unknown interface in the probe result")
@@ -87,13 +113,16 @@ import Testing
     )
     func cancellationFinishesPromptly() async throws {
       let route = try await discoverLoopbackRoute(for: .ipv4)
-      let server = try LoopbackUDPServer(route: route, reply: nil)
+      let payload = Data("cancel-probe".utf8)
+      let server = try LoopbackUDPServer(
+        route: route, reply: nil, accepts: .payload(Array(payload)))
       let probe = Task {
         try await udpProbe(
           config: UDPProbeConfig(
             host: route.address,
             port: server.port,
             timeout: 3 * cancellationWatchdog,
+            payload: payload,
             interface: route.interfaceName,
             sourceIP: route.address,
             preferredFamily: .v4
@@ -231,13 +260,23 @@ import Testing
     return try #require(route, "No active \(family.testDescription) loopback route was discovered")
   }
 
+  /// A loopback UDP server that yields, and answers with `reply`, each datagram its filter
+  /// accepts; every other one is a stray (``DatagramFilter``), counted in ``ignored``.
   private final class LoopbackUDPServer: @unchecked Sendable {
     let datagrams: AsyncStream<Data>
     let port: Int
+    let ignored: FaultCounter
 
     private let source: DispatchSourceRead
+    private let socketFD: Int32
 
-    init(route: LoopbackRoute, reply: Data?) throws {
+    /// - Parameter startReading: when false, nothing is read until ``start()``, so a test can
+    ///   queue datagrams ahead of the probe's.
+    init(
+      route: LoopbackRoute, reply: Data?, accepts filter: DatagramFilter, startReading: Bool = true
+    )
+      throws
+    {
       let socketFD = socket(route.family.socketFamily, SOCK_DGRAM, IPPROTO_UDP)
       guard socketFD >= 0 else {
         throw LoopbackUDPServerError.posix(errno)
@@ -251,6 +290,7 @@ import Testing
         throw error
       }
 
+      let ignored = FaultCounter()
       let (datagrams, continuation) = AsyncStream<Data>.makeStream()
       let source = DispatchSource.makeReadSource(
         fileDescriptor: socketFD,
@@ -275,8 +315,13 @@ import Testing
           }
         }
         guard byteCount >= 0 else { return }
+        let datagram = Array(buffer.prefix(Int(byteCount)))
+        guard filter.accepts(datagram) else {
+          ignored.increment()
+          return
+        }
 
-        continuation.yield(Data(buffer.prefix(Int(byteCount))))
+        continuation.yield(Data(datagram))
 
         if let reply {
           reply.withUnsafeBytes { bytes in
@@ -299,12 +344,20 @@ import Testing
         close(socketFD)
         continuation.finish()
       }
-      source.activate()
+      if startReading { source.activate() }
 
       self.datagrams = datagrams
       self.port = boundPort
       self.source = source
+      self.socketFD = socketFD
+      self.ignored = ignored
     }
+
+    /// Starts reading, for a server made with `startReading: false`.
+    func start() { source.activate() }
+
+    /// Datagrams waiting on the socket (`SO_NUMRCVPKT`); valid until the server is released.
+    var queued: Int32 { queuedDatagrams(socketFD) }
 
     private static func bind(_ socketFD: Int32, to route: LoopbackRoute) throws -> Int {
       switch route.family {
@@ -379,6 +432,9 @@ import Testing
     }
 
     deinit {
+      // An inactive source must be activated before it is released; activating an active one
+      // does nothing.
+      source.activate()
       source.cancel()
     }
   }
