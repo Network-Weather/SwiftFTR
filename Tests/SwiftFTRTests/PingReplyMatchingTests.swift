@@ -336,26 +336,36 @@ struct PingReplyMatchingTests {
     arguments: families)
   func lateReplyWithinPingIsCounted(family: Int32) async throws {
     // `timeout` is the reply window after the last probe; an earlier probe's reply counts until
-    // then. Probe 1's reply comes 0.7 s after it, past the 0.5 s timeout but well before the ping
-    // ends, which is no earlier than probe 3 at about 2 s.
+    // then. Probe 1's reply comes 0.7 s after it, past the 0.5 s timeout. Probe 3, which is never
+    // answered, leaves only once that reply and probe 2's are queued, so the ping is still running
+    // when it reads them, however slowly loopback delivers.
     let delay: TimeInterval = 0.7
-    let network = try FakeICMPNetwork(family: family) { probe in
-      let id = probe.identifier
-      return [
-        Self.reply(family, id: id, seq: probe.sequence, after: probe.sequence == 1 ? delay : 0)
-      ]
+    let ping = try DirectPing(
+      family: family, config: PingConfig(count: 3, interval: 0.05, timeout: 0.5)
+    ) { probe in
+      switch probe.sequence {
+      case 1: return [Self.reply(family, id: probe.identifier, seq: 1, after: delay)]
+      case 2: return [Self.reply(family, id: probe.identifier, seq: 2)]
+      default: return []
+      }
     }
-    defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig())
-    let config = PingConfig(count: 3, interval: 1.0, timeout: 0.5)
+    defer { ping.stop() }
+    ping.beforeSend = { seq, fd in
+      guard seq == 3 else { return }
+      ping.premise(ping.waitUntilReplied(2, fd))
+    }
 
+    let config = ping.config
     let (result, _) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: network.journal
+      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
     ) {
-      try await network.install { try await tracer.ping(to: "fake.test", config: config) }
+      try await ping.run()
     }
+    #expect(ping.premiseHeld, "probe 1's late reply was never queued before probe 3's send")
     let s = result.statistics
-    #expect(s.sent == 3 && s.received == 3, "\(Self.summary(result))")
+    #expect(s.sent == 3 && s.received == 2, "\(Self.summary(result))")
+    #expect(
+      result.responses.map { $0.rtt != nil } == [true, true, false], "\(Self.summary(result))")
     #expect((result.responses.first?.rtt ?? 0) >= delay, "\(Self.summary(result))")
   }
 
