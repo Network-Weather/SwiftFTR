@@ -82,6 +82,15 @@ enum TestSeams {
   /// ``dnsServerPort`` to reach a loopback fixture.
   @TaskLocal static var whoamiServers: [String]?
 
+  /// Arms the wake-up for a caller's public-IP resolver's deadline, in place of a task sleeping
+  /// until it: receives the deadline and the action that wakes the race, and returns the call that
+  /// stops the wake-up. A test can leave the race unwoken so that only the commit rule decides.
+  typealias ArmPublicIPDeadline =
+    @Sendable (_ deadline: ContinuousClock.Instant, _ wake: @escaping @Sendable () -> Void) ->
+    @Sendable () -> Void
+
+  @TaskLocal static var armPublicIPDeadline: ArmPublicIPDeadline?
+
   /// Awaited by `discoverPaths` once it holds a topology, just before it checks for an
   /// invalidation and returns, so a test can order a network change before or after that step.
   @TaskLocal static var beforeMultipathCommit: (@Sendable () async -> Void)?

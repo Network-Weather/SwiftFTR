@@ -9,7 +9,8 @@ public enum IPAddressFamily: String, Sendable, Hashable, Codable, CaseIterable {
   case v4
   case v6
 
-  /// The family of a numeric address, or `nil` if `address` is not one.
+  /// The socket family of a numeric address, or `nil` if `address` is not one. An IPv4-mapped
+  /// address is `.v6` here; ``publicAddress(_:)`` gives the family a public address belongs to.
   init?(address: String) {
     switch detectAddressFamily(address) {
     case AF_INET: self = .v4
@@ -130,17 +131,28 @@ public enum PublicIPResolverStrategy: Sendable {
   case custom(any PublicIPResolver)
 }
 
-/// `observation`, in canonical form, if it is a globally routable address of `family` that says
-/// it is of that family; otherwise `nil`.
+/// The canonical form and family of `presentation` as a public address, or `nil` if it is not a
+/// globally routable one (``isGloballyRoutablePublicIP(_:)``). An IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`) has IPv4 routing semantics, so it is the IPv4 address, in dotted-quad
+/// form; every other address is in `inet_ntop` form. The one rule for seeds, the configured
+/// address and every resolver's answer.
+func publicAddress(_ presentation: String) -> (address: String, family: IPAddressFamily)? {
+  guard isGloballyRoutablePublicIP(presentation), let parsed = ParsedIPAddress(presentation)
+  else { return nil }
+  if let v4 = parsed.canonicalIPv4Presentation { return (v4, .v4) }
+  guard let canonical = canonicalIPAddress(presentation) else { return nil }
+  return (canonical, .v6)
+}
+
+/// `observation`, in canonical form, if it is a public address of `family` that says it is of
+/// that family (see ``publicAddress(_:)``); otherwise `nil`.
 func validatedPublicIP(_ observation: PublicIPObservation, for family: IPAddressFamily)
   -> PublicIPObservation?
 {
-  guard observation.family == family,
-    IPAddressFamily(address: observation.address) == family,
-    isGloballyRoutablePublicIP(observation.address),
-    let canonical = canonicalIPAddress(observation.address)
+  guard observation.family == family, let accepted = publicAddress(observation.address),
+    accepted.family == family
   else { return nil }
-  return PublicIPObservation(address: canonical, family: family, source: observation.source)
+  return PublicIPObservation(address: accepted.address, family: family, source: observation.source)
 }
 
 /// Seconds from now until `instant` on the continuous clock, never less than zero.
@@ -163,53 +175,84 @@ struct LibraryPublicIPResolver: PublicIPResolver {
   }
 }
 
-/// Asks a caller's `resolver`, and returns its answer, or `nil` once `request.deadline` passes
-/// first.
+/// Asks a caller's `resolver`, and returns its answer, or `nil` if it does not answer before
+/// `request.deadline`.
 ///
-/// One resume decides: the answer, the deadline, or the calling task's cancellation, whichever
-/// comes first. The resolver runs in a task of its own that this does not wait for, so one that
-/// never returns, or ignores cancellation, cannot hold the caller; it is cancelled when the race
-/// is decided, and what it returns afterwards goes nowhere.
+/// The deadline rule: `request.deadline` is the one deadline, and the one place an outcome is
+/// committed reads the clock first. An answer, or a failure, committed once the clock has reached
+/// the deadline is `nil`, whichever event arrived first; so nothing late is accepted, however late
+/// the deadline's wake-up runs. The wake-up only commits that `nil` when no answer comes, and does
+/// nothing if it runs early. Cancellation of the calling task wins whenever it comes.
+///
+/// The resolver runs in a task of its own that this does not wait for, so one that never returns,
+/// or ignores cancellation, cannot hold the caller; it is cancelled once the outcome is committed,
+/// and what it returns afterwards goes nowhere.
 ///
 /// - Throws: `CancellationError` when the calling task is cancelled first, or the resolver's own
-///   error when it throws first.
+///   error when it throws in time.
 func askWithinDeadline(_ resolver: any PublicIPResolver, _ request: PublicIPRequest) async throws
   -> PublicIPObservation?
 {
-  let race = SingleResumeRace<PublicIPObservation?>()
+  let deadline = request.deadline
+  let race = DeadlineRace(deadline: deadline)
+  let arm = TestSeams.armPublicIPDeadline ?? sleepUntilDeadline
   return try await withTaskCancellationHandler {
     try await withCheckedThrowingContinuation { continuation in
       race.attach(continuation)
       let ask = Task {
         do {
-          race.finish(.success(try await resolver.publicIP(for: request)))
+          race.commit(.answer(.success(try await resolver.publicIP(for: request))))
         } catch {
-          race.finish(.failure(error))
+          race.commit(.answer(.failure(error)))
         }
       }
-      let timer = Task {
-        try? await Task.sleep(until: request.deadline, clock: .continuous)
-        race.finish(.success(nil))
-      }
+      let stopWake = arm(deadline) { race.commit(.wake) }
       race.onFinish {
         ask.cancel()
-        timer.cancel()
+        stopWake()
       }
     }
   } onCancel: {
-    race.finish(.failure(CancellationError()))
+    race.commit(.cancellation)
   }
 }
 
-/// Resumes one continuation with the first result offered, from any thread, however the offer and
-/// the attachment are ordered, then runs the cleanup once.
-final class SingleResumeRace<T: Sendable>: @unchecked Sendable {
+/// The default wake-up for ``askWithinDeadline(_:_:)``: a task that sleeps until `deadline` and
+/// wakes the race. Returns the call that stops it.
+@Sendable func sleepUntilDeadline(
+  _ deadline: ContinuousClock.Instant, wake: @escaping @Sendable () -> Void
+) -> @Sendable () -> Void {
+  let timer = Task {
+    while !Task.isCancelled {
+      try? await Task.sleep(until: deadline, clock: .continuous)
+      if ContinuousClock.now >= deadline { break }
+    }
+    if !Task.isCancelled { wake() }
+  }
+  return { timer.cancel() }
+}
+
+/// The race behind ``askWithinDeadline(_:_:)``: resumes one continuation with the first outcome
+/// committed, from any thread, however the commit and the attachment are ordered, then runs the
+/// cleanup once.
+final class DeadlineRace: @unchecked Sendable {
+  enum Event {
+    case answer(Result<PublicIPObservation?, Error>)
+    case wake
+    case cancellation
+  }
+
+  private let deadline: ContinuousClock.Instant
   private let lock = NSLock()
-  private var continuation: CheckedContinuation<T, Error>?
-  private var outcome: Result<T, Error>?
+  private var continuation: CheckedContinuation<PublicIPObservation?, Error>?
+  private var outcome: Result<PublicIPObservation?, Error>?
   private var cleanup: (@Sendable () -> Void)?
 
-  func attach(_ newContinuation: CheckedContinuation<T, Error>) {
+  init(deadline: ContinuousClock.Instant) {
+    self.deadline = deadline
+  }
+
+  func attach(_ newContinuation: CheckedContinuation<PublicIPObservation?, Error>) {
     lock.lock()
     guard let outcome else {
       continuation = newContinuation
@@ -220,20 +263,35 @@ final class SingleResumeRace<T: Sendable>: @unchecked Sendable {
     newContinuation.resume(with: outcome)
   }
 
-  /// Offers `result`; only the first offer is delivered.
-  func finish(_ result: Result<T, Error>) {
+  /// The one place an outcome is committed: the first committed is delivered. The clock is read
+  /// here, under the lock, for every event but cancellation (see ``askWithinDeadline(_:_:)``).
+  func commit(_ event: Event) {
     lock.lock()
     guard outcome == nil else {
       lock.unlock()
       return
     }
-    outcome = result
+    let passed = ContinuousClock.now >= deadline
+    let decided: Result<PublicIPObservation?, Error>
+    switch event {
+    case .cancellation:
+      decided = .failure(CancellationError())
+    case .wake:
+      guard passed else {
+        lock.unlock()
+        return
+      }
+      decided = .success(nil)
+    case .answer(let answer):
+      decided = passed ? .success(nil) : answer
+    }
+    outcome = decided
     let waiting = continuation
     continuation = nil
     let pending = cleanup
     cleanup = nil
     lock.unlock()
-    waiting?.resume(with: result)
+    waiting?.resume(with: decided)
     pending?()
   }
 

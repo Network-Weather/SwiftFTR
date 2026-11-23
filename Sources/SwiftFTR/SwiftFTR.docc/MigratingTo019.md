@@ -382,8 +382,9 @@ let address: String? = await tracer.publicIP
 After:
 
 ```swift
-let address: String? =
-  await tracer.publicIP(for: .v4)?.address ?? tracer.publicIP(for: .v6)?.address
+let v4 = await tracer.publicIP(for: .v4)?.address
+let v6 = await tracer.publicIP(for: .v6)?.address
+let address: String? = v4 ?? v6
 ```
 
 ## A classified trace asks for its public address once, after the probes, for their family
@@ -441,7 +442,7 @@ used. A seed's ``PublicIPSource`` is kept and reported as ``ClassifiedTrace/publ
 
 **What a caller sees.**
 
-- With `SwiftFTRConfig(publicIP: "203.0.113.7")` (an IPv4 address) an IPv6 classified trace no
+- With `SwiftFTRConfig(publicIP: "9.9.9.9")` (an IPv4 address) an IPv6 classified trace no
   longer reports it: it asks the strategy for an IPv6 address, which by default sends IPv6 STUN.
 - A configured private or documentation address, which 0.18 reported and classified with, is
   ignored, and the trace asks the strategy instead.

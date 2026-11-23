@@ -104,7 +104,7 @@ final class ConfigurationTests: XCTestCase {
       maxHops: 20,
       maxWaitMs: 1000,
       payloadSize: 56,
-      publicIP: "203.0.113.50",  // TEST-NET-3 address
+      publicIP: "9.9.9.9",  // a public address: documentation ranges are refused
       enableLogging: false
     )
 
@@ -114,7 +114,8 @@ final class ConfigurationTests: XCTestCase {
       let classified = try await tracer.traceClassified(to: "1.1.1.1")
 
       // Public IP should be what we configured
-      XCTAssertEqual(classified.publicIP, "203.0.113.50")
+      XCTAssertEqual(classified.publicIP, "9.9.9.9")
+      XCTAssertEqual(classified.publicIPSource, .configured)
 
       // Should have performed classification
       XCTAssertFalse(classified.hops.isEmpty)

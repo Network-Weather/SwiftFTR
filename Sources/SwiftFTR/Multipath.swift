@@ -636,6 +636,7 @@ extension SwiftFTR {
       // One question for the whole run, IPv4 by contract, before the first batch. Its answer, or
       // its absence, is handed to every flow, so no flow asks again. It is asked on its own,
       // before the race below, because both wait on the handle's one cancellation slot.
+      try validateBeforeQuestion(target: target)
       let publicIP = try await publicIPObservation(for: .v4, handle: handle)
       let worker = MultipathWorkerSpawner(
         baseConfig: swiftConfig,
@@ -674,6 +675,29 @@ extension SwiftFTR {
     guard activeTraces.contains(handle) else { throw TracerouteError.cancelled }
     if Task.isCancelled { throw CancellationError() }
     return try outcome.get()
+  }
+
+  /// Rejects, before the run's public-IP question, every input a flow would reject only after it:
+  /// the interface, the source address (its form, its family, and whether this host can bind it),
+  /// and a numeric destination of the wrong family. So an unusable binding never sends discovery
+  /// traffic. A destination name that does not resolve is found only by the flows.
+  private func validateBeforeQuestion(target: String) throws {
+    if let name = config.interface { _ = try validateInterface(name) }
+    if let source = config.sourceIP {
+      try validateSourceIPFamily(source, destinationFamily: AF_INET)
+      let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+      if fd >= 0 {
+        defer { close(fd) }
+        if let message = bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: source) {
+          throw TracerouteError.sourceIPBindFailed(
+            sourceIP: source, errno: errno, details: message)
+        }
+      }
+    }
+    // Literals resolve without `getaddrinfo` under a forced family.
+    if containsNUL(target) || detectAddressFamily(target) != -1 {
+      _ = try resolveHost(host: target, prefer: .v4)
+    }
   }
 
   /// Runs flow workers that reuse caches without escaping the caller's task group.
