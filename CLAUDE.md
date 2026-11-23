@@ -69,10 +69,9 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - `@_spi(Test)` exposes `__parseICMPMessage` for unit tests
 
 **Public-IP Resolution** (`Sources/SwiftFTR/PublicIPResolver.swift`)
-- `PublicIPResolver` protocol and `SwiftFTRConfig.publicIPResolver` strategy: `.library` (default), `.disabled`, `.custom(_:)`
+- `PublicIPResolver` protocol and `SwiftFTRConfig.publicIPResolver` strategy: `.library` (default; wraps `publicIPDiscovery(family:...)` in `STUN.swift`), `.disabled`, `.custom(_:)`
 - A classified trace asks once, after its probes, for the family they used: configured address of that family, then seed or cache of that family, then the strategy
 - `askWithinDeadline` holds a caller's resolver to the request deadline with a single-resume race; every answer is checked for global scope and family
-- The library's resolver wraps `publicIPDiscovery(family:...)` in `STUN.swift`
 
 **Classification System** (`Sources/SwiftFTR/Segmentation.swift`)
 - `TraceClassifier` categorizes hops: LOCAL, ISP, TRANSIT, VPN, DESTINATION

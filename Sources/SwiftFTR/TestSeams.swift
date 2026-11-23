@@ -82,9 +82,8 @@ enum TestSeams {
   /// ``dnsServerPort`` to reach a loopback fixture.
   @TaskLocal static var whoamiServers: [String]?
 
-  /// Arms the wake-up for a caller's public-IP resolver's deadline, in place of a task sleeping
-  /// until it: receives the deadline and the action that wakes the race, and returns the call that
-  /// stops the wake-up. A test can leave the race unwoken so that only the commit rule decides.
+  /// Arms the wake-up at a caller's public-IP resolver's deadline in place of a sleeping task, and
+  /// returns the call that stops it. A test can leave the race unwoken, or wake it early.
   typealias ArmPublicIPDeadline =
     @Sendable (_ deadline: ContinuousClock.Instant, _ wake: @escaping @Sendable () -> Void) ->
     @Sendable () -> Void
