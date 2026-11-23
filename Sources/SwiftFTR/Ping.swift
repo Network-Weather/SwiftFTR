@@ -340,6 +340,11 @@ struct PingExecutor: Sendable {
     }
 
     if let sourceIPStr = effectiveSourceIP {
+      // `inet_pton` would read only the text before a NUL and bind that address instead.
+      guard !containsNUL(sourceIPStr) else {
+        throw TracerouteError.sourceIPBindFailed(
+          sourceIP: sourceIPStr, errno: EINVAL, details: "Invalid source IP: contains a NUL")
+      }
       switch family {
       case AF_INET:
         var addr = sockaddr_in()

@@ -26,6 +26,8 @@ public struct ResolvedHost: Sendable {
 ///
 /// For v6 the link-local `%zone` suffix is honored via `parseIPv6Scoped`.
 internal func bindSourceIP(sockfd: Int32, family: Int32, sourceIP: String) -> String? {
+  // `inet_pton` would read only the text before a NUL and bind that address instead.
+  guard !containsNUL(sourceIP) else { return "Invalid source IP address: contains a NUL character" }
   switch family {
   case AF_INET:
     var addr = sockaddr_in()

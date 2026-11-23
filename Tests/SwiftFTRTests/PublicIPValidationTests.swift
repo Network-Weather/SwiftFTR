@@ -220,6 +220,36 @@ struct PublicIPValidationTests {
     }
   }
 
+  @Test("Binding a socket to a source address with an embedded NUL fails")
+  func sourceBindRejectsEmbeddedNUL() throws {
+    let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    try #require(fd >= 0)
+    defer { close(fd) }
+    #expect(bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: "127.0.0.1\u{0}junk") != nil)
+    // Positive control: the address alone binds.
+    #expect(bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: "127.0.0.1") == nil)
+  }
+
+  @Test("A ping from a source address with an embedded NUL fails before it sends")
+  func pingSourceRejectsEmbeddedNUL() async throws {
+    let network = try FakeICMPNetwork { probe in
+      [.init(ICMPWire.echoReply(family: AF_INET, id: probe.identifier, seq: probe.sequence))]
+    }
+    defer { network.stop() }
+    let tracer = offlineTracer(SwiftFTRConfig())
+    let config = PingConfig(count: 1, timeout: 5, sourceIP: "127.0.0.1\u{0}junk")
+    let (thrown, _) = try await measure(within: 20) {
+      await EventBasedDNSTests.error {
+        try await network.install { try await tracer.ping(to: "fake.test", config: config) }
+      }
+    }
+    if case TracerouteError.sourceIPBindFailed? = thrown {
+    } else {
+      Issue.record("expected sourceIPBindFailed, got \(String(describing: thrown))")
+    }
+    #expect(network.probes.value == 0)
+  }
+
   @Test("A DNS query to a server address with an embedded NUL fails as an invalid address")
   func dnsServerRejectsEmbeddedNUL() async {
     // Rejected before any socket opens; without the check the query would go to 127.0.0.1.
