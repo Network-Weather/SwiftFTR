@@ -626,3 +626,16 @@ Observations that are not defects of the library:
   send loop enqueues each send and sleeps on its own, so a hook cannot keep probe 2 back until a
   reply is read. Its reply is now injected (one loopback crossing, not two) and its interval is
   2 s, which still has to outlast delivery; a seam on the send loop's sleep would remove that.
+- **The receive-loop deadline tests' feed started too late to feed anything** (#103). Under that
+  load `traceDeadline` and `streamDeadline` failed with "sent 0 -> 0": `EndlessReplies` began its
+  replies when the fake network saw the first probe, and that probe crossed loopback after the
+  0.3 s window had closed. The two strict failures reported earlier (294 replies sent, 4 read) are
+  the same start, landing just before the window closed; the sent count is read after the trace
+  returns, while the feed runs on. The replies now start as the probe socket is made, and the
+  socket is handed over only once ten are queued, so it is fed when the window opens. They are
+  echo replies for sequence 0, which no trace, stream or ping sends, so they need no identifier
+  from the operation. The read count stays an estimate (sent minus queued), which counts replies
+  still in flight as read, so on a loaded host it can overstate what the operation read.
+  `FaultInjectionProbeWindowTests.unreachableReported` needed three unreachable replies inside
+  0.3 s; hops 1 and 2 now answer unreachable and hop 3 is the destination, with a window past the
+  watchdog, so only the destination's reply ends the trace.
