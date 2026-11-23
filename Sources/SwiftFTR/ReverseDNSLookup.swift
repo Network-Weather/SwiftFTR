@@ -324,6 +324,10 @@ final class ReverseDNSLookup: @unchecked Sendable {
   private var permitWait: Task<Void, Never>?
   /// Whether the start call has been entered, so the query was asked.
   private var queryAsked = false
+  /// When the real deadline passes, in `DispatchTime` uptime nanoseconds; `nil` while a
+  /// substitute arms the deadline. The start checks it, because the timer's handler can run
+  /// after the instant it was scheduled for.
+  private var deadlineUptime: UInt64?
 
   // Confined to `queue`.
   private var ref: DNSServiceRef?
@@ -398,12 +402,15 @@ final class ReverseDNSLookup: @unchecked Sendable {
     }
     let timer = DispatchSource.makeTimerSource(queue: Self.timerQueue)
     // Capped so the conversion to nanoseconds cannot overflow.
-    timer.schedule(deadline: .now() + min(timeout, 365 * 86400))
+    let nanoseconds = UInt64(max(0, min(timeout, 365 * 86400)) * 1_000_000_000)
+    let deadline = DispatchTime.now().uptimeNanoseconds + nanoseconds
+    timer.schedule(deadline: DispatchTime(uptimeNanoseconds: deadline))
     timer.setEventHandler { [weak self] in self?.resolve(.timedOut) }
     // Activated before it can be cancelled: libdispatch traps on releasing a source that was
     // never activated.
     timer.activate()
     lock.lock()
+    deadlineUptime = deadline
     if outcome == nil {
       self.timer = timer
       lock.unlock()
@@ -468,10 +475,18 @@ final class ReverseDNSLookup: @unchecked Sendable {
     dispatchPrecondition(condition: .onQueue(queue))
     lock.lock()
     let resolved = outcome != nil
-    if !resolved { queryAsked = true }
+    // The deadline itself, not whether its timer's handler has run yet: a lookup with no time
+    // left makes no query and does not keep the permit through a start call.
+    let expired = deadlineUptime.map { DispatchTime.now().uptimeNanoseconds >= $0 } ?? false
+    if !resolved && !expired { queryAsked = true }
     lock.unlock()
     guard !resolved else {
       tearDown()
+      return
+    }
+    guard !expired else {
+      // Not asked, so this resolves as `.timedOutBeforeQuery`, and tears down.
+      resolve(.timedOut, onQueue: true)
       return
     }
     let retained = Unmanaged.passRetained(CallbackContext(lookup: self))

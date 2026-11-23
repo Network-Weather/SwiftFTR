@@ -548,6 +548,23 @@ struct ReverseDNSLookupTests {
     try await Self.expectTornDown(fake, references: 1)
   }
 
+  @Test("A lookup whose real deadline has already passed makes no query")
+  func expiredRealDeadlineMakesNoQuery() async throws {
+    // The timer's handler usually runs after the start would: the start must check the deadline
+    // itself, not wait for the handler.
+    let fake = FakeDNSService(deadline: .timer)
+    for _ in 0..<200 {
+      let (outcome, _) = try await measure(within: Self.watchdog) {
+        await fake.install {
+          await ReverseDNSLookup.lookup("192.0.2.1", timeout: 1e-9)
+        }
+      }
+      #expect(outcome == .timedOutBeforeQuery)
+    }
+    #expect(fake.starts.isEmpty)
+    try await Self.expectTornDown(fake, references: 0)
+  }
+
   @Test("The real deadline timer does not need the lookup's queue")
   func realTimerRunsOffTheLookupQueue() async throws {
     let gate = StallGate()
