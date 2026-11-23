@@ -148,6 +148,10 @@ internal func makeProbeSocketNonBlocking(sockfd: Int32) -> String? {
 /// that unblocks Stage 2 traceroute.
 internal func resolveHost(host: String, prefer: PreferredFamily) throws -> ResolvedHost {
   if let substitute = TestSeams.resolveHost { return try substitute(host, prefer) }
+  // `getaddrinfo` and `inet_pton` would see only the text before a NUL and resolve that instead.
+  guard !containsNUL(host) else {
+    throw TracerouteError.resolutionFailed(host: host, details: "contains a NUL character")
+  }
   let detected = detectAddressFamily(host)
 
   // Force-mode fast paths: when the caller explicitly asked for v4 or v6, skip

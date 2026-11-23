@@ -3,6 +3,10 @@ import Testing
 
 @testable import SwiftFTR
 
+#if canImport(Darwin)
+  import Darwin
+#endif
+
 /// What `seedPublicIP` (through `isGloballyRoutablePublicIP`) accepts as a public address, checked
 /// against the IANA IPv4 and IPv6 Special-Purpose Address Registries and the IPv6 Address Space
 /// registry (all as last updated October 2025). Hop classification is a separate question: some
@@ -61,6 +65,13 @@ struct PublicIPValidationTests {
     Case(address: "::ffff:\($0.address)", accepted: $0.accepted, why: "mapped: \($0.why)")
   }
 
+  /// The IPv4 table again, embedded in the NAT64 well-known prefix (`64:ff9b::a.b.c.d`). RFC 6052
+  /// section 3.1 forbids that prefix for non-global IPv4 addresses, so each embedded address is
+  /// judged by the IPv4 rules.
+  static let ipv4NAT64: [Case] = ipv4.map {
+    Case(address: "64:ff9b::\($0.address)", accepted: $0.accepted, why: "NAT64: \($0.why)")
+  }
+
   static let ipv6: [Case] = [
     accept("2606:4700:4700::1111", "ordinary global unicast in 2000::/3"),
     reject("::1", "::1/128 loopback, RFC 4291"),
@@ -116,6 +127,11 @@ struct PublicIPValidationTests {
     #expect(isGloballyRoutablePublicIP(entry.address) == entry.accepted)
   }
 
+  @Test("IPv4 in the NAT64 well-known prefix", arguments: ipv4NAT64)
+  func nat64Validation(_ entry: Case) {
+    #expect(isGloballyRoutablePublicIP(entry.address) == entry.accepted)
+  }
+
   @Test("IPv6", arguments: ipv6)
   func ipv6Validation(_ entry: Case) {
     #expect(isGloballyRoutablePublicIP(entry.address) == entry.accepted)
@@ -126,6 +142,96 @@ struct PublicIPValidationTests {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
     #expect(await tracer.seedPublicIP("fec0::1", source: .gatewayReported) == false)
     #expect(await tracer.publicIP == nil)
+  }
+
+  @Test(
+    "seedPublicIP rejects a NAT64 address embedding a private IPv4 address and keeps a public one")
+  func seedNAT64() async {
+    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
+    #expect(await tracer.seedPublicIP("64:ff9b::192.168.1.1", source: .gatewayReported) == false)
+    #expect(await tracer.publicIP == nil)
+    #expect(await tracer.seedPublicIP("64:ff9b::8.8.8.8", source: .gatewayReported))
+    #expect(await tracer.publicIP == "64:ff9b::808:808")
+  }
+
+  /// Strings that hold a valid address up to an embedded NUL. A C-string conversion stops at the
+  /// NUL, so a parser that converted first would accept the address before it.
+  static let nulTerminatedAddresses = [
+    "8.8.8.8\u{0}junk", "8.8.8.8\u{0}", "2606:4700:4700::1111\u{0}junk", "::ffff:8.8.8.8\u{0}x",
+    "64:ff9b::8.8.8.8\u{0}x",
+  ]
+
+  @Test("seedPublicIP rejects a string with an embedded NUL", arguments: nulTerminatedAddresses)
+  func seedRejectsEmbeddedNUL(_ address: String) async {
+    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
+    #expect(await tracer.seedPublicIP(address, source: .gatewayReported) == false)
+    #expect(await tracer.publicIP == nil)
+  }
+
+  @Test("The address parsers reject a string with an embedded NUL")
+  func parsersRejectEmbeddedNUL() {
+    #expect(detectAddressFamily("127.0.0.1\u{0}junk") == -1)
+    #expect(detectAddressFamily("::1\u{0}junk") == -1)
+    #expect(canonicalIPAddress("8.8.8.8\u{0}junk") == nil)
+    #expect(ParsedIPAddress("8.8.8.8\u{0}junk") == nil)
+    #expect(ipAddressScope(of: "10.0.0.1\u{0}junk") == nil)
+    #expect(asnLookupAddress(for: "8.8.8.8\u{0}junk") == nil)
+    #expect(isPrivateIPv4("10.0.0.1\u{0}junk") == false)
+    #expect(isCGNATIPv4("100.64.0.1\u{0}junk") == false)
+    #expect(reverseIPv6Nibbles("2001:db8::1\u{0}junk") == nil)
+    // Positive controls: the same strings without the NUL.
+    #expect(detectAddressFamily("127.0.0.1") == AF_INET)
+    #expect(isPrivateIPv4("10.0.0.1") && isCGNATIPv4("100.64.0.1"))
+    #expect(reverseIPv6Nibbles("2001:db8::1") != nil)
+  }
+
+  @Test("Reverse DNS does not look up the address before an embedded NUL")
+  func reverseDNSRejectsEmbeddedNUL() {
+    let lookups = FaultCounter()
+    let lookup: NameInfoLookup = { _, _, host, _, _, _, _ in
+      lookups.increment()
+      host?.pointee = 0x61  // "a"
+      host?.advanced(by: 1).pointee = 0
+      return 0
+    }
+    #expect(reverseDNS("127.0.0.1\u{0}junk", using: lookup) == nil)
+    #expect(reverseDNS("::1\u{0}junk", using: lookup) == nil)
+    #expect(lookups.value == 0)
+    // Positive control: the same lookup answers for the address alone.
+    #expect(reverseDNS("127.0.0.1", using: lookup) == "a")
+  }
+
+  @Test("Destination resolution rejects a name with an embedded NUL")
+  func resolutionRejectsEmbeddedNUL() throws {
+    for prefer in [PreferredFamily.auto, .v4] {
+      #expect(throws: TracerouteError.self) {
+        try resolveHost(host: "127.0.0.1\u{0}junk", prefer: prefer)
+      }
+    }
+    #expect(throws: TracerouteError.self) { try resolveHost(host: "::1\u{0}junk", prefer: .v6) }
+    // Positive control: the literal alone resolves without a lookup.
+    #expect(try resolveHost(host: "127.0.0.1", prefer: .v4).canonical == "127.0.0.1")
+  }
+
+  @Test("A source address with an embedded NUL is rejected")
+  func sourceAddressRejectsEmbeddedNUL() {
+    #expect(throws: TracerouteError.self) {
+      try validateSourceIPFamily("127.0.0.1\u{0}junk", destinationFamily: AF_INET)
+    }
+  }
+
+  @Test("A DNS query to a server address with an embedded NUL fails as an invalid address")
+  func dnsServerRejectsEmbeddedNUL() async {
+    // Rejected before any socket opens; without the check the query would go to 127.0.0.1.
+    do {
+      _ = try await SwiftFTR().dns.a(
+        hostname: "nul.example", server: "127.0.0.1\u{0}junk", timeout: 1)
+      Issue.record("the query succeeded")
+    } catch DNSError.invalidIP(let server) {
+      #expect(server == "127.0.0.1\u{0}junk")
+    } catch {
+      Issue.record("expected DNSError.invalidIP, got \(error)")
+    }
   }
 
   /// Hop classification is unchanged: documentation and reserved ranges still classify as
