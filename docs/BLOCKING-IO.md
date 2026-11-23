@@ -280,9 +280,10 @@ value with its type stated, compile unchanged and mean what they meant (a bare
 initializers on Swift 6.4 only; the pull request that adds the first one adds a test of the
 selection, so CI's Swift 6.1 checks it too. No initializer signature is changed or removed.
 
-**What must ship together.** Reverse-DNS Lookup with Reverse-DNS Cache. Enrichment Lifetimes
-before either Deadline row, or the default deadline budgets one discovery and the call spends
-two. Deadline For Traces and Deadline For Multipath in the same release, since flows run the
+**What must ship together.** Reverse-DNS Lookup with Reverse-DNS Cache. Resolver Seam and
+Enrichment Lifetimes before either Deadline row: without the first a failed discovery is paid
+twice against a default that budgets one, and without the second an ASN lookup can outrun the
+cap the default sums. Deadline For Traces and Deadline For Multipath in the same release, since flows run the
 same pipeline. If a row stops under the second-pass rule in Gates, what can be released without
 it is David's call, made against this list.
 
@@ -321,11 +322,13 @@ never the caller's address (#153). It is not bound to the tracer's interface eit
   nothing. `SwiftFTRConfig` gets a strategy with three cases: the library's resolver (the
   default), none, or the caller's. (ASN resolution has no such strategy case today; a caller's
   `ASNResolver` is passed per call. This is new shape, not a copy.)
-- **The tracer enforces the deadline, not the resolver.** The wait on a resolver is a
-  single-resume race between its answer, the deadline and cancellation, so a caller's resolver
-  that never returns, or ignores cancellation, cannot hold the call; a task group that joins its
-  children would. An answer that arrives after the caller was released is dropped and never
-  written to the cache.
+- **The tracer enforces the deadline on a caller's resolver.** The wait on it is a single-resume
+  race between its answer, the deadline and cancellation, so one that never returns, or ignores
+  cancellation, cannot hold the call; a task group that joins its children would. An answer that
+  arrives after the caller was released is dropped and never written to the cache. The
+  library's own resolver is not raced this way: it holds the deadline itself and decides at it
+  from the replies in hand, so an answer it is entitled to give at the deadline cannot lose to a
+  second timer aimed at the same instant. Cancellation still ends it at once.
 - **Per family, and after the family is known.** The cache holds one observation per family, and
   a seed fills only its own family; today one slot holds either, so an IPv6 seed can label the
   hops of an IPv4 trace. A trace asks for the family it actually probed, which for the
@@ -394,7 +397,8 @@ address is reported as soon as two servers have reported the same one. Otherwise
 compared when every attempt has finished or the deadline passes, whichever is first: one
 distinct address is reported, and two different ones yield none. So a single healthy server
 still answers, at the deadline if another is stalled, and a disagreement is never hidden by
-whichever reply came first.
+whichever reply came first. That decision at the deadline is the resolver's own and the only
+one: the tracer does not run a second timer against it.
 
 Tests: the STUN fault battery against the new transport; a refused port does not delay the other
 servers; two servers that agree answer at once; a healthy endpoint beside a stalled name yields
