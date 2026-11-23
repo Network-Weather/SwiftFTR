@@ -17,13 +17,13 @@ final class HeldUDPServer: @unchecked Sendable {
   let family: Int32
   let requests = FaultCounter()
 
+  /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
   private let lock = NSLock()
   private var stopped = false
   private var released = false
   private var releasedAt: TimeInterval?
   private var clients: [(sockaddr_storage, socklen_t)] = []
-  private let loopExited = DispatchSemaphore(value: 0)
 
   init(family: Int32 = AF_INET) throws {
     self.family = family
@@ -53,16 +53,13 @@ final class HeldUDPServer: @unchecked Sendable {
     clients = []
   }
 
+  /// Releases every held client, then stops answering, without waiting: the serve thread closes
+  /// the socket when it next wakes, within its 20 ms receive timeout. Safe to call from `defer` in
+  /// an async test, since it parks no thread.
   func stop() {
     release()
     lock.lock()
-    let wasStopped = stopped
     stopped = true
-    lock.unlock()
-    guard !wasStopped else { return }
-    loopExited.wait()
-    lock.lock()
-    close(fd)
     lock.unlock()
   }
 
@@ -81,7 +78,14 @@ final class HeldUDPServer: @unchecked Sendable {
   }
 
   private func serve() {
-    defer { loopExited.signal() }
+    // The serve thread owns `fd`. It closes it under the lock that `answer` checks `stopped`
+    // under, and only once `stopped` is set, so nothing sends on the number after it is closed
+    // and perhaps handed to another test's socket.
+    defer {
+      lock.lock()
+      close(fd)
+      lock.unlock()
+    }
     var buffer = [UInt8](repeating: 0, count: 2048)
     while true {
       lock.lock()
@@ -99,6 +103,11 @@ final class HeldUDPServer: @unchecked Sendable {
       }
       guard n >= 0 else { continue }
       lock.lock()
+      // A request that arrives after `stop()` is neither counted nor answered.
+      guard !stopped else {
+        lock.unlock()
+        return
+      }
       if released {
         answer(source, length)
       } else {
@@ -548,5 +557,113 @@ struct AsyncPublicIPDiscoveryTests {
     #expect(ips.v4 == nil)
     #expect(released.value == 0, "an attempt waited for the occupant to free its slot")
     #expect(silent.requests.value == 0, "an attempt ran although no slot was free")
+  }
+
+  // MARK: Whoami servers that refuse or cannot be reached
+
+  /// How the first whoami server fails, and the `DNSError` its query throws.
+  enum WhoamiFailure: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    /// ICMP port unreachable after the send: `connectionRefused`.
+    case refused
+    /// ICMP host unreachable after the send: `unreachable`.
+    case hostUnreachable
+    /// This machine has no route, so the send fails: `unreachable`.
+    case noRoute
+    var testDescription: String { rawValue }
+  }
+
+  /// A `recv` whose first call drains the datagram waiting and reports `code`, as the kernel does
+  /// once an ICMP error has arrived for the connected socket; later calls are plain `recv`.
+  static func firstReceiveFails(with code: Int32) -> TestSeams.ReceiveDatagram {
+    let calls = FaultCounter()
+    return { fd, buffer in
+      calls.increment()
+      let received = Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
+      guard calls.value == 1 else { return received }
+      Darwin.errno = code
+      return -1
+    }
+  }
+
+  /// A `send` whose first call fails with `code` and sends nothing; later calls are plain `send`.
+  static func firstSendFails(with code: Int32) -> TestSeams.SendDatagram {
+    let calls = FaultCounter()
+    return { fd, bytes in
+      calls.increment()
+      guard calls.value > 1 else {
+        Darwin.errno = code
+        return -1
+      }
+      return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+    }
+  }
+
+  @Test(
+    "A whoami server that refuses or cannot be reached is passed over at once for the next",
+    arguments: WhoamiFailure.allCases)
+  func whoamiFailurePassedOver(failure: WhoamiFailure) async throws {
+    let whoami = try LoopbackUDPResponder { query in
+      (Self.whoamiAnswer(to: query, ip: "198.51.100.44"), 0)
+    }
+    defer { whoami.stop() }
+
+    // Each server is asked for longer than the watchdog, so only a failure that ends the first
+    // query at once lets the second answer in time.
+    let (found, _) = try await measure(within: Self.watchdog) {
+      try await TestSeams.$whoamiServers.withValue(["127.0.0.1", "127.0.0.1"]) {
+        try await TestSeams.$dnsServerPort.withValue(whoami.port) {
+          switch failure {
+          case .refused, .hostUnreachable:
+            let code = failure == .refused ? ECONNREFUSED : EHOSTUNREACH
+            return try await TestSeams.$receiveDatagram.withValue(
+              Self.firstReceiveFails(with: code)
+            ) {
+              try await getPublicIPv4ViaDNS(timeout: 3 * Self.watchdog)
+            }
+          case .noRoute:
+            return try await TestSeams.$sendDatagram.withValue(
+              Self.firstSendFails(with: ENETUNREACH)
+            ) {
+              try await getPublicIPv4ViaDNS(timeout: 3 * Self.watchdog)
+            }
+          }
+        }
+      }
+    }
+    #expect(found.ip == "198.51.100.44")
+    // A query that failed after its send reached the responder; one with no route did not.
+    let expectedRequests = failure == .noRoute ? 1 : 2
+    #expect(whoami.requests.value == expectedRequests)
+  }
+
+  @Test("With every whoami server refusing, discovery fails at once instead of timing out")
+  func whoamiAllRefused() async throws {
+    let refusing = try RefusingUDPPort()
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-refused")
+
+    // No STUN servers, so the fallback decides. The budget and the DNS timeout outlive the
+    // watchdog, so a refusal waited out as silence would fail the test at the watchdog.
+    let (thrown, _) = try await measure(within: Self.watchdog) {
+      await Self.withFixtures(
+        servers: Self.servers(), whoamiPort: refusing.port, executor: executor
+      ) {
+        await TestSeams.$whoamiServers.withValue(["127.0.0.1", "127.0.0.1"]) { () -> Error? in
+          do {
+            _ = try await publicIPv4Discovery(
+              stunTimeout: 0.2, dnsTimeout: 3 * Self.watchdog, interface: nil, sourceIP: nil,
+              enableLogging: false, budget: 3 * Self.watchdog)
+            return nil
+          } catch {
+            return error
+          }
+        }
+      }
+    }
+    // A definite failure from both tiers, not the budget running out.
+    guard case PublicIPError.allMethodsFailed(_, let dnsError)? = thrown else {
+      Issue.record("expected allMethodsFailed, got \(String(describing: thrown))")
+      return
+    }
+    #expect(dnsError.contains("No response from DNS servers"), "\(dnsError)")
   }
 }
