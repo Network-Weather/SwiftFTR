@@ -8,19 +8,22 @@ import Testing
   import Darwin
 #endif
 
-/// A loopback DNS peer that answers each query with a scripted list of datagrams, sent in order,
-/// and can also keep sending one datagram derived from the first query every ``interval`` until
-/// ``stop()``.
+/// A loopback DNS peer that answers each query its filter accepts with a scripted list of
+/// datagrams, sent in order, and can also keep sending one datagram derived from the first query
+/// every ``interval`` until the query's socket closes or ``stop()``.
 ///
 /// Every datagram leaves from the socket the query reached, so the client's connected socket
 /// accepts it as coming from its server. The continuous feed is slow on purpose: a flood sent flat
-/// out overflows loopback's input queue and drops datagrams for every socket on the host.
+/// out overflows loopback's input queue and drops datagrams for every socket on the host. Any
+/// datagram the filter turns away is a stray (``DatagramFilter``): counted in ``ignored``, never
+/// scripted.
 final class ScriptedDNSPeer: @unchecked Sendable {
   typealias Script = @Sendable (_ query: [UInt8]) -> [(datagram: [UInt8], after: TimeInterval)]
   typealias Feed = @Sendable (_ query: [UInt8]) -> [UInt8]
 
   let port: UInt16
   let requests = FaultCounter()
+  let ignored = FaultCounter()
   /// Datagrams sent, scripted and fed.
   let sent = FaultCounter()
   /// The gap between fed datagrams, and so the longest a blocking read waits for one.
@@ -28,11 +31,18 @@ final class ScriptedDNSPeer: @unchecked Sendable {
 
   /// Owned by the serve and feed threads: the last of them to exit closes it.
   private let fd: Int32
+  private let filter: DatagramFilter
   private let script: Script
   private let feed: Feed?
   private let lock = NSLock()
   private var stopped = false
   private var feeding = false
+  /// When the query's socket closed, through ``endingFeedAtClose(_:)``: the feed sends nothing
+  /// after it.
+  private var clientClosedAt: TimeInterval?
+  /// Duplicates of the query sockets closed through ``endingFeedAtClose(_:)``, held so their port
+  /// numbers stay taken until the last thread exits.
+  private var heldClients: [Int32] = []
   private var feedSent = 0
   private var lastFeed: TimeInterval?
   private var longestGap: TimeInterval = 0
@@ -41,15 +51,56 @@ final class ScriptedDNSPeer: @unchecked Sendable {
   /// Threads that have not exited yet.
   private var threads = 1
 
-  init(family: Int32 = AF_INET, feed: Feed? = nil, script: @escaping Script) throws {
+  /// - Parameter gate: when given, the serve thread reads nothing until it opens, so a test can
+  ///   queue datagrams ahead of its query.
+  init(
+    family: Int32 = AF_INET, accepts filter: DatagramFilter = .dnsQuery(),
+    readsAfter gate: StallGate? = nil, feed: Feed? = nil, script: @escaping Script
+  ) throws {
+    self.filter = filter
     self.script = script
     self.feed = feed
     (fd, port) = try bindLoopback(family: family, type: SOCK_DGRAM)
     setReceiveTimeout(fd, seconds: 0.02)
-    Thread { [self] in self.serve() }.start()
+    Thread { [self] in
+      gate?.wait(limit: 60)
+      self.serve()
+    }.start()
   }
 
   deinit { stop() }
+
+  /// Datagrams waiting on the socket (`SO_NUMRCVPKT`), or -1 once stopped.
+  var queued: Int32 {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopped ? -1 : queuedDatagrams(fd)
+  }
+
+  /// Runs `body` with the event-based transport's close pointed at this peer: before the query's
+  /// socket closes, the feed stops, under the lock every send holds, and the peer keeps a
+  /// duplicate of the socket until its last thread exits. So nothing the feed sends can reach
+  /// another socket handed the client's port number.
+  func endingFeedAtClose<T>(_ body: () async throws -> T) async rethrows -> T {
+    let close: TestSeams.CloseDescriptor = { [self] fd in
+      let held = dup(fd)
+      lock.lock()
+      clientClosedAt = clientClosedAt ?? monotonicNow()
+      if held >= 0 { if threads == 0 { Darwin.close(held) } else { heldClients.append(held) } }
+      lock.unlock()
+      return Darwin.close(fd)
+    }
+    return try await TestSeams.$closeDescriptor.withValue(close) { try await body() }
+  }
+
+  /// Whether the feed stopped because the query's socket closed, and how many datagrams it sent
+  /// after that (none, unless the stop failed).
+  var feedEndedAtClose: (ended: Bool, sentAfter: Int) {
+    lock.lock()
+    defer { lock.unlock() }
+    return (clientClosedAt != nil, sentAfterClose)
+  }
+  private var sentAfterClose = 0
 
   /// Stops the script and the feed, without waiting: nothing is sent once this returns, and the
   /// last thread to exit closes the socket, the serve thread within its 20 ms receive timeout.
@@ -65,7 +116,11 @@ final class ScriptedDNSPeer: @unchecked Sendable {
   private func threadExited() {
     lock.lock()
     threads -= 1
-    if threads == 0 { close(fd) }
+    if threads == 0 {
+      close(fd)
+      for held in heldClients { close(held) }
+      heldClients = []
+    }
     lock.unlock()
   }
 
@@ -93,21 +148,24 @@ final class ScriptedDNSPeer: @unchecked Sendable {
     return feedSent
   }
 
-  /// Whether the feed was still running, sent at least `minimum` datagrams since `mark`, and never
-  /// left a gap reaching `limit` (after which a blocking read on the client would report no data).
+  /// Whether the feed ran until the query's socket closed (or still runs), sent at least
+  /// `minimum` datagrams since `mark`, and never left a gap reaching `limit` (after which a
+  /// blocking read on the client would report no data), up to that close.
   func keptFeeding(since mark: Int, minimum: Int = 1, limit: TimeInterval) -> (
     ok: Bool, detail: String
   ) {
     lock.lock()
     defer { lock.unlock() }
-    let sinceLast = lastFeed.map { monotonicNow() - $0 }
+    let end = clientClosedAt ?? monotonicNow()
+    let sinceLast = lastFeed.map { end - $0 }
+    let running = feeding && (clientClosedAt != nil || !stopped)
     let ok =
-      feeding && !stopped && feedSent - mark >= minimum && longestGap < limit
+      running && feedSent - mark >= minimum && longestGap < limit
       && sinceLast.map { $0 < limit } == true
     return (
       ok,
-      "feeding: \(feeding && !stopped), fed \(mark) -> \(feedSent), longest gap \(longestGap)s, "
-        + "since last \(sinceLast.map { "\($0)s" } ?? "never")"
+      "feeding until close: \(running), fed \(mark) -> \(feedSent), "
+        + "longest gap \(longestGap)s, last feed to close \(sinceLast.map { "\($0)s" } ?? "never")"
     )
   }
 
@@ -117,12 +175,20 @@ final class ScriptedDNSPeer: @unchecked Sendable {
     return stopped
   }
 
+  private var isClientClosed: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return clientClosedAt != nil
+  }
+
   private func send(_ datagram: [UInt8], to address: sockaddr_storage, _ length: socklen_t) -> Bool
   {
     lock.lock()
     defer { lock.unlock() }
     // Once stopped, the socket may already be closed.
     guard !stopped else { return false }
+    // Nothing goes to the query's port once its socket closed.
+    guard clientClosedAt == nil else { return false }
     var destination = address
     let n = datagram.withUnsafeBytes { raw in
       withUnsafePointer(to: &destination) {
@@ -131,7 +197,10 @@ final class ScriptedDNSPeer: @unchecked Sendable {
         }
       }
     }
-    if n == datagram.count { sent.increment() }
+    if n == datagram.count {
+      sent.increment()
+      if clientClosedAt != nil { sentAfterClose += 1 }
+    }
     return n == datagram.count
   }
 
@@ -150,6 +219,10 @@ final class ScriptedDNSPeer: @unchecked Sendable {
       }
       guard n >= 0 else { continue }
       let query = Array(buffer.prefix(n))
+      guard filter.accepts(query) else {
+        ignored.increment()
+        continue
+      }
       lock.lock()
       lastQuery = (query, source, length)
       lock.unlock()
@@ -179,7 +252,7 @@ final class ScriptedDNSPeer: @unchecked Sendable {
       defer { threadExited() }
       // A test that forgets to stop the feed must not leave it running for the whole suite.
       let safetyStop = monotonicNow() + 60
-      while !isStopped, monotonicNow() < safetyStop {
+      while !isStopped, !isClientClosed, monotonicNow() < safetyStop {
         if send(datagram, to: source, length) {
           let now = monotonicNow()
           lock.lock()
@@ -437,6 +510,14 @@ struct DNSForeignReplyTests {
     return 0
   }
 
+  /// Checks that the feed stopped when the query closed its socket and sent nothing after: it
+  /// sends every 2 ms, so one that went on would have sent within half a second.
+  static func expectFeedEndedAtClose(_ peer: ScriptedDNSPeer) async throws {
+    #expect(peer.feedEndedAtClose.ended, "the query's socket never closed through the peer")
+    let sentAfterClose = await eventually(within: 0.5) { peer.feedEndedAtClose.sentAfter > 0 }
+    #expect(!sentAfterClose, "the feed sent \(peer.feedEndedAtClose.sentAfter) after the close")
+  }
+
   static func endlessForeign(family: Int32 = AF_INET) throws -> ScriptedDNSPeer {
     try ScriptedDNSPeer(
       family: family, feed: { Self.foreign(Self.answer($0, last: 1)) }, script: { _ in [] })
@@ -451,12 +532,14 @@ struct DNSForeignReplyTests {
     let timeout: TimeInterval = 0.3
 
     let (thrown, elapsed) = try await measure(within: Self.watchdog) {
-      await TestSeams.$fileControl.withValue(Self.leaveBlocking) {
-        await TestSeams.$receiveDatagram.withValue(Self.countingReceive(reads)) {
-          await EventBasedDNSTests.error {
-            try await __dnsQuery(
-              server: Self.loopback(family), port: peer.port, name: "endless.example", type: 1,
-              timeout: timeout)
+      await peer.endingFeedAtClose {
+        await TestSeams.$fileControl.withValue(Self.leaveBlocking) {
+          await TestSeams.$receiveDatagram.withValue(Self.countingReceive(reads)) {
+            await EventBasedDNSTests.error {
+              try await __dnsQuery(
+                server: Self.loopback(family), port: peer.port, name: "endless.example", type: 1,
+                timeout: timeout)
+            }
           }
         }
       }
@@ -464,6 +547,7 @@ struct DNSForeignReplyTests {
     let flow = peer.keptFeeding(since: 0, limit: Self.neverDryTimeout)
 
     #expect(flow.ok, "the socket was not kept fed while the query waited: \(flow.detail)")
+    try await Self.expectFeedEndedAtClose(peer)
     #expect(reads.value >= 10, "the query read only \(reads.value) datagrams")
     #expect(EventBasedDNSTests.isTimeout(thrown), "\(String(describing: thrown))")
     #expect(elapsed >= timeout * 0.95, "ended after \(elapsed)s against a \(timeout)s timeout")
@@ -478,12 +562,14 @@ struct DNSForeignReplyTests {
     let timeout: TimeInterval = 60
 
     let task = Task {
-      await TestSeams.$fileControl.withValue(Self.leaveBlocking) {
-        await TestSeams.$receiveDatagram.withValue(Self.countingReceive(reads)) {
-          await EventBasedDNSTests.error {
-            try await __dnsQuery(
-              server: "127.0.0.1", port: peer.port, name: "endless.example", type: 1,
-              timeout: timeout)
+      await peer.endingFeedAtClose {
+        await TestSeams.$fileControl.withValue(Self.leaveBlocking) {
+          await TestSeams.$receiveDatagram.withValue(Self.countingReceive(reads)) {
+            await EventBasedDNSTests.error {
+              try await __dnsQuery(
+                server: "127.0.0.1", port: peer.port, name: "endless.example", type: 1,
+                timeout: timeout)
+            }
           }
         }
       }
@@ -598,7 +684,7 @@ struct DNSForeignReplyTests {
     let delay: TimeInterval = 0.2
     // Each TXT query gets a foreign copy of its answer at once and the real one after `delay`,
     // so a lookup that moved on at the foreign one would not resolve.
-    let peer = try ScriptedDNSPeer { query in
+    let peer = try ScriptedDNSPeer(accepts: CymruFixture.query) { query in
       guard let (reply, _) = CymruFixture.answer(query) else { return [] }
       return [(Self.foreign(reply), 0), (reply, delay)]
     }
