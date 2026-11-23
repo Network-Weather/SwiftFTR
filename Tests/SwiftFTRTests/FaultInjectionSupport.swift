@@ -79,16 +79,23 @@ func measure<T>(_ body: () async throws -> T) async rethrows -> (T, TimeInterval
 /// Thrown by ``measure(within:_:)`` when the operation outlives its watchdog.
 struct WatchdogExpired: Error, CustomStringConvertible {
   let limit: TimeInterval
-  var description: String { "operation still running after the \(limit)s watchdog" }
+  /// What the caller's `diagnose` reported when the watchdog fired, if it passed one.
+  var diagnosis: String? = nil
+  var description: String {
+    "operation still running after the \(limit)s watchdog"
+      + (diagnosis.map { "; at expiry:\n\($0)" } ?? "")
+  }
 }
 
 /// Seconds elapsed while running `body`, or ``WatchdogExpired`` once `limit` seconds pass.
 ///
 /// The operation runs in its own task and the watchdog does not wait for it to finish, so an
 /// operation that never returns fails the test instead of hanging the run. The abandoned task is
-/// cancelled.
+/// cancelled. `diagnose`, when given, is evaluated as the watchdog fires and its text carried in the
+/// error, so a stuck operation reports what its fixture saw.
 func measure<T: Sendable>(
-  within limit: TimeInterval, _ body: @escaping @Sendable () async throws -> T
+  within limit: TimeInterval, diagnose: @autoclosure @escaping @Sendable () -> String = "",
+  _ body: @escaping @Sendable () async throws -> T
 ) async throws -> (T, TimeInterval) {
   let start = monotonicNow()
   let outcome = WatchdogRace<T>()
@@ -101,7 +108,11 @@ func measure<T: Sendable>(
   }
   let watchdog = Task {
     try? await Task.sleep(nanoseconds: UInt64(limit * 1_000_000_000))
-    outcome.finish(.failure(WatchdogExpired(limit: limit)))
+    // Cancelled only once the operation has finished: nothing to report.
+    if Task.isCancelled { return }
+    let diagnosis = diagnose()
+    outcome.finish(
+      .failure(WatchdogExpired(limit: limit, diagnosis: diagnosis.isEmpty ? nil : diagnosis)))
   }
   let result = await outcome.value
   watchdog.cancel()
@@ -216,11 +227,13 @@ func loopbackAddress(family: Int32, port: UInt16) -> (sockaddr_storage, socklen_
 }
 
 /// Opens a socket bound to loopback on an ephemeral port and returns it with the port.
+///
+/// No `SO_REUSEADDR`: with it, Darwin picks an IPv6 ephemeral port without checking sockets bound
+/// to the unspecified address, so it can hand out a port an unbound probe socket took on its first
+/// send, and the loopback datagrams meant for that socket then arrive here instead.
 func bindLoopback(family: Int32, type: Int32) throws -> (fd: Int32, port: UInt16) {
   let fd = socket(family, type, 0)
   guard fd >= 0 else { throw FixtureError.socket("socket", errno) }
-  var on: Int32 = 1
-  _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
   var (address, length) = loopbackAddress(family: family, port: 0)
   let bound = withUnsafePointer(to: &address) {
     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, length) }
@@ -291,6 +304,9 @@ final class FakeICMPNetwork: @unchecked Sendable {
   let family: Int32
   let port: UInt16
   let probes = FaultCounter()
+  /// Datagrams this peer has sent, scripted replies and injected ones alike, counted once
+  /// `sendto` has returned.
+  let repliesSent = FaultCounter()
 
   /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
@@ -299,6 +315,9 @@ final class FakeICMPNetwork: @unchecked Sendable {
   private var stopped = false
   private let socketsLock = NSLock()
   private var openedSockets: [Int32] = []
+  /// What the peer received and sent, for a test to print when an operation outlives its
+  /// watchdog. Guarded by `lock`; capped so a long trace cannot grow it without bound.
+  private var events: [String] = []
 
   init(family: Int32 = AF_INET, script: @escaping Script) throws {
     self.family = family
@@ -434,6 +453,8 @@ final class FakeICMPNetwork: @unchecked Sendable {
         sequence: UInt16(bytes[6]) << 8 | UInt16(bytes[7]),
         hopLimit: hopLimit)
       probes.increment()
+      record(
+        "probe id=\(probe.identifier) seq=\(probe.sequence) from port \(Self.port(of: source))")
       for reply in script(probe) {
         if reply.delay <= 0 {
           send(reply.bytes, to: source, hopLimit: reply.hopLimit)
@@ -450,7 +471,7 @@ final class FakeICMPNetwork: @unchecked Sendable {
 
   /// Sends `reply` now, from this network's address, to the socket `fd` is bound to, as if it
   /// answered a probe from `fd`. Returns false if `fd` has no local address yet (it binds on its
-  /// first send).
+  /// first send) or the datagram could not be sent.
   @discardableResult
   func inject(_ reply: Reply, to fd: Int32) -> Bool {
     var address = sockaddr_storage()
@@ -464,15 +485,41 @@ final class FakeICMPNetwork: @unchecked Sendable {
     guard named == 0, port != 0 else { return false }
     // A socket bound to the wildcard address is reached on loopback.
     let (destination, _) = loopbackAddress(family: family, port: port)
-    send(reply.bytes, to: destination, hopLimit: reply.hopLimit)
-    return true
+    return send(reply.bytes, to: destination, hopLimit: reply.hopLimit)
   }
 
-  private func send(_ bytes: [UInt8], to destination: sockaddr_storage, hopLimit: Int32?) {
+  /// What the peer received and sent so far, one event per line.
+  var journal: String {
+    lock.lock()
+    defer { lock.unlock() }
+    return events.joined(separator: "\n")
+  }
+
+  private func record(_ event: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    recordLocked(event)
+  }
+
+  /// Requires `lock`.
+  private func recordLocked(_ event: String) {
+    if events.count < 200 { events.append(event) }
+  }
+
+  private static func port(of address: sockaddr_storage) -> UInt16 {
+    withUnsafeBytes(of: address) { UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self)) }
+  }
+
+  /// Whether the whole datagram was sent.
+  @discardableResult
+  private func send(_ bytes: [UInt8], to destination: sockaddr_storage, hopLimit: Int32?) -> Bool {
     lock.lock()
     defer { lock.unlock() }
     // Closed under the same lock, so a late reply never reaches a recycled descriptor.
-    guard !stopped else { return }
+    guard !stopped else {
+      recordLocked("reply of \(bytes.count) bytes to port \(Self.port(of: destination)): stopped")
+      return false
+    }
     if family == AF_INET6 {
       // Set on every send, under the lock, so one reply's hop limit never leaks into the next.
       // -1 restores the system default.
@@ -482,13 +529,17 @@ final class FakeICMPNetwork: @unchecked Sendable {
     }
     var destination = destination
     let length = socklen_t(destination.ss_len)
-    _ = bytes.withUnsafeBytes { raw in
+    let sent = bytes.withUnsafeBytes { raw in
       withUnsafePointer(to: &destination) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
           sendto(fd, raw.baseAddress, raw.count, 0, $0, length)
         }
       }
     }
+    let outcome = sent == bytes.count ? "sent" : "sendto returned \(sent), errno \(errno)"
+    if sent == bytes.count { repliesSent.increment() }
+    recordLocked("reply of \(bytes.count) bytes to port \(Self.port(of: destination)): \(outcome)")
+    return sent == bytes.count
   }
 
   private static func hopLimit(from msg: msghdr) -> Int? {
@@ -794,28 +845,73 @@ final class RefusingTCPPort: @unchecked Sendable {
 ///
 /// The port belongs to a socket connected to another loopback address, so the kernel delivers it
 /// only datagrams from that peer and answers everyone else as it would for an unbound port, while
-/// no other socket can be handed the number.
+/// no other socket can be handed the number (see ``bindRefusingUDP(family:)``).
 final class RefusingUDPPort: @unchecked Sendable {
   let port: UInt16
-  private let fd: Int32
+  private let descriptors: [Int32]
 
   init(family: Int32 = AF_INET) throws {
-    let (bound, boundPort) = try bindLoopback(family: family, type: SOCK_DGRAM)
-    // Port 9 (discard): connecting a datagram socket sends nothing; it only fixes the peer.
-    var (peer, length) = loopbackAddress(family: family, port: 9)
-    let connected = withUnsafePointer(to: &peer) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(bound, $0, length) }
-    }
-    guard connected == 0 else {
-      let code = errno
-      close(bound)
-      throw FixtureError.socket("connect", code)
-    }
-    fd = bound
-    port = boundPort
+    let refusing = try bindRefusingUDP(family: family)
+    port = refusing.port
+    descriptors = [refusing.fd] + (refusing.ipv6Guard.map { [$0] } ?? [])
   }
 
-  deinit { close(fd) }
+  deinit { for descriptor in descriptors { close(descriptor) } }
+}
+
+/// A UDP socket bound to loopback on an ephemeral port and connected to the discard port, so the
+/// kernel refuses datagrams to the port from anyone else, with the IPv6 guard an IPv4 port needs.
+///
+/// Darwin picks an IPv6 ephemeral port without checking IPv4 sockets, so a dual-stack socket bound
+/// to `[::]` (a fake network's IPv6 probe socket, say) could be handed an IPv4 port's number, and
+/// IPv4 datagrams to it would then be delivered there instead of refused. For IPv4 a v6-only
+/// socket on `[::]` with the same number, connected like the first, keeps the number out of IPv6
+/// hands and receives nothing itself. The caller closes both descriptors.
+func bindRefusingUDP(family: Int32) throws -> (fd: Int32, port: UInt16, ipv6Guard: Int32?) {
+  // A dual-stack socket can take the number between the two binds; then start again.
+  for _ in 0..<20 {
+    let (bound, boundPort) = try bindLoopback(family: family, type: SOCK_DGRAM)
+    do {
+      try connectToDiscard(bound, family: family)
+    } catch {
+      close(bound)
+      throw error
+    }
+    guard family == AF_INET else { return (bound, boundPort, nil) }
+    let guardSocket = socket(AF_INET6, SOCK_DGRAM, 0)
+    guard guardSocket >= 0 else {
+      let code = errno
+      close(bound)
+      throw FixtureError.socket("socket", code)
+    }
+    var on: Int32 = 1
+    _ = setsockopt(
+      guardSocket, IPPROTO_IPV6, IPV6_V6ONLY, &on, socklen_t(MemoryLayout<Int32>.size))
+    var any = sockaddr_in6()
+    any.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+    any.sin6_family = sa_family_t(AF_INET6)
+    any.sin6_port = boundPort.bigEndian
+    let guarded = withUnsafePointer(to: &any) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        bind(guardSocket, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+      }
+    }
+    if guarded == 0, (try? connectToDiscard(guardSocket, family: AF_INET6)) != nil {
+      return (bound, boundPort, guardSocket)
+    }
+    close(guardSocket)
+    close(bound)
+  }
+  throw FixtureError.socket("no IPv4 port free of IPv6 sockets", EADDRINUSE)
+}
+
+/// Port 9 (discard): connecting a datagram socket sends nothing; it only fixes the peer.
+private func connectToDiscard(_ fd: Int32, family: Int32) throws {
+  var (peer, length) = loopbackAddress(family: family, port: 9)
+  let connected = withUnsafePointer(to: &peer) {
+    $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
+  }
+  guard connected == 0 else { throw FixtureError.socket("connect", errno) }
 }
 
 // MARK: - Loopback UDP responder

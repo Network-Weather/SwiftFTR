@@ -79,7 +79,7 @@ struct PingReplyMatchingTests {
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
 
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: network.journal) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     let s = result.statistics
@@ -123,7 +123,9 @@ struct PingReplyMatchingTests {
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.05, timeout: 0.5)
 
-    let (result, elapsed) = try await measure(within: Self.safetyTimer(config) - 1) {
+    let (result, elapsed) = try await measure(
+      within: Self.safetyTimer(config) - 1, diagnose: network.journal
+    ) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     let s = result.statistics
@@ -159,7 +161,7 @@ struct PingReplyMatchingTests {
     // The reply window outlasts the watchdog, so the ping must end on its third real reply.
     let config = PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
 
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: network.journal) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     let s = result.statistics
@@ -186,12 +188,16 @@ struct PingReplyMatchingTests {
     defer { ping.stop() }
     ping.beforeSend = { seq, fd in
       guard seq == 2 else { return }
-      ping.network.inject(
+      // The premise needs the injected reply itself on the wire: if its send failed, the queue
+      // check would be satisfied by the ordinary replies alone.
+      let injected = ping.network.inject(
         Self.reply(family, id: DirectPing.identifier, seq: 2, mark: Self.ignored), to: fd)
-      ping.premise(queuedDatagrams(fd) >= 1 || waitForQueued(fd, atLeast: 1))
+      ping.premise(injected && ping.waitUntilEveryReplyQueuedOrRead(fd))
     }
 
-    let (result, _) = try await measure(within: Self.watchdog) { try await ping.run() }
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
+      try await ping.run()
+    }
     #expect(ping.premiseHeld, "the early reply was never queued ahead of probe 2's send")
     let s = result.statistics
     #expect(s.sent == 3 && s.received == 3 && s.packetLoss == 0, "\(Self.summary(result))")
@@ -220,7 +226,9 @@ struct PingReplyMatchingTests {
     }
 
     let config = ping.config
-    let (result, elapsed) = try await measure(within: Self.safetyTimer(config) - 1) {
+    let (result, elapsed) = try await measure(
+      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
+    ) {
       try await ping.run()
     }
     #expect(ping.premiseHeld, "the early reply was never queued ahead of probe 2's send")
@@ -260,7 +268,7 @@ struct PingReplyMatchingTests {
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
 
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: network.journal) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     let s = result.statistics
@@ -296,7 +304,9 @@ struct PingReplyMatchingTests {
       }
     }
 
-    let (result, _) = try await measure(within: Self.watchdog) { try await ping.run() }
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
+      try await ping.run()
+    }
     #expect(ping.premiseHeld, "the replies were not queued and read as staged")
     let s = result.statistics
     #expect(s.sent == 2 && s.received == 2, "\(Self.summary(result))")
@@ -330,7 +340,9 @@ struct PingReplyMatchingTests {
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 1.0, timeout: 0.5)
 
-    let (result, _) = try await measure(within: Self.safetyTimer(config) - 1) {
+    let (result, _) = try await measure(
+      within: Self.safetyTimer(config) - 1, diagnose: network.journal
+    ) {
       try await network.install { try await tracer.ping(to: "fake.test", config: config) }
     }
     let s = result.statistics
@@ -362,7 +374,9 @@ struct PingReplyMatchingTests {
       }
     }
 
-    let (result, _) = try await measure(within: Self.watchdog) { try await ping.run() }
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
+      try await ping.run()
+    }
     #expect(ping.premiseHeld, "the send loop never finished before the reply was sent")
     let s = result.statistics
     #expect(s.sent == 1 && s.received == 1 && s.packetLoss == 0, "\(Self.summary(result))")
@@ -387,7 +401,9 @@ struct PingReplyMatchingTests {
       ping.premise(ping.clock.readingCount > 0)
     }
 
-    let (result, _) = try await measure(within: Self.watchdog) { try await ping.run() }
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
+      try await ping.run()
+    }
     #expect(ping.premiseHeld, "probe 1's reply was not read before probe 2's send")
     let s = result.statistics
     #expect(s.sent == 1 && s.received == 1 && s.packetLoss == 0, "\(Self.summary(result))")
@@ -407,7 +423,9 @@ struct PingReplyMatchingTests {
     defer { ping.stop() }
     ping.failingSends = [2]
 
-    let (result, _) = try await measure(within: Self.watchdog) { try await ping.run() }
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
+      try await ping.run()
+    }
     let s = result.statistics
     #expect(
       s.sent == 2 && s.received == 2,
@@ -431,7 +449,9 @@ struct PingReplyMatchingTests {
     ping.failingSends = [1]
 
     let config = ping.config
-    let (result, elapsed) = try await measure(within: Self.safetyTimer(config) - 1) {
+    let (result, elapsed) = try await measure(
+      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
+    ) {
       try await ping.run()
     }
     let s = result.statistics
@@ -493,6 +513,28 @@ final class DirectPing: @unchecked Sendable {
   }
 
   func premise(_ held: Bool) { state.lock.withLock { state.premises.append(held) } }
+
+  /// Waits, blocking this thread for at most `limit` seconds, until every datagram the network
+  /// has sent to `fd` is either queued there or already read by the ping. Returns whether that
+  /// happened.
+  ///
+  /// Called from a send hook, on the ping's queue, right after an injection, it shows that the
+  /// injected datagram is queued: the read handler cannot run meanwhile, so nothing more is read,
+  /// and the count is met only once that datagram has landed. Loopback delivers after `sendto`
+  /// returns, so a bare "at least one queued" can be met instead by an earlier reply still
+  /// waiting unread while the injected one is in flight, which then lands after the send it was
+  /// meant to precede. Every reply the ping reads takes one clock reading, and before the send
+  /// loop finishes nothing else reads that clock.
+  func waitUntilEveryReplyQueuedOrRead(_ fd: Int32, limit: TimeInterval = 10) -> Bool {
+    let giveUp = monotonicNow() + limit
+    while true {
+      let sent = network.repliesSent.value
+      let accounted = Int(queuedDatagrams(fd)) + clock.readingCount
+      if accounted == sent && network.repliesSent.value == sent { return true }
+      if monotonicNow() >= giveUp { return false }
+      usleep(500)
+    }
+  }
 
   init(family: Int32, config: PingConfig, script: @escaping FakeICMPNetwork.Script) throws {
     let network = try FakeICMPNetwork(family: family, script: script)
