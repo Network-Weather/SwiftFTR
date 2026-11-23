@@ -274,10 +274,15 @@ final class FakeICMPNetwork: @unchecked Sendable {
   struct Reply: Sendable {
     let bytes: [UInt8]
     let delay: TimeInterval
+    /// The IPv6 hop limit to send this reply with, which the receiver reads from ancillary data.
+    /// `nil` sends with the system default. Ignored on IPv4, whose receive loop reads the TTL
+    /// from an IP header carried in `bytes` instead.
+    let hopLimit: Int32?
 
-    init(_ bytes: [UInt8], after delay: TimeInterval = 0) {
+    init(_ bytes: [UInt8], after delay: TimeInterval = 0, hopLimit: Int32? = nil) {
       self.bytes = bytes
       self.delay = delay
+      self.hopLimit = hopLimit
     }
   }
 
@@ -419,23 +424,50 @@ final class FakeICMPNetwork: @unchecked Sendable {
       probes.increment()
       for reply in script(probe) {
         if reply.delay <= 0 {
-          send(reply.bytes, to: source)
+          send(reply.bytes, to: source, hopLimit: reply.hopLimit)
         } else {
           // Captured by value: `source` is a `var` (the receive writes into it), though nothing
           // writes it once this datagram has been read.
           DispatchQueue.global().asyncAfter(deadline: .now() + reply.delay) { [source] in
-            self.send(reply.bytes, to: source)
+            self.send(reply.bytes, to: source, hopLimit: reply.hopLimit)
           }
         }
       }
     }
   }
 
-  private func send(_ bytes: [UInt8], to destination: sockaddr_storage) {
+  /// Sends `reply` now, from this network's address, to the socket `fd` is bound to, as if it
+  /// answered a probe from `fd`. Returns false if `fd` has no local address yet (it binds on its
+  /// first send).
+  @discardableResult
+  func inject(_ reply: Reply, to fd: Int32) -> Bool {
+    var address = sockaddr_storage()
+    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let named = withUnsafeMutablePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+    }
+    let port = withUnsafeBytes(of: address) {
+      UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+    }
+    guard named == 0, port != 0 else { return false }
+    // A socket bound to the wildcard address is reached on loopback.
+    let (destination, _) = loopbackAddress(family: family, port: port)
+    send(reply.bytes, to: destination, hopLimit: reply.hopLimit)
+    return true
+  }
+
+  private func send(_ bytes: [UInt8], to destination: sockaddr_storage, hopLimit: Int32?) {
     lock.lock()
     defer { lock.unlock() }
     // Closed under the same lock, so a late reply never reaches a recycled descriptor.
     guard !stopped else { return }
+    if family == AF_INET6 {
+      // Set on every send, under the lock, so one reply's hop limit never leaks into the next.
+      // -1 restores the system default.
+      var hops: Int32 = hopLimit ?? -1
+      _ = setsockopt(
+        fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS, &hops, socklen_t(MemoryLayout<Int32>.size))
+    }
     var destination = destination
     let length = socklen_t(destination.ss_len)
     _ = bytes.withUnsafeBytes { raw in

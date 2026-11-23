@@ -44,6 +44,10 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   truth. `FaultInjectionSupport.swift` now has the TCP and HTTP fixtures they need.
 - **Gate `TraceLifecycleTests.cancelActiveTracesCancelsClassifiedTrace` off the network**: it runs
   in the offline suite but sends a real trace and real STUN queries.
+- **Measure ping RTTs from the kernel's arrival stamp**: ping already reads it for every reply to
+  judge whether the reply came after its request, but still times the reply when the read handler
+  takes it, so a busy queue or a long read batch adds to the RTT. Using the stamp would remove that,
+  and it is the same clock as the send stamp.
 - **`connectionRefused` and `unreachable` cases on `DNSError`**, so the throwing query methods tell
   a refused port and an unreachable host from a send failure and from silence, as `dnsProbe`'s
   `outcome` does. New cases break exhaustive switches in consumers, so this waits for a release

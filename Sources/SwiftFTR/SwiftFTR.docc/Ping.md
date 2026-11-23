@@ -15,6 +15,11 @@ The ping functionality provides ICMP echo request/reply support with comprehensi
 
 All RTT values are `TimeInterval` seconds; multiply by 1000 for milliseconds.
 
+A ping counts only the first echo reply to each request it has sent. Replies for sequence numbers
+it never sent or has not sent yet, and duplicates, are ignored, so they cannot change the
+statistics or end the ping early. `timeout` is the reply window after the last request; a reply to
+an earlier request still counts if it arrives within it.
+
 ## Basic Ping
 
 Send a single ICMP echo request:

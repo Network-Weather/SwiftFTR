@@ -430,6 +430,8 @@ public struct PingConfig: Sendable {
     public init(count: Int = 5, interval: TimeInterval = 1.0, timeout: TimeInterval = 2.0,
                 payloadSize: Int = 56, interface: String? = nil, sourceIP: String? = nil,
                 preferredFamily: PreferredFamily = .auto)
+    // timeout: reply window after the last request; an earlier request's reply counts until then.
+    // Only the first reply to each request sent counts; strays and duplicates are ignored.
 }
 public struct PingResult: Sendable, Codable {
     public let target: String
