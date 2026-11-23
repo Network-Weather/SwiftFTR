@@ -56,10 +56,24 @@ jobs:
         run: swift --version
       # Fails on any source break that api-breakage-allowlist.txt does not name, one exact
       # diagnostic per line. The breaks allowed are the ones docs/BLOCKING-IO.md names for 0.19.
-      - name: Diagnose API breaking changes
+      # TEMPORARY diagnostic steps (to be removed): find why 6.1.2 reports every API removed.
+      - name: List Xcodes
+        run: ls /Applications | grep -i xcode; xcode-select -p
+      - name: Diagnose API breaking changes (verbose, diagnostic)
         run: |
-          swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
-            --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt"
+          swift package --verbose diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
+            --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt" 2>&1 | tee apidiff.log \
+            | grep -v "^\[" | grep -iE "digester|error|warning|cannot|failed|breaking|breakage" | head -80 || true
+          echo "--- dumps"
+          find .build -path '*apidiff*' -name '*.json' -exec ls -la {} \; | head
+      - name: Dump the current module directly (diagnostic)
+        run: |
+          MODS=$(dirname $(find .build/debug/Modules .build/arm64-apple-macosx/debug/Modules -name 'SwiftFTR.swiftmodule' 2>/dev/null | head -1))
+          echo "modules: $MODS"
+          xcrun swift-api-digester -dump-sdk -module SwiftFTR -o current.json \
+            -I "$MODS" -sdk "$(xcrun --show-sdk-path)" -target arm64-apple-macosx13.0 -v 2>&1 | tail -30 || true
+          ls -la current.json || true
+          grep -c '"kind": "TypeDecl"' current.json || true
 
   docs:
     name: Documentation (DocC)
