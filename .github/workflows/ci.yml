@@ -56,30 +56,26 @@ jobs:
         run: swift --version
       # Fails on any source break that api-breakage-allowlist.txt does not name, one exact
       # diagnostic per line. The breaks allowed are the ones docs/BLOCKING-IO.md names for 0.19.
-      # TEMPORARY diagnostic steps (to be removed): find why 6.1.2 reports every API removed.
-      - name: Diagnose API breaking changes (verbose, diagnostic)
+      # TEMPORARY diagnostic steps (to be removed): which part of the SwiftPM invocation fails.
+      - name: Variants (diagnostic)
         run: |
           set +e
-          swift package --verbose diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
-            --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt" > apidiff.log 2>&1
-          echo "exit $?"
-          echo "--- digester invocations"
-          grep -n "swift-api-digester" apidiff.log | cut -c1-3000
-          echo "--- tail"
-          grep -v "swift-frontend\|/swiftc \|/clang " apidiff.log | tail -15
-          echo "--- dumps"
-          find .build -path '*apidiff*' -name 'SwiftFTR*.json' -exec ls -la {} +
-      - name: Compare dumps made directly (diagnostic)
-        run: |
-          set +e
-          SDK="$(xcrun --show-sdk-path)"
-          BASE=$(find .build -path '*apidiff*' -name 'SwiftFTR.json' | head -1)
-          xcrun swift-api-digester -dump-sdk -module SwiftFTR -o current.json \
-            -I .build/debug/Modules -sdk "$SDK" -target arm64-apple-macosx13.0
-          xcrun swift-api-digester -diagnose-sdk -module SwiftFTR -baseline-path "$BASE" \
-            -I .build/debug/Modules -sdk "$SDK" -target arm64-apple-macosx13.0 2>&1 | tail -20
-          echo "--- json vs json"
-          xcrun swift-api-digester -diagnose-sdk -input-paths "$BASE" -input-paths current.json 2>&1 | tail -20
+          ALLOW="$PWD/api-breakage-allowlist.txt"
+          variant() {
+            name=$1; shift
+            echo "=== $name"
+            "$@" > "v-$name.log" 2>&1
+            echo "exit $?"
+            grep -E "breaking change|No breaking|API breakage" "v-$name.log" | head -6
+            rm -rf .build/arm64-apple-macosx/apidiff
+          }
+          variant targets-616 swift package diagnose-api-breaking-changes v0.18.1 --targets SwiftFTR --breakage-allowlist-path "$ALLOW"
+          variant products-noallow-616 swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR
+          export DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer
+          swift --version
+          rm -rf .build
+          variant products-263 swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR --breakage-allowlist-path "$ALLOW"
+          variant products-noallow-263 swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR
 
   docs:
     name: Documentation (DocC)
