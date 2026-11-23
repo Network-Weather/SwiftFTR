@@ -53,9 +53,11 @@ no-route failure, and a `catch DNSError.timeout` no longer catches a host or net
 report: code that retried on `timeout` no longer retries for that case, which arrives at once
 rather than after the timeout.
 
-**What to change.** Add the two cases to every exhaustive switch, and decide for each `catch`
-whether the new cases belong with it. To keep 0.18's handling exactly, route each new case to the
-arm that used to receive it.
+**What to change.** Add the two cases to every exhaustive switch, and choose a retry policy for
+each. 0.18's handling cannot be kept exactly: `unreachable` joins a report that 0.18 threw as
+`timeout` with a local no-route failure it threw as `sendFailed`, and nothing in the error tells
+them apart afterwards (a later `dnsProbe` measures a new request, not the one that failed). The
+example below makes one explicit choice for each case; adapt it to the consumer's policy.
 
 Before:
 
@@ -74,7 +76,7 @@ do {
 }
 ```
 
-After, keeping 0.18's handling:
+After, retrying both kinds of unreachable failure and not retrying a refusal:
 
 ```swift
 do {
@@ -83,8 +85,16 @@ do {
 } catch let error as DNSError {
   switch error {
   case .timeout: retryLater()
-  case .unreachable: retryLater()  // 0.18 threw timeout, or sendFailed for no route at send
-  case .sendFailed, .connectionRefused: reportNoDNSServer()
+  case .unreachable:
+    // Retry, as for timeout: no route, or the network reported the server unreachable. It
+    // arrives at once rather than after the timeout, so retry after a backoff, not in a loop.
+    // (0.18 threw timeout for the network's report, and sendFailed for a local no-route.)
+    retryLater()
+  case .connectionRefused:
+    // Do not retry: the host answered that no DNS server listens on the port.
+    // (0.18 threw sendFailed for this.)
+    reportNoDNSServer()
+  case .sendFailed: reportNoDNSServer()
   case .invalidIP, .invalidHostname, .invalidTimeout: reportBadInput()
   case .socketCreationFailed, .setsockoptFailed, .bindFailed: reportLocalFailure()
   case .malformedResponse, .noRecords, .serverError: reportAnswer(error)
@@ -92,10 +102,9 @@ do {
 }
 ```
 
-0.18 also threw `sendFailed` when this machine had no route; a consumer that wants that case with
-`reportNoDNSServer()` as before cannot tell it from a delivered unreachable report by the error
-alone, and should use `dnsProbe`'s ``DNSProbeResult/elapsed`` (`nil` when nothing came back) if
-the difference matters.
+A consumer that would rather not retry a local no-route failure, as 0.18 effectively did, cannot
+tell it from the network's report by the error; treat every `unreachable` the same, whichever way
+it chooses.
 
 ## A DNS reply that echoes another question is ignored
 
