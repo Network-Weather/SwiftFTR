@@ -387,13 +387,13 @@ numbers are as of the commit that added this section.
     reply is judged as before. A reply to an earlier probe
     that arrives after `timeout` but before the ping's last reply window ends still counts, as
     `PingConfig.timeout` documents. Tests: `PingReplyMatchingTests`, IPv4 and IPv6.
-- **A ping whose send failed waited out its whole window** (#138). Confirmed and fixed. Early
+29. **A ping whose send failed waited out its whole window** (#138). Confirmed and fixed. Early
   completion compared the replies with the configured `count`, which a ping with a failed send
   can never reach: two probes, the first send failing and the second answered at once, ended at
   the reply deadline. Once the send loop has finished, the ping now compares the replies with the
   sends that succeeded, both when the loop finishes and when a reply arrives. Tests:
   `PingReplyMatchingTests` (`failedSend…`), IPv4 and IPv6.
-- **`seedPublicIP` accepted a NAT64 address wrapping a private IPv4 address, and strings with an
+30. **`seedPublicIP` accepted a NAT64 address wrapping a private IPv4 address, and strings with an
   embedded NUL** (#139). Confirmed and fixed. `64:ff9b::192.168.1.1` was accepted because the
   well-known prefix was accepted whatever it embedded; RFC 6052 section 3.1 forbids it for
   non-global IPv4. `"8.8.8.8\u{0}junk"` was accepted as `8.8.8.8` because `inet_pton` reads a C
@@ -403,7 +403,7 @@ numbers are as of the commit that added this section.
   for ping, trace and the TCP and UDP probes (which resolved and probed the text before the NUL).
   The parsers and destination resolution now reject such a string. Interface names reach
   `if_nametoindex` the same way and are not checked. Tests: `PublicIPValidationTests`.
-- **A DNS reply's question was never compared with the query** (#128). Confirmed and fixed. A
+31. **A DNS reply's question was never compared with the query** (#128). Confirmed and fixed. A
   reply with the query's transaction ID was accepted whatever question it echoed, so its answers
   were reported for the name asked. A datagram whose first question is readable and names another
   name (compared without regard to ASCII case), type or class is now ignored like one with a

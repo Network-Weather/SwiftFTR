@@ -34,7 +34,7 @@ struct ReverseDNSQuestion: Sendable, Equatable {
   ///
   /// A string with an embedded NUL is no literal: `inet_pton` would see only the part before it.
   init?(address: String) {
-    guard !address.utf8.contains(0) else { return nil }
+    guard !containsNUL(address) else { return nil }
     var v4 = in_addr()
     if address.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
       self.init(ipv4: withUnsafeBytes(of: &v4) { Array($0) })
