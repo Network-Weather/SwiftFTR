@@ -21,7 +21,8 @@ Unreleased
 - **`seedPublicIP` rejects a NAT64 address embedding a non-global IPv4 address** (#139).
   `64:ff9b::/96` addresses were accepted whatever they embedded; RFC 6052 section 3.1 forbids the
   well-known prefix for non-global IPv4 addresses. `seedPublicIP("64:ff9b::192.168.1.1", …)` now
-  returns `false`; `64:ff9b::8.8.8.8` is still accepted.
+  returns `false`, and so does `64:ff9b::1`, which embeds `0.0.0.1`; `64:ff9b::8.8.8.8` is
+  still accepted.
 - **Address and destination strings containing a NUL are rejected** (#139). `inet_pton` and
   `getaddrinfo` read a C string, so `"8.8.8.8\u{0}junk"` was taken as `8.8.8.8`. Now
   `seedPublicIP` returns `false`; `isPrivateIPv4` and `isCGNATIPv4` return `false`;
