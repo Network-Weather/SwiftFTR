@@ -29,8 +29,12 @@ struct DNSProbeOutcomeTests {
     }.0
   }
 
-  static func answering(rcode: UInt8 = 0, family: Int32 = AF_INET) throws -> LoopbackUDPResponder {
-    try LoopbackUDPResponder(family: family, accepts: .dnsQuery()) { query in
+  /// A server answering any query, or only one for `name` when given (a test that counts its
+  /// requests names its query).
+  static func answering(rcode: UInt8 = 0, family: Int32 = AF_INET, name: String? = nil) throws
+    -> LoopbackUDPResponder
+  {
+    try LoopbackUDPResponder(family: family, accepts: .dnsQuery(named: name)) { query in
       (
         FaultInjectionWireTests.dnsResponse(
           to: query, rcode: rcode, answerCount: rcode == 0 ? 1 : 0,
@@ -274,7 +278,7 @@ struct DNSProbeOutcomeTests {
     "No route at connect or send is unreachable, with no timing, and the query methods throw unreachable",
     arguments: Stage.allCases, [EHOSTUNREACH, EHOSTDOWN, ENETUNREACH, ENETDOWN])
   func locallyUnreachable(stage: Stage, code: Int32) async throws {
-    let server = try Self.answering()
+    let server = try Self.answering(name: "route.example")
     defer { server.stop() }
     let send: TestSeams.SendDatagram = { _, _ in
       Darwin.errno = code
