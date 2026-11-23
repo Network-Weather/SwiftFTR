@@ -33,7 +33,7 @@ How It Works
    - Compute RTT with a monotonic clock and place the hop at `ttl - 1`.
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
 5) Optional classification (when using `traceClassified`):
-   - Enrich classified traces with a configured value or cached IPv4 discovery (STUN, then DNS fallback). The separate `getPublicIPs()` call returns uncached STUN results for v4 and v6 in parallel.
+   - Enrich classified traces with the public address of the family probed: a configured value, a seeded or cached one, or else one question to the `publicIPResolver` strategy (the library's STUN, with a DNS fallback for IPv4; none; or the caller's own `PublicIPResolver`). The separate `getPublicIPs()` call returns uncached STUN results for v4 and v6 in parallel.
    - Batch‑resolve ASNs. By default (`.hybrid(.embedded)`) the embedded swift-ip2asn database answers first and Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) covers only addresses the database misses; `asnResolverStrategy` selects DNS-only, embedded-only, or a remote database instead. Apply heuristics for PRIVATE and CGNAT ranges.
    - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and "hole‑fill" missing stretches between identical segments.
 
@@ -140,7 +140,7 @@ Key Features
 **Public IP Discovery**
 - `getPublicIPs()` is an uncached, STUN-only call that runs IPv4 and IPv6 in parallel and returns whichever families succeeded
 - `discoverPublicIPWithHostname()` performs fresh IPv4 discovery on each call: STUN first, then an unbound Akamai DNS-whoami fallback, plus optional system-routed rDNS
-- Classified trace honors `SwiftFTRConfig.publicIP`; otherwise its `SwiftFTR` actor caches discovered IPv4 until invalidation. Multipath also honors the override and reuses an actor-cached value when available
+- Classified trace honors `SwiftFTRConfig.publicIP` for traces of its family; otherwise it uses a seeded or cached address of the trace's family, or asks the `SwiftFTRConfig.publicIPResolver` strategy once and caches an accepted answer per family until invalidation. Supply your own `PublicIPResolver` with `.custom(_:)`, or send nothing with `.disabled`. Multipath also honors the override and reuses an actor-cached value when available
 
 **Architecture**
 - Actor-based design for thread safety
@@ -472,8 +472,8 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 - [Migrating to 0.14](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo014.md): upgrade guide from 0.13 to 0.14 covering new `DNSError` cases, behavior and CLI changes, plus runtime changes in later releases. (updated 2026-11-21; update when: a later release changes a behavior it describes, or 0.13 adopters no longer need it)
 
 ### Reference and examples
-- [Examples](docs/guides/EXAMPLES.md): worked Swift examples for each feature area, including trace, hop outcomes, configuration, network-change lifecycle, streaming, DNS, ping, multipath, bufferbloat, SwiftUI, concurrency, errors, DNS probe outcomes and ASN strategies. (updated 2026-11-22; update when: a public API used in a sample changes shape, or a release adds a feature area with no example)
-- [Condensed API reference](docs/reference/AI_REFERENCE.md): public types, method signatures, defaults, enum and error cases and CLI flags with short snippets, sized to load whole into an agent's context. (updated 2026-11-22; update when: a release changes a public signature, default, enum case or CLI flag)
+- [Examples](docs/guides/EXAMPLES.md): worked Swift examples for each feature area, including trace, hop outcomes, configuration, network-change lifecycle, streaming, DNS, ping, multipath, bufferbloat, SwiftUI, concurrency, errors, DNS probe outcomes and ASN strategies. (updated 2026-11-23; update when: a public API used in a sample changes shape, or a release adds a feature area with no example)
+- [Condensed API reference](docs/reference/AI_REFERENCE.md): public types, method signatures, defaults, enum and error cases and CLI flags with short snippets, sized to load whole into an agent's context. (updated 2026-11-23; update when: a release changes a public signature, default, enum case or CLI flag)
 
 ### Tools and fixtures
 - [hop-monitor](Sources/hop-monitor/README.md): the demo CLI that traces a path and then pings every hop continuously, with its output, statistics and limits. (updated 2026-11-21; update when: `Sources/hop-monitor/main.swift` changes its arguments, limits or statistics)

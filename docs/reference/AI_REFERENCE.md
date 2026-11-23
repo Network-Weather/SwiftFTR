@@ -81,7 +81,7 @@ public actor SwiftFTR {
     public func seedPublicIP(_ address: String, source: PublicIPSource) -> Bool
     public func invalidatePublicIP()
     public func clearCaches() async               // public IP + rDNS
-    public var publicIP: String? { get }          // configured override, else cached value
+    public func publicIP(for family: IPAddressFamily) -> PublicIPObservation?  // configured, else seeded or cached, of that family
 }
 ```
 
@@ -102,8 +102,9 @@ Notes:
   and strings containing a NUL are rejected). Every address and destination string the library
   parses is rejected if it contains a NUL: as an address it is invalid, as a destination it throws
   `TracerouteError.resolutionFailed`. A seed is discarded by the next `invalidatePublicIP()`,
-  `clearCaches()` or `networkChanged()`. `PublicIPSource` has cases `.validatedCallerCache` and
-  `.gatewayReported`; the library does not retain the source.
+  `clearCaches()` or `networkChanged()`. A seed fills only its own family's slot. `PublicIPSource`
+  has cases `.validatedCallerCache` and `.gatewayReported`; the seed is cached with it and reported
+  as `ClassifiedTrace.publicIPSource`.
 - `discoverPublicIPWithHostname()` discovers IPv4 via STUN through the configured interface, with
   an unbound DNS fallback, and ignores `SwiftFTRConfig.publicIP`.
 
@@ -128,6 +129,7 @@ public struct SwiftFTRConfig: Sendable {
     public let sourceIP: String?                  // must be assigned to the interface; family must match destination
     public let asnResolverStrategy: ASNResolverStrategy  // default .hybrid(.embedded)
     public let preferredFamily: PreferredFamily   // default .auto
+    public let publicIPResolver: PublicIPResolverStrategy  // default .library
 
     public init(
         maxHops: Int = 40,
@@ -145,6 +147,30 @@ public struct SwiftFTRConfig: Sendable {
         asnResolverStrategy: ASNResolverStrategy = .hybrid(.embedded),
         preferredFamily: PreferredFamily = .auto
     )
+    // The same parameters plus `publicIPResolver: PublicIPResolverStrategy = .library`.
+    public init(maxHops:...preferredFamily:publicIPResolver:)
+}
+
+public enum PublicIPResolverStrategy: Sendable {
+    case library                       // STUN, with a DNS whoami fallback for IPv4
+    case disabled                      // nothing sent; classify without an address
+    case custom(any PublicIPResolver)  // the caller's, held to publicIPDiscoveryTimeout
+}
+
+public protocol PublicIPResolver: Sendable {
+    func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation?
+}
+public struct PublicIPRequest: Sendable {
+    public let family: IPAddressFamily            // .v4 or .v6, the family the trace probed
+    public let interface: String?                 // the tracer's binding
+    public let sourceIP: String?                  // only if of `family`
+    public let deadline: ContinuousClock.Instant  // publicIPDiscoveryTimeout from the question
+}
+public struct PublicIPObservation: Sendable, Hashable, Codable {
+    public let address: String
+    public let family: IPAddressFamily
+    public let source: PublicIPObservationSource  // .configured, .validatedCallerCache,
+                                                  // .gatewayReported, .stun, .dnsWhoami, or the caller's own
 }
 ```
 
@@ -153,8 +179,9 @@ Arguments must be passed in declaration order. Values are validated when an oper
 non-finite `rdnsCacheTTL`, a negative `rdnsCacheSize`, or a non-positive hybrid `fallbackTimeout`
 throws `TracerouteError.invalidConfiguration(reason:)`. The two enrichment budgets never throw: a
 `rdnsLookupTimeout` or `publicIPDiscoveryTimeout` that is zero, negative, non-finite or out of
-range is replaced by its default (5 s and 6 s respectively). `interface`, `sourceIP` and `publicIP`
-are fixed per instance, so a host that needs several binding contexts holds several
+range is replaced by its default (5 s and 6 s respectively). A `publicIP` that is not a globally
+routable address is not used, and it answers only traces of its own family. `interface`, `sourceIP`
+and `publicIP` are fixed per instance, so a host that needs several binding contexts holds several
 `SwiftFTR` instances. `maxHops` is the instance default; `TraceOptions(maxHops:)` overrides it for one call. Each instance owns its rDNS cache, cached public IP and active traces; the
 DNS-based ASN cache is shared process-wide, and a loaded ASN database is shared by
 every live resolver for the same source.
@@ -252,6 +279,7 @@ public struct ClassifiedTrace: Sendable, Codable {
     public let destinationIP: String
     public let destinationHostname: String?
     public let publicIP: String?
+    public let publicIPSource: PublicIPObservationSource?  // where publicIP came from
     public let publicHostname: String?
     public let clientASN: Int?
     public let clientASName: String?
@@ -274,15 +302,18 @@ public struct ClassifiedHop: Sendable, Codable {
 }
 ```
 
-`traceClassified` gets the client's public IP from `config.publicIP`, then the actor cache (which
-`seedPublicIP` populates), then fresh IPv4 discovery (STUN, then a DNS TXT query to
-`whoami.ds.akahelp.net`). Each discovery attempt is bounded by `publicIPDiscoveryTimeout`, one
-deadline shared by every name lookup, STUN attempt and DNS query in it (STUN stops at its own
-share, servers × per-server timeout, so the DNS fallback always gets time), and
-there can be two: one before the trace, and, if that one finds no address, a second during
-classification. With an empty cache and stalled discovery, a classified trace can therefore spend
-up to twice `publicIPDiscoveryTimeout` on public-IP discovery. If both fail or time out,
-classification proceeds without a public IP.
+`traceClassified` asks for the public IP once its probes have returned, for the family they used:
+`config.publicIP` if it is a globally routable address of that family, then the seeded or cached
+observation of that family, then the `publicIPResolver` strategy, asked once. The library's
+resolver is IPv4 STUN then a DNS TXT query to `whoami.ds.akahelp.net`, or IPv6 STUN, under one
+`publicIPDiscoveryTimeout` deadline shared by every name lookup, STUN attempt and DNS query (STUN
+stops at its own share, servers × per-server timeout, so the DNS fallback always gets time). A
+caller's resolver is held to the same deadline by the tracer: one that never returns or ignores
+cancellation is abandoned there, and its late answer is never cached. Every answer must be a
+globally routable address of the family asked for. A miss is not cached, so the next trace asks
+again; the classifier itself (`TraceClassifier.classify(trace:destinationIP:resolver:timeout:publicIP:vpnContext:)`,
+`publicIP` required) never discovers, so a failed question costs one budget, not two. The result's
+`publicIPSource` says where the address came from.
 
 ### 8. HopCategory
 
@@ -1025,13 +1056,11 @@ struct TraceView: View {
 - **rDNS phase**: lookups run concurrently, each bounded by `rdnsLookupTimeout` (default 5 s).
   Results are cached per instance (TTL 86400 s, 1000 entries by default). Multipath flows use
   the instance's rDNS cache and ASN resolver, so they follow the same settings.
-- **Public IP** (classified trace and multipath only): each discovery attempt is bounded by
-  `publicIPDiscoveryTimeout` (default 6 s), and a classified trace makes up to two attempts (before
-  the trace, then again during classification if the first found nothing). An address found by
-  the first attempt is cached per instance until invalidated; one found only by the second is
-  returned in that result and not cached, so the next trace discovers again. Multipath reuses an existing cached value but does not
-  write its own discoveries back; with no cached value, each flow discovers on its own, each
-  attempt bounded by the instance's `publicIPDiscoveryTimeout`.
+- **Public IP** (classified trace and multipath only): one question per classified trace, bounded
+  by `publicIPDiscoveryTimeout` (default 6 s), asked after the probes. An accepted answer is cached
+  per instance and family until invalidated; a miss is not. Multipath reuses an existing cached
+  value but does not write its own answers back; with no cached value, each flow asks on its own,
+  each question bounded by the instance's `publicIPDiscoveryTimeout`.
 - **ASN**: the embedded database answers locally (microseconds per lookup once loaded; it reloads
   if every resolver holding it has been released). DNS-based results are cached process-wide with
   a soft cap of 2048 entries. ASN caches

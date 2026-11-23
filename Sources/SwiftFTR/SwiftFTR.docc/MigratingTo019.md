@@ -1,6 +1,6 @@
 # Migrating to SwiftFTR 0.19
 
-Handle the two new DNSError cases and the DNS, address-validation, ping, bufferbloat, public-IP discovery and CLI changes introduced in SwiftFTR 0.19.
+Handle the two new DNSError cases, the public-IP resolver, and the DNS, address-validation, ping, bufferbloat, public-IP discovery and CLI changes introduced in SwiftFTR 0.19.
 
 ## Overview
 
@@ -13,8 +13,10 @@ person or a coding agent can work through a consumer one change at a time:
 
 To find the call sites to review, search the consumer for `switch` over `DNSError`,
 `DNSError.sendFailed`, `dnsProbe(`, `DNSError.timeout`,
-`.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, `getPublicIPs(`, `publicIPDiscoveryTimeout`, and any script
-that reads the output of `swift-ftr probe dns`.
+`.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, `getPublicIPs(`, `publicIPDiscoveryTimeout`,
+`.classify(`, `.publicIP` read from a `SwiftFTR` tracer, `SwiftFTRConfig(` calls that pass `publicIP:`,
+`traceClassified(` results whose `publicIP` or `clientASN` is read for an IPv6 destination, and any
+script that reads the output of `swift-ftr probe dns`.
 
 ## Update the package
 
@@ -323,4 +325,139 @@ After:
 
 ```swift
 let config = SwiftFTRConfig(publicIPDiscoveryTimeout: 4.0)  // STUN and the fallback both fit
+```
+
+## TraceClassifier.classify takes the public address and no longer finds it
+
+**What changed.** ``TraceClassifier/classify(trace:destinationIP:resolver:timeout:publicIP:vpnContext:)``
+classifies with the public address it is given, or without one, and sends nothing to find it. The
+parameters that existed only for its discovery (`interface`, `sourceIP`, `enableLogging` and
+`publicIPDiscoveryTimeout`) are gone, and `publicIP` no longer has a default.
+
+**What a caller sees.** A call that passes any of the removed parameters, or leaves `publicIP` out,
+no longer compiles. A call that passed `publicIP: nil` (or left it out) to have the classifier run
+STUN now classifies without a public address: hops in the client's own network are labelled
+TRANSIT rather than ISP, and `clientASN` is `nil`.
+
+**What to change.** Drop the removed arguments and pass `publicIP` explicitly. To keep 0.18's
+discovery, use ``SwiftFTR/SwiftFTR/traceClassified(to:vpnContext:resolver:)``, which asks for the
+address once; or find it yourself and pass it in.
+
+Before:
+
+```swift
+let classified = try await TraceClassifier().classify(
+  trace: trace, destinationIP: destination, resolver: resolver,
+  interface: "en0", sourceIP: source, enableLogging: true, publicIPDiscoveryTimeout: 4)
+```
+
+After:
+
+```swift
+let known = await tracer.publicIP(for: .v4)?.address  // or your own observation, or nil
+let classified = try await TraceClassifier().classify(
+  trace: trace, destinationIP: destination, resolver: resolver, publicIP: known)
+```
+
+## SwiftFTR.publicIP is per address family
+
+**What changed.** The tracer keeps one public address per family, with where it came from. The
+`publicIP` property is replaced by ``SwiftFTR/SwiftFTR/publicIP(for:)``, which takes an
+``IPAddressFamily`` and returns a ``PublicIPObservation`` (address, family and source) or `nil`.
+Like the property, it returns the configured ``SwiftFTRConfig/publicIP`` first, and otherwise
+what is seeded or cached, without asking anyone.
+
+**What a caller sees.** `await tracer.publicIP` no longer compiles.
+
+**What to change.** Name the family, and read `.address`. Where 0.18 code did not care which
+family it got, ask for the one the trace used, or IPv4 first:
+
+Before:
+
+```swift
+let address: String? = await tracer.publicIP
+```
+
+After:
+
+```swift
+let address: String? =
+  await tracer.publicIP(for: .v4)?.address ?? tracer.publicIP(for: .v6)?.address
+```
+
+## A classified trace asks for its public address once, after the probes, for their family
+
+**What changed.** ``SwiftFTR/SwiftFTR/traceClassified(to:vpnContext:resolver:)`` asked for an IPv4
+address before probing, whatever the destination, and when that failed the classifier asked again,
+so a failed discovery cost twice ``SwiftFTRConfig/publicIPDiscoveryTimeout``. It now asks once,
+after the probes have returned, for the family they used, through the new
+``SwiftFTRConfig/publicIPResolver`` strategy: the library's resolver by default (STUN, with the DNS
+whoami fallback for IPv4, the discovery 0.18 ran), ``PublicIPResolverStrategy/disabled``, or the
+caller's own ``PublicIPResolver``. An answer that is not a globally routable address of that
+family is not used. ``ClassifiedTrace/publicIPSource`` says where the address came from.
+
+**What a caller sees.**
+
+- An IPv6 trace reports the IPv6 public address found by IPv6 STUN, where 0.18 reported the IPv4
+  one; with no answer to IPv6 STUN, `publicIP` and `clientASN` are `nil`, and hops in the client's
+  own network are labelled TRANSIT rather than ISP.
+- With discovery failing, a classified trace spends one budget on it, not two.
+- An address the library's discovery finds that is not globally routable (the whoami fallback can
+  return one) is no longer used.
+- `ClassifiedTrace` encodes a new `publicIPSource` key.
+
+**What to change.** Nothing for an IPv4 caller with the default strategy. A caller that needs an
+address where STUN is blocked, or knows better than STUN which exit a trace takes, supplies a
+resolver; one that must send nothing disables it:
+
+Before:
+
+```swift
+let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))
+```
+
+After:
+
+```swift
+struct GatewayResolver: PublicIPResolver {
+  func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation? {
+    guard let wan = await gatewayWANAddress(family: request.family) else { return nil }  // yours
+    return PublicIPObservation(address: wan, family: request.family, source: .gatewayReported)
+  }
+}
+let tracer = SwiftFTR(
+  config: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(GatewayResolver())))
+// or: SwiftFTRConfig(interface: "en0", publicIPResolver: .disabled)
+```
+
+## A configured or seeded public address answers only its own family, and must be public
+
+**What changed.** ``SwiftFTRConfig/publicIP`` and a seed from
+``SwiftFTR/SwiftFTR/seedPublicIP(_:source:)`` each apply only to traces of their own address
+family. A configured address that is not globally routable (private, CGNAT, link-local, loopback,
+documentation ranges and the others ``SwiftFTR/SwiftFTR/seedPublicIP(_:source:)`` rejects) is not
+used. A seed's ``PublicIPSource`` is kept and reported as ``ClassifiedTrace/publicIPSource``.
+
+**What a caller sees.**
+
+- With `SwiftFTRConfig(publicIP: "203.0.113.7")` (an IPv4 address) an IPv6 classified trace no
+  longer reports it: it asks the strategy for an IPv6 address, which by default sends IPv6 STUN.
+- A configured private or documentation address, which 0.18 reported and classified with, is
+  ignored, and the trace asks the strategy instead.
+- An IPv6 seed no longer labels an IPv4 trace, and the reverse.
+
+**What to change.** Configure a public address, seed each family you know, and disable the strategy
+if no discovery traffic may be sent:
+
+Before:
+
+```swift
+let config = SwiftFTRConfig(publicIP: knownWAN)  // 0.18: used for every trace, never discovered
+```
+
+After:
+
+```swift
+let config = SwiftFTRConfig(publicIP: knownWAN, publicIPResolver: .disabled)
+// knownWAN must be globally routable, and answers only traces of its own family.
 ```

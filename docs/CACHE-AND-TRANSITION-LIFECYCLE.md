@@ -34,20 +34,25 @@ cache — for callers without finer-grained evidence.
 As of 0.18.0, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
 `Utils.swift`.
 
-- `networkChanged()` bumps the cache generation, clears the cached public IP,
+- The public-IP cache holds one `PublicIPObservation` per address family (address, family,
+  source), each with its own generation.
+- `networkChanged()` bumps both public-IP generations, clears both cached public IPs,
   snapshots and cancels every registered operation (`trace`, `traceClassified`,
   `traceStream` and `discoverPaths`; each throws `TracerouteError.cancelled`), and
   clears the entire rDNS cache. It does not clear the ASN cache. `ping` and the
   probes are not registered and keep running.
-- `clearCaches()` bumps the generation and clears the public IP and the whole
-  rDNS cache; `invalidatePublicIP()` bumps the generation and clears only the
-  public IP. Neither cancels traces.
-- `SwiftFTRConfig.publicIP` is an immutable, authoritative override: when set,
-  classified traces bypass public-IP discovery entirely. It is configuration,
-  not a cache.
-- Public-IP discovery is generation-guarded: a result that arrives after an
-  invalidation is neither returned nor cached
-  (`effectivePublicIPForClassification`).
+- `clearCaches()` bumps both generations and clears both public IPs and the whole
+  rDNS cache; `invalidatePublicIP()` bumps both generations and clears only the
+  public IPs. Neither cancels traces.
+- `SwiftFTRConfig.publicIP` is an immutable, authoritative override: when set to a
+  globally routable address, classified traces of its family bypass public-IP
+  discovery entirely. It is configuration, not a cache.
+- A classified trace asks the `SwiftFTRConfig.publicIPResolver` strategy at most
+  once, after its probes, for the family they used. The question is
+  generation-guarded: an answer that arrives after an invalidation or a seed of
+  that family is neither returned nor cached (`effectivePublicIP(for:ask:)`), and
+  a caller's resolver that answers after the request deadline is not waited for
+  and never cached.
 - `RDNSCache` holds entries for 86400 s, evicting the oldest-inserted entry at 1000 entries
   (both configurable through `SwiftFTRConfig`), caches negative results, and
   has a stall breaker: after two consecutive lookups that take at least 90% of their
@@ -103,7 +108,7 @@ The library-owned state and what may invalidate it:
 | Data | Key | Invalidated by |
 |---|---|---|
 | Active trace handles | cache generation | `networkChanged()`; `cancelActiveTraces()` |
-| Discovered public IP | current generation | `invalidatePublicIP()`, `clearCaches()`, `networkChanged()` |
+| Discovered or seeded public IP | address family, current generation of that family | `invalidatePublicIP()`, `clearCaches()`, `networkChanged()`; a seed replaces its own family only |
 | Globally routable rDNS | IP address | 86400 s TTL or oldest-inserted capacity eviction; should survive local transitions |
 | Network-scoped rDNS (private, CGNAT, link-local, ULA, loopback) | IP address | `invalidateNetworkScopedRDNS()`; `networkChanged()` |
 | ASN results | globally routable address | Capacity only (no TTL); local transitions must not clear it |
@@ -186,9 +191,10 @@ override, which suppresses discovery permanently. The method:
   Acceptance does not prove the address is announced or is the host's own;
 - rejects placeholder strings by construction — there is no way to seed
   `"unknown"`;
-- stores the canonical (`inet_ntop`) form, bumps the cache generation so an
-  older in-flight discovery cannot overwrite the seed, and returns whether the
-  address was accepted;
+- stores the canonical (`inet_ntop`) form with its source in the slot of its own
+  address family, bumps that family's generation so an older in-flight question
+  cannot overwrite the seed, and returns whether the address was accepted. A trace
+  that uses the seed reports the source as `ClassifiedTrace.publicIPSource`;
 - leaves the discovery path unchanged when a seed is rejected.
 
 **Ordering requirement**: a seed applies to the generation current when it is
@@ -259,12 +265,10 @@ it see no behavior change. Beyond that, library-level tests demonstrate:
 - Whether `seedPublicIP` should accept a typed address once the library has a
   public address representation; today the public surface is string
   presentations.
-- What `PublicIPSource` is for. `seedPublicIP` requires it and then discards it:
-  a gateway-reported address and a caller-validated one are cached identically,
-  and nothing reads the source back. Either the library should persist it and act
-  on the difference — a lower-trust source might be treated as a hint that expires
-  sooner, or might not satisfy classification on its own — or the parameter should
-  be dropped, since a required argument that does nothing misleads the caller.
-  Resolve this before the seeding API is considered settled.
+- Whether the library should act on a seed's `PublicIPSource`. It is kept and
+  reported beside the address, but a gateway-reported address and a
+  caller-validated one are otherwise treated alike; a lower-trust source might be
+  treated as a hint that expires sooner, or might not satisfy classification on its
+  own.
 - Whether a gateway-reported WAN value should be seedable at all, or only usable
   by callers to decide that a revalidation is redundant.

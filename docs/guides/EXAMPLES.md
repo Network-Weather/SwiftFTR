@@ -209,7 +209,31 @@ func seed(_ wanAddress: String) async {
 ```
 
 Unlike `SwiftFTRConfig(publicIP:)`, which permanently bypasses discovery for that instance, a
-seeded address lasts only until the next invalidation.
+seeded address lasts only until the next invalidation. Both apply only to traces of their own
+address family: an IPv4 seed does not label an IPv6 trace.
+
+To answer the public-address question yourself, for example from what the gateway reports, give
+the tracer a `PublicIPResolver`. It is asked at most once per classified trace, after the probes,
+for the family they used, and held to `publicIPDiscoveryTimeout`:
+
+```swift
+struct GatewayResolver: PublicIPResolver {
+    let gateway: GatewayClient  // your own type
+
+    func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation? {
+        guard let wan = try await gateway.wanAddress(family: request.family) else { return nil }
+        return PublicIPObservation(address: wan, family: request.family, source: .gatewayReported)
+    }
+}
+
+let tracer = SwiftFTR(config: SwiftFTRConfig(
+    publicIPResolver: .custom(GatewayResolver(gateway: gateway))))
+let trace = try await tracer.traceClassified(to: "example.com")
+print(trace.publicIP ?? "none", trace.publicIPSource?.rawValue ?? "")
+```
+
+`SwiftFTRConfig(publicIPResolver: .disabled)` sends nothing: a trace with no configured or
+seeded address of its family classifies without one.
 
 ## Streaming Traceroute (v0.11.0+)
 

@@ -786,9 +786,8 @@ struct PublicIPDiscoveryTimeout: Error {}
 /// Name lookups that cannot get an executor slot are abandoned at it too, instead of using up the
 /// whole discovery. With an overall `deadline`, the share is also cut so that at least
 /// `min(dnsTimeout, budget) / 2` is left for the fallback, `budget` being the time from `start` to
-/// `deadline`. For the default 6 s budget that cut never applies: pre-trace discovery (2 s per
-/// server, two servers) ends STUN at 4 s, leaving 2 s; the classifier's (0.8 s) at 1.6 s, leaving
-/// 4.4 s.
+/// `deadline`. For the default 6 s budget that cut never applies: the library's resolver (2 s per
+/// server, two servers) ends STUN at 4 s, leaving 2 s.
 func stunPhaseDeadline(
   servers: Int, stunTimeout: TimeInterval, dnsTimeout: TimeInterval, start: TimeInterval,
   deadline: TimeInterval?

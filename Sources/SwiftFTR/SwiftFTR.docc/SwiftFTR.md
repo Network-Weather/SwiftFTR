@@ -86,9 +86,15 @@ let mx = try await tracer.dns.query(name: "gmail.com", type: .mx)
   ``SwiftFTR/SwiftFTR/traceClassified(to:vpnContext:resolver:)`` for offline or deterministic
   lookups.
 - Set ``SwiftFTR/SwiftFTRConfig/publicIP`` when creating ``SwiftFTR/SwiftFTRConfig`` to override
-  public-address discovery for classified trace and multipath enrichment for the lifetime of the
-  tracer. Standalone public-IP discovery APIs ignore this value. To supply a known address that a
-  later network change should discard, use ``SwiftFTR/SwiftFTR/seedPublicIP(_:source:)`` instead.
+  public-address discovery for classified trace and multipath enrichment of the same address
+  family for the lifetime of the tracer. Standalone public-IP discovery APIs ignore this value. To
+  supply a known address that a later network change should discard, use
+  ``SwiftFTR/SwiftFTR/seedPublicIP(_:source:)`` instead.
+- Set ``SwiftFTR/SwiftFTRConfig/publicIPResolver`` to ``SwiftFTR/PublicIPResolverStrategy/custom(_:)``
+  to answer the public-address question with your own ``SwiftFTR/PublicIPResolver``, or to
+  ``SwiftFTR/PublicIPResolverStrategy/disabled`` to send nothing. The tracer asks once per
+  classified trace, after its probes, for the family they used, and reports where the address came
+  from as ``SwiftFTR/ClassifiedTrace/publicIPSource``.
 - Override `maxHops` for a single trace with ``SwiftFTR/TraceOptions`` via
   ``SwiftFTR/SwiftFTR/trace(to:options:)`` or
   ``SwiftFTR/SwiftFTR/traceClassified(to:vpnContext:resolver:options:)``.
@@ -108,7 +114,8 @@ network state changed, call the individual controls instead:
   ``SwiftFTR/SwiftFTR/clearCaches()`` clears the public IP and the reverse-DNS cache.
 - ``SwiftFTR/SwiftFTR/seedPublicIP(_:source:)`` caches an address that passes the
   library's special-range checks (which do not prove global routability) for the current cache
-  generation, with a ``SwiftFTR/PublicIPSource``.
+  generation of its address family, with a ``SwiftFTR/PublicIPSource``.
+  ``SwiftFTR/SwiftFTR/publicIP(for:)`` reads back what a trace of a family would use.
 
 ## Topics
 
@@ -211,6 +218,12 @@ network state changed, call the individual controls instead:
 
 - ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``
 - ``SwiftFTR/PublicIPs``
+- ``SwiftFTR/PublicIPResolver``
+- ``SwiftFTR/PublicIPResolverStrategy``
+- ``SwiftFTR/PublicIPRequest``
+- ``SwiftFTR/PublicIPObservation``
+- ``SwiftFTR/PublicIPObservationSource``
+- ``SwiftFTR/IPAddressFamily``
 - ``SwiftFTR/PublicIPSource``
 - ``SwiftFTR/PublicIPError``
 
