@@ -27,6 +27,10 @@ struct FaultInjectionWireTests {
   /// trips the watchdog rather than racing it.
   static let lateAnswer: TimeInterval = 2 * watchdog
 
+  /// The timeout of a call the fixture must answer: generous, since the answer ends it, so a slow
+  /// loopback on a loaded host cannot turn an answer into a timeout. Inside ``watchdog``.
+  static let answeredTimeout: TimeInterval = 10
+
   // MARK: STUN
 
   /// A binding success response echoing the request's transaction ID and mapping `ip`.
@@ -66,7 +70,7 @@ struct FaultInjectionWireTests {
       Self.stunSuccess(for: request, ip: [198, 51, 100, 7]).map { ($0, 0) }
     }
     defer { server.stop() }
-    let result = await Self.runSTUN(server: server, timeout: 0.5)
+    let result = await Self.runSTUN(server: server, timeout: Self.answeredTimeout)
     #expect(try result?.get().ip == "198.51.100.7")
   }
 
@@ -90,7 +94,10 @@ struct FaultInjectionWireTests {
 
     let unwrapped = try #require(result, "STUN never returned from a \(fault) server")
     #expect(throws: STUNError.self) { try unwrapped.get() }
-    #expect(server.requests.value == 1)
+    // The request can still be on its way when a 0.3 s timeout ends the call.
+    #expect(
+      await eventually(within: 10) { server.requests.value == 1 },
+      "requests: \(server.requests.value)")
   }
 
   @Test("A sub-microsecond STUN timeout is still a timeout, not an unbounded wait")
@@ -153,7 +160,7 @@ struct FaultInjectionWireTests {
       (Self.dnsResponse(to: query, answers: Self.aRecord), 0)
     }
     defer { server.stop() }
-    let result = await Self.runDNS(port: server.port, timeout: 0.5)
+    let result = await Self.runDNS(port: server.port, timeout: Self.answeredTimeout)
     let answers = try #require(try result?.get())
     #expect(answers.first?.rdata == Data([192, 0, 2, 9]))
   }
@@ -186,7 +193,10 @@ struct FaultInjectionWireTests {
       }
     }
     defer { server.stop() }
-    let timeout: TimeInterval = 0.3
+    // A fault the fixture answers decides the query, so it gets a timeout its answer ends; only
+    // silence, junk it ignores and an answer after the watchdog leave the query to time out.
+    let timeout: TimeInterval =
+      [.silent, .garbage, .slow].contains(fault) ? 0.3 : Self.answeredTimeout
     let result = await Self.runDNS(port: server.port, timeout: timeout)
 
     let unwrapped = try #require(result, "DNS never returned from a \(fault) server")
@@ -198,9 +208,10 @@ struct FaultInjectionWireTests {
         guard case DNSError.serverError(let rcode) = error else { return false }
         return rcode == (fault == .nxdomain ? 3 : 2)
       }
-    case .oversized, .overstatedAnswerCount:
+    case .oversized, .overstatedAnswerCount, .compressionLoop:
       // Fewer answer records arrived than the header claims (an oversized reply is cut off at the
-      // client's receive buffer), and an incomplete answer section is rejected.
+      // client's receive buffer), an incomplete answer section is rejected, and so is an owner
+      // name that points at itself.
       #expect {
         try unwrapped.get()
       } throws: { error in
@@ -229,7 +240,8 @@ struct FaultInjectionWireTests {
     let refusing = try RefusingTCPPort()
 
     let open = try await tcpProbe(
-      config: TCPProbeConfig(host: "127.0.0.1", port: Int(listener.port), timeout: 1))
+      config: TCPProbeConfig(
+        host: "127.0.0.1", port: Int(listener.port), timeout: Self.answeredTimeout))
     #expect(open.connectionState == .open)
 
     // A refused connect is answered at once. The timeout outlasts the watchdog, so a probe that
@@ -259,11 +271,13 @@ struct FaultInjectionWireTests {
     defer { withExtendedLifetime(closed) {} }
 
     let replied = try await udpProbe(
-      config: UDPProbeConfig(host: "127.0.0.1", port: Int(echo.port), timeout: 1, payload: payload))
+      config: UDPProbeConfig(
+        host: "127.0.0.1", port: Int(echo.port), timeout: Self.answeredTimeout, payload: payload))
     #expect(replied.responseType == "udp_reply")
 
     let refused = try await udpProbe(
-      config: UDPProbeConfig(host: "127.0.0.1", port: Int(closedPort), timeout: 1, payload: payload)
+      config: UDPProbeConfig(
+        host: "127.0.0.1", port: Int(closedPort), timeout: Self.answeredTimeout, payload: payload)
     )
     // The host answered that the port is closed: reachable host, unreachable port.
     #expect(refused.responseType == "icmp_port_unreachable", "\(refused.responseType ?? "nil")")
@@ -287,7 +301,8 @@ struct FaultInjectionWireTests {
   func httpPositiveControl() async throws {
     let server = try LoopbackTCPServer(behavior: .respond(response: Self.okResponse, after: 0))
     defer { server.stop() }
-    let result = try await httpProbe(url: "http://127.0.0.1:\(server.port)/", timeout: 2)
+    let result = try await httpProbe(
+      url: "http://127.0.0.1:\(server.port)/", timeout: Self.answeredTimeout)
     #expect(result.isReachable)
     #expect(result.statusCode == 200)
   }
@@ -298,7 +313,8 @@ struct FaultInjectionWireTests {
       "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
     let server = try LoopbackTCPServer(behavior: .respond(response: response, after: 0))
     defer { server.stop() }
-    let result = try await httpProbe(url: "http://127.0.0.1:\(server.port)/", timeout: 2)
+    let result = try await httpProbe(
+      url: "http://127.0.0.1:\(server.port)/", timeout: Self.answeredTimeout)
     #expect(result.isReachable)
     #expect(result.statusCode == 503)
   }
@@ -307,7 +323,8 @@ struct FaultInjectionWireTests {
   func httpSlowFirstByte() async throws {
     let server = try LoopbackTCPServer(behavior: .respond(response: Self.okResponse, after: 0.4))
     defer { server.stop() }
-    let result = try await httpProbe(url: "http://127.0.0.1:\(server.port)/", timeout: 3)
+    let result = try await httpProbe(
+      url: "http://127.0.0.1:\(server.port)/", timeout: Self.answeredTimeout)
     #expect(result.isReachable)
     #expect(result.statusCode == 200)
   }
@@ -319,7 +336,11 @@ struct FaultInjectionWireTests {
 
   @Test("HTTP probe reports failure within its timeout", arguments: HTTPFault.allCases)
   func httpFaults(fault: HTTPFault) async throws {
-    let timeout: TimeInterval = 0.5
+    // A refusal, a reset or a close ends the probe itself, so its timeout outlasts the watchdog: a
+    // probe that missed the fault and waited trips it. Only a silent or late server leaves the
+    // probe to its own short timeout.
+    let endsAtTimeout = fault == .acceptThenSilence || fault == .firstByteTooLate
+    let timeout: TimeInterval = endsAtTimeout ? 0.5 : 4 * Self.watchdog
     let server: LoopbackTCPServer?
     let port: UInt16
     // Held until the probe has finished, so the port stays reserved while it is used.
@@ -351,7 +372,13 @@ struct FaultInjectionWireTests {
     }
     #expect(!result.isReachable, "\(fault): \(result.error ?? "no error")")
     #expect(result.statusCode == nil)
-    if fault != .refused { #expect((server?.accepted.value ?? 0) >= 1) }
+    // The server counts the connection on its own thread, which a 0.5 s timeout can outrun on a
+    // loaded host, so wait for the count.
+    if fault != .refused {
+      #expect(
+        await eventually(within: 10) { (server?.accepted.value ?? 0) >= 1 },
+        "accepted: \(server?.accepted.value ?? 0)")
+    }
   }
 
   @Test("A cancelled HTTP probe against a silent server returns at once")
