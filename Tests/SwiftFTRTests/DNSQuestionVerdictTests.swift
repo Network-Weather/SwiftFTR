@@ -94,16 +94,29 @@ struct DNSQuestionVerdictTests {
         return refusedHeader + [50] + Array("abc".utf8)
       case .nameOver255:
         // Four 63-byte labels and the root: 257 bytes, with a complete type and class.
-        let label = [UInt8(63)] + [UInt8](repeating: UInt8(ascii: "a"), count: 63)
-        return refusedHeader + label + label + label + label + [0] + typeClass
+        let label: [UInt8] = [63] + [UInt8](repeating: UInt8(ascii: "a"), count: 63)
+        // Built in steps: Swift 6.1 cannot type-check the whole sum as one expression.
+        var reply: [UInt8] = refusedHeader
+        for _ in 0..<4 { reply += label }
+        reply += [0]
+        reply += typeClass
+        return reply
       case .missingTerminator:
         return refusedHeader + [3] + Array("abc".utf8)
       case .typeClassCutShort:
-        return refusedHeader + name + typeClass.prefix(2)
+        return refusedHeader + name + Array(typeClass.prefix(2))
       case .twoQuestionsFirstMatching:
-        return header(questions: 2, answers: 1) + name + typeClass + name + typeClass + answer
+        var reply: [UInt8] = header(questions: 2, answers: 1)
+        reply += name + typeClass
+        reply += name + typeClass
+        reply += answer
+        return reply
       case .twoQuestionsFirstOther:
-        return header(questions: 2, answers: 1) + otherName + typeClass + name + typeClass + answer
+        var reply: [UInt8] = header(questions: 2, answers: 1)
+        reply += otherName + typeClass
+        reply += name + typeClass
+        reply += answer
+        return reply
       case .noQuestionTrailingBytes:
         return header(questions: 0, answers: 0, rcode: 5) + [0xDE, 0xAD, 0xBE, 0xEF]
       }
