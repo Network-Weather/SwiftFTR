@@ -7,8 +7,7 @@ import dnssd
 /// The `DNSServiceQueryRecord` reverse lookup: the question it asks, the outcome of each reply,
 /// and the `DNSServiceRef` rules (start and deallocate on the lookup's queue, one deallocate per
 /// reference, one resume per call) under every way a lookup can end. Everything here runs
-/// against ``FakeDNSService`` except the real-daemon tests, which ask only for loopback names
-/// the daemon answers from its local records, and the gated live comparison.
+/// against ``FakeDNSService``; only the tests named for the real timer use the lookup's own clock.
 @Suite
 struct ReverseDNSLookupTests {
   static let watchdog: TimeInterval = 20
@@ -611,10 +610,10 @@ struct ReverseDNSLookupTests {
   // MARK: - Event orders forced by the test
   //
   // The fake holds the lookup's queue with a blocker, so a reply can be queued behind it and the
-  // cancellation or deadline made to resolve the caller first, or the reply let through first.
-  // What it cannot force is which of two resolutions that happen off the queue at the same
-  // instant (a cancellation and the deadline timer) takes the lock first; that is the lock's job,
-  // and the racing loops below and the stress loop cover it.
+  // cancellation or wake-up made to commit first, or the reply let through first. What it cannot
+  // force is which of two events that arrive off the queue at the same instant (a cancellation
+  // and the wake-up) takes the lock first; that is the lock's job, and the racing loops below
+  // cover it.
 
   @Test("Order: the reply runs first, then the cancellation does nothing")
   func orderReplyThenCancel() async throws {
