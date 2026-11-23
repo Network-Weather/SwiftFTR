@@ -136,8 +136,13 @@ public struct NetworkTopology: Sendable, Codable {
   /// Source IP address
   public let sourceIP: String?
 
-  /// Public address used for classification, whether configured, cached, or discovered.
+  /// Public address every path was classified with: configured, seeded, cached, or the answer to
+  /// the one question the run asked before its first batch.
   public let publicIP: String?
+
+  /// Where ``publicIP`` came from, or `nil` when there is none. See
+  /// ``ClassifiedTrace/publicIPSource``.
+  public let publicIPSource: PublicIPObservationSource?
 
   /// All discovered paths (may contain duplicates if fingerprints match)
   public let paths: [DiscoveredPath]
@@ -158,11 +163,30 @@ public struct NetworkTopology: Sendable, Codable {
     uniquePathCount: Int,
     discoveryDuration: TimeInterval
   ) {
+    self.init(
+      destination: destination, destinationIP: destinationIP, sourceAdapter: sourceAdapter,
+      sourceIP: sourceIP, publicIP: publicIP, publicIPSource: nil, paths: paths,
+      uniquePathCount: uniquePathCount, discoveryDuration: discoveryDuration)
+  }
+
+  /// Creates a topology whose public address names its source.
+  public init(
+    destination: String,
+    destinationIP: String,
+    sourceAdapter: String?,
+    sourceIP: String?,
+    publicIP: String?,
+    publicIPSource: PublicIPObservationSource?,
+    paths: [DiscoveredPath],
+    uniquePathCount: Int,
+    discoveryDuration: TimeInterval
+  ) {
     self.destination = destination
     self.destinationIP = destinationIP
     self.sourceAdapter = sourceAdapter
     self.sourceIP = sourceIP
     self.publicIP = publicIP
+    self.publicIPSource = publicIPSource
     self.paths = paths
     self.uniquePathCount = uniquePathCount
     self.discoveryDuration = discoveryDuration
@@ -326,11 +350,14 @@ protocol MultipathFlowRunning: Sendable {
 struct MultipathDiscovery<Worker: MultipathFlowRunning>: Sendable {
   private let worker: Worker
   private let config: SwiftFTRConfig
+  /// The parent's answer to the public-address question, handed to every flow.
+  private let publicIP: PublicIPObservation?
   private let debugTracing: Bool
 
-  init(worker: Worker, config: SwiftFTRConfig) {
+  init(worker: Worker, config: SwiftFTRConfig, publicIP: PublicIPObservation? = nil) {
     self.worker = worker
     self.config = config
+    self.publicIP = publicIP
     self.debugTracing =
       ProcessInfo.processInfo.environment["SWIFTFTR_DEBUG_MULTIPATH"] != nil
   }
@@ -468,7 +495,8 @@ struct MultipathDiscovery<Worker: MultipathFlowRunning>: Sendable {
       destinationIP: discoveredPaths.first?.trace.destinationIP ?? target,
       sourceAdapter: config.interface,
       sourceIP: config.sourceIP,
-      publicIP: discoveredPaths.first?.trace.publicIP,
+      publicIP: publicIP?.address,
+      publicIPSource: publicIP?.source,
       paths: discoveredPaths,
       uniquePathCount: canonicalPaths.count,
       discoveryDuration: duration
@@ -596,14 +624,6 @@ extension SwiftFTR {
     try swiftConfig.validateForOperation()
     try config.validateForOperation()
 
-    let worker = MultipathWorkerSpawner(
-      baseConfig: swiftConfig,
-      rdnsCache: self.rdnsCache,
-      asnResolver: self.asnResolver,
-      publicIPCache: self.publicIPCache
-    )
-    let discovery = MultipathDiscovery(worker: worker, config: swiftConfig)
-
     // The flow workers are separate tracers, so this tracer's network change cannot reach them
     // through their own handles. Register one here and race discovery against it. Both run as
     // children of one group, so every flow worker is joined before this returns either way.
@@ -613,6 +633,17 @@ extension SwiftFTR {
 
     let outcome: Result<NetworkTopology, Error>
     do {
+      // One question for the whole run, IPv4 by contract, before the first batch. Its answer, or
+      // its absence, is handed to every flow, so no flow asks again. It is asked on its own,
+      // before the race below, because both wait on the handle's one cancellation slot.
+      let publicIP = try await publicIPObservation(for: .v4, handle: handle)
+      let worker = MultipathWorkerSpawner(
+        baseConfig: swiftConfig,
+        rdnsCache: self.rdnsCache,
+        asnResolver: self.asnResolver,
+        publicIP: publicIP
+      )
+      let discovery = MultipathDiscovery(worker: worker, config: swiftConfig, publicIP: publicIP)
       outcome = .success(
         try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
           group.addTask {
@@ -650,7 +681,8 @@ extension SwiftFTR {
     let baseConfig: SwiftFTRConfig
     let rdnsCache: RDNSCache
     let asnResolver: ASNResolver
-    let publicIPCache: [IPAddressFamily: PublicIPObservation]
+    /// The parent's public address, or `nil` when it has none; a flow never asks for one.
+    let publicIP: PublicIPObservation?
 
     func runMultipathFlow(
       target: String,
@@ -662,7 +694,8 @@ extension SwiftFTR {
       let worker = makeFlowTracer(maxHops: maxHops, timeoutMs: timeoutMs)
       let trace = try await worker.performClassifiedTraceWithFlowID(
         to: target,
-        flowIdentifier: flowID.icmpID
+        flowIdentifier: flowID.icmpID,
+        publicIP: publicIP
       )
       try Task.checkCancellation()
       return (flowID, trace)
@@ -677,38 +710,18 @@ extension SwiftFTR {
         config: baseConfig.multipathFlowConfig(maxHops: maxHops, timeoutMs: timeoutMs),
         rdnsCache: rdnsCache,
         asnResolver: asnResolver,
-        publicIPCache: publicIPCache
+        publicIPCache: [:]
       )
     }
   }
 
-  /// Internal method to run classified trace with specific flow identifier
-  ///
-  /// Used by multipath discovery to run Paris Traceroute with controlled flow IDs.
-  /// Creates a temporary SwiftFTR instance with multipath-specific config.
-  func traceClassifiedWithFlowID(
-    to target: String,
-    flowID: FlowIdentifier,
-    maxHops: Int,
-    timeoutMs: Int
-  ) async throws -> ClassifiedTrace {
-    let tempTracer = MultipathWorkerSpawner(
-      baseConfig: self.config,
-      rdnsCache: self.rdnsCache,
-      asnResolver: self.asnResolver,
-      publicIPCache: self.publicIPCache
-    ).makeFlowTracer(maxHops: maxHops, timeoutMs: timeoutMs)
-
-    return try await tempTracer.performClassifiedTraceWithFlowID(
-      to: target,
-      flowIdentifier: flowID.icmpID
-    )
-  }
-
   /// Internal implementation of classified trace with flow ID
+  ///
+  /// The flow classifies with `publicIP`, its parent's answer, and asks for nothing itself.
   fileprivate func performClassifiedTraceWithFlowID(
     to host: String,
-    flowIdentifier: UInt16
+    flowIdentifier: UInt16,
+    publicIP observation: PublicIPObservation?
   ) async throws -> ClassifiedTrace {
     try config.validateForOperation()
 
@@ -722,9 +735,7 @@ extension SwiftFTR {
       _ = try validateInterface(interfaceName)
     }
 
-    let observation = try await publicIPObservation(for: .v4, handle: handle)
     let effectivePublicIP = observation?.address
-    // Do not start resolving a destination for a flow whose question was cancelled.
     try Task.checkCancellation()
 
     // Perform base trace with flow ID

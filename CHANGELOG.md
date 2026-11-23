@@ -35,7 +35,8 @@ Unreleased
   from: `.configured`, `.validatedCallerCache` or `.gatewayReported` (a seed), `.stun` or
   `.dnsWhoami` (the library's resolver), or whatever a caller's resolver names. It is encoded
   beside `publicIP`; JSON without it decodes as `nil`. A further `ClassifiedTrace` initializer
-  takes it.
+  takes it. **`NetworkTopology.publicIPSource`** does the same for a multipath run, with a further
+  `NetworkTopology` initializer.
 
 ### Behavior changes
 
@@ -126,6 +127,14 @@ Unreleased
   STUN). An address that is not globally routable, whether configured, returned by a resolver or
   found by the library's discovery, is not used: a configured private or documentation address is
   ignored where 0.18 used it, and the trace asks the strategy instead.
+- **A multipath run asks for its public address once** (decision 12). `discoverPaths` asks for
+  IPv4 in the parent, after registering for cancellation and before its first batch of flows, and
+  hands the answer, or its absence, to every flow. Each flow used to discover on its own when
+  nothing was cached, so a failing discovery cost every flow a budget and a caller's resolver
+  would have been asked once per flow. The parent caches an accepted answer per family as a
+  classified trace does, where flows never wrote theirs back, and `NetworkTopology.publicIP` is
+  that answer rather than the first path's. A network change during the question ends the run
+  with `TracerouteError.cancelled` before any flow probes.
 - **A seed's `PublicIPSource` is kept**, and reported as `ClassifiedTrace.publicIPSource` by the
   traces that use it.
 
