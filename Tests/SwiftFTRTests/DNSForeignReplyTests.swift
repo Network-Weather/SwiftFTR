@@ -26,6 +26,7 @@ final class ScriptedDNSPeer: @unchecked Sendable {
   /// The gap between fed datagrams, and so the longest a blocking read waits for one.
   let interval: TimeInterval = 0.002
 
+  /// Owned by the serve and feed threads: the last of them to exit closes it.
   private let fd: Int32
   private let script: Script
   private let feed: Feed?
@@ -37,7 +38,7 @@ final class ScriptedDNSPeer: @unchecked Sendable {
   private var longestGap: TimeInterval = 0
   private var scriptedSendStarts: [TimeInterval] = []
   private var lastQuery: (query: [UInt8], source: sockaddr_storage, length: socklen_t)?
-  private let threadsExited = DispatchSemaphore(value: 0)
+  /// Threads that have not exited yet.
   private var threads = 1
 
   init(family: Int32 = AF_INET, feed: Feed? = nil, script: @escaping Script) throws {
@@ -50,15 +51,22 @@ final class ScriptedDNSPeer: @unchecked Sendable {
 
   deinit { stop() }
 
+  /// Stops the script and the feed, without waiting: nothing is sent once this returns, and the
+  /// last thread to exit closes the socket, the serve thread within its 20 ms receive timeout.
+  /// Safe to call from `defer` in an async test, since it parks no thread.
   func stop() {
     lock.lock()
-    let wasStopped = stopped
     stopped = true
-    let count = threads
     lock.unlock()
-    guard !wasStopped else { return }
-    for _ in 0..<count { threadsExited.wait() }
-    close(fd)
+  }
+
+  /// Called by each thread as it exits. The last one closes `fd`, under the lock `send` holds, so
+  /// nothing sends on the number after it is closed and perhaps handed to another test's socket.
+  private func threadExited() {
+    lock.lock()
+    threads -= 1
+    if threads == 0 { close(fd) }
+    lock.unlock()
   }
 
   /// When each scripted datagram's `sendto` began, in order: a reader that has a datagram cannot
@@ -111,6 +119,10 @@ final class ScriptedDNSPeer: @unchecked Sendable {
 
   private func send(_ datagram: [UInt8], to address: sockaddr_storage, _ length: socklen_t) -> Bool
   {
+    lock.lock()
+    defer { lock.unlock() }
+    // Once stopped, the socket may already be closed.
+    guard !stopped else { return false }
     var destination = address
     let n = datagram.withUnsafeBytes { raw in
       withUnsafePointer(to: &destination) {
@@ -124,7 +136,7 @@ final class ScriptedDNSPeer: @unchecked Sendable {
   }
 
   private func serve() {
-    defer { threadsExited.signal() }
+    defer { threadExited() }
     var buffer = [UInt8](repeating: 0, count: 65536)
     while !isStopped {
       var source = sockaddr_storage()
@@ -164,7 +176,7 @@ final class ScriptedDNSPeer: @unchecked Sendable {
     threads += 1
     lock.unlock()
     Thread { [self] in
-      defer { threadsExited.signal() }
+      defer { threadExited() }
       // A test that forgets to stop the feed must not leave it running for the whole suite.
       let safetyStop = monotonicNow() + 60
       while !isStopped, monotonicNow() < safetyStop {

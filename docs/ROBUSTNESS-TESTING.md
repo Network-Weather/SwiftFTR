@@ -37,7 +37,7 @@ that fail when any phase can wait without a bound or strand its caller.
 - **Local fixtures for every other protocol.** TCP listeners that refuse, accept and stay silent,
   reset mid-response or answer slowly; an HTTP responder on the same listener; UDP responders for
   STUN and DNS that stay silent, answer late or answer garbage. All bind `127.0.0.1` or `::1` on an
-  ephemeral port. No new test sends a packet off the host. The fixtures have tests of their own
+  ephemeral port, without `SO_REUSEADDR` (see the last observation below). No new test sends a packet off the host. The fixtures have tests of their own
   (`FaultInjectionFixtureTests`).
 - **Private executors.** Any test that stalls a blocking call does it on a private
   `BlockingIOExecutor`, installed through the seam, never on the process-wide one.
@@ -70,15 +70,18 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Probe socket | creation fails the way `socket(2)` does; every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `ProbeWindow` |
 | Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
-| Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
+| Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts; with a failed send, the ping ends once every probe that left is answered, whether the last reply or the end of the send loop comes last, does not end before its remaining probes are sent, and still waits out its window for an unanswered probe (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change; STUN attempts against silent loopback servers and a silent whoami server, each able to outlast the watchdog, ended by the one discovery deadline; a name lookup waiting for a slot, abandoned at it; the whoami fallback answering while every executor slot is held, with STUN servers given by address and by name; STUN's share of the budget; a failure at the deadline reported as a timeout whichever timer fired first; standalone `getPublicIPs` ended by its caller's cancellation, returning the family that answered, and leaving the cooperative pool free with more stalled calls than it has threads | traceClassified, discoverPaths, getPublicIPs | `Enrichment`, `Cancellation`, `AsyncPublicIPDiscoveryTests` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
-| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
+| Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached and, though it ran past the stall threshold, does not count toward the breaker | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
 | DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage without the query's transaction ID (ignored, so a timeout), oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
 | DNS transport | refused port (IPv4 and IPv6); empty datagram (ignored, so a timeout); `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
 | DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; a short datagram with the query's transaction ID (`malformedReply`); `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` from `connect` (connect seam) and `send`; other connect and send errors, an unclassified receive error and an invalid server; a stall inside the read excluded from the round trip; an unreachable error read before the send ignored; no read once the exchange has finished and closed its socket, with a second reply still queued (answered, timed out, cancelled); cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
-| DNS foreign replies | a reply with another transaction ID, then the real one, which answers with its own round trip (IPv4 and IPv6); empty and one-byte datagrams, then the real reply; only foreign replies, read while the query still waits, then a timeout and `timedOut`; a datagram with the query's ID but no valid header, still `malformedResponse` at once; a stale reply queued before the send and read after it; after a foreign datagram, a reply or refusal that comes only after the deadline, which is a timeout because each read event judges at most one datagram (query and dnsProbe); foreign replies that never stop, on a socket that never runs dry, with the deadline (IPv4 and IPv6) and cancellation still ending the query; a Team Cymru lookup answered foreign first; the blocking TXT path: a foreign and an empty datagram before the reply, a wait bounded by the time left after a foreign reply, a reply returned after the deadline (as the first read, or after a foreign one) taken as a timeout and the next server tried, and an endless feed | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, CymruDNSResolver, `DNSClient.queryTXTBlocking` | `DNSForeignReplyTests` |
+| DNS foreign replies | a reply with another transaction ID, then the real one, which answers with its own round trip (IPv4 and IPv6); empty and one-byte datagrams, then the real reply; only foreign replies, read while the query still waits, then a timeout and `timedOut`; a datagram with the query's ID but no valid header, still `malformedResponse` at once; a stale reply queued before the send and read after it; after a foreign datagram, a reply or refusal that comes only after the deadline, which is a timeout because each read event judges at most one datagram (query and dnsProbe); foreign replies that never stop, on a socket that never runs dry, with the deadline (IPv4 and IPv6) and cancellation still ending the query; a Team Cymru lookup answered foreign first; a TXT lookup, as the whoami fallback makes it, sent a foreign and an empty datagram before the reply | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, CymruDNSResolver, `DNSClient.queryTXT` | `DNSForeignReplyTests` |
+| DNS question echo | a reply with the query's ID echoing another name, type or class, then the real reply (IPv4 and IPv6); only such replies, then a timeout and `timedOut`; the name echoed in another letter case answers; a header-only REFUSED still answers with RCODE 5; a question cut short is still `malformedResponse` at once; an endless feed of such replies with the deadline still ending the query (IPv4 and IPv6); a TXT lookup, as the whoami fallback makes it, sent such a reply before the real one | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, `DNSClient.queryTXT` | `DNSQuestionMatchTests` |
+| DNS first-question verdicts | every shape of a same-ID reply's first question (matching, other letter case, other name or type, a compression pointer into the header, a pointer loop, reserved label types 0x40 and 0x80, a label past the end, a name over 255 bytes, a missing terminator, type and class cut short, two questions with the first matching or not, no question with trailing bytes), with its verdict on the query, dnsProbe and the whoami fallback's TXT lookup, and the shared reading the matcher and validator both use | the `__dnsQuery` SPI, dnsProbe, `DNSClient.queryTXT` | `DNSQuestionVerdictTests` |
+| Address parsing | `seedPublicIP` and the public-address table, for IPv4, IPv4-mapped and NAT64-embedded IPv4 and IPv6; a NUL inside an address or destination string, through every parser and public entry point that reaches one | seedPublicIP, isPrivateIPv4, isCGNATIPv4, reverseIPv6Nibbles, reverseDNS, destination resolution, DNS server and source addresses | `PublicIPValidationTests` |
 | DNS error replies | well-formed NXDOMAIN (SOA in authority; CNAME chain), SERVFAIL and REFUSED (question echoed; header only) keep their response code; the same codes with a declared answer record missing or cut short, or a declared question missing or cut short, are `malformedResponse` and `malformedReply` | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe | `DNSErrorReplyValidationTests` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
@@ -87,16 +90,24 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails; for the probes, the result, nothing sent or connected, and the socket closed, against a pass-through control | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ReceiveLoop`, `ProbeNonBlockingSetupTests` |
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
-| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
+| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP `stop()` returns without waiting for its handlers and `stopAndWait()` joins them; a stopped UDP fixture's thread closes its own socket | fixtures | `Fixture` |
 
-Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`
-and `DNSForeignReplyTests` for the event-based DNS transport, `CymruEventBasedTests` for the
-Team Cymru lookups on it, and `ProbeNonBlockingSetupTests` for the TCP and UDP probes' socket
-setup. Every timed operation runs under a watchdog
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`,
-`DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport, and `CymruEventBasedTests` for the
-Team Cymru lookups on it. Every timed operation runs under a watchdog
+`DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport,
+`CymruEventBasedTests` for the Team Cymru lookups on it, and `ProbeNonBlockingSetupTests` for the
+TCP and UDP probes' socket setup. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
+
+Fixture teardown parks no thread. A fixture's `stop()` sets a flag under the fixture's lock and
+returns; the fixture's own thread notices within its 20 ms receive timeout or poll and closes its
+socket as it exits. Every other path that sends on that socket (a delayed reply, an injected one)
+checks the flag under the same lock, and the close happens under that lock after the flag is set,
+so no descriptor number is used after it is closed and perhaps handed to another test's socket.
+A fixture with more than one thread closes its socket in the last one to exit; `EndlessReplies`
+keeps the reply port reserved until its sender's last reply has gone. A test that needs a fixture
+joined awaits it without a thread (`LoopbackTCPServer.stopAndWait()`). The suite passes with
+`LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, which limits the cooperative pool and so exposes a
+blocking call made from an async test.
 
 Not covered, and why:
 
@@ -270,7 +281,7 @@ numbers are as of the commit that added this section.
     socket failed at once with `ECONNREFUSED` and the client called it `DNSError.timeout`, so
     `dnsProbe` said "Timeout - no response" about a host that had answered. Measured on `main`:
     `timeout` after 1 ms, for a fixture port and for port 53 on loopback. Now the query methods
-    throw `sendFailed`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
+    throw `connectionRefused`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
     that names the refusal and `outcome == .refused`, with `elapsed` set to when it arrived.
     Tests: `EventBasedDNSTests.refusedPort` and `DNSProbeOutcomeTests.refused`, IPv4 and IPv6.
 18. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
@@ -312,7 +323,7 @@ numbers are as of the commit that added this section.
     `DNSError.sendFailed` with the errno discarded, and a send-time errno was dropped, so "no route
     to this server", the usual no-network case, read "Failed to send query". `EHOSTUNREACH`,
     `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` are now `outcome == .unreachable` with the errno, and
-    other errnos are named in the message. The query methods still throw `sendFailed`. Test:
+    other errnos are named in the message. The query methods throw `unreachable`. Test:
     `DNSProbeOutcomeTests.locallyUnreachable`, both stages and all four errnos.
 24. **An unclassified receive error was reported as a timeout.** Fixed: `dnsProbe` said "Timeout -
     no response" for a socket error that came at once. It now says a receive error occurred, with
@@ -325,7 +336,8 @@ numbers are as of the commit that added this section.
     deadline; one with the right ID still decides, valid or not. After the send the transport judges at most one datagram per read
     event, so an ignored one costs its own event: a datagram read later in the same event could
     have arrived after the stamp taken for it, even after the deadline. An endless stream of
-    ignored datagrams therefore cannot hold off the deadline or cancellation. The blocking TXT path waits only for the time it has left, and treats a reply `recv` returns after the deadline, which its receive timeout alone allows by about 2 ms, as a timeout.
+    ignored datagrams therefore cannot hold off the deadline or cancellation. Every DNS query takes
+    this path, the whoami fallback's TXT lookup included.
     Tests: `DNSForeignReplyTests`.
 26. **The TCP and UDP probes ran on a blocking socket when `fcntl` failed** (#107). Confirmed and
     fixed. Both ignored the two `fcntl` results, and neither read the `fileControl` seam, so an
@@ -370,6 +382,34 @@ numbers are as of the commit that added this section.
     reply is judged as before. A reply to an earlier probe
     that arrives after `timeout` but before the ping's last reply window ends still counts, as
     `PingConfig.timeout` documents. Tests: `PingReplyMatchingTests`, IPv4 and IPv6.
+29. **A ping whose send failed waited out its whole window** (#138). Confirmed and fixed. Early
+  completion compared the replies with the configured `count`, which a ping with a failed send
+  can never reach: two probes, the first send failing and the second answered at once, ended at
+  the reply deadline. Once the send loop has finished, the ping now compares the replies with the
+  sends that succeeded, both when the loop finishes and when a reply arrives. Tests:
+  `PingReplyMatchingTests` (`failedSend…`), IPv4 and IPv6.
+30. **`seedPublicIP` accepted a NAT64 address wrapping a private IPv4 address, and strings with an
+  embedded NUL** (#139). Confirmed and fixed. `64:ff9b::192.168.1.1` was accepted because the
+  well-known prefix was accepted whatever it embedded; RFC 6052 section 3.1 forbids it for
+  non-global IPv4. `"8.8.8.8\u{0}junk"` was accepted as `8.8.8.8` because `inet_pton` reads a C
+  string. The same truncation reached every parser that hands a caller's string to `inet_pton` or
+  `getaddrinfo`: `isPrivateIPv4`, `isCGNATIPv4`, `reverseIPv6Nibbles`, `reverseDNS` (which looked
+  up the address before the NUL), DNS server and source addresses, and destination resolution
+  for ping, trace and the TCP and UDP probes (which resolved and probed the text before the NUL).
+  The parsers and destination resolution now reject such a string. Interface names reach
+  `if_nametoindex` the same way and are not checked. Tests: `PublicIPValidationTests`.
+31. **A DNS reply's question was never compared with the query** (#128). Confirmed and fixed. A
+  reply with the query's transaction ID was accepted whatever question it echoed, so its answers
+  were reported for the name asked. A datagram whose first question is readable and names another
+  name (compared without regard to ASCII case), type or class is now ignored like one with a
+  foreign ID, by every DNS query, the whoami fallback's TXT lookup included, and the query waits
+  on to its deadline.
+  The matcher and the validator read the first question by one rule, so they agree on which
+  questions are unreadable (and so malformed): review of the first version found that its own
+  reader let a compression pointer through, and the validator then read a pointer into the
+  header as the root name and took the reply's REFUSED; and that it had no 255-byte limit, so a
+  malformed reply was ignored as a different question. Tests: `DNSQuestionMatchTests`,
+  `DNSQuestionVerdictTests`.
 
 Observations that are not defects of the library:
 
@@ -388,7 +428,43 @@ Observations that are not defects of the library:
   by `.timeLimit`, whose task group still joins the stuck child. Waits for a fixture to start,
   become ready or be cancelled go through `waitBounded`, and polls for one to run through
   `eventually`, each failing the test after ten seconds. A test that gives up does not join the
-  operation it was waiting on. Waits that cannot fail to end are left unbounded: a fixture's stop
-  path, a stall the test itself releases, a call with its own timeout.
+  operation it was waiting on. A wait for a task that only the behaviour under test can end, a
+  cancellation or a deadline the test is checking, runs under `measure(within:)`. Waits that
+  cannot fail to end are left unbounded: a stall the test itself releases, a call with its own
+  timeout that is not the one under test.
 - `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
   identifies a socket by its bound local address when checking that the library closed it.
+- A loopback fixture could take the port of an IPv6 probe socket and receive its replies. The
+  fake network hands trace and ping an unbound UDP socket, which takes an ephemeral port on `[::]`
+  at its first send. Fixtures bound `::1` on port 0 with `SO_REUSEADDR`, and with that option
+  Darwin chooses an IPv6 ephemeral port by exact address only, so it could hand a fixture a port
+  such a socket already held. Holding 2,000 implicitly bound sockets and binding 2,000 fixtures
+  gave about 240 collisions over IPv6 and none over IPv4 or without the option. Every later
+  datagram to that port went to the fixture, so a ping given a reply window past its watchdog
+  waited it out: the IPv6 ping reply-matching tests failed at their 20 s watchdog in about one
+  full debug suite run in fifteen. With another process churning such binds alongside, 4 of 60
+  IPv6 runs of the control test hit the watchdog and none of 60 IPv4 runs, each with every probe
+  seen and every reply sent. Fixtures no longer set the option. Another process that binds `::1`
+  with it, such as a suite built before this change running at the same time, can still take
+  the port. When a ping reply-matching test hits its watchdog it reports the fake network's
+  journal of probes received and replies sent. Test:
+  `FaultInjectionFixtureTests.loopbackFixtureKeepsOffWildcardPorts`.
+- An IPv4 refusing UDP port could stop refusing. `RefusingUDPPort` binds `127.0.0.1` and connects
+  the socket elsewhere, so the kernel answers other senders with port-unreachable. Darwin picks
+  an IPv6 ephemeral port without checking IPv4 sockets, so a dual-stack socket bound to `[::]`
+  could be handed the same number (about 260 of 2,000 such binds against 2,000 refusing ports),
+  and IPv4 datagrams to the port then went to it: no refusal. `EventBasedDNSTests.refusedPort`
+  waited out its watchdog, and `refusalBeforeTheSendIsIgnored`, whose
+  `RefusingThenAnsweringUDPPort` refuses the same way, failed with `sendFailed`, each about once
+  in fifteen full debug runs. Both fixtures now bind through `bindRefusingUDP(family:)`, which
+  for IPv4 also holds a v6-only socket on `[::]` with the same number.
+  Port-unreachable rate limiting is not the cause: Darwin suppresses only repeats for the same
+  flow within 100 ms (`net.inet.udp.port_unreach_rlc_*`), and refusals kept arriving during a
+  flood of 63,000 sends to other closed ports. Test:
+  `FaultInjectionFixtureTests.refusingUDPPortKeepsOffDualStack`.
+- A ping test's precondition could be met by the wrong datagram.
+  `PingReplyMatchingTests.replyQueuedBeforeSendIsIgnored` took "a datagram is queued" as proof
+  that its injected early reply had landed before probe 2 left, but probe 1's own reply, still
+  unread, met that while the injected one was in flight on loopback. Landing after the send, the
+  injected reply was rightly kept. The test now waits until every datagram the fake network sent
+  to the socket is queued or read.

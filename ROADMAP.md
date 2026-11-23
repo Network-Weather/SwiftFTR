@@ -31,9 +31,6 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
 - **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code
   reading). Decide between failing classification fast and loading in the background, and make
   the SwiftIP2ASN cache directory injectable so a test can stage it without touching the user's.
-- **Strengthen `cancelledLookupNotCached` to cover the stall breaker**: it cancels one lookup at
-  once, so it would not notice the cancellation guard moving below the breaker update. Use two
-  slow lookups that each pass the stall threshold before being cancelled.
 - **Report an HTTP status as soon as the headers arrive** (#122, finding 27): URLSession withholds
   the response until body bytes follow it, so a server that stalls after its headers is reported
   only at the timeout, and without its status if no body byte came. Fixing it means reading the

@@ -98,7 +98,10 @@ Notes:
 - `seedPublicIP` accepts only syntactically valid, globally routable IPv4/IPv6 addresses and
   returns `false` otherwise (private, CGNAT, link-local, loopback, multicast, documentation and
   benchmark ranges, IPv6 outside `2000::/3` other than `64:ff9b::/96` (including site-local
-  `fec0::/10`), and zone-suffixed strings are rejected). A seed is discarded by the next `invalidatePublicIP()`,
+  `fec0::/10`), a `64:ff9b::/96` address embedding a rejected IPv4 address, zone-suffixed strings
+  and strings containing a NUL are rejected). Every address and destination string the library
+  parses is rejected if it contains a NUL: as an address it is invalid, as a destination it throws
+  `TracerouteError.resolutionFailed`. A seed is discarded by the next `invalidatePublicIP()`,
   `clearCaches()` or `networkChanged()`. `PublicIPSource` has cases `.validatedCallerCache` and
   `.gatewayReported`; the library does not retain the source.
 - `discoverPublicIPWithHostname()` discovers IPv4 via STUN through the configured interface, with
@@ -493,8 +496,10 @@ public func dnsProbe(config: DNSProbeConfig) async throws -> DNSProbeResult
 //   error for a malformed reply; false for silence, a refused port and local errors
 //   A reply missing question or answer records its header declares is malformed whatever its
 //   RCODE (checked before the RCODE); authority and additional sections are not checked
-//   Only a datagram carrying the query's transaction ID is a reply; others (wrong ID, under
-//   2 bytes, empty) are ignored until the timeout, so only such datagrams -> .timedOut
+//   Only a datagram carrying the query's transaction ID, and not echoing another question
+//   (name compared case-insensitively, type, class), is a reply; others (wrong ID, another
+//   question, under 2 bytes, empty) are ignored until the timeout, so only such datagrams ->
+//   .timedOut. A reply with no question section (QDCOUNT 0) is still a reply
 //   outcome: DNSProbeOutcome, a struct with static members (switch needs `default`):
 //     .answered, .refused, .timedOut, .malformedReply, .unreachable, .failed; JSON: raw string
 //   elapsed: send to whatever came back from the network; nil when nothing did (timedOut,
@@ -541,10 +546,18 @@ public enum DNSRecordData: Sendable {
 public enum DNSError: Error, Sendable {
     case invalidIP(String), invalidHostname(String), invalidTimeout(TimeInterval)
     case socketCreationFailed, setsockoptFailed(option: String, errno: Int32), bindFailed(String)
-    case sendFailed, timeout, malformedResponse, noRecords, serverError(rcode: Int)
+    case sendFailed, connectionRefused, unreachable
+    case timeout, malformedResponse, noRecords, serverError(rcode: Int)
 }
+// Exhaustive switches must name every case (0.19 added connectionRefused and unreachable).
+// connectionRefused: ICMP port unreachable after the send (the host is up, no DNS server).
+// unreachable: ICMP host/network unreachable after the send, or connect/send failing with
+//   EHOSTUNREACH, EHOSTDOWN, ENETUNREACH or ENETDOWN. Each maps as dnsProbe's outcome does.
+// sendFailed: any other send or connect failure (short send, EPERM, EMSGSIZE, buffer pressure
+//   past the timeout). timeout: silence, or a receive error not listed above.
 // malformedResponse: a datagram with the query's transaction ID that is not valid DNS. One with
-// another ID, or too short to carry one, is ignored; only such datagrams end as timeout.
+// another ID, too short to carry one, or echoing another question (another name, type or class;
+// the name compared case-insensitively) is ignored; only such datagrams end as timeout.
 
 // Standalone functions with an explicit server:
 public func reverseDNS(ip: String, server: String, timeout: TimeInterval = 2.0,

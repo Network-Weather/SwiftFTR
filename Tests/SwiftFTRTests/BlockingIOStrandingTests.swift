@@ -67,23 +67,37 @@ struct BlockingIOStrandingTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.timer-release")
     let occupied = Counter()
     let released = Counter()
+    let free = DispatchSemaphore(value: 0)
 
+    // The only worker stays held until the deadline has fired, so the operation is still queued
+    // when it does, however slowly this task runs.
     let holder = Task {
       try? await executor.run(priority: .userInitiated) {
         occupied.increment()
-        Thread.sleep(forTimeInterval: 0.3)
+        free.wait()
       }
     }
+    // Also on an early exit, so the worker is not left blocked for the rest of the suite.
+    defer { free.signal() }
     try #require(
       await eventually(within: 10) { occupied.value > 0 }, "the worker was never occupied")
 
-    // The marker lives only in the operation's closure, so it dies when the bridge lets go.
+    // The marker lives only in the operation's closure, so it dies when the bridge lets go. The
+    // call runs under a watchdog of its own: the worker stays held until after it returns, so a
+    // deadline that failed to resume the caller would otherwise hang the test.
     do {
       let marker = DeinitMarker { released.increment() }
-      await #expect(throws: BlockingIOTimeout.self) {
-        try await executor.run(priority: .userInitiated, deadline: 0.05) { marker.touch() }
+      let (thrown, _) = try await measure(within: 20) { () -> Error? in
+        do {
+          try await executor.run(priority: .userInitiated, deadline: 0.05) { marker.touch() }
+          return nil
+        } catch {
+          return error
+        }
       }
+      #expect(thrown is BlockingIOTimeout, "\(String(describing: thrown))")
     }
+    free.signal()
     await holder.value
 
     let giveUp = monotonicNow() + 2.0

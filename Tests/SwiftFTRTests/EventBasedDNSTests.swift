@@ -170,7 +170,7 @@ struct EventBasedDNSTests {
       probe.error
         == "Connection refused - the host is up but no DNS server is listening on this port",
       "\(probe.error ?? "nil")")
-    #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
+    #expect(Self.isConnectionRefused(thrown), "\(String(describing: thrown))")
   }
 
   @Test("An empty datagram carries no transaction ID: it is ignored, and the query times out")
@@ -524,7 +524,7 @@ struct EventBasedDNSTests {
     switch exit {
     case .answered: #expect(thrown == nil, "\(String(describing: thrown))")
     case .timedOut: #expect(Self.isTimeout(thrown), "\(String(describing: thrown))")
-    case .refused: #expect(Self.isSendFailed(thrown), "\(String(describing: thrown))")
+    case .refused: #expect(Self.isConnectionRefused(thrown), "\(String(describing: thrown))")
     case .malformed: #expect(Self.isMalformed(thrown), "\(String(describing: thrown))")
     case .cancelled, .cancelledWhileWaitingToWrite, .cancelledWhileBackingOff:
       #expect(thrown is CancellationError, "\(String(describing: thrown))")
@@ -561,6 +561,16 @@ struct EventBasedDNSTests {
 
   static func isSendFailed(_ error: Error?) -> Bool {
     if case DNSError.sendFailed? = error { return true }
+    return false
+  }
+
+  static func isConnectionRefused(_ error: Error?) -> Bool {
+    if case DNSError.connectionRefused? = error { return true }
+    return false
+  }
+
+  static func isUnreachable(_ error: Error?) -> Bool {
+    if case DNSError.unreachable? = error { return true }
     return false
   }
 
@@ -700,33 +710,39 @@ final class DescriptorLedger: @unchecked Sendable {
 /// datagram reaches the socket and is answered with `reply`.
 final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
   let port: UInt16
+  /// Owned by ``stop()`` until ``startAnswering()``, and by the answering thread after it, which
+  /// closes it as it exits.
   private let fd: Int32
+  /// Keeps the number out of dual-stack IPv6 hands (``bindRefusingUDP(family:)``); closed by
+  /// ``stop()``.
+  private let ipv6Guard: Int32?
   private let reply: @Sendable ([UInt8]) -> [UInt8]
   private let lock = NSLock()
   private var answering = false
-  private let served = DispatchSemaphore(value: 0)
+  private var stopped = false
+  /// How long the answering thread waits for its datagram.
+  private let answerWindow: TimeInterval = 5
 
   init(reply: @escaping @Sendable ([UInt8]) -> [UInt8]) throws {
-    let (bound, boundPort) = try bindLoopback(family: AF_INET, type: SOCK_DGRAM)
-    var (peer, length) = loopbackAddress(family: AF_INET, port: 9)
-    let connected = withUnsafePointer(to: &peer) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(bound, $0, length) }
-    }
-    guard connected == 0 else {
-      let code = errno
-      close(bound)
-      throw FixtureError.socket("connect", code)
-    }
-    setReceiveTimeout(bound, seconds: 5)
-    fd = bound
-    port = boundPort
+    let refusing = try bindRefusingUDP(family: AF_INET)
+    // Short, so the answering thread sees `stop()` promptly between receives.
+    setReceiveTimeout(refusing.fd, seconds: 0.02)
+    fd = refusing.fd
+    port = refusing.port
+    ipv6Guard = refusing.ipv6Guard
     self.reply = reply
+  }
+
+  private var isStopped: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopped
   }
 
   /// Disconnects the socket and answers the next datagram on a thread of its own.
   func startAnswering() {
     lock.lock()
-    guard !answering else {
+    guard !answering, !stopped else {
       lock.unlock()
       return
     }
@@ -737,18 +753,23 @@ final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
     unspecified.sa_family = sa_family_t(AF_UNSPEC)
     _ = connect(fd, &unspecified, socklen_t(MemoryLayout<sockaddr>.size))
     Thread.detachNewThread { [self] in
-      defer { served.signal() }
+      defer { close(fd) }
       var buffer = [UInt8](repeating: 0, count: 2048)
       var source = sockaddr_storage()
       var sourceLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
-      let received = buffer.withUnsafeMutableBytes { raw in
-        withUnsafeMutablePointer(to: &source) {
-          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-            recvfrom(fd, raw.baseAddress, raw.count, 0, $0, &sourceLength)
+      let giveUp = monotonicNow() + answerWindow
+      var received = -1
+      while received < 0, !isStopped, monotonicNow() < giveUp {
+        sourceLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        received = buffer.withUnsafeMutableBytes { raw in
+          withUnsafeMutablePointer(to: &source) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+              recvfrom(fd, raw.baseAddress, raw.count, 0, $0, &sourceLength)
+            }
           }
         }
       }
-      guard received > 0 else { return }
+      guard received > 0, !isStopped else { return }
       let answer = reply(Array(buffer.prefix(received)))
       _ = answer.withUnsafeBytes { raw in
         withUnsafePointer(to: &source) {
@@ -760,12 +781,16 @@ final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
     }
   }
 
-  /// Waits for the answering thread, if one started, then closes the socket.
+  /// Stops without waiting. Before ``startAnswering()`` it closes the socket; after it, the
+  /// answering thread closes it as it exits, within its 20 ms receive timeout. Safe to call from
+  /// `defer` in an async test, since it parks no thread.
   func stop() {
     lock.lock()
-    let started = answering
+    let wasStopped = stopped
+    stopped = true
+    let threadOwnsSocket = answering
     lock.unlock()
-    if started { served.wait() }
-    close(fd)
+    if !wasStopped && !threadOwnsSocket { close(fd) }
+    if !wasStopped, let ipv6Guard { close(ipv6Guard) }
   }
 }

@@ -66,7 +66,8 @@ struct PingLifecycleTests {
     }
 
     await #expect {
-      try await task.value
+      // Bounded: a cancellation that does not reach the operation fails here instead of hanging.
+      _ = try await measure(within: 20) { try await task.value }
     } throws: { isPingCancellation($0) }
 
     #expect(fixture.sends.count == 0)
@@ -87,7 +88,8 @@ struct PingLifecycleTests {
     task.cancel()
 
     await #expect {
-      try await task.value
+      // Bounded: a cancellation that does not reach the operation fails here instead of hanging.
+      _ = try await measure(within: 20) { try await task.value }
     } throws: { isPingCancellation($0) }
 
     // `run()` resumes only after the stored sender task has exited. A leaked or

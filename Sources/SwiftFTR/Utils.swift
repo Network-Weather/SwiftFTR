@@ -8,12 +8,21 @@ import Foundation
 /// Strips a scope ID (for example, `%interface-name`) from an IPv6 link-local address before parsing.
 @inline(__always)
 func detectAddressFamily(_ ip: String) -> Int32 {
+  guard !containsNUL(ip) else { return -1 }
   var addr4 = in_addr()
   if inet_pton(AF_INET, ip, &addr4) == 1 { return Int32(AF_INET) }
   let bare = ip.split(separator: "%", maxSplits: 1).first.map(String.init) ?? ip
   var addr6 = in6_addr()
   if inet_pton(AF_INET6, bare, &addr6) == 1 { return Int32(AF_INET6) }
   return -1
+}
+
+/// Whether `text` contains a NUL character. A C string ends at its first NUL, so `inet_pton` and
+/// `getaddrinfo` would see only the text before it and accept a string that is not an address or
+/// a name; every parser here rejects such a string before converting it.
+@inline(__always)
+func containsNUL(_ text: String) -> Bool {
+  text.utf8.contains(0)
 }
 
 /// Parse an IPv6 server string like `fe80::1%interface-name` into (bareIP, scopeID).
@@ -68,6 +77,7 @@ func ipv6String(_ addr: in6_addr, scopeID: UInt32 = 0) -> String {
 /// Canonical presentation form (inet_ntop) of an IPv4 or IPv6 address string.
 /// Returns nil if the string is not a syntactically valid numeric IP address.
 func canonicalIPAddress(_ presentation: String) -> String? {
+  guard !containsNUL(presentation) else { return nil }
   var address4 = in_addr()
   if presentation.withCString({ inet_pton(AF_INET, $0, &address4) }) == 1 {
     var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
@@ -113,7 +123,13 @@ struct ParsedIPAddress: Hashable, Sendable {
   private let family: Family
   private let bytes: [UInt8]
 
+  private init(family: Family, bytes: [UInt8]) {
+    self.family = family
+    self.bytes = bytes
+  }
+
   init?(_ presentation: String) {
+    guard !containsNUL(presentation) else { return nil }
     var address4 = in_addr()
     if presentation.withCString({ inet_pton(AF_INET, $0, &address4) }) == 1 {
       self.family = .ipv4
@@ -183,7 +199,9 @@ struct ParsedIPAddress: Hashable, Sendable {
   /// Rejects non-globally-reachable entries from the IANA IPv4 and IPv6 Special-Purpose Address
   /// Registries (RFC 6890, RFC 5737, RFC 2544, RFC 1112, RFC 8215, RFC 6666, RFC 9780, RFC 3849,
   /// RFC 9637, RFC 9602, etc.), and IPv6 outside 2000::/3 other than 64:ff9b::/96, which the IANA
-  /// IPv6 Address Space registry reserves (including site-local fec0::/10, RFC 3879).
+  /// IPv6 Address Space registry reserves (including site-local fec0::/10, RFC 3879). A
+  /// 64:ff9b::/96 address is accepted only when the IPv4 address it embeds is (RFC 6052 section
+  /// 3.1).
   var isGloballyRoutablePublicAddress: Bool {
     guard scope == .global else { return false }
     switch family {
@@ -229,11 +247,14 @@ struct ParsedIPAddress: Hashable, Sendable {
         return false
       }
       // 64:ff9b::/96 (Well-Known Prefix, RFC 6052) is globally reachable although it lies
-      // outside 2000::/3.
+      // outside 2000::/3, but only for the IPv4 address it embeds in its last four bytes: RFC 6052
+      // section 3.1 forbids the prefix for non-global IPv4 addresses, so the embedded address
+      // must pass the IPv4 checks above.
       if bytes[0] == 0x00 && bytes[1] == 0x64 && bytes[2] == 0xff && bytes[3] == 0x9b
         && bytes[4..<12].allSatisfy({ $0 == 0 })
       {
-        return true
+        return ParsedIPAddress(family: .ipv4, bytes: Array(bytes[12..<16]))
+          .isGloballyRoutablePublicAddress
       }
       // fec0::/10 (deprecated site-local, RFC 3879). Also covered by the 2000::/3 rule below;
       // named here because it was once a valid unicast scope.
@@ -372,7 +393,8 @@ func isGloballyRoutableIPAddress(_ presentation: String) -> Bool {
 /// multicast, unspecified, documentation / test networks (RFC 5737, RFC 3849),
 /// benchmark ranges (RFC 2544, RFC 5180), Class E reserved (240.0.0.0/4), limited broadcast,
 /// IPv6 outside the 2000::/3 unicast space other than 64:ff9b::/96 (so deprecated site-local
-/// fec0::/10 and IPv4-compatible ::/96 too), and any address with a scope/zone index (%zone).
+/// fec0::/10 and IPv4-compatible ::/96 too), a 64:ff9b::/96 address embedding an IPv4 address
+/// rejected here, any address with a scope/zone index (%zone), and any string containing a NUL.
 @inline(__always)
 func isGloballyRoutablePublicIP(_ presentation: String) -> Bool {
   guard !presentation.contains("%") else { return false }
@@ -399,6 +421,7 @@ func asnLookupAddress(for presentation: String) -> String? {
 /// Returns nil if the input isn't a parseable IPv6 address. Scope suffix `%zone`
 /// is stripped before parsing.
 public func reverseIPv6Nibbles(_ ip: String) -> String? {
+  guard !containsNUL(ip) else { return nil }
   let (bare, _) = parseIPv6Scoped(ip)
   var addr = in6_addr()
   guard bare.withCString({ inet_pton(AF_INET6, $0, &addr) }) == 1 else { return nil }

@@ -296,7 +296,6 @@ private final class BlockedSendPair: @unchecked Sendable {
   private var draining = false
   private var drainerRunning = false
   private var drainedBytes = 0
-  private let drainerExited = DispatchSemaphore(value: 0)
 
   /// How many bytes the drainer has consumed so far. Every byte counted here is
   /// space the writer did not have when its burst started.
@@ -369,22 +368,24 @@ private final class BlockedSendPair: @unchecked Sendable {
           if received > 0 { recordDrained(received) }
         }
       }
-      drainerExited.signal()
+      // The drainer owns the reader once it runs, and closes it as it exits.
+      _ = Darwin.close(reader)
     }
     thread.stackSize = 512 * 1024
     thread.start()
     ready.wait()
   }
 
+  /// Closes the pair without waiting for the drainer, which closes the reader itself within its
+  /// 20 ms poll. Safe to call from `defer` in an async test, since it parks no thread.
   func close() {
     lock.lock()
-    let wasRunning = drainerRunning
+    let drainerOwnsReader = drainerRunning
     draining = false
     drainerRunning = false
     lock.unlock()
-    if wasRunning { drainerExited.wait() }
     _ = Darwin.close(writer)
-    _ = Darwin.close(reader)
+    if !drainerOwnsReader { _ = Darwin.close(reader) }
   }
 
   private func shouldKeepDraining() -> Bool {

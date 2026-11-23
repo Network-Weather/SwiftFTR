@@ -1444,8 +1444,10 @@ public actor SwiftFTR {
   /// Private (RFC 1918), carrier-grade NAT (100.64.0.0/10), link-local, loopback,
   /// multicast, the other ranges the IANA special-purpose registries mark as not globally
   /// reachable (such as documentation and benchmarking), IPv6 outside the `2000::/3` unicast
-  /// space other than `64:ff9b::/96` (such as deprecated site-local `fec0::/10`), and malformed
-  /// strings (including placeholder sentinels like `"unknown"`) are rejected.
+  /// space other than `64:ff9b::/96` (such as deprecated site-local `fec0::/10`), a `64:ff9b::/96`
+  /// address whose embedded IPv4 address is one of those (RFC 6052 section 3.1), and malformed
+  /// strings (including placeholder sentinels like `"unknown"` and any string containing a NUL)
+  /// are rejected.
   ///
   /// A successful seed applies only to the cache generation active at the call. Any
   /// subsequent invalidation (such as ``invalidatePublicIP()``, ``clearCaches()``, or

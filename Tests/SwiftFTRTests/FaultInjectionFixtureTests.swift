@@ -40,11 +40,14 @@ struct FaultInjectionFixtureTests {
     let gate = StallGate()
     defer { gate.open() }
     let finished = FaultCounter()
-    await #expect(throws: WatchdogExpired.self) {
-      _ = try await measure(within: 0.2) {
+    do {
+      _ = try await measure(within: 0.2, diagnose: "fixture state") {
         await gate.waitAsync(limit: 20)
         finished.increment()
       }
+      Issue.record("the watchdog did not fire")
+    } catch let expired as WatchdogExpired {
+      #expect(expired.diagnosis == "fixture state", "\(expired)")
     }
     #expect(finished.value == 0, "the watchdog returned only after the operation had ended")
 
@@ -52,6 +55,92 @@ struct FaultInjectionFixtureTests {
     gate.open()
     #expect(
       await eventually(within: 10) { finished.value == 1 }, "the abandoned operation never ended")
+  }
+
+  @Test("A loopback fixture is never handed the port of a socket bound to the unspecified address")
+  func loopbackFixtureKeepsOffWildcardPorts() throws {
+    // A probe socket the library sends on unbound takes an ephemeral port on the unspecified
+    // address at its first send. A fixture later handed the same number on ::1 would receive
+    // every loopback reply meant for the probe socket, and the operation would wait out its whole
+    // window. Hold `held` such sockets and bind `binds` fixtures one at a time: were the kernel
+    // free to hand out held ports, about held * binds / 16384 (some 31) would collide.
+    let held = 128
+    let binds = 4000
+    var holders: [Int32] = []
+    defer { for fd in holders { close(fd) } }
+    var heldPorts = Set<UInt16>()
+    for _ in 0..<held {
+      let fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+      guard fd >= 0 else { throw FixtureError.socket("socket", errno) }
+      holders.append(fd)
+      var any = sockaddr_in6()
+      any.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      any.sin6_family = sa_family_t(AF_INET6)
+      let bound = withUnsafePointer(to: &any) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+      }
+      guard bound == 0 else { throw FixtureError.socket("bind", errno) }
+      var actual = sockaddr_storage()
+      var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      _ = withUnsafeMutablePointer(to: &actual) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+      }
+      heldPorts.insert(
+        withUnsafeBytes(of: actual) {
+          UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+        })
+    }
+    var collisions: [UInt16] = []
+    for _ in 0..<binds {
+      let (fd, port) = try bindLoopback(family: AF_INET6, type: SOCK_DGRAM)
+      close(fd)
+      if heldPorts.contains(port) { collisions.append(port) }
+    }
+    #expect(heldPorts.count == held)
+    #expect(collisions.isEmpty, "fixtures were handed held ports: \(collisions)")
+  }
+
+  @Test("An IPv4 refusing UDP port is never handed to a dual-stack IPv6 socket")
+  func refusingUDPPortKeepsOffDualStack() throws {
+    // A dual-stack socket bound to [::] on a refusing port's number would receive the IPv4
+    // datagrams meant to be refused, and the operation under test would see silence. Hold
+    // `held` refusing ports and bind `binds` dual-stack sockets one at a time: were the kernel
+    // free to hand out the held numbers, about held * binds / 16384 (some 16) would collide.
+    let held = 64
+    let binds = 4000
+    let refusing = try (0..<held).map { _ in try RefusingUDPPort(family: AF_INET) }
+    let heldPorts = Set(refusing.map(\.port))
+    var collisions: [UInt16] = []
+    for _ in 0..<binds {
+      let fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+      guard fd >= 0 else { throw FixtureError.socket("socket", errno) }
+      defer { close(fd) }
+      var off: Int32 = 0
+      _ = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
+      var any = sockaddr_in6()
+      any.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      any.sin6_family = sa_family_t(AF_INET6)
+      let bound = withUnsafePointer(to: &any) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+      }
+      guard bound == 0 else { throw FixtureError.socket("bind", errno) }
+      var actual = sockaddr_storage()
+      var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      _ = withUnsafeMutablePointer(to: &actual) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+      }
+      let port = withUnsafeBytes(of: actual) {
+        UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+      }
+      if heldPorts.contains(port) { collisions.append(port) }
+    }
+    #expect(heldPorts.count == held)
+    #expect(collisions.isEmpty, "dual-stack sockets were handed refusing ports: \(collisions)")
+    withExtendedLifetime(refusing) {}
   }
 
   @Test("The UDP responder hands a zero-byte request to its script")
@@ -107,12 +196,14 @@ struct FaultInjectionFixtureTests {
   }
 
   @Test(
-    "Stopping the TCP server ends every handler before it returns",
+    "Stopping the TCP server does not wait for its handlers; stopAndWait() ends every one",
     arguments: [
       LoopbackTCPServer.Behavior.silent,
       .respond(response: Array("late".utf8), after: 30),
     ])
-  func tcpServerStopJoinsHandlers(behavior: LoopbackTCPServer.Behavior) async throws {
+  func tcpServerStopDoesNotWaitAndStopAndWaitJoins(behavior: LoopbackTCPServer.Behavior)
+    async throws
+  {
     let exitGate = StallGate()
     defer { exitGate.open() }
     let server = try LoopbackTCPServer(behavior: behavior, exitGate: exitGate)
@@ -123,28 +214,71 @@ struct FaultInjectionFixtureTests {
       $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(client, $0, length) }
     }
     #expect(connected == 0)
-    _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
+    if case .respond = behavior {
+      // Sent at once, so it is waiting for the handler however late the handler or this task
+      // runs, and read by the handler before stop(): a request still unread when the connection
+      // closes turns the end-of-file checked below into a reset. The silent handler reads
+      // nothing, so it is sent no request.
+      _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
+    }
     #expect(await eventually(within: 10) { server.accepted.value == 1 })
+    if case .respond = behavior {
+      #expect(await eventually(within: 10) { server.requestsRead.value == 1 })
+    }
 
-    // stop() runs on its own thread. The handler is held at the exit gate, so stop() must not
-    // return until the gate opens: returning earlier means it did not wait for the handler.
-    let stopped = FaultCounter()
-    Thread.detachNewThread {
-      server.stop()
-      stopped.increment()
+    // The handler cannot finish while the exit gate is shut (its own limit is 30 s), so a stop()
+    // that returns within the 10 s watchdog did so without waiting for it. Run on its own thread,
+    // so a stop() that does wait cannot park this test's.
+    let returned = await returnsWithin(10) { server.stop() }
+    #expect(returned, "stop() waited for a handler")
+
+    // stopAndWait() must not return until the gate opens: returning earlier means it did not wait
+    // for the handler.
+    let joined = FaultCounter()
+    let join = Task {
+      await server.stopAndWait()
+      joined.increment()
     }
     try await Task.sleep(nanoseconds: 300_000_000)
-    #expect(stopped.value == 0, "stop() returned while a handler was still running")
+    #expect(joined.value == 0, "stopAndWait() returned while a handler was still running")
 
-    // Released, the handler finishes and stop() returns, without waiting for the handler's own
-    // 30 s behavior.
+    // Released, the handler finishes and stopAndWait() returns, without waiting for the
+    // handler's own 30 s behavior.
     exitGate.open()
-    #expect(await eventually(within: 10) { stopped.value == 1 }, "stop() did not return")
+    _ = try await measure(within: 10) { await join.value }
+    #expect(joined.value == 1)
 
     // The connection was shut down, so the client sees end-of-file: 0, not a receive timeout.
     setReceiveTimeout(client, seconds: 1)
     var buffer = [UInt8](repeating: 0, count: 16)
     let received = recv(client, &buffer, buffer.count, 0)
     #expect(received == 0, "recv returned \(received), errno \(errno)")
+  }
+
+  /// Whether a fresh socket, with no reuse options, can bind `port` on loopback: false while
+  /// another socket still holds it.
+  static func canBind(type: Int32, port: UInt16) -> Bool {
+    let probe = socket(AF_INET, type, 0)
+    guard probe >= 0 else { return false }
+    defer { close(probe) }
+    var (address, length) = loopbackAddress(family: AF_INET, port: port)
+    return withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(probe, $0, length) }
+    } == 0
+  }
+
+  @Test("A stopped UDP fixture's own thread closes its socket")
+  func udpFixtureThreadClosesItsSocket() async throws {
+    let responder = try LoopbackUDPResponder { _ in nil }
+    let network = try FakeICMPNetwork { _ in [] }
+    let ports = [responder.port, network.port]
+    #expect(!ports.contains { Self.canBind(type: SOCK_DGRAM, port: $0) }, "a port was not held")
+    responder.stop()
+    network.stop()
+    // stop() returns at once and leaves the socket to the serve thread, which must close it.
+    let released = await eventually(within: 10) {
+      ports.allSatisfy { Self.canBind(type: SOCK_DGRAM, port: $0) }
+    }
+    #expect(released, "a serve thread did not close its socket")
   }
 }

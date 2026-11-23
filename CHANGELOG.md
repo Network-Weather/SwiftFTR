@@ -6,7 +6,65 @@ All notable changes to this project are documented here. This project follows Se
 Unreleased
 ----------
 
+### Breaking changes
+
+- **`DNSError` adds `connectionRefused` and `unreachable`**, the one source break 0.19 takes
+  (decision 10 in docs/BLOCKING-IO.md). An exhaustive `switch` over `DNSError` must handle both;
+  `MigratingTo019.md` has the edit. `swift package diagnose-api-breaking-changes v0.18.1` reports
+  exactly these two, and `api-breakage-allowlist.txt` lists them for the CI gate.
+
 ### Behavior changes
+
+- **The DNS query methods throw `connectionRefused` for a refused port** (they threw
+  `sendFailed`): the server's host answered with ICMP port unreachable after the query was sent.
+- **The DNS query methods throw `unreachable` for a host or network unreachable report** (they
+  threw `timeout`): the ICMP report arrived after the query was sent, at once rather than at the
+  timeout, so a caller that retried on `timeout` no longer does for this case.
+- **The DNS query methods throw `unreachable` when this machine has no route to the server**
+  (they threw `sendFailed`): `connect` or `send` failed with `EHOSTUNREACH`, `EHOSTDOWN`,
+  `ENETUNREACH` or `ENETDOWN`. Every other send or connect failure still throws `sendFailed`, and
+  `dnsProbe`'s results do not change for any of these.
+
+- **A DNS reply that echoes another question is ignored** (#128). A reply carrying the query's
+  transaction ID was accepted whatever question it echoed, and its answers were reported for the
+  name that was asked. A datagram whose first question is readable and names another name
+  (compared without regard to ASCII case), type or class is now ignored like one with a foreign
+  transaction ID (RFC 5452 sections 3 and 9.1), by every DNS query, the whoami fallback's
+  included, and the query waits on to its deadline. A server that sends only such replies now makes
+  the query methods throw `DNSError.timeout` (they returned its answers) and `dnsProbe` report
+  `outcome == .timedOut`, `isReachable == false` (it reported `.answered`). A reply with no
+  question section, such as a header-only REFUSED, still decides the query with its response
+  code, and one whose first question cannot be read (a name that is not plain labels, over 255
+  bytes or cut short, or a type and class cut short) is still `malformedResponse`. One case moves
+  to that rule: a first question whose name is a compression pointer, which can only point into
+  the header, was read as the root name and its response code believed; it is now
+  `malformedResponse` (`dnsProbe`: `.malformedReply`, still reachable).
+- **`seedPublicIP` rejects a NAT64 address embedding a non-global IPv4 address** (#139).
+  `64:ff9b::/96` addresses were accepted whatever they embedded; RFC 6052 section 3.1 forbids the
+  well-known prefix for non-global IPv4 addresses. `seedPublicIP("64:ff9b::192.168.1.1", …)` now
+  returns `false`, and so does `64:ff9b::1`, which embeds `0.0.0.1`; `64:ff9b::8.8.8.8` is
+  still accepted.
+- **Address and destination strings containing a NUL are rejected** (#139). `inet_pton` and
+  `getaddrinfo` read a C string, so `"8.8.8.8\u{0}junk"` was taken as `8.8.8.8`. Now
+  `seedPublicIP` returns `false`; `isPrivateIPv4` and `isCGNATIPv4` return `false`;
+  `reverseIPv6Nibbles` and `reverseDNS(_:)` return `nil` without a lookup; a DNS query to such a
+  server throws `DNSError.invalidIP`; a source address with a NUL fails to bind
+  (`TracerouteError.sourceIPBindFailed` for ping and trace, `DNSError.bindFailed` for DNS, an
+  error result for the TCP and UDP probes); and
+  a destination with a NUL throws `TracerouteError.resolutionFailed` from ping and trace and is
+  an unresolved result from the TCP and UDP probes, where each resolved and probed the text before
+  the NUL. Interface names are not checked.
+- **The CLI describes a failed DNS probe as one that could not complete** (#140). `swift-ftr
+  probe dns` printed `failed: the probe could not run` for `outcome == .failed`, which also covers
+  a probe whose query was sent and whose receive then failed; it now prints `failed: the probe
+  could not complete`.
+
+- **`testBufferbloat` sends its default upload load to Cloudflare's speed test** (#89). With no
+  `uploadURL`, the upload load went to `https://httpbin.org/post`, a free community service that
+  makes no availability promise. It now goes to `https://speed.cloudflare.com/__up`, the same
+  provider as the default download load, which is built for this traffic. The requests are
+  unchanged (256 KiB POSTs on each of `parallelStreams` streams until the load phase ends). A
+  caller that sets `uploadURL` is unaffected.
 
 - **`getPublicIPs` ends when its caller is cancelled, and no longer blocks Swift's cooperative
   pool** (finding 9 in `docs/ROBUSTNESS-TESTING.md`). Its IPv4 and IPv6 sweeps are child tasks of
@@ -31,9 +89,46 @@ Unreleased
   up at STUN's share and the fallback can still find the address where discovery used to find
   none.
 
+### Bug fixes
+
+- **A ping whose send failed ends once every probe that was sent is answered** (#138). Early
+  completion compared the replies with the configured `count`, which a ping with a failed send
+  never reaches, so it waited out its whole reply window. Once the send loop has finished, it now
+  compares them with the sends that succeeded, whether the loop or the last reply comes last.
+  Results are unchanged; a ping with an unanswered probe still waits out the full `timeout` after
+  its last send.
+- **The README's DNS Probe feature line described the query API** (#136). It now describes
+  `dnsProbe`, with the 11-record-type query API (`tracer.dns`) listed separately.
+
 ### Tooling
 
-- The blocking DNS query behind the whoami fallback is removed; every DNS query now uses the
+- **Fixture teardown no longer parks a thread of Swift's cooperative pool** (#129). `stop()` on
+  the loopback test fixtures (`FakeICMPNetwork`, `LoopbackUDPResponder`, `LoopbackTCPServer`,
+  `ScriptedDNSPeer`, `RefusingThenAnsweringUDPPort`, `EndlessReplies`) and
+  `BlockedSendPair.close()` used to wait on a semaphore for the fixture's thread, from `defer` in
+  async tests: 547 calls on cooperative threads per offline run, 2.8 s of parked thread time in
+  all, up to 21 ms each. They now signal and return, and each fixture thread closes its own socket as it
+  exits, under the lock any other sender checks, so a descriptor number is never used after it is
+  closed. `LoopbackTCPServer.stopAndWait()` is added for a test that needs the handlers joined.
+  With `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` the offline suite ran in 7.4 to 8.8 s before and
+  4.6 to 4.9 s after (three runs each, debug, one Mac); with the default pool, 4.05 s against
+  4.03 s.
+- **The DNS wire-hardening tests pass with the cooperative pool limited.** Their fixture blocked
+  in `recvfrom` inside `Task.detached`, and with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` the
+  query it was answering could not run, so a test failed with a timeout. The fixture now
+  receives on a thread of its own.
+- **Tests that wait for a cancellation to land fail at a watchdog instead of hanging** (#135).
+  `cancelActiveTracesInterruptsASNEnrichment` waited forever on its trace when
+  `cancelActiveTraces()` did nothing; it now fails after its 20 s watchdog. The same
+  `measure(within:)` wrap is on every other test that awaited a task only its cancellation, or a
+  deadline under test, could end: in the blocking-I/O bridge, bufferbloat, interface-bound HTTPS,
+  multipath, ping lifecycle, TCP probe and DNS wire-hardening tests.
+- **`cancelledLookupNotCached` covers the stall breaker.** It cancels two reverse-DNS lookups
+  that have each run past the stall threshold and checks that neither opens the breaker, with two
+  uncancelled lookups of the same length as the control that does. The previous version, which
+  cancelled one lookup at once, passed with the cancellation check moved below the breaker
+  update; this one fails.
+- **The blocking DNS query behind the whoami fallback is removed**; every DNS query now uses the
   event-based transport. The public-IP test seam is async, and new task-local seams point STUN
   and the whoami fallback at loopback fixtures.
 
@@ -814,7 +909,6 @@ examples and a checklist.
 
 - `IPv6Reachability` helper gates network-gated v6 tests on actual routable v6 connectivity — skips cleanly on v4-only CI runners. GitHub-hosted macOS runners notably lack public v6, so the v6 integration tests skip there.
 - All **168** unit tests pass with `PTR_SKIP_STUN=1 SKIP_NETWORK_TESTS=1 swift test`.
-
 
 0.12.4 — 2026-05-27
 -------------------

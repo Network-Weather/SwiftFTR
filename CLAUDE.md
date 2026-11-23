@@ -31,6 +31,17 @@ swift format lint --strict -r Sources Tests
 swift format format --in-place -r Sources Tests
 ```
 
+### API compatibility
+```bash
+# Fails on any source break against the last release that the allowlist does not name
+# (one exact diagnostic per line, as the tool prints it; no comments). CI runs the same, on
+# Xcode 26.3 rather than the minimum toolchain: Swift 6.1.2's command reports every public
+# declaration as removed. CI also runs it without the allowlist and requires exactly the
+# allowlisted breaks, so the check is shown to discriminate.
+swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
+  --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt"
+```
+
 ### Documentation
 ```bash
 swift package --allow-writing-to-directory docc \
@@ -129,7 +140,19 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 SwiftFTR has production consumers whose integrations depend on contracts that are easy to break silently: single dest-string entry points, canonical `inet_ntop` address form, link-local zone-suffix preservation, family-agnostic errors, concurrent-ping safety, unprivileged sockets only. For non-trivial API changes, surface the relevant constraints up front in your plan, not during PR review.
 
-Never name, link, or path-reference specific downstream applications or their private repositories anywhere in this repository — docs, code comments, commit messages, telemetry excerpts. Refer to them as "downstream consumers" / "the host app", and strip consumer-internal details (source paths, line numbers, commit hashes, infrastructure identifiers) when recording field evidence here.
+A downstream application may be named. Never link or path-reference its private repositories,
+and never disclose private information about a consumer: source paths, line numbers, commit
+hashes, infrastructure identifiers, customer or usage details. Strip those when recording field
+evidence here. (David, 2026-11-22, relaxing the earlier rule that the application itself must not
+be named.)
+
+## CI runs on GitHub-hosted runners
+
+This repository is public and accepts pull requests from forks, so its workflows run on
+GitHub-hosted macOS runners, never on a self-hosted one: a self-hosted runner would execute a
+stranger's pull-request code on a private machine. This is a deliberate exception to the general
+rule that CI runs on self-hosted runners. Do not add `runs-on: self-hosted` (or a self-hosted
+label) to any workflow here. (David, 2026-11-22.)
 
 ## Size the pull request, not just the commits
 

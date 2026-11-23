@@ -73,8 +73,18 @@ struct CLIDNSProbeOutputTests {
     Row(
       name: "failed",
       result: result(.failed, reachable: false, error: "Invalid server IP: x"),
-      lines: down + ["  Outcome: failed: the probe could not run", "  Error: Invalid server IP: x"]
+      lines: down + [
+        "  Outcome: failed: the probe could not complete", "  Error: Invalid server IP: x",
+      ]
     ),
+    // A probe whose query was sent and whose receive then failed reports `.failed` too, so the
+    // wording must not say it never ran.
+    Row(
+      name: "failed, after the query was sent",
+      result: result(.failed, reachable: false, error: "Receive failed (errno=54)"),
+      lines: down + [
+        "  Outcome: failed: the probe could not complete", "  Error: Receive failed (errno=54)",
+      ]),
     // An outcome this build does not know prints its raw value.
     Row(
       name: "an outcome added later",

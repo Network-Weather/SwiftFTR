@@ -56,12 +56,22 @@ struct DNSProbeOutcomeTests {
     #expect(result.elapsed == rtt)
   }
 
-  @Test("A refused port is refused, with elapsed and no rtt", arguments: [AF_INET, AF_INET6])
+  @Test(
+    "A refused port is refused, with elapsed and no rtt, and the query methods throw connectionRefused",
+    arguments: [AF_INET, AF_INET6])
   func refused(family: Int32) async throws {
     let refusing = try RefusingUDPPort(family: family)
-    let result = try await Self.probe(
-      port: refusing.port, server: family == AF_INET6 ? "::1" : "127.0.0.1")
+    let server = family == AF_INET6 ? "::1" : "127.0.0.1"
+    let result = try await Self.probe(port: refusing.port, server: server)
+    let (thrown, _) = try await measure(within: Self.watchdog) {
+      await EventBasedDNSTests.error {
+        try await __dnsQuery(
+          server: server, port: refusing.port, name: "outcome.example", type: 1,
+          timeout: Self.longTimeout)
+      }
+    }
     withExtendedLifetime(refusing) {}
+    #expect(EventBasedDNSTests.isConnectionRefused(thrown), "\(String(describing: thrown))")
 
     #expect(result.outcome == .refused)
     #expect(!result.isReachable)
@@ -118,9 +128,21 @@ struct DNSProbeOutcomeTests {
     let server = try Self.answering()
     defer { server.stop() }
 
-    let result = try await TestSeams.$receiveDatagram.withValue(Self.receiveFails(with: code)) {
-      try await Self.probe(port: server.port)
+    let (result, thrown) = try await TestSeams.$receiveDatagram.withValue(
+      Self.receiveFails(with: code)
+    ) {
+      let result = try await Self.probe(port: server.port)
+      let (thrown, _) = try await measure(within: Self.watchdog) {
+        await EventBasedDNSTests.error {
+          try await __dnsQuery(
+            server: "127.0.0.1", port: server.port, name: "outcome.example", type: 1,
+            timeout: Self.longTimeout)
+        }
+      }
+      return (result, thrown)
     }
+    // 0.18 threw `timeout` here, although the report arrived long before the timeout.
+    #expect(EventBasedDNSTests.isUnreachable(thrown), "\(String(describing: thrown))")
     #expect(result.outcome == .unreachable)
     #expect(!result.isReachable)
     #expect(result.rtt == nil)
@@ -130,6 +152,12 @@ struct DNSProbeOutcomeTests {
     #expect(error.hasPrefix(code == ENETUNREACH ? "Network unreachable" : "Host unreachable"))
     #expect(error.contains(String(cString: strerror(code))), "\(error)")
     #expect(!error.contains("Timeout"))
+    // The whole message, as 0.18 wrote it.
+    let expected =
+      code == ENETUNREACH
+      ? "Network unreachable - the network reported no route to the server (errno=51: Network is unreachable)"
+      : "Host unreachable - the network reported the server's host unreachable (errno=65: No route to host)"
+    #expect(error == expected)
   }
 
   enum Failure: String, CaseIterable, CustomTestStringConvertible, Sendable {
@@ -147,23 +175,46 @@ struct DNSProbeOutcomeTests {
       return -1
     }
 
-    let result: DNSProbeResult
+    let address = failure == .invalidServer ? "not-an-address" : "127.0.0.1"
+    // The probe and the query method, run under the same seams.
+    func run() async throws -> (DNSProbeResult, Error?) {
+      let result = try await Self.probe(port: server.port, server: address)
+      let (thrown, _) = try await measure(within: Self.watchdog) {
+        await EventBasedDNSTests.error {
+          try await __dnsQuery(
+            server: address, port: server.port, name: "outcome.example", type: 1,
+            timeout: Self.longTimeout)
+        }
+      }
+      return (result, thrown)
+    }
+
+    let (result, thrown): (DNSProbeResult, Error?)
     switch failure {
     case .send:
-      result = try await TestSeams.$sendDatagram.withValue(send) {
-        try await Self.probe(port: server.port)
-      }
+      (result, thrown) = try await TestSeams.$sendDatagram.withValue(send) { try await run() }
     case .connect:
-      result = try await TestSeams.$connectSocket.withValue(Self.connectFails(with: EADDRNOTAVAIL))
-      {
-        try await Self.probe(port: server.port)
-      }
+      (result, thrown) = try await TestSeams.$connectSocket.withValue(
+        Self.connectFails(with: EADDRNOTAVAIL)
+      ) { try await run() }
     case .unclassifiedReceive:
-      result = try await TestSeams.$receiveDatagram.withValue(Self.receiveFails(with: ECONNRESET)) {
-        try await Self.probe(port: server.port)
-      }
+      (result, thrown) = try await TestSeams.$receiveDatagram.withValue(
+        Self.receiveFails(with: ECONNRESET)
+      ) { try await run() }
     case .invalidServer:
-      result = try await Self.probe(port: server.port, server: "not-an-address")
+      (result, thrown) = try await run()
+    }
+    // The query methods keep 0.18's errors for these: only refusals and no-route reports moved.
+    switch failure {
+    case .send, .connect:
+      #expect(EventBasedDNSTests.isSendFailed(thrown), "\(String(describing: thrown))")
+    case .unclassifiedReceive:
+      #expect(EventBasedDNSTests.isTimeout(thrown), "\(String(describing: thrown))")
+    case .invalidServer:
+      if case DNSError.invalidIP("not-an-address")? = thrown {
+      } else {
+        Issue.record("expected invalidIP, got \(String(describing: thrown))")
+      }
     }
     #expect(result.outcome == .failed)
     #expect(!result.isReachable)
@@ -218,7 +269,7 @@ struct DNSProbeOutcomeTests {
   }
 
   @Test(
-    "No route at connect or send is unreachable, with no timing, and the query methods still throw sendFailed",
+    "No route at connect or send is unreachable, with no timing, and the query methods throw unreachable",
     arguments: Stage.allCases, [EHOSTUNREACH, EHOSTDOWN, ENETUNREACH, ENETDOWN])
   func locallyUnreachable(stage: Stage, code: Int32) async throws {
     let server = try Self.answering()
@@ -250,7 +301,7 @@ struct DNSProbeOutcomeTests {
     let network = code == ENETUNREACH || code == ENETDOWN
     #expect(error.hasPrefix(network ? "Network unreachable" : "Host unreachable"), "\(error)")
     #expect(error.contains("(errno=\(code): \(String(cString: strerror(code))))"), "\(error)")
-    #expect(EventBasedDNSTests.isSendFailed(thrown), "\(String(describing: thrown))")
+    #expect(EventBasedDNSTests.isUnreachable(thrown), "\(String(describing: thrown))")
     #expect(server.requests.value == 0)
   }
 
@@ -279,6 +330,47 @@ struct DNSProbeOutcomeTests {
     #expect(txts == [CymruFixture.origin])
     #expect(connects.value == 2)
     #expect(server.requests.value == 1)
+  }
+
+  enum DeliveredFailure: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case refused, hostUnreachable, networkUnreachable
+    var errno: Int32 {
+      switch self {
+      case .refused: ECONNREFUSED
+      case .hostUnreachable: EHOSTUNREACH
+      case .networkUnreachable: ENETUNREACH
+      }
+    }
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "A TXT lookup refused or unreachable at the first server moves on to the next",
+    arguments: DeliveredFailure.allCases)
+  func txtDeliveredFailureFallsThrough(failure: DeliveredFailure) async throws {
+    let server = try LoopbackUDPResponder { query in CymruFixture.answer(query) }
+    defer { server.stop() }
+    // The first exchange's read reports the failure in place of its reply; later reads are plain.
+    let reads = FaultCounter()
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      reads.increment()
+      guard reads.value == 1 else { return Darwin.recv(fd, buffer.baseAddress, buffer.count, 0) }
+      _ = Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
+      Darwin.errno = failure.errno
+      return -1
+    }
+
+    let (txts, _) = try await measure(within: Self.watchdog) {
+      await TestSeams.$receiveDatagram.withValue(receive) {
+        await TestSeams.$dnsServerPort.withValue(server.port) {
+          await DNSClient.queryTXT(
+            name: "8.8.8.8.origin.asn.cymru.com", timeout: Self.longTimeout,
+            servers: ["127.0.0.1", "127.0.0.1"])
+        }
+      }
+    }
+    #expect(txts == [CymruFixture.origin])
+    #expect(server.requests.value == 2)
   }
 
   @Test("The reported round trip excludes time spent inside the read call")

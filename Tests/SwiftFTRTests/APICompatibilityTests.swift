@@ -50,4 +50,30 @@ struct APICompatibilityTests {
     #expect(config.sourceIP == nil)
     _ = probe
   }
+
+  /// Compiles only while these are exactly ``DNSError``'s cases: a case added or removed breaks
+  /// this exhaustive switch, as it would a consumer's. 0.19 added `connectionRefused` and
+  /// `unreachable`.
+  @Test("DNSError has exactly the cases a consumer's exhaustive switch names")
+  func dnsErrorCasesAreExhaustive() {
+    func name(_ error: DNSError) -> String {
+      switch error {
+      case .invalidIP: "invalidIP"
+      case .invalidHostname: "invalidHostname"
+      case .invalidTimeout: "invalidTimeout"
+      case .socketCreationFailed: "socketCreationFailed"
+      case .setsockoptFailed: "setsockoptFailed"
+      case .bindFailed: "bindFailed"
+      case .sendFailed: "sendFailed"
+      case .connectionRefused: "connectionRefused"
+      case .unreachable: "unreachable"
+      case .timeout: "timeout"
+      case .malformedResponse: "malformedResponse"
+      case .noRecords: "noRecords"
+      case .serverError: "serverError"
+      }
+    }
+    #expect(name(.connectionRefused) == "connectionRefused")
+    #expect(name(.unreachable) == "unreachable")
+  }
 }

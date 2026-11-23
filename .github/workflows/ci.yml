@@ -41,6 +41,48 @@ jobs:
       - name: Build external API compatibility consumer
         run: swift build --package-path TestLibraryUsage
 
+  api:
+    name: API compatibility (against v0.18.1)
+    runs-on: macos-15
+    needs: format
+    # Swift 6.1.2's `swift package diagnose-api-breaking-changes` reports every public declaration
+    # of this package as removed (124 "has been removed"), with or without the allowlist and with
+    # --products or --targets, although its own swift-api-digester, run directly against the same
+    # baseline dump, reports exactly the two added DNSError cases. So this job, and only this job,
+    # runs on a newer Xcode from the image; build and test stay on the minimum toolchain.
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # The baseline is a tag: fetch all history and tags so v0.18.1 can be checked out.
+          fetch-depth: 0
+          fetch-tags: true
+      - name: Swift version
+        run: swift --version
+      # The check must discriminate: without the allowlist it has to report exactly the breaks the
+      # allowlist names, one exact diagnostic per line, and nothing else. The breaks allowed are the
+      # ones docs/BLOCKING-IO.md names for 0.19.
+      - name: Without the allowlist, exactly the allowlisted breaks are reported
+        run: |
+          set +e
+          swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR > unlisted.log 2>&1
+          status=$?
+          set -e
+          grep -o 'API breakage: .*' unlisted.log | sort > reported.txt
+          grep -v '^[[:space:]]*$' api-breakage-allowlist.txt | sort > allowed.txt
+          cat reported.txt
+          if [ "$status" -eq 0 ] || ! diff -u allowed.txt reported.txt; then
+            echo "::error::the API check without the allowlist did not report exactly the allowlisted breaks"
+            tail -40 unlisted.log
+            exit 1
+          fi
+      - name: Diagnose API breaking changes
+        run: |
+          swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
+            --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt"
+
   docs:
     name: Documentation (DocC)
     runs-on: macos-15

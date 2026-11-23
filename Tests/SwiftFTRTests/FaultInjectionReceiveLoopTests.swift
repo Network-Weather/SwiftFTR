@@ -45,7 +45,6 @@ final class EndlessReplies: @unchecked Sendable {
   private var senderGone = false
   private var lastSend: TimeInterval?
   private var longestGap: TimeInterval = 0
-  private let senderExited = DispatchSemaphore(value: 0)
 
   init(family: Int32 = AF_INET) {
     self.family = family
@@ -123,11 +122,14 @@ final class EndlessReplies: @unchecked Sendable {
     lock.unlock()
     let datagram = ICMPWire.echoReply(family: family, id: identifier &+ 1, seq: 1)
     let thread = Thread { [self] in
+      // The sender releases the duplicate itself, after its last reply, so the port stays
+      // reserved for as long as replies are sent to it.
       defer {
         lock.lock()
         senderGone = true
+        if socketCopy >= 0 { close(socketCopy) }
+        socketCopy = -1
         lock.unlock()
-        senderExited.signal()
       }
       send(datagram, to: port)
     }
@@ -197,18 +199,17 @@ final class EndlessReplies: @unchecked Sendable {
     return max(0, sentCount - Int(queued))
   }
 
-  /// Stops the replies, waits for the sender to exit, and releases the duplicate descriptor.
+  /// Stops the replies without waiting. The duplicate descriptor is released here if the replies
+  /// never started, and otherwise by the sender as it exits, within one ``interval`` of this call,
+  /// so the port stays reserved until the last reply has gone. Safe to call from `defer` in an
+  /// async test, since it parks no thread.
   func stop() {
     lock.lock()
-    let wasStopped = stopped
-    let wasStarted = started
     stopped = true
-    lock.unlock()
-    guard !wasStopped else { return }
-    if wasStarted { senderExited.wait() }
-    lock.lock()
-    if socketCopy >= 0 { close(socketCopy) }
-    socketCopy = -1
+    if !started, socketCopy >= 0 {
+      close(socketCopy)
+      socketCopy = -1
+    }
     lock.unlock()
   }
 
