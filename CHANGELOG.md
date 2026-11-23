@@ -6,8 +6,50 @@ All notable changes to this project are documented here. This project follows Se
 Unreleased
 ----------
 
+### Behavior changes
+
+- **`httpProbe` reports a server that sent its headers and then stalled its body as reachable**
+  (#122). URLSession tells the probe about a response only once body bytes follow the headers, so
+  such a server reached the timeout and was reported as `isReachable == false`,
+  `statusCode == nil`, error `"Timeout"`. When the timeout fires after the first response byte
+  arrived, the result is now `isReachable == true`, `rtt` is the time to that byte, and `error`
+  begins `"Timeout: "` and says whether the headers were complete. `statusCode` is set when
+  URLSession had parsed the headers, which it does once some body bytes have arrived; with none,
+  complete headers cannot be told from a partial status line, so it stays `nil`. A timeout before
+  any response byte is unchanged. The probe still reports these only at its timeout, not when the
+  headers arrive.
+- **A DNS error reply that is missing records its header declares is malformed** (#119). The
+  question and answer records a reply's header declares are now checked before its response
+  code, for every code, as they already were for NOERROR. A reply with the query's transaction
+  ID, an error code such as NXDOMAIN, SERVFAIL or REFUSED, and a declared question or answer
+  record that is missing or cut short now throws `DNSError.malformedResponse` from the query
+  methods (it threw `serverError`), and `dnsProbe` reports `outcome == .malformedReply` with
+  `responseCode == nil` (it reported `.answered` with that code). `isReachable` and `rtt` are
+  unchanged. Well-formed error replies keep their code, including NXDOMAIN with an SOA in the
+  authority section and REFUSED sent as a bare header; authority and additional records are
+  not checked, for any code.
+- **`seedPublicIP` rejects IPv6 addresses outside the unicast space** (#92). It accepted any IPv6
+  address its special-range checks did not name, including deprecated site-local `fec0::/10`
+  (RFC 3879), IPv4-compatible `::/96` and other blocks the IANA IPv6 Address Space registry
+  reserves, none of which can be a host's public address. It now accepts IPv6 only in `2000::/3`
+  (RFC 4291 section 2.4) or the NAT64 prefix `64:ff9b::/96` (RFC 6052), still minus the
+  special-purpose ranges it already rejected, and returns `false` for the rest, so discovery runs
+  instead. IPv4 checks are unchanged; they already matched the IANA IPv4 registry. Hop
+  classification is unchanged.
+
 ### Bug fixes
 
+- **`ping` counts only the first reply to each request it sent** (#106). Any echo reply carrying
+  the ping's identifier was recorded under its sequence number, and the ping ended once it held
+  as many as it sends. A reply to a sequence never sent could end a ping after its first probe
+  with no loss reported, or before a later probe's reply with loss reported on a clean path; a
+  reply to a sequence not yet sent was taken as that probe's reply, with a negative RTT; a
+  duplicate replaced the first reply's RTT and TTL. Such replies are now ignored, including one
+  that reached the socket before its request left (while the send was retrying buffer
+  pressure), judged by the kernel's arrival stamp (`SO_TIMESTAMP_MONOTONIC`). On a network
+  that sends them, `received`, `packetLoss` and the RTTs can differ from 0.18.0, which
+  misreported them. `PingConfig.timeout` is now documented as what it always was: the reply
+  window after the last request, within which a reply to any earlier request still counts.
 - **`tcpProbe` and `udpProbe` no longer probe on a blocking socket when `fcntl` fails** (#107).
   Both ignored the results of the two `fcntl` calls that set `O_NONBLOCK`. A blocking TCP
   `connect` waits for the kernel's own connect timeout, past the probe's timeout and its
@@ -22,69 +64,16 @@ Unreleased
   and an `Elapsed:` line when something came back without a round trip, such as a refusal. An
   answer prints as before. `--json` output, the flags and the exit status are unchanged: exit 1
   when the server is not reachable (refused, timed out, unreachable, failed), 0 otherwise.
-### Behavior changes
-
-- **`httpProbe` reports a server that sent its headers and then stalled its body as reachable**
-  (#122). URLSession tells the probe about a response only once body bytes follow the headers, so
-  such a server reached the timeout and was reported as `isReachable == false`,
-  `statusCode == nil`, error `"Timeout"`. When the timeout fires after the first response byte
-  arrived, the result is now `isReachable == true`, `rtt` is the time to that byte, and `error`
-  begins `"Timeout: "` and says whether the headers were complete. `statusCode` is set when
-  URLSession had parsed the headers, which it does once some body bytes have arrived; with none,
-  complete headers cannot be told from a partial status line, so it stays `nil`. A timeout before
-  any response byte is unchanged. The probe still reports these only at its timeout, not when the
-  headers arrive.
-### Behavior changes
-
-- **A DNS error reply that is missing records its header declares is malformed** (#119). The
-  question and answer records a reply's header declares are now checked before its response
-  code, for every code, as they already were for NOERROR. A reply with the query's transaction
-  ID, an error code such as NXDOMAIN, SERVFAIL or REFUSED, and a declared question or answer
-  record that is missing or cut short now throws `DNSError.malformedResponse` from the query
-  methods (it threw `serverError`), and `dnsProbe` reports `outcome == .malformedReply` with
-  `responseCode == nil` (it reported `.answered` with that code). `isReachable` and `rtt` are
-  unchanged. Well-formed error replies keep their code, including NXDOMAIN with an SOA in the
-  authority section and REFUSED sent as a bare header; authority and additional records are
-  not checked, for any code.
-- **`ping` counts only the first reply to each request it sent** (#106). Any echo reply carrying
-  the ping's identifier was recorded under its sequence number, and the ping ended once it held
-  as many as it sends. A reply to a sequence never sent could end a ping after its first probe
-  with no loss reported, or before a later probe's reply with loss reported on a clean path; a
-  reply to a sequence not yet sent was taken as that probe's reply, with a negative RTT; a
-  duplicate replaced the first reply's RTT and TTL. Such replies are now ignored, including one
-  that reached the socket before its request left (while the send was retrying buffer
-  pressure), judged by the kernel's arrival stamp (`SO_TIMESTAMP_MONOTONIC`). On a network
-  that sends them, `received`, `packetLoss` and the RTTs can differ from 0.18.0, which
-  misreported them. `PingConfig.timeout` is now documented as what it always was: the reply
-  window after the last request, within which a reply to any earlier request still counts.
-- **Multipath flow workers carry every `SwiftFTRConfig` field of the tracer that started them**
-  (#91). The per-flow configuration was rebuilt field by field and left `rdnsCacheTTL`,
-  `rdnsCacheSize`, `rdnsLookupTimeout` and `asnResolverStrategy` at their defaults. Flows did not
-  act on those defaults: they share the caller's reverse-DNS cache and ASN resolver, which are
-  built from those settings, and tests now pin that a flow's reverse DNS stops at the caller's
-  deadline and that it classifies with the caller's resolver. One helper now copies the whole
-  configuration except a flow's hop limit, per-probe wait and forced IPv4 family, and a test fails
-  if a field added later is not carried over. No caller-visible change.
-
-### Behavior changes
-
-- **`seedPublicIP` rejects IPv6 addresses outside the unicast space** (#92). It accepted any IPv6
-  address its special-range checks did not name, including deprecated site-local `fec0::/10`
-  (RFC 3879), IPv4-compatible `::/96` and other blocks the IANA IPv6 Address Space registry
-  reserves, none of which can be a host's public address. It now accepts IPv6 only in `2000::/3`
-  (RFC 4291 section 2.4) or the NAT64 prefix `64:ff9b::/96` (RFC 6052), still minus the
-  special-purpose ranges it already rejected, and returns `false` for the rest, so discovery runs
-  instead. IPv4 checks are unchanged; they already matched the IANA IPv4 registry. Hop
-  classification is unchanged.
 - **Documentation corrections (#96).** The guides and reference say which operations
   `networkChanged()` and `cancelActiveTraces()` end (`trace`, `traceClassified`, `traceStream` and
   `discoverPaths`, not `ping` or the probes), that multipath public-IP discovery honours
   `publicIPDiscoveryTimeout`, and which work uses the blocking-I/O executor (system reverse DNS
   and public-IP discovery, not DNS queries or Team Cymru lookups). The README says that
   `trace --json` never sends private, CGNAT, loopback, link-local, multicast or unspecified
-  addresses to Team Cymru, and that `-i` is the
-  interval on `ping`, so cross-command guidance uses `--interface`. The EAGAIN page's summary says
-  a trace in which no probe was sent throws rather than reporting `.notSent`.
+  addresses to Team Cymru, and that `-i` is the interval on `ping`, so cross-command guidance uses
+  `--interface`. The EAGAIN page's summary says a trace in which no probe was sent throws rather
+  than reporting `.notSent`.
+
 ### Tooling
 
 - **The offline test selection no longer reaches the network (#92, #89).** With
@@ -94,6 +83,14 @@ Unreleased
   fixture or a local substitute and keeps its claim. The HTTP probe success and 404 tests, which
   failed whenever the third-party test site was slow, run offline against a loopback server; one
   gated HTTPS smoke test remains, with no assertion on the server's speed.
+- **Multipath flow workers carry every `SwiftFTRConfig` field of the tracer that started them**
+  (#91). The per-flow configuration was rebuilt field by field and left `rdnsCacheTTL`,
+  `rdnsCacheSize`, `rdnsLookupTimeout` and `asnResolverStrategy` at their defaults. Flows did not
+  act on those defaults: they share the caller's reverse-DNS cache and ASN resolver, which are
+  built from those settings, and tests now pin that a flow's reverse DNS stops at the caller's
+  deadline and that it classifies with the caller's resolver. One helper now copies the whole
+  configuration except a flow's hop limit, per-probe wait and forced IPv4 family, and a test fails
+  if a field added later is not carried over. No caller-visible change.
 
 0.18.0 — 2026-11-22
 -------------------

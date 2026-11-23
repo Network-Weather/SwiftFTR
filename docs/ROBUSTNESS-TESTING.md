@@ -334,7 +334,7 @@ numbers are as of the commit that added this section.
     trip, `.error` for TCP and no response type for UDP, with a message naming the failed step
     and errno, before anything is sent, with the socket closed. Tests: `ProbeNonBlockingSetupTests`.
 
-26. **A server that sent its headers and stalled its body was reported unreachable** (#122).
+27. **A server that sent its headers and stalled its body was reported unreachable** (#122).
     Confirmed, partly fixed. URLSession calls the delegate's `didReceive response` only once body
     bytes follow the headers: one byte when the response declares `Content-Type:
     application/octet-stream`, otherwise enough to sniff a type from (600 bytes was enough, 10
@@ -348,7 +348,7 @@ numbers are as of the commit that added this section.
     Reporting the status as soon as the headers arrive needs a transport that reads the status
     line itself. Test: `FaultInjectionWireTests.httpHeadersThenStall`, whose prompt-status
     expectations are recorded with `withKnownIssue`.
-26. **Ping counted echo replies it had not asked for.** Confirmed and fixed. Any echo reply with
+28. **Ping counted echo replies it had not asked for.** Confirmed and fixed. Any echo reply with
     the ping's identifier was recorded under its sequence number, and the ping ended once it had
     as many as it sends. A reply to a sequence never sent ended a three-probe ping after its first
     probe, reporting one sent, one received and no loss; with each probe answered behind a stray,
