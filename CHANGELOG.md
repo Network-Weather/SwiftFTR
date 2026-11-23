@@ -29,8 +29,8 @@ Unreleased
   transaction ID was accepted whatever question it echoed, and its answers were reported for the
   name that was asked. A datagram whose first question is readable and names another name
   (compared without regard to ASCII case), type or class is now ignored like one with a foreign
-  transaction ID (RFC 5452 sections 3 and 9.1), on the event-based path and the blocking whoami
-  path, and the query waits on to its deadline. A server that sends only such replies now makes
+  transaction ID (RFC 5452 sections 3 and 9.1), by every DNS query, the whoami fallback's
+  included, and the query waits on to its deadline. A server that sends only such replies now makes
   the query methods throw `DNSError.timeout` (they returned its answers) and `dnsProbe` report
   `outcome == .timedOut`, `isReachable == false` (it reported `.answered`). A reply with no
   question section, such as a header-only REFUSED, still decides the query with its response
@@ -65,6 +65,29 @@ Unreleased
   provider as the default download load, which is built for this traffic. The requests are
   unchanged (256 KiB POSTs on each of `parallelStreams` streams until the load phase ends). A
   caller that sets `uploadURL` is unaffected.
+
+- **`getPublicIPs` ends when its caller is cancelled, and no longer blocks Swift's cooperative
+  pool** (finding 9 in `docs/ROBUSTNESS-TESTING.md`). Its IPv4 and IPv6 sweeps are child tasks of
+  the caller, and each STUN server-name lookup and each STUN attempt runs on the bounded executor.
+  A cancelled call returns at once with what it had found, usually both fields `nil`, where it
+  used to run on until every server had answered or timed out. `stunTimeout` is still per server;
+  the call as a whole still has no bound while a server name is resolving. See
+  `MigratingTo019.md`.
+- **Public-IP discovery in `traceClassified` and `discoverPaths` stops at
+  `publicIPDiscoveryTimeout` instead of running on in an executor slot.** Discovery is async: one
+  deadline, `publicIPDiscoveryTimeout` from its start, bounds every STUN name lookup, STUN attempt
+  and whoami DNS query, and is passed down to each. Each STUN attempt is its own executor request,
+  abandoned after twice its per-server timeout or at the deadline, whichever is first, so a
+  stalled attempt keeps one slot but the discovery moves on to the next server and the fallback.
+  The STUN tier, name lookups included, also ends at its own share of the time: the number of
+  servers times the per-server timeout, cut where needed to leave the whoami fallback at least
+  half its DNS timeout (or half the budget, if that is smaller). With the default 6 s budget the
+  cut never applies: STUN ends by 4 s in the discovery before the trace (2 s per server) and by
+  1.6 s in the classifier's (0.8 s), leaving the fallback 2 s and 4.4 s, so with free slots and
+  silent servers the fallback starts when it did in 0.18.1. The whoami fallback uses the
+  event-based DNS transport and needs no slot, so with every slot held, STUN's name lookups give
+  up at STUN's share and the fallback can still find the address where discovery used to find
+  none. See `MigratingTo019.md`.
 
 ### Bug fixes
 
@@ -105,6 +128,9 @@ Unreleased
   uncancelled lookups of the same length as the control that does. The previous version, which
   cancelled one lookup at once, passed with the cancellation check moved below the breaker
   update; this one fails.
+- **The blocking DNS query behind the whoami fallback is removed**; every DNS query now uses the
+  event-based transport. The public-IP test seam is async, and new task-local seams point STUN
+  and the whoami fallback at loopback fixtures.
 
 0.18.1 — 2026-11-22
 -------------------
