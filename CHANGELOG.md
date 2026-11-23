@@ -87,7 +87,7 @@ Unreleased
   silent servers the fallback starts when it did in 0.18.1. The whoami fallback uses the
   event-based DNS transport and needs no slot, so with every slot held, STUN's name lookups give
   up at STUN's share and the fallback can still find the address where discovery used to find
-  none.
+  none. See `MigratingTo019.md`.
 
 ### Bug fixes
 
