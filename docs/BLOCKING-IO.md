@@ -258,11 +258,12 @@ overlap in time; the "After" column is what must have landed first.
 | Test Hygiene | | #135 (a watchdog on the ASN-enrichment cancellation test), #129 (fixture teardown that does not block an async test), the stronger `cancelledLookupNotCached` (ROADMAP). Tests only. |
 | DNS Error Cases | Small Fixes | `DNSError.connectionRefused` and `DNSError.unreachable`, mapped by where the failure came from: a refusal received after the send (`sendFailed` today), an unreachable received after the send (`timeout` today), and a local routing failure on connect or send (`sendFailed` today). `dnsProbe`'s result for each origin does not change. Adds the API allowlist and runs the API check in CI. |
 | Async Public-IP Discovery | Small Fixes | The stage below. STUN server names and each STUN attempt run as executor requests under one absolute discovery deadline; nothing moves onto the cooperative pool. Deletes the blocking DNS path, so it lands after Small Fixes has touched it. |
-| Event-Based STUN | Async Public-IP Discovery | The stage below: every discovery method runs at once, bound to the tracer's interface (#151), with a cancellable, bounded wait on each server-name lookup and a stated rule for an empty datagram (today `recvTimeout`). |
+| Public-IP Resolver | Async Public-IP Discovery | The stage below: an injectable `PublicIPResolver`, one question per call, no discovery in the classifier or in flows, the library's resolver in its own file with a direct DNS echo in place of the whoami query through recursive resolvers (#153), every method bound to the tracer's interface (#151). |
+| Event-Based STUN | Public-IP Resolver | The stage below: STUN on the event-based transport and every method of the library's resolver running at once, with a cancellable, bounded wait on each server-name lookup and a stated rule for an empty datagram (today `recvTimeout`). |
 | Reverse-DNS Lookup | | The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test, the descriptor-count test at a lowered limit and the gated live comparison. Unused until the next row; the two are released together. |
 | Reverse-DNS Cache | Reverse-DNS Lookup | `RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker, and `withTraceCancellation` around the multipath flow's reverse-DNS wait. |
 | Resolution Off The Actor | Event-Based STUN, Reverse-DNS Cache | The stage below, as one change: the resolution seam is one closure shared by trace, streaming trace, ping and the probes, so it becomes async for all of them together. If it outgrows the cap, the second pull request is the forward-resolution budget option (decision 7) and `discoverPaths` resolving once. |
-| Enrichment Lifetimes | Async Public-IP Discovery | A public-IP discovery that was attempted and failed is remembered for the rest of the call, so the classifier does not pay for it again. The ASN lookup's timeout reaches every resolver it passes through (`HybridASNResolver` ignores it today), and a caller leaving a shared ASN database load neither cancels it for others nor leaves the resolver latched as failed. |
+| Enrichment Lifetimes | Public-IP Resolver | The ASN lookup's timeout reaches every resolver it passes through (`HybridASNResolver` ignores it today), and a caller leaving a shared ASN database load neither cancels it for others nor leaves the resolver latched as failed. (Remembering a failed public-IP attempt moved to Public-IP Resolver.) |
 | Deadline For Traces | Resolution Off The Actor, Enrichment Lifetimes | The deadline clock, the phase bookkeeping and its lock, the `TracerouteError` deadline case (decision 6), the result field naming the phase, and the new configuration option, for `traceClassified`. Measured hops are committed when the receive window completes, so expiry in any later phase can return them. Every phase the default sums has a cap: both reverse-DNS waves, classification, and the scheduling allowance. |
 | Deadline For Multipath | Deadline For Traces | `discoverPaths` and its per-flow pipeline: the phase is reported on the topology, paths from finished batches are returned, and the actor-side publication check still rejects a result from before a network change. |
 | Offline Tripwire | every row above | A test-only check on each real network path that fails an offline test reaching anything but loopback or a fixture the test bound itself (ROADMAP). Tests that deliberately exercise the real transport against a loopback fixture keep doing so. Last, because it touches the paths the other rows rewrite. |
@@ -300,37 +301,67 @@ The STUN exchange itself is still blocking after this stage and runs as individu
 requests, one per attempt. Server names resolve as they do today. The classified IPv4 path keeps
 its DNS fallback; the standalone API stays STUN-only.
 
+### Public-IP Resolver
+
+Public-IP resolution becomes something a caller can replace, behind one seam, instead of code
+spread through the trace, the classifier and each multipath flow (David, 2026-11-22). A host app
+often knows more than the library can find out: which interface is the hardline and which the
+VPN, what the gateway reports, what it observed a minute ago. And the library's own fallback is
+wrong today: it asks recursive resolvers (`1.1.1.1`, `8.8.8.8`) for a whoami name and reads a
+record built from the client-subnet hint the resolver forwards, which on one measured network was
+a different host in the right /24 through one resolver and a different /24 through the other,
+never the caller's address (#153). It is not bound to the tracer's interface either (#151).
+
+- **The seam.** A public `PublicIPResolver` protocol, injected the way `ASNResolver` is: one async
+  method that is given the address family wanted, the interface and source address the tracer is
+  bound to, and the time it may take, and returns the address with a label saying how it was
+  found, or nothing. `SwiftFTRConfig` chooses a strategy: the library's own resolver (the
+  default), none, or the caller's.
+- **One question per call.** When no address is configured or seeded, a classified trace or a
+  multipath run asks the resolver once, under `publicIPDiscoveryTimeout`, inside the trace's
+  cancellation. The answer is cached under today's generation rules. An attempt that found
+  nothing is remembered for the rest of the call. An injected resolver that ignores cancellation
+  cannot be stopped: the caller is released and the documentation says so.
+- **Nothing else discovers.** `TraceClassifier.classify` classifies with the address it is given
+  or without one; its parameters that exist only for discovery go. Multipath flows are handed the
+  parent's answer and never run their own. The second discovery a failed call pays today
+  (finding 6) goes with this.
+- **The library's resolver, in its own file.** STUN, and a DNS echo asked directly: a packet the
+  library sends itself to a literal address of a server that reports the source address of the
+  packet it receives (`whoami.cloudflare`, class CH, to Cloudflare's resolver addresses, which
+  also answers for IPv6; `o-o.myaddr.l.google.com` to Google's authoritative servers). Never
+  through a recursive resolver, and never the resolver the host was configured with. Every method
+  is bound to the request's interface and source address; a method that cannot be bound is not
+  used. The whoami query through recursive resolvers is deleted.
+- **Standalone `getPublicIPs`** keeps its signature and asks the library's resolver, so it gains
+  the direct echo and loses nothing.
+- **Source breaks** (decision 10): the `classify` parameters, and whatever of `PublicIPError` and
+  `STUNPublicIP` no longer describes anything. Each gets an upgrade-guide entry.
+
+Tests: a caller's resolver is asked once per call and its answer classifies the trace; with the
+strategy set to none nothing is sent and the trace classifies without an address; a resolver that
+never returns is abandoned at the budget and not asked again in that call; a network change
+during the question ends the call; multipath flows ask nothing; an answer shaped like today's
+client-subnet guess is not accepted by the library's resolver; on a bound tracer every method's
+socket is bound, and with the bind failing no packet is sent.
+
 ### Event-Based STUN
 
-The STUN exchange moves onto the transport from Event-Based DNS, against an already-resolved
-endpoint. STUN keeps failing on the first invalid reply, as now. Name resolution for STUN servers
-is not changed here beyond a bounded, cancellable wait on each lookup; it moves with Resolution
-Off The Actor.
+Inside the library's resolver. The STUN exchange moves onto the transport from Event-Based DNS,
+against an already-resolved endpoint, and **the methods run at the same time** (David,
+2026-11-22): each STUN server as its name resolves and each DNS echo start at once, hold no
+thread, and share the whole discovery deadline. The first valid answer wins and the rest are
+stopped. The STUN share of the budget from Async Public-IP Discovery goes away with the sequence
+it protected. STUN keeps failing on the first invalid reply, as now. Name resolution for STUN
+servers gets a bounded, cancellable wait here and moves with Resolution Off The Actor.
 
-**The methods run at the same time, each bound to the tracer's interface** (David, 2026-11-22).
-Discovery exists to say what address the world sees for one interface, so a caller can contrast
-the exit of a VPN or the default route with the hardline's. Today the methods run in sequence
-(each STUN server, then the DNS whoami fallback), and the fallback is not bound to the tracer's
-interface or source address at all (#151), so on a bound tracer it can report another route's
-exit as this interface's.
-
-- Every method (each STUN server as its name resolves, and the whoami query for IPv4) starts at
-  once, holds no thread, and is bound to the same interface and source address as the trace. A
-  method that cannot be bound is not used; nothing runs unbound in its place.
-- For a classified trace the first valid answer wins and the rest are stopped. The result records
-  which method supplied it. Which method wins can differ from 0.18, where STUN had to fail before
-  whoami was asked; the changelog says so.
-- The STUN share of the budget from Async Public-IP Discovery goes away with the sequence it
-  protected: every method has the whole discovery deadline.
-- Standalone `getPublicIPs` stays per interface and STUN-only in its return type. Collecting
-  every method's answer for one interface, so that two methods disagreeing is itself reported, is
-  decision 12.
+Which method answers can differ from 0.18, where STUN had to fail before anything else was
+asked; the changelog says so.
 
 Tests: the STUN fault battery against the new transport; a refused port does not delay the other
-methods; a healthy endpoint beside a stalled name yields an address, in classified and standalone
-discovery; whoami answers while STUN is silent without waiting for it; on a bound tracer every
-method's socket is bound, and with the bind failing no query is sent; `getPublicIPs` still returns
-a partial result when one family answers.
+methods; a healthy endpoint beside a stalled name yields an address; a DNS echo answers while
+STUN is silent without waiting for it; `getPublicIPs` still returns a partial result when one
+family answers.
 
 ### Event-Based Reverse DNS
 
@@ -555,12 +586,19 @@ otherwise. Decided ones say so.
     2026-11-22; its limits and terms were not checked. Callers who set `uploadURL` are unaffected.
     It is its own pull request (Upload Default), with an upgrade-guide entry.
 
-12. **Reporting every discovery method's answer.** Open. With the methods running at once
-    (Event-Based STUN), a caller could be given each method's answer for an interface, so that
-    STUN and whoami disagreeing is visible instead of the first answer hiding the second.
-    Recommended: not in 0.19.0; the first answer wins and names its method, and the fuller report
-    is a ROADMAP item, because it needs a new public result type and a decision on how long to
-    wait for the slower method.
+12. **Public-IP resolution is injectable.** Decided: a `PublicIPResolver` the caller can replace,
+    with the library's own as the default, and existing callers may break for it in 0.19.0
+    (David, 2026-11-22). See Public-IP Resolver.
+13. **The DNS whoami fallback.** Decided: not through a resolver, whose own address can differ
+    materially from the caller's; acceptable only as a packet the library crafts and sends itself
+    to a server that echoes its source (David, 2026-11-22). Measurement in #153.
+14. **Is the wrong fallback patched in 0.18?** Read by the author from David's "we can put this in
+    0.19" as no: #153 is fixed in 0.19.0 by Public-IP Resolver, with no 0.18.2. Not stated by
+    David in those words.
+15. **Reporting every method's answer.** Open. With the methods running at once, a caller could be
+    given each method's answer for an interface, so that two methods disagreeing is visible.
+    Recommended: not in 0.19.0. The first answer wins and names its method; a caller who wants
+    more supplies a resolver. ROADMAP.
 
 ## Out of scope
 
