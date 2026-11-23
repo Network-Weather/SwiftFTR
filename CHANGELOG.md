@@ -17,7 +17,11 @@ Unreleased
   the query methods throw `DNSError.timeout` (they returned its answers) and `dnsProbe` report
   `outcome == .timedOut`, `isReachable == false` (it reported `.answered`). A reply with no
   question section, such as a header-only REFUSED, still decides the query with its response
-  code, and one whose question cannot be read is still `malformedResponse`.
+  code, and one whose first question cannot be read (a name that is not plain labels, over 255
+  bytes or cut short, or a type and class cut short) is still `malformedResponse`. One case moves
+  to that rule: a first question whose name is a compression pointer, which can only point into
+  the header, was read as the root name and its response code believed; it is now
+  `malformedResponse` (`dnsProbe`: `.malformedReply`, still reachable).
 - **`seedPublicIP` rejects a NAT64 address embedding a non-global IPv4 address** (#139).
   `64:ff9b::/96` addresses were accepted whatever they embedded; RFC 6052 section 3.1 forbids the
   well-known prefix for non-global IPv4 addresses. `seedPublicIP("64:ff9b::192.168.1.1", …)` now
