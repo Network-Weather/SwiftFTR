@@ -339,7 +339,10 @@ struct AsyncPublicIPDiscoveryTests {
     let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
 
     // Each attempt and the fallback could each run past the watchdog on their own; only the
-    // budget can end discovery inside it.
+    // budget can end discovery inside it. The budget is the one real duration here, and
+    // what is checked below must happen inside it: the first attempt sent within STUN's share
+    // (four seconds) and the fallback asked in the four after. On a three-core CI runner with the
+    // rest of the suite running, a one-second budget ended before the first attempt was sent.
     let outcome = try await measure(within: Self.watchdog) {
       await Self.withFixtures(servers: servers, whoamiPort: whoami.port, executor: executor) {
         do {
@@ -347,7 +350,7 @@ struct AsyncPublicIPDiscoveryTests {
             try await publicIPDiscovery(
               family: .v4,
               stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
-              interface: nil, sourceIP: nil, enableLogging: false, budget: 1))
+              interface: nil, sourceIP: nil, enableLogging: false, budget: 8))
         } catch {
           return .failure(error)
         }
@@ -355,12 +358,15 @@ struct AsyncPublicIPDiscoveryTests {
     }.0
     #expect(throws: PublicIPDiscoveryTimeout.self) { try outcome.get() }
     #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
-    #expect(first.requests.value == 1)
+    // Each fixture counts a request on its own thread, so wait for the counts.
+    let firstAsked = await eventually(within: 10) { first.requests.value == 1 }
+    #expect(firstAsked, "the first server was asked \(first.requests.value) times")
 
     // STUN's share of the budget ends at half of it, so the fallback was asked inside the
     // budget, and the second server never got time.
     #expect(second.requests.value == 0)
-    #expect(whoami.requests.value == 1)
+    let fallbackAsked = await eventually(within: 10) { whoami.requests.value == 1 }
+    #expect(fallbackAsked, "the fallback was asked \(whoami.requests.value) times")
 
     // The discovery itself ended, not only the wait for it: once the stalled attempt lets go of
     // its slot, nothing goes on to the next server or asks the fallback again.
