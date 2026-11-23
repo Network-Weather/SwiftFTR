@@ -300,13 +300,14 @@ struct PingReplyMatchingTests {
     #expect(ping.premiseHeld, "the replies were not queued and read as staged")
     let s = result.statistics
     #expect(s.sent == 2 && s.received == 2, "\(Self.summary(result))")
-    let firstStamps = ping.clock.stamps(withQueued: 1)
-    #expect(firstStamps.count == 1, "stamps taken with one datagram queued: \(firstStamps)")
+    // The first reading taken with one datagram queued is the first reply's: a later reading (arming
+    // the deadline after reply 2 is queued) can also see one queued, so the count is not asserted.
+    let firstStamp = try #require(ping.clock.stamps(withQueued: 1).first)
     let sentAt = try #require(ping.sendTimes[1])
     let rtt = try #require(result.responses.first?.rtt)
     #expect(
-      rtt == (firstStamps.first ?? .nan) - sentAt,
-      "probe 1's RTT \(rtt)s is not its first reply's (\(firstStamps.map { $0 - sentAt }))")
+      rtt == firstStamp - sentAt,
+      "probe 1's RTT \(rtt)s is not its first reply's (\(firstStamp - sentAt)s)")
   }
 
   // MARK: Late replies
@@ -415,7 +416,12 @@ final class DirectPing: @unchecked Sendable {
 
   func run() async throws -> PingResult { try await operation.run() }
 
-  func stop() { network.stop() }
+  func stop() {
+    // The hooks capture this object; drop them so it and its fixture are released.
+    beforeSend = nil
+    afterSend = nil
+    network.stop()
+  }
 }
 
 /// Ping's clock, recording each reading with the number of datagrams queued on `fd` at the time.
