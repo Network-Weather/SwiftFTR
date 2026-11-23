@@ -703,6 +703,9 @@ final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
   /// Owned by ``stop()`` until ``startAnswering()``, and by the answering thread after it, which
   /// closes it as it exits.
   private let fd: Int32
+  /// Keeps the number out of dual-stack IPv6 hands (``bindRefusingUDP(family:)``); closed by
+  /// ``stop()``.
+  private let ipv6Guard: Int32?
   private let reply: @Sendable ([UInt8]) -> [UInt8]
   private let lock = NSLock()
   private var answering = false
@@ -711,20 +714,12 @@ final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
   private let answerWindow: TimeInterval = 5
 
   init(reply: @escaping @Sendable ([UInt8]) -> [UInt8]) throws {
-    let (bound, boundPort) = try bindLoopback(family: AF_INET, type: SOCK_DGRAM)
-    var (peer, length) = loopbackAddress(family: AF_INET, port: 9)
-    let connected = withUnsafePointer(to: &peer) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(bound, $0, length) }
-    }
-    guard connected == 0 else {
-      let code = errno
-      close(bound)
-      throw FixtureError.socket("connect", code)
-    }
+    let refusing = try bindRefusingUDP(family: AF_INET)
     // Short, so the answering thread sees `stop()` promptly between receives.
-    setReceiveTimeout(bound, seconds: 0.02)
-    fd = bound
-    port = boundPort
+    setReceiveTimeout(refusing.fd, seconds: 0.02)
+    fd = refusing.fd
+    port = refusing.port
+    ipv6Guard = refusing.ipv6Guard
     self.reply = reply
   }
 
@@ -786,5 +781,6 @@ final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
     let threadOwnsSocket = answering
     lock.unlock()
     if !wasStopped && !threadOwnsSocket { close(fd) }
+    if !wasStopped, let ipv6Guard { close(ipv6Guard) }
   }
 }
