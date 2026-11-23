@@ -175,9 +175,10 @@ func traceUsingCallerSelection(
 ## Network Changes (v0.17.0+)
 
 `networkChanged()` ends every `trace`, `traceClassified`, `traceStream` and `discoverPaths` in
-flight (each throws `TracerouteError.cancelled`) and clears the cached public IP and reverse-DNS
-entries in one call. `ping` and the probes are not tied to the tracer and keep running. When you know only part of the network state changed, use the finer controls instead of
-replacing the `SwiftFTR` instance. ASN data is not network-scoped, and none of these clear it.
+flight (each throws `TracerouteError.cancelled`; `discoverPaths` since 0.18.0) and clears the
+cached public IP and reverse-DNS entries in one call. `ping` and the probes are not tied to the
+tracer and keep running. When you know only part of the network state changed, use the finer
+controls instead of replacing the `SwiftFTR` instance. ASN data is not network-scoped, and none of these clear it.
 
 ```swift
 import SwiftFTR

@@ -13,7 +13,8 @@ Unreleased
   `discoverPaths`, not `ping` or the probes), that multipath public-IP discovery honours
   `publicIPDiscoveryTimeout`, and which work uses the blocking-I/O executor (system reverse DNS
   and public-IP discovery, not DNS queries or Team Cymru lookups). The README says that
-  `trace --json` never sends private or other non-global hops to Team Cymru, and that `-i` is the
+  `trace --json` never sends private, CGNAT, loopback, link-local, multicast or unspecified
+  addresses to Team Cymru, and that `-i` is the
   interval on `ping`, so cross-command guidance uses `--interface`. The EAGAIN page's summary says
   a trace in which no probe was sent throws rather than reporting `.notSent`.
 
