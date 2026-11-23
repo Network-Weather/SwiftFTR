@@ -18,7 +18,6 @@ shipped. The signatures themselves are summarized in
 - [Concurrent Traces](#concurrent-traces)
 - [Error Handling](#error-handling)
 - [ASN Classification](#asn-classification)
-- [Custom Resolvers](#custom-resolvers)
 - [Performance Monitoring](#performance-monitoring)
 - [Testing & Debugging](#testing--debugging)
 
@@ -175,9 +174,11 @@ func traceUsingCallerSelection(
 
 ## Network Changes (v0.17.0+)
 
-`networkChanged()` cancels active traces and clears the cached public IP and reverse-DNS entries in
-one call. When you know only part of the network state changed, use the finer controls instead of
-replacing the `SwiftFTR` instance. ASN data is not network-scoped, and none of these clear it.
+`networkChanged()` ends every `trace`, `traceClassified`, `traceStream` and `discoverPaths` in
+flight (each throws `TracerouteError.cancelled`; `discoverPaths` since 0.18.0) and clears the
+cached public IP and reverse-DNS entries in one call. `ping` and the probes are not tied to the
+tracer and keep running. When you know only part of the network state changed, use the finer
+controls instead of replacing the `SwiftFTR` instance. ASN data is not network-scoped, and none of these clear it.
 
 ```swift
 import SwiftFTR
@@ -187,7 +188,7 @@ let tracer = SwiftFTR()
 // Conservative reset: cancel traces, drop public IP and rDNS caches
 await tracer.networkChanged()
 
-// Cancel in-flight traces but keep every cache
+// End in-flight traces, streams and multipath runs but keep every cache
 await tracer.cancelActiveTraces()
 
 // Keep only rDNS entries whose address scope is global; evict every other entry

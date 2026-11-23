@@ -185,7 +185,7 @@ for hop in classified.hops {
 }
 
 // Handle network changes (e.g., WiFi to cellular, VPN connect/disconnect)
-await tracer.networkChanged()  // Cancels active traces and clears caches
+await tracer.networkChanged()  // Ends traces, streams and multipath runs in flight; clears public-IP and rDNS caches
 
 // Ping API
 let pingConfig = PingConfig(count: 5, interval: 1.0, timeout: 2.0)
@@ -394,7 +394,7 @@ Options:
 ### Other subcommands
 - `probe tcp|udp|http|dns ...`: one-shot reachability probes (for example `swift-ftr probe tcp example.com 443`, `swift-ftr probe dns 1.1.1.1 example.com`)
 - `bufferbloat`: latency under load (`--target`, `--baseline`, `--load`, `--load-type`, `--streams`, `--no-rpm`, `--json`)
-- `interfaces`: list network interfaces and the exact BSD names that `-i/--interface` accepts (`--vpn-only`, `--physical-only`, `--include-inactive`, `--json`)
+- `interfaces`: list network interfaces and the exact BSD names that `--interface` accepts (`--vpn-only`, `--physical-only`, `--include-inactive`, `--json`)
 
 Every subcommand prints its full option list with `--help`.
 
@@ -408,7 +408,7 @@ Configuration and Flags
 - Bufferbloat honors route binding only for baseline latency (`loadDuration: 0`); loaded tests reject effective binding.
 - HTTP/HTTPS probes use URLSession and do not support either binding option.
 - Socket binding controls the documented probe sockets only. Hostname resolution, system rDNS, DNS-whoami fallback, and Team Cymru ASN lookups are not bound by these settings.
-- CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `-i/--interface`, `-s/--source`.
+- CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `--interface`, `-s/--source`. Use the long `--interface` form across commands: `-i` is the interface on `trace`, `stream`, `multipath` and the TCP and DNS probes, but the interval on `ping`, whose short interface flag is `-I`.
 
 Design Details
 --------------
@@ -451,7 +451,7 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 - [Agent guidance](CLAUDE.md): commands, architecture overview, environment variables, conventions and merge/release duties for coding agents working in this repo. (updated 2026-11-21; update when: a command, environment variable, core component or repo convention changes)
 
 ### API guides (DocC articles)
-- [SwiftFTR](Sources/SwiftFTR/SwiftFTR.docc/SwiftFTR.md): DocC landing page with the feature overview, quick samples, configuration and network-change controls, and the Topics map of the public API. (updated 2026-11-21; update when: a public type or `SwiftFTR` method is added or removed, or a `SwiftFTRConfig` default changes)
+- [SwiftFTR](Sources/SwiftFTR/SwiftFTR.docc/SwiftFTR.md): DocC landing page with the feature overview, quick samples, configuration and network-change controls, and the Topics map of the public API. (updated 2026-11-22; update when: a public type or `SwiftFTR` method is added or removed, or a `SwiftFTRConfig` default changes)
 - [Tracing](Sources/SwiftFTR/SwiftFTR.docc/Tracing.md): basic and classified traceroute, per-trace options, hop outcomes and enrichment bounds. (updated 2026-11-21; update when: `trace` or `traceClassified` signatures, `TraceOptions`, or ASN and enrichment defaults change)
 - [Streaming traceroute](Sources/SwiftFTR/SwiftFTR.docc/StreamingTrace.md): `traceStream` usage, `StreamingTraceConfig` defaults, retry and early-completion behavior. (updated 2026-11-21; update when: `StreamingTraceConfig` or the emission rules for streaming hops change)
 - [Ping](Sources/SwiftFTR/SwiftFTR.docc/Ping.md): `ping(to:config:)` usage, statistics semantics and concurrent pinging. (updated 2026-11-21; update when: `PingConfig`, `PingStatistics` or ping concurrency behavior changes)
@@ -526,8 +526,10 @@ Data and services:
   [swift-ip2asn](https://github.com/network-weather/swift-ip2asn), built from
   [iptoasn.com](https://iptoasn.com) data, and falls back to [Team Cymru's
   IP-to-ASN mapping service](https://www.team-cymru.com/ip-asn-mapping) over DNS
-  for addresses the database does not cover. The CLI's `trace --json` output is an exception: it
-  also sends every hop, the destination and the public IP to Team Cymru for its ASN fields.
+  for addresses the database does not cover. The CLI's `trace --json` output is an exception: for
+  its ASN fields it also queries Team Cymru for the hop, destination and public addresses, even
+  those the embedded database already covered. Private, CGNAT, loopback, link-local, multicast and
+  unspecified addresses are filtered out before any query, so they are never sent.
 
 Peer tools doing analogous work:
 

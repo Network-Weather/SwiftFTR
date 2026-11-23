@@ -31,12 +31,14 @@ cache — for callers without finer-grained evidence.
 
 ## Current behavior
 
-As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
+As of 0.18.0, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
 `Utils.swift`.
 
 - `networkChanged()` bumps the cache generation, clears the cached public IP,
-  snapshots and cancels active traces, and clears the entire rDNS cache. It does
-  not clear the ASN cache.
+  snapshots and cancels every registered operation (`trace`, `traceClassified`,
+  `traceStream` and `discoverPaths`; each throws `TracerouteError.cancelled`), and
+  clears the entire rDNS cache. It does not clear the ASN cache. `ping` and the
+  probes are not registered and keep running.
 - `clearCaches()` bumps the generation and clears the public IP and the whole
   rDNS cache; `invalidatePublicIP()` bumps the generation and clears only the
   public IP. Neither cancels traces.
@@ -61,10 +63,11 @@ As of 0.17.1, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
   is internal; `invalidateNetworkScopedRDNS()` and `seedPublicIP(_:source:)`
   both use it.
 - Blocking syscalls submitted through `runDetachedBlockingIO` in `Utils.swift`
-  (reverse DNS, DNS queries, Team Cymru ASN queries, the actor's public-IP
-  enrichment) run
-  on a process-global executor bounded at eight concurrent operations. The
-  standalone `getPublicIPs()` calls STUN directly and is not bounded by it. An operation whose
+  (system reverse DNS and public-IP discovery for classified traces and
+  multipath) run on a process-global executor bounded at eight concurrent
+  operations. DNS queries, `dnsProbe` and Team Cymru ASN lookups do not use it:
+  each is a non-blocking UDP exchange that holds no thread. The standalone
+  `getPublicIPs()` calls STUN directly and is not bounded by it either. An operation whose
   caller is cancelled or times out while it is still queued is dropped without
   running; one already running holds its slot until the system call returns,
   even though its caller has been released.

@@ -76,6 +76,15 @@ Unreleased
   special-purpose ranges it already rejected, and returns `false` for the rest, so discovery runs
   instead. IPv4 checks are unchanged; they already matched the IANA IPv4 registry. Hop
   classification is unchanged.
+- **Documentation corrections (#96).** The guides and reference say which operations
+  `networkChanged()` and `cancelActiveTraces()` end (`trace`, `traceClassified`, `traceStream` and
+  `discoverPaths`, not `ping` or the probes), that multipath public-IP discovery honours
+  `publicIPDiscoveryTimeout`, and which work uses the blocking-I/O executor (system reverse DNS
+  and public-IP discovery, not DNS queries or Team Cymru lookups). The README says that
+  `trace --json` never sends private, CGNAT, loopback, link-local, multicast or unspecified
+  addresses to Team Cymru, and that `-i` is the
+  interval on `ping`, so cross-command guidance uses `--interface`. The EAGAIN page's summary says
+  a trace in which no probe was sent throws rather than reporting `.notSent`.
 
 0.18.0 — 2026-11-22
 -------------------

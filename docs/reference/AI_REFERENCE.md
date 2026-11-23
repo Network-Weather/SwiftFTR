@@ -74,7 +74,7 @@ public actor SwiftFTR {
     public func preloadASNDatabase() async
 
     // Network-transition lifecycle and caches
-    public func networkChanged() async            // cancel traces + clear public IP + clear rDNS
+    public func networkChanged() async            // cancel operations + clear public IP + clear rDNS
     public func cancelActiveTraces() async        // cancel only; caches preserved
     public func invalidateNetworkScopedRDNS() async  // evict non-global rDNS entries only
     @discardableResult
@@ -88,6 +88,12 @@ public actor SwiftFTR {
 Notes:
 - `ping(to:config:)` is `nonisolated` (and `@concurrent` on Swift 6.2+ compilers), so concurrent
   pings from one instance run in parallel, each on its own socket.
+- `networkChanged()` and `cancelActiveTraces()` end every `trace`, `traceClassified`,
+  `traceStream` and `discoverPaths` in flight with `TracerouteError.cancelled`. For `trace`,
+  `traceClassified` and `discoverPaths` that holds even if the caller cancelled too; a stream
+  throws it only if the tracer ends the stream first, and otherwise a consumer that cancelled sees
+  iteration end normally. `ping` and the probe functions are not tied to the tracer and keep
+  running.
 - `networkChanged()` does not clear the ASN cache; ASN data is not network-scoped.
 - `seedPublicIP` accepts only syntactically valid, globally routable IPv4/IPv6 addresses and
   returns `false` otherwise (private, CGNAT, link-local, loopback, multicast, documentation and
