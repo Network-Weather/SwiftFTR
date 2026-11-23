@@ -2089,38 +2089,60 @@ struct DNSClient {
     return carriesTransactionID(id, datagram) && !echoesOtherQuestion(query, datagram)
   }
 
-  /// Whether the datagram's first question is present, readable, and not the one `query` asked:
-  /// another name (compared without regard to ASCII case, RFC 4343), type or class.
+  /// The first question of a DNS message, read by the single rule both the question matcher
+  /// (``echoesOtherQuestion(_:_:)``) and the validator (``parseAnswers(message:)``) use, so they
+  /// cannot disagree on what counts as a readable question.
+  enum FirstQuestion: Equatable {
+    /// The header declares no question (QDCOUNT 0), as some REFUSED and FORMERR replies are sent.
+    case absent
+    /// The header is cut short, or the first question's name is not a sequence of plain labels
+    /// ending in the root label within 255 bytes (RFC 1035 section 3.1), or its type and class
+    /// are cut short. A compression pointer is unreadable here: nothing precedes the first
+    /// question but the header, so it can only point into the header.
+    case unreadable
+    /// The name occupies `name`, and the type and class end at `end`.
+    case readable(name: Range<Int>, end: Int)
+  }
+
+  static func firstQuestion(_ message: [UInt8]) -> FirstQuestion {
+    guard message.count >= 12 else { return .unreadable }
+    guard message[4] != 0 || message[5] != 0 else { return .absent }
+    var offset = 12
+    var nameLength = 1  // The terminating root label.
+    while true {
+      guard offset < message.count else { return .unreadable }
+      let label = Int(message[offset])
+      if label == 0 { break }
+      // 11xxxxxx is a pointer, 01xxxxxx and 10xxxxxx are reserved label types.
+      guard label & 0xC0 == 0 else { return .unreadable }
+      nameLength += 1 + label
+      guard nameLength <= 255, offset + 1 + label <= message.count else { return .unreadable }
+      offset += 1 + label
+    }
+    let nameEnd = offset + 1
+    guard nameEnd + 4 <= message.count else { return .unreadable }
+    return .readable(name: 12..<nameEnd, end: nameEnd + 4)
+  }
+
+  /// Whether the datagram's first question is readable (``firstQuestion(_:)``) and not the one
+  /// `query` asked: another name (compared without regard to ASCII case, RFC 4343), type or
+  /// class.
   ///
-  /// A datagram that declares no question (QDCOUNT 0, as some REFUSED and FORMERR replies are
-  /// sent) does not, and neither does one whose question cannot be read (a header or name cut
-  /// short, or a name that starts with a compression pointer, which can only point back into the
-  /// header): such a datagram is left to ``validateResponse``, which rejects the unreadable ones as
-  /// malformed. `query` is a request built here, with one uncompressed question after the header.
+  /// A datagram that declares no question does not, and neither does one whose first question is
+  /// unreadable: such a datagram carries the query's transaction ID, so it is left to
+  /// ``validateResponse``, which accepts the first and rejects the second as malformed. `query` is
+  /// a request built here, with one uncompressed question after the header.
   static func echoesOtherQuestion(_ query: [UInt8], _ datagram: ArraySlice<UInt8>) -> Bool {
     let reply = Array(datagram)
-    guard reply.count >= 12, reply[4] != 0 || reply[5] != 0 else { return false }
-    // The end of the first question's name in `message`, from offset 12, if it is all plain labels.
-    func nameEnd(_ message: [UInt8]) -> Int? {
-      var offset = 12
-      while offset < message.count {
-        let length = Int(message[offset])
-        if length == 0 { return offset + 1 }
-        guard length & 0xC0 == 0 else { return nil }
-        offset += 1 + length
-      }
-      return nil
-    }
-    guard let replyEnd = nameEnd(reply), replyEnd + 4 <= reply.count,
-      let queryEnd = nameEnd(query), queryEnd + 4 <= query.count
+    guard case .readable(let replyName, let replyEnd) = firstQuestion(reply),
+      case .readable(let queryName, let queryEnd) = firstQuestion(query)
     else { return false }
     func folded(_ byte: UInt8) -> UInt8 { (0x41...0x5A).contains(byte) ? byte | 0x20 : byte }
     let sameName =
-      replyEnd == queryEnd
-      && zip(reply[12..<replyEnd], query[12..<queryEnd]).allSatisfy {
-        folded($0) == folded($1)
-      }
-    let sameTypeAndClass = reply[replyEnd..<replyEnd + 4] == query[queryEnd..<queryEnd + 4]
+      replyName.count == queryName.count
+      && zip(reply[replyName], query[queryName]).allSatisfy { folded($0) == folded($1) }
+    let sameTypeAndClass =
+      reply[replyName.upperBound..<replyEnd] == query[queryName.upperBound..<queryEnd]
     return !(sameName && sameTypeAndClass)
   }
 
@@ -2183,10 +2205,15 @@ struct DNSClient {
     let qd = Int(r16(4))
     let an = Int(r16(6))
     var off = 12
-    for _ in 0..<qd {
-      guard parseName(bytes, &off) != nil else { return nil }
-      off += 4  // type+class
-      if off > bytes.count { return nil }
+    if qd > 0 {
+      // The first question by the rule the question matcher uses; any later ones as before.
+      guard case .readable(_, let end) = firstQuestion(bytes) else { return nil }
+      off = end
+      for _ in 1..<qd {
+        guard parseName(bytes, &off) != nil else { return nil }
+        off += 4  // type+class
+        if off > bytes.count { return nil }
+      }
     }
     var answers: [Answer] = []
     for _ in 0..<an {
