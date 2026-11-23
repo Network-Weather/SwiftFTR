@@ -12,12 +12,15 @@ private let lifecycleWatchdog: TimeInterval = 20
 struct TraceLifecycleTests {
   @Test("cancelActiveTraces cancels active trace while preserving caches", .timeLimit(.minutes(1)))
   func cancelActiveTracesPreservesCaches() async throws {
-    let tracer = SwiftFTR(
-      config: SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: false)
+    // Reverse DNS answers from a local stub, so populating the cache sends no query.
+    let tracer = offlineTracer(
+      SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: false),
+      rdns: RDNSCache { _ in "one.one.one.one" }
     )
 
     // Populate rDNS cache with an entry
-    _ = await tracer.rdnsCache.lookup("1.1.1.1")
+    #expect(await tracer.rdnsCache.lookup("1.1.1.1") == "one.one.one.one")
+    #expect(await tracer.rdnsCache.count == 1)
 
     // Set a cached public IP directly or via effective discovery
     let _ = await tracer.effectivePublicIPForClassification { "198.51.100.1" }
@@ -66,6 +69,7 @@ struct TraceLifecycleTests {
 
     // Verify caches are still intact!
     #expect(await tracer.publicIP == "198.51.100.1")
+    #expect(await tracer.rdnsCache.count == 1)
 
     // Now call networkChanged() and verify it DOES clear the public IP and rDNS
     await tracer.networkChanged()
@@ -125,33 +129,46 @@ struct TraceLifecycleTests {
 
   @Test("cancelActiveTraces cancels in-flight classified trace")
   func cancelActiveTracesCancelsClassifiedTrace() async throws {
-    let tracer = SwiftFTR(
-      config: SwiftFTRConfig(
+    // A loopback peer that never answers, with a receive window that outlasts the watchdog, so the
+    // trace is still probing when it is cancelled and only the cancellation can end it in time.
+    // Public-IP discovery, reverse DNS and ASN lookups are local substitutes.
+    let network = try FakeICMPNetwork { _ in [] }
+    defer { network.stop() }
+    let tracer = offlineTracer(
+      SwiftFTRConfig(
         maxHops: 30,
-        maxWaitMs: 1000,
+        maxWaitMs: Int(3 * lifecycleWatchdog * 1_000),
         enableLogging: false,
         noReverseDNS: false
       )
     )
 
-    let task = Task {
-      try await tracer.traceClassified(to: "192.0.2.1")
-    }
+    try await network.install {
+      let task = Task {
+        try await tracer.traceClassified(to: "fake.test")
+      }
 
-    let started = await waitUntil {
-      await !tracer.activeTraces.isEmpty
-    }
-    #expect(started)
+      let receiving = await waitUntil {
+        guard let handle = await tracer.activeTraces.first else { return false }
+        return await handle.hasCancellationHandler
+      }
+      #expect(receiving, "The classified trace should reach its receive window before cancellation")
+      #expect(
+        await waitUntil { network.probes.value > 0 },
+        "The classified trace should have sent its probes")
 
-    await tracer.cancelActiveTraces()
-
-    do {
-      _ = try await task.value
-      Issue.record("traceClassified should have thrown cancelled")
-    } catch TracerouteError.cancelled {
-      // Expected
-    } catch {
-      Issue.record("Unexpected error from cancelled traceClassified: \(error)")
+      let (outcome, _) = try await measure(within: lifecycleWatchdog) {
+        await tracer.cancelActiveTraces()
+        return await task.result
+      }
+      switch outcome {
+      case .success:
+        Issue.record("traceClassified should have thrown cancelled")
+      case .failure(TracerouteError.cancelled):
+        break  // Expected
+      case .failure(let error):
+        Issue.record("Unexpected error from cancelled traceClassified: \(error)")
+      }
     }
 
     let unregistered = await waitUntil { await tracer.activeTraces.isEmpty }

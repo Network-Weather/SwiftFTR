@@ -237,14 +237,21 @@ struct STUNTests {
 
   @Test("SwiftFTR caches STUN result")
   func testSTUNCaching() async throws {
-    // Test that we can override public IP without STUN call
-    let config = SwiftFTRConfig(publicIP: "203.0.113.1")
-    let tracer = SwiftFTR(config: config)
+    // Test that we can override public IP without STUN call. The trace runs against a loopback
+    // peer with local reverse DNS and ASN stubs, and discovery is a counting substitute.
+    let config = SwiftFTRConfig(maxHops: 4, publicIP: "203.0.113.1")
+    let tracer = offlineTracer(config)
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
+    defer { network.stop() }
+    let discovery = OfflinePublicIPDiscovery()
 
     // This should use the provided IP, not call STUN
-    let result = try await tracer.traceClassified(to: "1.1.1.1")
+    let result = try await discovery.install {
+      try await network.install { try await tracer.traceClassified(to: "fake.test") }
+    }
 
     #expect(result.publicIP == "203.0.113.1")
+    #expect(discovery.calls.value == 0, "a configured public IP must not start discovery")
   }
 
   @Test("networkChanged invalidates STUN cache")
@@ -362,8 +369,11 @@ struct STUNTests {
     #expect(resolved != nil)
     #expect(resolved?.serverLen == socklen_t(MemoryLayout<sockaddr_in>.size))
 
+    // A 64-character label cannot be encoded as a DNS name (labels are at most 63 octets), so the
+    // resolver rejects it without sending a query. A well-formed name that does not exist, even
+    // under a reserved TLD, is sent to the configured DNS servers.
     let invalid = resolveSTUNServer(
-      host: "invalid.domain.that.does.not.exist.example", port: 3478, family: AF_INET)
+      host: String(repeating: "a", count: 64) + ".example", port: 3478, family: AF_INET)
     #expect(invalid == nil)
   }
 
