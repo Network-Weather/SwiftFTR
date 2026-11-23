@@ -224,9 +224,9 @@ struct STUNTests {
   @Test(
     "stunGetPublicIPWithFallback rejects invalid timeouts before DNS",
     arguments: [0.0, -1.0, .infinity])
-  func testFallbackInvalidTimeout(timeout: TimeInterval) {
-    #expect {
-      try stunGetPublicIPWithFallback(family: AF_INET, timeout: timeout)
+  func testFallbackInvalidTimeout(timeout: TimeInterval) async {
+    await #expect {
+      try await stunGetPublicIPWithFallback(family: AF_INET, timeout: timeout)
     } throws: { error in
       guard case STUNError.invalidTimeout = error else { return false }
       return true
@@ -381,9 +381,9 @@ struct STUNTests {
     "STUN fallback tries multiple servers",
     .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
   )
-  func testSTUNFallback() throws {
+  func testSTUNFallback() async throws {
     // Should succeed using any of the fallback servers
-    let result = try stunGetPublicIPv4WithFallback(timeout: 2.0)
+    let result = try await stunGetPublicIPWithFallback(family: AF_INET, timeout: 2.0)
 
     #expect(result.ip.contains("."))
     #expect(result.ip.split(separator: ".").count == 4)
@@ -393,8 +393,9 @@ struct STUNTests {
     "STUN fallback with logging",
     .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
   )
-  func testSTUNFallbackWithLogging() throws {
-    let result = try stunGetPublicIPv4WithFallback(timeout: 2.0, enableLogging: true)
+  func testSTUNFallbackWithLogging() async throws {
+    let result = try await stunGetPublicIPWithFallback(
+      family: AF_INET, timeout: 2.0, enableLogging: true)
     #expect(result.ip.contains("."))
   }
 
@@ -423,8 +424,8 @@ struct STUNTests {
     "DNS-based public IP discovery via Akamai whoami",
     .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
   )
-  func testDNSPublicIPDiscovery() throws {
-    let result = try getPublicIPv4ViaDNS(timeout: 5.0)
+  func testDNSPublicIPDiscovery() async throws {
+    let result = try await getPublicIPv4ViaDNS(timeout: 5.0)
 
     // Should get a valid IPv4 address
     #expect(result.ip.contains("."))
@@ -437,8 +438,8 @@ struct STUNTests {
     "DNS public IP with logging",
     .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
   )
-  func testDNSPublicIPWithLogging() throws {
-    let result = try getPublicIPv4ViaDNS(timeout: 5.0, enableLogging: true)
+  func testDNSPublicIPWithLogging() async throws {
+    let result = try await getPublicIPv4ViaDNS(timeout: 5.0, enableLogging: true)
     #expect(result.ip.contains("."))
   }
 
@@ -467,9 +468,9 @@ struct STUNTests {
     "Unified getPublicIPv4 succeeds",
     .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
   )
-  func testUnifiedPublicIPDiscovery() throws {
+  func testUnifiedPublicIPDiscovery() async throws {
     // Should succeed via STUN (fast path) or DNS (fallback)
-    let result = try getPublicIPv4(stunTimeout: 2.0, dnsTimeout: 5.0)
+    let result = try await getPublicIPv4(stunTimeout: 2.0, dnsTimeout: 5.0)
 
     #expect(result.ip.contains("."))
     let parts = result.ip.split(separator: ".").compactMap { Int($0) }
@@ -481,8 +482,8 @@ struct STUNTests {
     "Unified getPublicIPv4 with logging",
     .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
   )
-  func testUnifiedPublicIPWithLogging() throws {
-    let result = try getPublicIPv4(
+  func testUnifiedPublicIPWithLogging() async throws {
+    let result = try await getPublicIPv4(
       stunTimeout: 2.0,
       dnsTimeout: 5.0,
       enableLogging: true
@@ -494,11 +495,11 @@ struct STUNTests {
     "STUN and DNS both return valid public IPs",
     .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
   )
-  func testSTUNAndDNSBothWork() throws {
+  func testSTUNAndDNSBothWork() async throws {
     // Both methods should return valid public IPv4 addresses
     // Note: They may differ on VPNs or multi-homed networks, so we just verify both work
-    let stunResult = try stunGetPublicIPv4WithFallback(timeout: 2.0)
-    let dnsResult = try getPublicIPv4ViaDNS(timeout: 5.0)
+    let stunResult = try await stunGetPublicIPWithFallback(family: AF_INET, timeout: 2.0)
+    let dnsResult = try await getPublicIPv4ViaDNS(timeout: 5.0)
 
     // Validate STUN result
     let stunParts = stunResult.ip.split(separator: ".").compactMap { Int($0) }

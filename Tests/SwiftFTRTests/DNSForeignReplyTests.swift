@@ -620,166 +620,27 @@ struct DNSForeignReplyTests {
     #expect(elapsed >= 2 * delay, "resolved after \(elapsed)s")
   }
 
-  // MARK: Blocking path
-
-  /// A blocking call made on its own thread, timed on that thread.
-  struct Blocking<T: Sendable>: Sendable {
-    let value: T
-    let startedAt: TimeInterval
-    let returnedAt: TimeInterval
-    var elapsed: TimeInterval { returnedAt - startedAt }
-  }
-
-  /// Runs the blocking `body` on a thread of its own, never on Swift's cooperative pool, under the
-  /// watchdog. A call held there would stall every other async test in the process for as long as
-  /// it blocks. `port` is bound as the DNS server port on that thread, since task-locals do not
-  /// cross to a new thread; bind any other seam inside `body` the same way.
-  static func onOwnThread<T: Sendable>(
-    port: UInt16, _ body: @escaping @Sendable () -> T
-  ) async throws -> Blocking<T> {
-    try await measure(within: Self.watchdog) {
-      await withCheckedContinuation { (continuation: CheckedContinuation<Blocking<T>, Never>) in
-        Thread.detachNewThread {
-          let startedAt = monotonicNow()
-          let value = TestSeams.$dnsServerPort.withValue(port) { body() }
-          let returnedAt = monotonicNow()
-          continuation.resume(
-            returning: Blocking(value: value, startedAt: startedAt, returnedAt: returnedAt))
-        }
-      }
-    }.0
-  }
+  // MARK: TXT lookups
 
   static let txtRecord: [UInt8] =
     [0xC0, 0x0C, 0, 16, 0, 1, 0, 0, 0, 60, 0, 3, 2] + Array("ok".utf8)
 
-  @Test("The blocking TXT query ignores a reply for another query and takes its own")
-  func blockingForeignThenValid() async throws {
+  @Test("A TXT lookup, as the whoami fallback makes it, ignores a reply for another query")
+  func txtForeignThenValid() async throws {
     let peer = try ScriptedDNSPeer { query in
       let reply = FaultInjectionWireTests.dnsResponse(to: query, answers: Self.txtRecord)
       return [(Self.foreign(reply), 0), ([], 0), (reply, 0)]
     }
     defer { peer.stop() }
 
-    let strings = try await Self.onOwnThread(port: peer.port) {
-      DNSClient.queryTXTBlocking(name: "blocking.example", timeout: 5, servers: ["127.0.0.1"])
-    }.value
+    let (strings, _) = try await measure(within: Self.watchdog) {
+      await TestSeams.$dnsServerPort.withValue(peer.port) {
+        await DNSClient.queryTXT(name: "txt.example", timeout: 5, servers: ["127.0.0.1"])
+      }
+    }
     #expect(strings == ["ok"])
     #expect(
       await eventually(within: Self.watchdog) { peer.sent.value == 3 }, "sent: \(peer.sent.value)")
-  }
-
-  @Test("After a foreign datagram the blocking TXT query waits only for the time it has left")
-  func blockingWaitsForTheTimeLeft() async throws {
-    let timeout: TimeInterval = 0.5
-    // A foreign reply at 0.3 s, then the real one at 0.7 s: after the deadline, but inside a full
-    // timeout restarted by the foreign reply (0.8 s).
-    let peer = try ScriptedDNSPeer { query in
-      let reply = FaultInjectionWireTests.dnsResponse(to: query, answers: Self.txtRecord)
-      return [(Self.foreign(reply), 0.3), (reply, 0.4)]
-    }
-    defer { peer.stop() }
-
-    // Stamped on the calling thread as the blocking call returns.
-    let call = try await Self.onOwnThread(port: peer.port) {
-      DNSClient.queryTXTBlocking(name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
-    }
-    let (strings, returnedAt) = (call.value, call.returnedAt)
-    #expect(await eventually(within: Self.watchdog) { peer.sent.value == 2 })
-    #expect(strings == nil, "the query took a reply sent after its deadline")
-    // It gave up before the real reply left, so it waited only for the time it had left; a wait
-    // restarted by the foreign reply would still be running when the real one arrived.
-    let sends = peer.scriptedSendTimes
-    try #require(sends.count == 2)
-    #expect(returnedAt < sends[1], "returned \(sends[1] - returnedAt)s after the real reply left")
-  }
-
-  enum LateRead: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    /// The query's reply is the first datagram read.
-    case firstReceive
-    /// A foreign datagram is read first, then the query's reply.
-    case afterForeign
-    var testDescription: String { rawValue }
-  }
-
-  /// When a receive seam's first call started, and how many reads it held past the deadline.
-  final class LateReadRecord: @unchecked Sendable {
-    private let lock = NSLock()
-    private var firstCall: TimeInterval?
-    private var calls = 0
-    let held = FaultCounter()
-
-    /// Counts a call, stamping the first, and returns its number and the first call's stamp.
-    func call() -> (number: Int, firstCall: TimeInterval) {
-      lock.lock()
-      defer { lock.unlock() }
-      calls += 1
-      if firstCall == nil { firstCall = monotonicNow() }
-      return (calls, firstCall!)
-    }
-  }
-
-  @Test(
-    "The blocking TXT query treats its reply read after the deadline as a timeout and moves on",
-    arguments: LateRead.allCases)
-  func blockingReplyReadAfterTheDeadline(stage: LateRead) async throws {
-    let timeout: TimeInterval = 0.5
-    let queries = FaultCounter()
-    // The first server's reply says "late"; the next server's, on the same port, says "ok".
-    let peer = try ScriptedDNSPeer { query in
-      queries.increment()
-      let text = Array((queries.value == 1 ? "late" : "ok").utf8)
-      let rdata = [UInt8(text.count)] + text
-      let record: [UInt8] = [0xC0, 0x0C, 0, 16, 0, 1, 0, 0, 0, 60, 0, UInt8(rdata.count)] + rdata
-      let reply = FaultInjectionWireTests.dnsResponse(to: query, answers: record)
-      guard queries.value == 1 else { return [(reply, 0)] }
-      return stage == .afterForeign ? [(Self.foreign(reply), 0), (reply, 0)] : [(reply, 0)]
-    }
-    defer { peer.stop() }
-    // The read that returns the first server's reply does not return until the deadline has
-    // passed: its first call starts after the deadline was stamped, so a full timeout after that
-    // call is past it. Every other read is a plain `recv`.
-    let record = LateReadRecord()
-    let lateCall = stage == .afterForeign ? 2 : 1
-    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
-      let (number, firstCall) = record.call()
-      let received = Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
-      guard number == lateCall else { return received }
-      let code = Darwin.errno
-      while monotonicNow() <= firstCall + timeout { usleep(1000) }
-      record.held.increment()
-      Darwin.errno = code
-      return received
-    }
-
-    let strings = try await Self.onOwnThread(port: peer.port) {
-      TestSeams.$receiveDatagram.withValue(receive) {
-        DNSClient.queryTXTBlocking(
-          name: "late.example", timeout: timeout, servers: ["127.0.0.1", "127.0.0.1"])
-      }
-    }.value
-    #expect(record.held.value == 1, "the reply was never held past the deadline")
-    #expect(strings == ["ok"], "the query took a reply read after its deadline")
-    #expect(queries.value == 2)
-  }
-
-  @Test("The blocking TXT query fed foreign datagrams that never stop gives up at its deadline")
-  func blockingEndlessForeign() async throws {
-    let peer = try Self.endlessForeign()
-    defer { peer.stop() }
-    let timeout: TimeInterval = 0.3
-
-    let call = try await Self.onOwnThread(port: peer.port) {
-      DNSClient.queryTXTBlocking(name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
-    }
-    let (strings, elapsed) = (call.value, call.elapsed)
-    // Every foreign datagram arrived well inside the receive timeout, so only a wait bounded by
-    // the time left, not restarted per datagram, can have ended while the feed was still running.
-    let flow = peer.keptFeeding(since: 0, minimum: 10, limit: timeout)
-
-    #expect(flow.ok, "the socket was not kept fed while the query waited: \(flow.detail)")
-    #expect(strings == nil)
-    #expect(elapsed >= timeout * 0.95, "ended after \(elapsed)s against a \(timeout)s timeout")
   }
 }
 

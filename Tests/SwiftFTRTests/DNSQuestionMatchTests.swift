@@ -221,10 +221,10 @@ struct DNSQuestionMatchTests {
     #expect(elapsed >= timeout * 0.95, "ended after \(elapsed)s against a \(timeout)s timeout")
   }
 
-  // MARK: Blocking path
+  // MARK: TXT lookups
 
-  @Test("The blocking TXT query ignores a reply echoing another question and takes its own")
-  func blockingOtherQuestionThenValid() async throws {
+  @Test("A TXT lookup, as the whoami fallback makes it, ignores a reply echoing another question")
+  func txtOtherQuestionThenValid() async throws {
     let peer = try ScriptedDNSPeer { query in
       // The reply to the other question says "no"; the query's own says "ok".
       let other = FaultInjectionWireTests.dnsResponse(
@@ -234,28 +234,13 @@ struct DNSQuestionMatchTests {
     }
     defer { peer.stop() }
 
-    let strings = try await Foreign.onOwnThread(port: peer.port) {
-      DNSClient.queryTXTBlocking(name: "blocking.example", timeout: 5, servers: ["127.0.0.1"])
-    }.value
+    let (strings, _) = try await measure(within: Self.watchdog) {
+      await TestSeams.$dnsServerPort.withValue(peer.port) {
+        await DNSClient.queryTXT(name: "txt.example", timeout: 5, servers: ["127.0.0.1"])
+      }
+    }
     #expect(strings == ["ok"])
     #expect(
       await eventually(within: Self.watchdog) { peer.sent.value == 2 }, "sent: \(peer.sent.value)")
-  }
-
-  @Test("The blocking TXT query fed replies echoing another question gives up at its deadline")
-  func blockingEndlessOtherQuestion() async throws {
-    let peer = try Self.endlessOtherQuestion()
-    defer { peer.stop() }
-    let timeout: TimeInterval = 0.3
-
-    let call = try await Foreign.onOwnThread(port: peer.port) {
-      DNSClient.queryTXTBlocking(name: "blocking.example", timeout: timeout, servers: ["127.0.0.1"])
-    }
-    let (strings, elapsed) = (call.value, call.elapsed)
-    let flow = peer.keptFeeding(since: 0, minimum: 10, limit: timeout)
-
-    #expect(flow.ok, "the socket was not kept fed while the query waited: \(flow.detail)")
-    #expect(strings == nil, "the reply to another question was taken")
-    #expect(elapsed >= timeout * 0.95, "ended after \(elapsed)s against a \(timeout)s timeout")
   }
 }
