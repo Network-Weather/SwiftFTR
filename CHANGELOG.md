@@ -43,16 +43,18 @@ the "Migrating to SwiftFTR 0.18" DocC article.
 - **`trace` and `traceClassified` say who cancelled them.** Cancelling the calling task throws
   `CancellationError`; `networkChanged()` or `cancelActiveTraces()` throws
   `TracerouteError.cancelled`, also when the caller cancelled too. A caller's own cancellation
-  used to be reported as `TracerouteError.cancelled` in most phases and as `CancellationError` in
-  one, so a caller that retried on `TracerouteError.cancelled` retried after cancelling itself.
-- **A `traceStream` consumer that cancels its task sees a normal end of iteration**, unless the
-  tracer had already ended the stream; the trace then stops probing and closes its socket. A
-  stream the tracer ends before it finishes still throws `TracerouteError.cancelled`.
+  used to be reported as `TracerouteError.cancelled` in most phases and as `CancellationError` at
+  some checkpoints between phases, so a caller that retried on `TracerouteError.cancelled`
+  retried after cancelling itself.
 - **`discoverPaths` throws `TracerouteError.cancelled` on `networkChanged()` and
   `cancelActiveTraces()`.** It used to ignore both, run to completion and return a topology
   measured on the old network. A topology or flow error that arrives after the invalidation began
-  but before the call returned is discarded too. Cancelling the calling task still throws
-  `CancellationError`; when both happened, `TracerouteError.cancelled` is reported.
+  but before the call returned is discarded too. Cancelling the calling task now always
+  throws `CancellationError`. In 0.17 it depended on where the cancellation landed:
+  `TracerouteError.cancelled` during a flow's probe receive window, where the flow's trace
+  reported the caller's cancellation as the tracer's, and `CancellationError` at the
+  task-cancellation checkpoints inside and between flows. When both happened,
+  `TracerouteError.cancelled` is reported.
 - **A network change ends a trace waiting on reverse DNS at once.** `networkChanged()` and
   `cancelActiveTraces()` did not interrupt the hostname lookups at the end of `trace()` and
   `traceClassified()`, so the trace threw `TracerouteError.cancelled` only when the slowest lookup
@@ -74,7 +76,8 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   included), is consumed and ignored, and the query keeps waiting, to the same timeout, for its
   own reply. 0.17 let the first datagram decide: a wrong transaction ID threw
   `DNSError.malformedResponse` and `dnsProbe` reported the server reachable with "Malformed
-  response", and an empty datagram threw `DNSError.timeout` at once. So a stale reply to an
+  response", an empty datagram threw `DNSError.timeout` at once, and a one-byte datagram threw
+  `DNSError.malformedResponse`. So a stale reply to an
   earlier query on a reused port no longer makes a silent server look like one that answered: a
   server that sends only such datagrams is now `DNSError.timeout`, and `dnsProbe` reports
   `outcome == .timedOut` with `isReachable == false`. A datagram that carries the query's ID but
@@ -82,7 +85,8 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   lookups, which use the same event-based transport, and the IPv4 whoami fallback, which still
   waits in a blocking `recv`, follow the same rule: after a wrong-ID datagram they keep waiting
   for the rest of that server's timeout before trying the next server, instead of moving on at
-  once.
+  once. The whoami path also treats a reply that arrives after its deadline as a timeout and tries
+  the next server.
 - **`dnsProbe` reports host and network unreachable as such.** When the network reports the
   server's host or network unreachable after the query is sent, `dnsProbe` returns
   `outcome == .unreachable` with an `error` naming it and its errno ("Host unreachable - …" or
@@ -92,8 +96,9 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   with `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or `ENETDOWN` (no route, or the interface is
   down), `dnsProbe` returns `outcome == .unreachable` with "Network unreachable - this machine has
   no route to the server (errno=…)" or a similar message, and `elapsed == nil`. It said "Failed to
-  send query". Other `connect` and `send` failures still say "Failed to send query", now followed
-  by the errno. The query methods still throw `DNSError.sendFailed` for all of them.
+  send query". Other `connect` and `send` failures still start "Failed to send query", now followed
+  by the failing call and its errno where there is one, for example "Failed to send query - send
+  failed (errno=1: Operation not permitted)". The query methods still throw `DNSError.sendFailed` for all of them.
 - **`dnsProbe` names a receive error instead of calling it a timeout.** A socket error while
   waiting for the reply that is not a refusal or an unreachable report says "Receive failed - the
   socket reported an error while waiting for the reply (errno=…)", with `outcome == .failed`. It
@@ -105,13 +110,18 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   blocking-I/O workers, which stalled reverse-DNS lookups can hold for seconds, and socket setup.
 - **Invalid DNS inputs are reported before any socket is opened.** A query with an invalid
   timeout, name or server address, or a source address of the wrong family for the server, throws
-  that error (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) at once. In 0.17 the
-  source address's family was checked only once a blocking-I/O worker ran the query.
+  that error (`invalidTimeout`, `invalidHostname`, `invalidIP`, `bindFailed`) at once. In 0.17 some
+  of these checks ran only once a blocking-I/O worker picked up the query, so behind busy workers
+  the error could be late. Which ones depended on the entry point: `dnsProbe` checked the timeout
+  and name first, the query functions checked less up front, and the server address and the
+  source address's family always waited for a worker. `dnsProbe` reports an invalid server
+  address or a wrong-family source address in its result's `error` rather than throwing, as
+  before.
 
 **Traces and multipath**
 
 - **A trace whose socket cannot be made non-blocking now fails instead of running.** `trace`,
-  `traceClassified` and `traceStream` throw `TracerouteError.socketCreateFailed` when either
+  `traceClassified` and `traceStream` (and `discoverPaths`, whose flows run the same trace) throw `TracerouteError.socketCreateFailed` when either
   `fcntl` call that sets `O_NONBLOCK` fails, before any probe is sent, as `ping` already did.
   Previously the failure was ignored and the trace ran on a blocking socket, where its receive
   loop could wait past its deadline for a reply that never came.
@@ -128,13 +138,15 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   network, and `nil` when nothing did; it is the only timing for a refusal, whose `rtt` stays
   `nil`. A new initializer takes both. The existing initializer, and JSON written by
   0.17 without an `outcome` key, still work and derive both from the other fields. Encoding adds
-  the `outcome` and `elapsed` keys, which also appear in `swift-ftr probe dns --json` output.
+  the `outcome` key, and the `elapsed` key when it has a value; both also appear in
+  `swift-ftr probe dns --json` output.
 
 ### Bug fixes
 
 - **A cancelled reverse-DNS lookup is no longer cached as "no hostname".** A lookup cut short by
   cancellation was recorded as a negative answer for the full cache TTL (24 h by default), so the
-  hop showed no hostname until the cache was cleared.
+  hop showed no hostname until the cache was cleared. A cancelled lookup also no longer counts
+  toward the reverse-DNS stall breaker.
 - **A cancelled `discoverPaths` flow stops promptly.** A flow cancelled during public-IP discovery
   no longer goes on to resolve its destination, and one cancelled during classification no longer
   waits on an ASN database load shared with other resolvers.
@@ -142,8 +154,9 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   one non-blocking UDP exchange watched by Dispatch sources, so it holds no thread and starts at
   once even while every worker is held. Behind a full executor a DNS query waited without limit,
   and a Cymru lookup gave up after three timeouts without sending anything, so a trace lost its
-  ASN data. Cancelling the calling task now ends a query, and a Cymru lookup waiting for one of
-  its eight concurrent queries, at once.
+  ASN data. Cancelling the calling task now also ends the query itself and closes its socket;
+  0.17 released the caller at once but left the query running on its worker until its timeout. A
+  Cymru lookup waiting for one of its eight query slots now returns at once.
 - **A DNS query whose send meets a full interface queue is retried within its timeout.**
   `ENOBUFS` retries after a short timer, where it failed with `DNSError.sendFailed` at once, and
   `EAGAIN` waits for the socket to drain without holding a thread. A send that does not succeed
@@ -162,8 +175,8 @@ the "Migrating to SwiftFTR 0.18" DocC article.
   probing but before it ended the stream was recorded and then ignored: the consumer saw a normal
   end. The stream now decides its outcome, unregisters and ends in one step on the tracer.
 - **A trace cancelled by both its caller and the tracer reports the tracer's cancellation.**
-  `traceClassified` cancelled during public-IP discovery reported `CancellationError` even when
-  `networkChanged()` had also ended it.
+  `traceClassified` cancelled at a checkpoint between phases, public-IP discovery among them,
+  reported `CancellationError` even when `networkChanged()` had also ended it.
 - **A trace's socket is closed only once dispatch has let go of it.** The trace paths closed the
   descriptor as the call returned, while the cancelled read source could still hold it, so the
   number could be reused under it. The descriptor is now closed from the read source's
@@ -172,8 +185,8 @@ the "Migrating to SwiftFTR 0.18" DocC article.
 ### Tooling
 
 - An offline fault-injection battery (`FaultInjection*Tests`) stages failing networks phase by
-  phase through task-local test seams and loopback fixtures, and asserts that every operation
-  returns while its stall is still in force, under a watchdog derived from its configuration. See
+  phase through task-local test seams and loopback fixtures, with watchdogs to catch an operation
+  that does not return and result checks to catch one that returns the wrong answer. See
   `docs/ROBUSTNESS-TESTING.md`.
 - Tests that wait for a fixture to start, become ready or be cancelled, or poll until a fixture
   has run, now fail after ten seconds instead of hanging the run when that never happens (#105).
