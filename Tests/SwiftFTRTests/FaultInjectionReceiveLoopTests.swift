@@ -29,13 +29,18 @@ import Testing
 /// which binds each to loopback so replies can be addressed to it, sets the timeout, and keeps a
 /// duplicate so the port cannot be handed to another socket while replies still go to it. It also
 /// substitutes `fcntl` so the operation's switch to non-blocking reports success and changes
-/// nothing. Replies start when the network sees the first probe, because their identifier must
-/// differ from the operation's, and run until ``stop()``.
+/// nothing. Replies start as the socket is made, before the operation sends anything, and the
+/// socket is handed over only once ``primed`` of them are queued on it, so the socket is already
+/// fed when the operation's window opens however slowly loopback delivers. They are echo replies
+/// for sequence 0, which no trace, stream or ping sends, so every operation reads and drops them
+/// whatever its identifier. They run until ``stop()``.
 final class EndlessReplies: @unchecked Sendable {
   let family: Int32
   /// The gap between replies, and so the longest a read waits for one.
   let interval: TimeInterval = 0.002
   private let receiveTimeout: TimeInterval = 1
+  /// Replies queued on the probe socket before it is handed to the operation.
+  static let primed: Int32 = 10
   private let lock = NSLock()
   private var started = false
   private var stopped = false
@@ -93,27 +98,31 @@ final class EndlessReplies: @unchecked Sendable {
       port = boundPort
       self.network = network
       lock.unlock()
+      startFeed()
+      // Waiting for replies that have to cross loopback, not for the operation, which has not
+      // sent anything yet. Bounded, and a short wait on a thread the call already holds.
+      let giveUp = monotonicNow() + 10
+      while queuedDatagrams(fd) < Self.primed, monotonicNow() < giveUp { usleep(1000) }
+      guard queuedDatagrams(fd) >= Self.primed else {
+        throw FixtureError.socket("only \(queuedDatagrams(fd)) replies queued before handover", 0)
+      }
       handedOver = true
       return fd
     }
   }
 
-  /// A network script that answers nothing itself and starts the replies at the first probe.
+  /// A network script that answers nothing itself.
   func silentScript() -> FakeICMPNetwork.Script {
     script { _ in [] }
   }
 
-  /// Wraps `script`, starting the replies at the first probe.
+  /// `script`, unchanged: the replies start with the socket, not at a probe.
   func script(_ script: @escaping FakeICMPNetwork.Script) -> FakeICMPNetwork.Script {
-    { [self] probe in
-      start(foreignTo: probe.identifier)
-      return script(probe)
-    }
+    script
   }
 
-  /// Starts sending echo replies for an identifier other than `identifier`. Later calls do
-  /// nothing.
-  func start(foreignTo identifier: UInt16) {
+  /// Starts sending echo replies for sequence 0 to the probe socket. Later calls do nothing.
+  private func startFeed() {
     lock.lock()
     guard !started, !stopped, socketCopy >= 0 else {
       lock.unlock()
@@ -122,7 +131,7 @@ final class EndlessReplies: @unchecked Sendable {
     started = true
     let port = self.port
     lock.unlock()
-    let datagram = ICMPWire.echoReply(family: family, id: identifier &+ 1, seq: 1)
+    let datagram = ICMPWire.echoReply(family: family, id: 0, seq: 0)
     let thread = Thread { [self] in
       // The sender releases the duplicate itself, after its last reply, so the port stays
       // reserved for as long as replies are sent to it.
