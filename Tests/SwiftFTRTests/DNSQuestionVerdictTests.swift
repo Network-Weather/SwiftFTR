@@ -8,8 +8,8 @@ import Testing
   import Darwin
 #endif
 
-/// Every shape a reply's first question can take, with the verdict each path gives it: the
-/// event-based query, `dnsProbe`, and the blocking TXT path. Each datagram carries the query's
+/// Every shape a reply's first question can take, with the verdict each caller gives it: the
+/// event-based query, `dnsProbe`, and the TXT lookup behind the whoami fallback. Each datagram carries the query's
 /// transaction ID. The question matcher and the validator read the first question by one rule
 /// (`DNSClient.firstQuestion`), so a datagram is either ignored as an answer to another question
 /// or decides the query, never both.
@@ -193,28 +193,30 @@ struct DNSQuestionVerdictTests {
     }
   }
 
-  // MARK: Blocking path
+  // MARK: TXT lookups
 
   @Test(
-    "Each first-question shape gets its verdict on the blocking TXT path", arguments: Shape.allCases
-  )
-  func blockingPath(shape: Shape) async throws {
+    "Each first-question shape gets its verdict from the TXT lookup the whoami fallback makes",
+    arguments: Shape.allCases)
+  func txtLookup(shape: Shape) async throws {
     let peer = try ScriptedDNSPeer { query in [(shape.datagram(query), 0)] }
     defer { peer.stop() }
     let timeout = Self.timeout(shape)
 
-    let call = try await Foreign.onOwnThread(port: peer.port) {
-      DNSClient.queryTXTBlocking(name: "question.example", timeout: timeout, servers: ["127.0.0.1"])
+    let (strings, elapsed) = try await measure(within: Self.watchdog) {
+      await TestSeams.$dnsServerPort.withValue(peer.port) {
+        await DNSClient.queryTXT(name: "question.example", timeout: timeout, servers: ["127.0.0.1"])
+      }
     }
     switch shape.verdict {
     case .answered:
-      #expect(call.value == ["ok"])
+      #expect(strings == ["ok"])
     case .refused, .malformed:
       // Decided at once without strings; a reply ignored would have run to the watchdog.
-      #expect(call.value == nil)
+      #expect(strings == nil)
     case .ignored:
-      #expect(call.value == nil)
-      #expect(call.elapsed >= timeout * 0.95, "ended after \(call.elapsed)s")
+      #expect(strings == nil)
+      #expect(elapsed >= timeout * 0.95, "ended after \(elapsed)s")
     }
   }
 }

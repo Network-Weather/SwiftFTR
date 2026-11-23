@@ -194,6 +194,8 @@ private func runDNSQuery(
   return (try reply.answers(), reply.rtt)
 }
 
+/// Applies `timeout` as both socket timeouts. Kept only behind the `@_spi(Test)` wrapper
+/// `__dnsApplySocketTimeout`, which is part of the API surface; no query path uses it.
 private func _applyDNSSocketTimeout(fd: Int32, timeout: TimeInterval) throws {
   var socketTimeout = try _dnsSocketTimeout(timeout)
   let optionSize = socklen_t(MemoryLayout<timeval>.size)
@@ -1842,78 +1844,6 @@ private func makeDNSQueryMessage(encodedQuery: [UInt8], queryType: UInt16) -> (
   return ([UInt8](msg), id)
 }
 
-/// A DNS query that waits for its reply in a blocking `recv` on the calling thread.
-///
-/// Its only caller is ``DNSClient/queryTXTBlocking(name:timeout:servers:)``, for the whoami
-/// fallback in `getPublicIPv4ViaDNS`, which runs inside a blocking public-IP closure and cannot
-/// await. Every other DNS query uses the event-based ``exchangeDNSQuery``. Refusals and host and
-/// network unreachable are all `DNSError.timeout` here. As on the event-based path, a datagram
-/// without the query's transaction ID (an empty one included), or echoing another question, is
-/// ignored, and the wait goes on with the time left.
-private func performDNSQueryBlocking(
-  server: String,
-  query: String,
-  queryType: UInt16,
-  timeout: TimeInterval,
-  interface: String?,
-  sourceIP: String?
-) throws -> [DNSClient.Answer] {
-  try _validateDNSTimeout(timeout)
-  let encodedQuery = try _encodeQName(query)
-
-  // Detect server address family (IPv4 vs IPv6)
-  let serverFamily = detectAddressFamily(server)
-  guard serverFamily == AF_INET || serverFamily == AF_INET6 else {
-    throw DNSError.invalidIP(server)
-  }
-
-  let fd = socket(serverFamily, SOCK_DGRAM, IPPROTO_UDP)
-  guard fd >= 0 else {
-    throw DNSError.socketCreationFailed
-  }
-  defer { close(fd) }
-
-  try bindDNSSocket(fd, family: serverFamily, interface: interface, sourceIP: sourceIP)
-  try _applyDNSSocketTimeout(fd: fd, timeout: timeout)
-
-  // A connected UDP socket only receives responses from this DNS server and port.
-  do {
-    try connectDNSSocket(
-      fd, server: server, port: TestSeams.dnsServerPort ?? 53, family: serverFamily)
-  } catch is DNSConnectFailure {
-    throw DNSError.sendFailed
-  }
-
-  let (msg, id) = makeDNSQueryMessage(encodedQuery: encodedQuery, queryType: queryType)
-  let deadline = monotonicNow() + timeout
-  let sent = msg.withUnsafeBytes { raw in
-    send(fd, raw.baseAddress, raw.count, 0)
-  }
-
-  guard sent == msg.count else {
-    throw DNSError.sendFailed
-  }
-
-  // Receive from the connected peer until a datagram is addressed to this query. Read on
-  // the calling thread, so a test's task-local seam is visible here; production has none.
-  let receiveDatagram =
-    TestSeams.receiveDatagram ?? { fd, buffer in recv(fd, buffer.baseAddress, buffer.count, 0) }
-  var buf = [UInt8](repeating: 0, count: dnsReceiveCapacity)
-  while true {
-    let n = buf.withUnsafeMutableBytes { receiveDatagram(fd, $0) }
-    // `SO_RCVTIMEO` bounds the wait only to the kernel's timer granularity (about 2 ms past it on
-    // loopback), so a datagram can still be returned after the deadline. A blocking `recv` returns
-    // once the datagram is there, so the stamp taken on return is the earliest one that bounds its
-    // arrival; one past the deadline is a timeout, on the first read as on any later one.
-    guard n >= 0, monotonicNow() <= deadline else { throw DNSError.timeout }
-    if DNSClient.isAddressed(to: msg, buf.prefix(n)) {
-      return try DNSClient.validateResponse(message: Data(buf.prefix(n)), expectedID: id)
-    }
-    // Not this query's reply: wait again, for the time left rather than a fresh timeout.
-    try _applyDNSSocketTimeout(fd: fd, timeout: max(deadline - monotonicNow(), 1e-6))
-  }
-}
-
 /// Runs the query behind ``dnsProbe(config:)`` and reports it as a probe outcome.
 ///
 /// Any DNS response, including an error code or a malformed reply, means the server is reachable.
@@ -2058,27 +1988,6 @@ struct DNSClient {
         server: server, query: name, queryType: DNSRecordType.txt.rawValue, timeout: timeout,
         interface: nil, sourceIP: nil
       ).answers
-      if let answers, let strings = txtStrings(from: answers) { return strings }
-    }
-    return nil
-  }
-
-  /// ``queryTXT(name:timeout:servers:)`` waiting in a blocking `recv` on the calling thread.
-  ///
-  /// Its only caller is `getPublicIPv4ViaDNS`, which runs inside a blocking public-IP closure and
-  /// cannot await. Do not add callers: use the async ``queryTXT(name:timeout:servers:)``.
-  static func queryTXTBlocking(
-    name: String, timeout: TimeInterval = 1.0, servers: [String] = defaultTXTServers
-  ) -> [String]? {
-    for server in servers {
-      let answers = try? performDNSQueryBlocking(
-        server: server,
-        query: name,
-        queryType: DNSRecordType.txt.rawValue,
-        timeout: timeout,
-        interface: nil,
-        sourceIP: nil
-      )
       if let answers, let strings = txtStrings(from: answers) { return strings }
     }
     return nil

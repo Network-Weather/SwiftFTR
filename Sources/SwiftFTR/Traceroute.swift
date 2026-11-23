@@ -1252,19 +1252,17 @@ public actor SwiftFTR {
     let sourceIP = config.sourceIP
     let enableLogging = config.enableLogging
 
+    let budget = config.publicIPDiscoveryTimeoutForOperation
+
     return try await withTraceCancellation(handle: handle) {
-      let discover = publicIPv4Discovery(
+      try await publicIPv4Discovery(
         stunTimeout: 2.0,
         dnsTimeout: 3.0,
         interface: interface,
         sourceIP: sourceIP,
-        enableLogging: enableLogging
-      )
-      return try await runDetachedBlockingIO(
-        deadline: self.config.publicIPDiscoveryTimeoutForOperation
-      ) {
-        try discover().ip
-      }
+        enableLogging: enableLogging,
+        budget: budget
+      ).ip
     }
   }
 
