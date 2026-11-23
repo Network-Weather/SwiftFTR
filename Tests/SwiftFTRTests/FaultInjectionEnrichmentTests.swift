@@ -31,11 +31,14 @@ struct FaultInjectionEnrichmentTests {
     let tracer = offlineTracer(
       SwiftFTRConfig(
         maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, publicIPDiscoveryTimeout: budget))
+    // A blocking attempt that stalls in its executor slot, as a STUN `recv` does.
     let discovery: TestSeams.DiscoverPublicIPv4 = {
       attempts.increment()
-      gate.wait(limit: 20)
-      finished.increment()
-      throw PublicIPError.allMethodsFailed(stunError: "stalled", dnsError: "stalled")
+      return try await runDetachedBlockingIO {
+        gate.wait(limit: 20)
+        finished.increment()
+        throw PublicIPError.allMethodsFailed(stunError: "stalled", dnsError: "stalled")
+      }
     }
 
     let trace = try await TestSeams.$blockingIOExecutor.withValue(executor) {
@@ -91,7 +94,7 @@ struct FaultInjectionEnrichmentTests {
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true, publicIPDiscoveryTimeout: 5))
     let discovery: TestSeams.DiscoverPublicIPv4 = {
       entered.increment()
-      gate.wait(limit: 5)
+      await gate.waitAsync(limit: 5)
       return STUNPublicIP(ip: "198.51.100.99")
     }
 
@@ -167,8 +170,10 @@ struct FaultInjectionEnrichmentTests {
     let attempts = FaultCounter()
     let discovery: TestSeams.DiscoverPublicIPv4 = {
       attempts.increment()
-      gate.wait(limit: 20)
-      throw PublicIPError.allMethodsFailed(stunError: "stalled", dnsError: "stalled")
+      return try await runDetachedBlockingIO {
+        gate.wait(limit: 20)
+        throw PublicIPError.allMethodsFailed(stunError: "stalled", dnsError: "stalled")
+      }
     }
     let config = MultipathConfig(
       flowVariations: 1, maxPaths: 4, earlyStopThreshold: 1, timeoutMs: 2000, maxHops: 4)
@@ -266,13 +271,17 @@ struct FaultInjectionEnrichmentTests {
     defer { gate.open() }
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    // Discovery and reverse DNS both queue behind the occupant; only their deadlines end them.
+    // A STUN attempt and reverse DNS both queue behind the occupant; only their deadlines end
+    // them.
     let rdns = RDNSCache(lookupDeadline: 0.3) { _ in
       try? await runDetachedBlockingIO(priority: .background, deadline: 0.3) { String?.none }
     }
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, publicIPDiscoveryTimeout: 0.3), rdns: rdns)
-    let discovery: TestSeams.DiscoverPublicIPv4 = { STUNPublicIP(ip: "198.51.100.7") }
+    // Discovery whose answer needs an executor slot, as a STUN attempt does.
+    let discovery: TestSeams.DiscoverPublicIPv4 = {
+      try await runDetachedBlockingIO { STUNPublicIP(ip: "198.51.100.7") }
+    }
 
     let trace = try await TestSeams.$blockingIOExecutor.withValue(executor) {
       try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
