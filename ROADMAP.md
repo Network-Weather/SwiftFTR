@@ -39,11 +39,6 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   status line from the connection, for example with the Network.framework transport in
   [docs/development/HTTPProbe-Production-Roadmap.md](docs/development/HTTPProbe-Production-Roadmap.md),
   while keeping URLSession's system routing for the existing API.
-- **Move the live probe tests onto the loopback fixtures**: they still assert success against a
-  third-party test site, so when that site is slow they fail although the probe reported the
-  truth. `FaultInjectionSupport.swift` now has the TCP and HTTP fixtures they need.
-- **Gate `TraceLifecycleTests.cancelActiveTracesCancelsClassifiedTrace` off the network**: it runs
-  in the offline suite but sends a real trace and real STUN queries.
 - **Measure ping RTTs from the kernel's arrival stamp**: ping already reads it for every reply to
   judge whether the reply came after its request, but still times the reply when the read handler
   takes it, so a busy queue or a long read batch adds to the RTT. Using the stamp would remove that,
