@@ -839,27 +839,70 @@ final class RefusingTCPPort: @unchecked Sendable {
 /// The port belongs to a socket connected to another loopback address, so the kernel delivers it
 /// only datagrams from that peer and answers everyone else as it would for an unbound port, while
 /// no other socket can be handed the number.
+///
+/// An IPv4 port also needs an IPv6 guard. Darwin picks an IPv6 ephemeral port without checking
+/// IPv4 sockets, so a dual-stack socket bound to `[::]` (a fake network's IPv6 probe socket, say)
+/// could be handed the number, and IPv4 datagrams to it would then be delivered there instead of
+/// refused. A v6-only socket on `[::]` with the same number, connected like the first, keeps the
+/// number out of IPv6 hands and receives nothing itself.
 final class RefusingUDPPort: @unchecked Sendable {
   let port: UInt16
-  private let fd: Int32
+  private let descriptors: [Int32]
 
   init(family: Int32 = AF_INET) throws {
-    let (bound, boundPort) = try bindLoopback(family: family, type: SOCK_DGRAM)
-    // Port 9 (discard): connecting a datagram socket sends nothing; it only fixes the peer.
-    var (peer, length) = loopbackAddress(family: family, port: 9)
-    let connected = withUnsafePointer(to: &peer) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(bound, $0, length) }
-    }
-    guard connected == 0 else {
-      let code = errno
+    // A dual-stack socket can take the number between the two binds; then start again.
+    for _ in 0..<20 {
+      let (bound, boundPort) = try bindLoopback(family: family, type: SOCK_DGRAM)
+      do {
+        try Self.connectToDiscard(bound, family: family)
+      } catch {
+        close(bound)
+        throw error
+      }
+      guard family == AF_INET else {
+        descriptors = [bound]
+        port = boundPort
+        return
+      }
+      let guardSocket = socket(AF_INET6, SOCK_DGRAM, 0)
+      guard guardSocket >= 0 else {
+        let code = errno
+        close(bound)
+        throw FixtureError.socket("socket", code)
+      }
+      var on: Int32 = 1
+      _ = setsockopt(
+        guardSocket, IPPROTO_IPV6, IPV6_V6ONLY, &on, socklen_t(MemoryLayout<Int32>.size))
+      var any = sockaddr_in6()
+      any.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      any.sin6_family = sa_family_t(AF_INET6)
+      any.sin6_port = boundPort.bigEndian
+      let guarded = withUnsafePointer(to: &any) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          bind(guardSocket, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+      }
+      if guarded == 0, (try? Self.connectToDiscard(guardSocket, family: AF_INET6)) != nil {
+        descriptors = [bound, guardSocket]
+        port = boundPort
+        return
+      }
+      close(guardSocket)
       close(bound)
-      throw FixtureError.socket("connect", code)
     }
-    fd = bound
-    port = boundPort
+    throw FixtureError.socket("no IPv4 port free of IPv6 sockets", EADDRINUSE)
   }
 
-  deinit { close(fd) }
+  /// Port 9 (discard): connecting a datagram socket sends nothing; it only fixes the peer.
+  private static func connectToDiscard(_ fd: Int32, family: Int32) throws {
+    var (peer, length) = loopbackAddress(family: family, port: 9)
+    let connected = withUnsafePointer(to: &peer) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
+    }
+    guard connected == 0 else { throw FixtureError.socket("connect", errno) }
+  }
+
+  deinit { for descriptor in descriptors { close(descriptor) } }
 }
 
 // MARK: - Loopback UDP responder
