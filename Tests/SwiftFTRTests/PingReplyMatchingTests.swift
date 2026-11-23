@@ -104,7 +104,11 @@ struct PingReplyMatchingTests {
   func unsentSequencesCannotEndPingEarly(family: Int32) async throws {
     // Probes 1 and 2 are answered, probe 3 never is. Alongside the first reply come replies to
     // sequences a three-probe ping never sends and a duplicate, enough to make up three replies.
-    let network = try FakeICMPNetwork(family: family) { probe in
+    // Probe 3 leaves only once all six replies are queued or read, so the ping reads them within
+    // probe 3's window however slow loopback is, and the window alone ends it.
+    let ping = try DirectPing(
+      family: family, config: PingConfig(count: 3, interval: 0.05, timeout: 0.5)
+    ) { probe in
       let id = probe.identifier
       switch probe.sequence {
       case 1:
@@ -119,15 +123,19 @@ struct PingReplyMatchingTests {
       default: return []
       }
     }
-    defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig())
-    let config = PingConfig(count: 3, interval: 0.05, timeout: 0.5)
-
-    let (result, elapsed) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: network.journal
-    ) {
-      try await network.install { try await tracer.ping(to: "fake.test", config: config) }
+    defer { ping.stop() }
+    ping.beforeSend = { seq, fd in
+      guard seq == 3 else { return }
+      ping.premise(ping.waitUntilReplied(6, fd))
     }
+
+    let config = ping.config
+    let (result, elapsed) = try await measure(
+      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
+    ) {
+      try await ping.run()
+    }
+    #expect(ping.premiseHeld, "the six replies were never queued before probe 3's send")
     let s = result.statistics
     #expect(
       s.sent == 3,
@@ -140,7 +148,8 @@ struct PingReplyMatchingTests {
     // Probe 3 leaves at about 0.1 s and is owed its 0.5 s window.
     #expect(elapsed >= 0.55, "the ping ended after \(elapsed)s: \(Self.summary(result))")
     #expect(
-      await eventually(within: 5) { network.probes.value == 3 }, "probes: \(network.probes.value)")
+      await eventually(within: 5) { ping.network.probes.value == 3 },
+      "probes: \(ping.network.probes.value)")
   }
 
   @Test(
@@ -209,13 +218,15 @@ struct PingReplyMatchingTests {
 
   @Test("A reply to a sequence not yet sent is not counted for it", arguments: families)
   func futureSequenceIsNotCounted(family: Int32) async throws {
-    // Right after probe 1 leaves, a reply for sequence 2 is queued on the probe socket, before
-    // probe 2 can be sent (both happen on the ping's queue). Probe 2 itself is never answered.
-    // Whether the ping reads that reply before or after probe 2 leaves, it answered nothing sent.
+    // Right after probe 1 leaves, a reply for sequence 2, marked to be ignored, is queued on the
+    // probe socket, before probe 2 can be sent (both happen on the ping's queue). Whether the ping
+    // reads that reply before or after probe 2 leaves, it answered nothing sent. Every probe is
+    // then answered, so the ping ends on its third real reply and no reply window is involved: a
+    // ping that took the early reply for probe 2 would keep its mark and drop the real one.
     let ping = try DirectPing(
-      family: family, config: PingConfig(count: 3, interval: 0.05, timeout: 0.5)
+      family: family, config: PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
     ) { probe in
-      probe.sequence == 2 ? [] : [Self.reply(family, id: probe.identifier, seq: probe.sequence)]
+      [Self.reply(family, id: probe.identifier, seq: probe.sequence)]
     }
     defer { ping.stop() }
     ping.afterSend = { seq, fd in
@@ -228,21 +239,16 @@ struct PingReplyMatchingTests {
       ping.premise(injected && ping.waitUntilEveryReplyQueuedOrRead(fd))
     }
 
-    let config = ping.config
-    let (result, elapsed) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
-    ) {
+    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
       try await ping.run()
     }
     #expect(ping.premiseHeld, "the early reply was never queued ahead of probe 2's send")
     let s = result.statistics
-    #expect(s.sent == 3 && s.received == 2, "\(Self.summary(result))")
-    #expect(
-      result.responses.map { $0.rtt != nil } == [true, false, true], "\(Self.summary(result))")
+    #expect(s.sent == 3 && s.received == 3, "\(Self.summary(result))")
     #expect((s.minRTT ?? -1) >= 0, "\(Self.summary(result))")
-    #expect(result.responses.compactMap(\.ttl).allSatisfy { $0 == Int(Self.kept) })
-    // Probe 2 is unanswered, so the ping waits out probe 3's window: about 0.6 s.
-    #expect(elapsed >= 0.55, "the ping ended after \(elapsed)s: \(Self.summary(result))")
+    #expect(
+      result.responses.allSatisfy { $0.ttl == Int(Self.kept) },
+      "the reply queued before probe 2 left was counted for it: \(Self.summary(result))")
   }
 
   // MARK: Duplicates
@@ -390,15 +396,22 @@ struct PingReplyMatchingTests {
     "A ping whose last send failed ends when the send loop finishes after every reply",
     arguments: families)
   func failedSendEndsWhenSendLoopFinishes(family: Int32) async throws {
-    // Probe 1 is answered at once; probe 2's send fails half a second later. The premise, checked
-    // on the ping's queue at probe 2's send, is that probe 1's reply has already been read.
+    // Probe 1's reply is put on its socket right after it leaves, one loopback crossing rather
+    // than the network's two; probe 2's send then fails. The premise, checked on the ping's queue
+    // at probe 2's send, is that probe 1's reply has already been read. The send loop enqueues
+    // each send and sleeps on its own, so no hook can hold probe 2 back until the reply is read:
+    // the interval must outlast loopback delivery, which took up to 0.75 s on a loaded host.
     let ping = try DirectPing(
-      family: family, config: PingConfig(count: 2, interval: 0.5, timeout: Self.windowPastWatchdog)
-    ) { probe in
-      [Self.reply(family, id: probe.identifier, seq: probe.sequence)]
-    }
+      family: family, config: PingConfig(count: 2, interval: 2, timeout: Self.windowPastWatchdog)
+    ) { _ in [] }
     defer { ping.stop() }
     ping.failingSends = [2]
+    ping.afterSend = { seq, fd in
+      guard seq == 1 else { return }
+      let injected = ping.network.inject(
+        Self.reply(family, id: DirectPing.identifier, seq: 1), to: fd)
+      ping.premise(injected && ping.waitUntilEveryReplyQueuedOrRead(fd))
+    }
     ping.beforeSend = { seq, _ in
       guard seq == 2 else { return }
       ping.premise(ping.clock.readingCount > 0)
@@ -442,7 +455,8 @@ struct PingReplyMatchingTests {
     arguments: families)
   func failedSendStillWaitsForUnansweredProbe(family: Int32) async throws {
     // Probe 1's send fails, probe 2 is answered, probe 3 never is: one sent probe is owed its
-    // window, so the ping does not end on probe 2's reply.
+    // window, so the ping does not end on probe 2's reply. Probe 3 leaves only once that reply is
+    // queued or read, so the ping counts it within probe 3's window however slow loopback is.
     let ping = try DirectPing(
       family: family, config: PingConfig(count: 3, interval: 0.05, timeout: 0.5)
     ) { probe in
@@ -450,6 +464,10 @@ struct PingReplyMatchingTests {
     }
     defer { ping.stop() }
     ping.failingSends = [1]
+    ping.beforeSend = { seq, fd in
+      guard seq == 3 else { return }
+      ping.premise(ping.waitUntilReplied(1, fd))
+    }
 
     let config = ping.config
     let (result, elapsed) = try await measure(
@@ -457,9 +475,10 @@ struct PingReplyMatchingTests {
     ) {
       try await ping.run()
     }
+    #expect(ping.premiseHeld, "probe 2's reply was never queued before probe 3's send")
     let s = result.statistics
     #expect(s.sent == 2 && s.received == 1, "\(Self.summary(result))")
-    // Probe 3 leaves at about 0.1 s and is owed its 0.5 s window.
+    // Probe 3 is owed its 0.5 s window.
     #expect(elapsed >= 0.55, "the ping ended after \(elapsed)s: \(Self.summary(result))")
   }
 }
@@ -537,6 +556,20 @@ final class DirectPing: @unchecked Sendable {
       if monotonicNow() >= giveUp { return false }
       usleep(500)
     }
+  }
+
+  /// Waits, blocking this thread for at most `limit` seconds, until the network has sent at least
+  /// `count` replies and every reply it sent to `fd` is queued there or read. Called from a send
+  /// hook, it holds that send until earlier replies have crossed loopback, so a reply window that
+  /// starts at the send does not depend on how fast loopback delivers. Returns whether that
+  /// happened.
+  func waitUntilReplied(_ count: Int, _ fd: Int32, limit: TimeInterval = 10) -> Bool {
+    let giveUp = monotonicNow() + limit
+    while network.repliesSent.value < count {
+      if monotonicNow() >= giveUp { return false }
+      usleep(500)
+    }
+    return waitUntilEveryReplyQueuedOrRead(fd, limit: max(0, giveUp - monotonicNow()))
   }
 
   init(family: Int32, config: PingConfig, script: @escaping FakeICMPNetwork.Script) throws {
