@@ -292,11 +292,11 @@ final class FakeICMPNetwork: @unchecked Sendable {
   let port: UInt16
   let probes = FaultCounter()
 
+  /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
   private let script: Script
   private let lock = NSLock()
   private var stopped = false
-  private let loopExited = DispatchSemaphore(value: 0)
   private let socketsLock = NSLock()
   private var openedSockets: [Int32] = []
 
@@ -370,20 +370,30 @@ final class FakeICMPNetwork: @unchecked Sendable {
     }
   }
 
+  /// Stops answering, without waiting: no reply is sent once this returns, and the serve thread
+  /// closes the peer's socket when it next wakes, within its 20 ms receive timeout. Safe to call
+  /// from `defer` in an async test, since it parks no thread.
   func stop() {
     lock.lock()
-    let wasStopped = stopped
     stopped = true
-    lock.unlock()
-    guard !wasStopped else { return }
-    loopExited.wait()
-    lock.lock()
-    close(fd)
     lock.unlock()
   }
 
+  private var isStopped: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopped
+  }
+
   private func serve() {
-    defer { loopExited.signal() }
+    // The serve thread owns `fd`. It closes it under the lock that `send` checks `stopped` under,
+    // and only once `stopped` is set, so nothing sends on the number after it is closed and
+    // perhaps handed to another test's socket.
+    defer {
+      lock.lock()
+      close(fd)
+      lock.unlock()
+    }
     var buffer = [UInt8](repeating: 0, count: 4096)
     var control = [UInt8](repeating: 0, count: 128)
     while true {
@@ -413,6 +423,8 @@ final class FakeICMPNetwork: @unchecked Sendable {
           }
         }
       }
+      // A probe that arrives after `stop()` is neither counted nor scripted.
+      if isStopped { return }
       guard received >= 8 else { continue }
       let bytes = Array(buffer.prefix(received))
       let requestType: UInt8 = family == AF_INET6 ? 128 : 8
@@ -555,10 +567,11 @@ func pathScript(family: Int32 = AF_INET, destinationTTL: Int, after delay: TimeI
 /// A loopback TCP listener whose behaviour after accepting is scripted per test.
 ///
 /// Each accepted connection belongs to the thread that handles it, which is the only code that
-/// reads, writes or closes it. `stop()` only shuts connections down, which wakes any pending I/O,
-/// and then waits for every handler to close its own descriptor. So a descriptor number is never
-/// touched after it is closed, and a parallel test that is handed the same number is never
-/// disturbed.
+/// reads, writes or closes it, and the listening socket belongs to the accept loop's thread. `stop()`
+/// only shuts connections down, under the lock a handler holds to withdraw its connection before
+/// closing it, which wakes any pending I/O. So a descriptor number is never touched after it is
+/// closed, and a parallel test that is handed the same number is never disturbed. `stop()` does not
+/// wait for the threads to finish; ``stopAndWait()`` does.
 final class LoopbackTCPServer: @unchecked Sendable {
   enum Behavior: Sendable {
     /// Accept, then never read or write.
@@ -584,13 +597,13 @@ final class LoopbackTCPServer: @unchecked Sendable {
   private var stopped = false
   /// Connections whose handler has not closed them yet.
   private var live: Set<Int32> = []
-  private let handlers = DispatchGroup()
+  /// The accept loop and every handler, until each has closed its descriptor.
+  private let threads = DispatchGroup()
   /// Signalled once by `stop()`; handlers that wait use it instead of sleeping.
   private let stopping = DispatchSemaphore(value: 0)
-  private let loopExited = DispatchSemaphore(value: 0)
 
   /// - Parameter exitGate: When given, every handler waits on it just before closing its
-  ///   connection, so a test can observe whether `stop()` waits for handlers.
+  ///   connection, so a test can observe which teardown waits for handlers.
   init(family: Int32 = AF_INET, behavior: Behavior, exitGate: StallGate? = nil) throws {
     self.exitGate = exitGate
     self.behavior = behavior
@@ -604,30 +617,43 @@ final class LoopbackTCPServer: @unchecked Sendable {
     }
     fd = bound
     port = boundPort
+    threads.enter()
     let thread = Thread { [self] in self.acceptLoop() }
     thread.start()
   }
 
   deinit { stop() }
 
+  /// Stops accepting and shuts every connection down, without waiting: handlers end on their own
+  /// threads, and the accept loop closes the listener within its 20 ms poll. Safe to call from
+  /// `defer` in an async test, since it parks no thread.
   func stop() {
     lock.lock()
     let wasStopped = stopped
     stopped = true
+    // Wake every handler: pending reads return, and waits on `stopping` end. A connection still
+    // in `live` has not been closed by its handler, which withdraws it under this lock first.
+    if !wasStopped {
+      for connection in live { _ = shutdown(connection, SHUT_RDWR) }
+    }
     lock.unlock()
-    guard !wasStopped else { return }
-    loopExited.wait()
-    close(fd)
-    // Wake every handler: pending reads return, and waits on `stopping` end.
-    lock.lock()
-    for connection in live { _ = shutdown(connection, SHUT_RDWR) }
-    lock.unlock()
-    stopping.signal()
-    handlers.wait()
+    if !wasStopped { stopping.signal() }
+  }
+
+  /// Stops the server as ``stop()`` does, then suspends, without holding a thread, until the
+  /// accept loop and every handler have closed their descriptors.
+  func stopAndWait() async {
+    stop()
+    await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+      threads.notify(queue: .global()) { continuation.resume() }
+    }
   }
 
   private func acceptLoop() {
-    defer { loopExited.signal() }
+    defer {
+      close(fd)
+      threads.leave()
+    }
     while true {
       lock.lock()
       let done = stopped
@@ -639,12 +665,19 @@ final class LoopbackTCPServer: @unchecked Sendable {
       guard client >= 0 else { continue }
       accepted.increment()
       lock.lock()
+      // Accepted after `stop()` shut the others down: nothing would wake its handler.
+      guard !stopped else {
+        lock.unlock()
+        close(client)
+        return
+      }
       live.insert(client)
       lock.unlock()
-      handlers.enter()
+      // Entered before the accept loop leaves, so the group cannot drain while a handler runs.
+      threads.enter()
       let behavior = self.behavior
       Thread.detachNewThread { [self] in
-        defer { handlers.leave() }
+        defer { threads.leave() }
         self.handle(client, behavior)
       }
     }
@@ -671,7 +704,8 @@ final class LoopbackTCPServer: @unchecked Sendable {
       write(response, to: client)
       waitForStop(limit: .infinity)
     }
-    // A test can hold the handler here to prove stop() waits for it.
+    // A test can hold the handler here to prove stop() does not wait for it, and stopAndWait()
+    // does.
     exitGate?.wait(limit: 30)
     lock.lock()
     live.remove(client)
@@ -788,11 +822,11 @@ final class LoopbackUDPResponder: @unchecked Sendable {
   let family: Int32
   let requests = FaultCounter()
 
+  /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
   private let script: Script
   private let lock = NSLock()
   private var stopped = false
-  private let loopExited = DispatchSemaphore(value: 0)
 
   init(family: Int32 = AF_INET, script: @escaping Script) throws {
     self.family = family
@@ -807,20 +841,30 @@ final class LoopbackUDPResponder: @unchecked Sendable {
 
   var address: (sockaddr_storage, socklen_t) { loopbackAddress(family: family, port: port) }
 
+  /// Stops answering, without waiting: no reply is sent once this returns, delayed ones included,
+  /// and the serve thread closes the socket when it next wakes, within its 20 ms receive timeout.
+  /// Safe to call from `defer` in an async test, since it parks no thread.
   func stop() {
     lock.lock()
-    let wasStopped = stopped
     stopped = true
-    lock.unlock()
-    guard !wasStopped else { return }
-    loopExited.wait()
-    lock.lock()
-    close(fd)
     lock.unlock()
   }
 
+  private var isStopped: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopped
+  }
+
   private func serve() {
-    defer { loopExited.signal() }
+    // The serve thread owns `fd`. It closes it under the lock that a delivery checks `stopped`
+    // under, and only once `stopped` is set, so nothing sends on the number after it is closed
+    // and perhaps handed to another test's socket.
+    defer {
+      lock.lock()
+      close(fd)
+      lock.unlock()
+    }
     var buffer = [UInt8](repeating: 0, count: 65536)
     while true {
       lock.lock()
@@ -836,6 +880,8 @@ final class LoopbackUDPResponder: @unchecked Sendable {
           }
         }
       }
+      // A request that arrives after `stop()` is neither counted nor scripted.
+      if isStopped { return }
       // A zero-byte datagram is a valid request; only a failed or timed-out receive is not.
       guard n >= 0 else { continue }
       requests.increment()
