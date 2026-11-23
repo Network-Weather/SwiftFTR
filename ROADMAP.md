@@ -48,6 +48,13 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   judge whether the reply came after its request, but still times the reply when the read handler
   takes it, so a busy queue or a long read batch adds to the RTT. Using the stamp would remove that,
   and it is the same clock as the send stamp.
+- **A tripwire that keeps the offline selection offline**: nothing stops a new test from reaching
+  the network with `SKIP_NETWORK_TESTS=1` set (the #92 sweep found 20 that did). A test-only flag
+  in `TestSeams`, set when that variable is, would make the real forward resolver, ICMP socket,
+  public-IP discovery, `getnameinfo`, DNS send and URLSession paths record a test issue when
+  entered without a substitute. It needs a check on each real path in `Sources/`, so it waits for a
+  release that may touch them. Running the suite under `sandbox-exec` with outbound network denied
+  catches only leaks whose test then fails: 2 of the 20.
 - **`connectionRefused` and `unreachable` cases on `DNSError`**, so the throwing query methods tell
   a refused port and an unreachable host from a send failure and from silence, as `dnsProbe`'s
   `outcome` does. New cases break exhaustive switches in consumers, so this waits for a release

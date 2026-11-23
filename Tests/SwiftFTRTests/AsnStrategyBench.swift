@@ -22,40 +22,44 @@ struct AsnStrategyBench {
 
   @Test("Local strategies cover what DNS covers", .enabled(if: !AsnStrategyBench.skipsNetwork))
   func localStrategiesMatchDNSCoverage() async throws {
-    for (label, strategy) in [
-      (".dns    ", ASNResolverStrategy.dns),
-      (".hybrid ", ASNResolverStrategy.hybrid(.embedded, fallbackTimeout: 1.0)),
-      (".embedded", ASNResolverStrategy.embedded),
-    ] {
-      let tracer = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: strategy))
-      _ = tracer  // resolver is created during init
-      let resolver: ASNResolver
-      switch strategy {
-      case .dns: resolver = CachingASNResolver(base: CymruDNSResolver())
-      case .embedded: resolver = LocalASNResolver(source: .embedded)
-      case .hybrid(let s, let t): resolver = HybridASNResolver(source: s, fallbackTimeout: t)
-      case .remote(let b, let u):
-        resolver = LocalASNResolver(source: .remote(bundledPath: b, url: u))
+    // The .dns and .hybrid passes query Team Cymru over live DNS, so they take the shared
+    // permit and do not overlap other suites' network traffic.
+    await NetworkTestGate.shared.withPermit {
+      for (label, strategy) in [
+        (".dns    ", ASNResolverStrategy.dns),
+        (".hybrid ", ASNResolverStrategy.hybrid(.embedded, fallbackTimeout: 1.0)),
+        (".embedded", ASNResolverStrategy.embedded),
+      ] {
+        let tracer = SwiftFTR(config: SwiftFTRConfig(asnResolverStrategy: strategy))
+        _ = tracer  // resolver is created during init
+        let resolver: ASNResolver
+        switch strategy {
+        case .dns: resolver = CachingASNResolver(base: CymruDNSResolver())
+        case .embedded: resolver = LocalASNResolver(source: .embedded)
+        case .hybrid(let s, let t): resolver = HybridASNResolver(source: s, fallbackTimeout: t)
+        case .remote(let b, let u):
+          resolver = LocalASNResolver(source: .remote(bundledPath: b, url: u))
+        }
+
+        // Cold pass: includes database load for local strategies, and populates the DNS cache.
+        let coldStart = monotonicNow()
+        let result = (try? await resolver.resolve(ipv4Addrs: Self.addresses, timeout: 2.0)) ?? [:]
+        let cold = monotonicNow() - coldStart
+
+        // Warm pass on the same resolver instance: steady-state lookup cost.
+        let warmStart = monotonicNow()
+        _ = try? await resolver.resolve(ipv4Addrs: Self.addresses, timeout: 2.0)
+        let warm = monotonicNow() - warmStart
+
+        print(
+          "  \(label)  resolved \(result.count)/\(Self.addresses.count)  cold=\(String(format: "%.3f", cold))s  warm=\(String(format: "%.4f", warm))s"
+        )
+
+        #expect(
+          result.count == Self.addresses.count,
+          "\(label) resolved \(result.count)/\(Self.addresses.count); the default strategy must not lose coverage"
+        )
       }
-
-      // Cold pass: includes database load for local strategies, and populates the DNS cache.
-      let coldStart = monotonicNow()
-      let result = (try? await resolver.resolve(ipv4Addrs: Self.addresses, timeout: 2.0)) ?? [:]
-      let cold = monotonicNow() - coldStart
-
-      // Warm pass on the same resolver instance: steady-state lookup cost.
-      let warmStart = monotonicNow()
-      _ = try? await resolver.resolve(ipv4Addrs: Self.addresses, timeout: 2.0)
-      let warm = monotonicNow() - warmStart
-
-      print(
-        "  \(label)  resolved \(result.count)/\(Self.addresses.count)  cold=\(String(format: "%.3f", cold))s  warm=\(String(format: "%.4f", warm))s"
-      )
-
-      #expect(
-        result.count == Self.addresses.count,
-        "\(label) resolved \(result.count)/\(Self.addresses.count); the default strategy must not lose coverage"
-      )
     }
   }
 }

@@ -14,9 +14,19 @@ private struct MockASNResolver: ASNResolver {
 }
 
 final class SwiftFTRClassificationTests: XCTestCase {
-  override func setUp() {
-    // Ensure no STUN is attempted during tests
-    setenv("PTR_SKIP_STUN", "1", 1)
+  /// Classifies `trace` with no public address, as the tests that call it intend. Discovery is
+  /// substituted by one that finds nothing, so the classifier never reaches live STUN; the library
+  /// does not read `PTR_SKIP_STUN`.
+  private func classifyWithoutPublicIP(
+    _ trace: TraceResult, destinationIP: String, resolver: ASNResolver
+  ) async throws -> ClassifiedTrace {
+    let discovery = OfflinePublicIPDiscovery()
+    let classified = try await discovery.install {
+      try await TraceClassifier().classify(
+        trace: trace, destinationIP: destinationIP, resolver: resolver, timeout: 0.1)
+    }
+    XCTAssertEqual(discovery.calls.value, 1, "classification did not ask for a public address")
+    return classified
   }
 
   func testClassificationRulesAndHoleFilling() async throws {
@@ -82,8 +92,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
     ]
     let tr = TraceResult(destination: "dst", maxHops: 1, reached: false, hops: hops)
     let resolver = MockASNResolver(mapping: [:])
-    let classified = try await TraceClassifier().classify(
-      trace: tr, destinationIP: "203.0.113.1", resolver: resolver, timeout: 0.1)
+    let classified = try await classifyWithoutPublicIP(
+      tr, destinationIP: "203.0.113.1", resolver: resolver)
     XCTAssertEqual(classified.hops[0].category, .isp)
     XCTAssertNil(classified.hops[0].asn)
   }
@@ -99,8 +109,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "203.0.113.10": ASNInfo(asn: 15133, name: "ExampleNet"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    let classified = try await TraceClassifier().classify(
-      trace: tr, destinationIP: "93.184.216.34", resolver: resolver, timeout: 0.1)
+    let classified = try await classifyWithoutPublicIP(
+      tr, destinationIP: "93.184.216.34", resolver: resolver)
     XCTAssertEqual(classified.hops[1].category, .destination)
     XCTAssertEqual(classified.hops[0].category, .destination)  // same ASN as destination
   }
@@ -118,8 +128,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "203.0.113.2": ASNInfo(asn: 64500, name: "TransitNet", prefix: "203.0.113.0/24"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    let classified = try await TraceClassifier().classify(
-      trace: tr, destinationIP: "198.51.100.10", resolver: resolver, timeout: 0.1)
+    let classified = try await classifyWithoutPublicIP(
+      tr, destinationIP: "198.51.100.10", resolver: resolver)
     XCTAssertEqual(classified.hops[1].category, .transit)
     XCTAssertEqual(classified.hops[1].asn, 64500)
   }
@@ -137,8 +147,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
       "198.51.100.2": ASNInfo(asn: 64501, name: "TransitB", prefix: "198.51.100.0/24"),
     ]
     let resolver = MockASNResolver(mapping: mapping)
-    let classified = try await TraceClassifier().classify(
-      trace: tr, destinationIP: "203.0.113.10", resolver: resolver, timeout: 0.1)
+    let classified = try await classifyWithoutPublicIP(
+      tr, destinationIP: "203.0.113.10", resolver: resolver)
     XCTAssertEqual(classified.hops[1].category, .transit)
     XCTAssertNil(classified.hops[1].asn)
   }
@@ -208,8 +218,8 @@ final class SwiftFTRClassificationTests: XCTestCase {
     ]
     let tr = TraceResult(destination: "dst", maxHops: 2, reached: false, hops: hops)
     let resolver = MockASNResolver(mapping: [:])  // No ASN data
-    let classified = try await TraceClassifier().classify(
-      trace: tr, destinationIP: "93.184.216.34", resolver: resolver, timeout: 0.1)
+    let classified = try await classifyWithoutPublicIP(
+      tr, destinationIP: "93.184.216.34", resolver: resolver)
 
     XCTAssertEqual(classified.hops[0].category, .local)
     XCTAssertEqual(classified.hops[1].category, .transit)  // Public IP without ASN = TRANSIT

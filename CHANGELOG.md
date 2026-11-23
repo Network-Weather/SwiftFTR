@@ -85,6 +85,15 @@ Unreleased
   addresses to Team Cymru, and that `-i` is the
   interval on `ping`, so cross-command guidance uses `--interface`. The EAGAIN page's summary says
   a trace in which no probe was sent throws rather than reporting `.notSent`.
+### Tooling
+
+- **The offline test selection no longer reaches the network (#92, #89).** With
+  `SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1`, classification tests ran live STUN, lifecycle and cache
+  tests made real reverse-DNS lookups and traces, `STUNTests` traced 1.1.1.1 and queried Team
+  Cymru, and the "unreachable host" probe tests sent packets to 192.0.2.1. Each now uses a loopback
+  fixture or a local substitute and keeps its claim. The HTTP probe success and 404 tests, which
+  failed whenever the third-party test site was slow, run offline against a loopback server; one
+  gated HTTPS smoke test remains, with no assertion on the server's speed.
 
 0.18.0 — 2026-11-22
 -------------------

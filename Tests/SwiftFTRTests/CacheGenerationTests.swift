@@ -186,9 +186,13 @@ struct CacheGenerationTests {
 
   @Test("SwiftFTR.invalidateNetworkScopedRDNS clears scoped entries via actor")
   func tracerScopedEviction() async {
-    let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: false))
+    // Lookups answer from a local stub, so populating the cache sends no reverse-DNS query.
+    let tracer = SwiftFTR(
+      config: SwiftFTRConfig(noReverseDNS: false), rdnsCache: RDNSCache { _ in "name.example" },
+      asnResolver: EmptyASNResolver(), cachedPublicIP: nil)
     _ = await tracer.rdnsCache.lookup("192.168.1.1")
     _ = await tracer.rdnsCache.lookup("1.1.1.1")
+    #expect(await tracer.rdnsCache.count == 2)
 
     await tracer.invalidateNetworkScopedRDNS()
     #expect(await tracer.rdnsCache.count == 1)
