@@ -41,7 +41,9 @@ struct ReverseDNSLookupTests {
     #expect(zoned.interfaceIndex == loopbackIndex)
     #expect(zoned.isMulticast)
     #expect(zoned.name.hasSuffix(".0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa"))
-    #expect(try #require(ReverseDNSQuestion(address: "fe80::1%7")).interfaceIndex == 7)
+    #expect(
+      try #require(ReverseDNSQuestion(address: "fe80::1%\(loopbackIndex)")).interfaceIndex
+        == loopbackIndex)
     #expect(try #require(ReverseDNSQuestion(address: "fe80::1")).interfaceIndex == 0)
 
     // On any other address a zone is ignored: it would scope a unicast question to one link.
@@ -53,6 +55,90 @@ struct ReverseDNSLookupTests {
     for invalid in ["", "host.example", "1.2.3", "1.2.3.4.5", "fe80::1%", "%lo0", "::g"] {
       #expect(ReverseDNSQuestion(address: invalid) == nil, "\(invalid)")
     }
+  }
+
+  /// An interface index that names no interface on this machine.
+  static func unusedInterfaceIndex() -> UInt32 {
+    var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+    var index: UInt32 = 1000
+    while if_indextoname(index, &name) != nil { index += 1 }
+    return index
+  }
+
+  @Test("Every input form gives its question, or none")
+  func inputTable() throws {
+    let loopbackIndex = if_nametoindex("lo0")
+    #expect(loopbackIndex != 0)
+    #expect(if_nametoindex("gone0") == 0, "the test needs an interface name that does not exist")
+    let unused = Self.unusedInterfaceIndex()
+    let v4 = "4.3.2.1.in-addr.arpa"
+    let v6 = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa"
+    let linkLocal = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa"
+    let cases: [(String, (name: String, index: UInt32)?)] = [
+      ("1.2.3.4", (v4, 0)),
+      ("01.2.3.4", (v4, 0)),  // inet_pton reads the leading zero as decimal
+      ("::ffff:1.2.3.4", (v4, 0)),
+      ("::ffff:1.2.3.4%lo0", (v4, 0)),  // a zone on a non-link-local address is ignored
+      ("2001:db8::1", (v6, 0)),
+      ("2001:DB8::1", (v6, 0)),
+      ("2001:0db8:0000:0000:0000:0000:0000:0001", (v6, 0)),
+      ("2001:db8::1%lo0", (v6, 0)),
+      ("2001:db8::1%gone0", (v6, 0)),
+      ("fe80::1", (linkLocal, 0)),
+      ("FE80::1%lo0", (linkLocal, loopbackIndex)),
+      ("fe80:0:0:0:0:0:0:1%lo0", (linkLocal, loopbackIndex)),
+      ("fe80::1%\(loopbackIndex)", (linkLocal, loopbackIndex)),
+      ("fe80::1%gone0", nil),
+      ("fe80::1%\(unused)", nil),
+      ("fe80::1%0", nil),
+      ("fe80::1%" + String(repeating: "x", count: 300), nil),
+      ("fe80::1%", nil),
+      ("fe80::1%lo0\0x", nil),
+      ("127.0.0.1\0junk", nil),
+      ("::1\0", nil),
+      ("", nil),
+      (" ", nil),
+      (" 1.2.3.4", nil),
+      ("1.2.3.4 ", nil),
+      ("1.2.3", nil),
+      ("1.2.3.4%lo0", nil),
+      ("[::1]", nil),
+      ("1.2.3.4:53", nil),
+      ("[::1]:53", nil),
+      ("%lo0", nil),
+      ("host.example", nil),
+    ]
+    for (input, expected) in cases {
+      let question = ReverseDNSQuestion(address: input)
+      if let expected {
+        let matches = question?.name == expected.name && question?.interfaceIndex == expected.index
+        #expect(matches, "\(input.debugDescription) -> \(String(describing: question))")
+      } else {
+        #expect(question == nil, "\(input.debugDescription) -> \(String(describing: question))")
+      }
+    }
+  }
+
+  @Test("A zone reaches the daemon as its interface index; an unknown zone or a NUL makes no query")
+  func zoneAndNULAtTheDaemon() async throws {
+    let loopbackIndex = if_nametoindex("lo0")
+    let fake = FakeDNSService()
+    let scoped = try await Self.run(fake, "fe80::1%lo0") {
+      fake.deliver(rdata: PTRData.name("host.example"))
+    }
+    #expect(scoped == .answer("host.example"))
+    let question = try #require(fake.question())
+    #expect(question.interfaceIndex == loopbackIndex)
+    try await Self.expectTornDown(fake, references: 1)
+
+    let refused = FakeDNSService()
+    for input in ["fe80::1%gone0", "fe80::1%\(Self.unusedInterfaceIndex())", "127.0.0.1\0junk"] {
+      let outcome = await refused.install {
+        await ReverseDNSLookup.lookup(input, timeout: Self.longTimeout)
+      }
+      #expect(outcome == .error(.invalidAddress), "\(input.debugDescription)")
+    }
+    #expect(refused.starts.isEmpty)
   }
 
   @Test("PTR data is decoded as exactly one uncompressed name, without the trailing dot")

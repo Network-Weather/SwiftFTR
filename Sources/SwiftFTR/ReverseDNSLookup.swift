@@ -24,7 +24,17 @@ struct ReverseDNSQuestion: Sendable, Equatable {
   /// name for the mapped form. A zone is honoured only on a link-local address, where it says
   /// which link to ask; on any other address it would scope a unicast question to an interface
   /// that may have no resolver, which the daemon answers with "no such record" at once.
+  ///
+  /// A zone on a link-local address must name an interface that exists, by name (`%en0`) or by
+  /// index (`%4`); otherwise there is no question, because falling back to every link would let
+  /// a responder on another link name an address the caller scoped elsewhere. A link-local
+  /// address with no zone asks on every link, as `getnameinfo` does for it (measured: unscoped
+  /// `fe80::1` is answered with the name a lookup scoped to `lo0` received), so its answer may
+  /// come from any link.
+  ///
+  /// A string with an embedded NUL is no literal: `inet_pton` would see only the part before it.
   init?(address: String) {
+    guard !address.utf8.contains(0) else { return nil }
     var v4 = in_addr()
     if address.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
       self.init(ipv4: withUnsafeBytes(of: &v4) { Array($0) })
@@ -43,6 +53,11 @@ struct ReverseDNSQuestion: Sendable, Equatable {
     }
 
     let isLinkLocal = bytes[0] == 0xFE && (bytes[1] & 0xC0) == 0x80
+    var interfaceIndex: UInt32 = 0
+    if isLinkLocal && parts.count == 2 {
+      guard let index = Self.interfaceIndex(zone: String(parts[1])) else { return nil }
+      interfaceIndex = index
+    }
     var nibbles: [String] = []
     nibbles.reserveCapacity(32)
     for byte in bytes.reversed() {
@@ -51,8 +66,18 @@ struct ReverseDNSQuestion: Sendable, Equatable {
     }
     self.init(
       name: nibbles.joined(separator: ".") + ".ip6.arpa",
-      interfaceIndex: isLinkLocal && parts.count == 2 ? parseIPv6Scoped(address).scopeID : 0,
+      interfaceIndex: interfaceIndex,
       isMulticast: isLinkLocal)
+  }
+
+  /// The index of the interface `zone` names, by name or as a decimal index, or `nil` when no
+  /// interface has that name or index.
+  private static func interfaceIndex(zone: String) -> UInt32? {
+    let byName = if_nametoindex(zone)
+    if byName != 0 { return byName }
+    guard let index = UInt32(zone), index != 0 else { return nil }
+    var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
+    return if_indextoname(index, &name) != nil ? index : nil
   }
 
   private init(ipv4 octets: [UInt8]) {
