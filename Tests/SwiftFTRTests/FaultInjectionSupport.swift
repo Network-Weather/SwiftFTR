@@ -943,30 +943,141 @@ private func connectToDiscard(_ fd: Int32, family: Int32) throws {
   guard connected == 0 else { throw FixtureError.socket("connect", errno) }
 }
 
+// MARK: - Stray datagrams
+
+/// Which datagrams a loopback fixture takes as its test's request.
+///
+/// A freshly bound loopback port can receive what was sent to a socket that held its number
+/// before, in another test: a fake network's late echo reply, a silent STUN server's garbage, an
+/// empty UDP probe, another test's late query. A fixture that answered, counted or parsed the
+/// first datagram to arrive would let any late sender in the suite decide its test, and a script
+/// that indexed a datagram shorter than it expects ends the whole test process. So every loopback
+/// responder takes only the datagram its test asked for and ignores the rest, empty ones
+/// included, and a script sees only datagrams its filter accepted.
+struct DatagramFilter: Sendable {
+  let accepts: @Sendable (_ datagram: [UInt8]) -> Bool
+
+  /// Exactly `payload`, which may be empty when the test sends an empty datagram on purpose.
+  static func payload(_ payload: [UInt8]) -> DatagramFilter { DatagramFilter { $0 == payload } }
+
+  /// A STUN Binding Request as the library sends it (RFC 5389 §6): a 20-byte header of type
+  /// 0x0001 with no attributes and the magic cookie.
+  static let stunBindingRequest = DatagramFilter { datagram in
+    datagram.count == 20 && datagram[0..<4] == [0x00, 0x01, 0x00, 0x00]
+      && datagram[4..<8] == [0x21, 0x12, 0xA4, 0x42]
+  }
+
+  /// A standard DNS query (QR clear, opcode 0) with one question, for a name other than the root,
+  /// that reads to its end, asking for `name` (ASCII case ignored) when one is given.
+  static func dnsQuery(named name: String? = nil) -> DatagramFilter {
+    let wanted = name.map {
+      $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+    return DatagramFilter { datagram in
+      guard datagram.count >= 12, datagram[2] & 0xF8 == 0, datagram[4] == 0, datagram[5] == 1,
+        let asked = dnsQuestionName(datagram), !asked.isEmpty
+      else { return false }
+      return wanted.map { $0 == asked.lowercased() } ?? true
+    }
+  }
+}
+
+/// The offset of the first question's QTYPE in `message`, or `nil` unless the question's name is
+/// a run of uncompressed labels ending in the root label and its type and class fit after it.
+func dnsQuestionTypeOffset(_ message: [UInt8]) -> Int? {
+  var offset = 12
+  while offset < message.count, message[offset] != 0 {
+    let length = Int(message[offset])
+    guard length & 0xC0 == 0, offset + 1 + length <= 12 + 255 else { return nil }
+    offset += 1 + length
+  }
+  guard offset < message.count, offset + 1 + 4 <= message.count else { return nil }
+  return offset + 1
+}
+
+/// The first question's name in `message`, labels joined by dots, or `nil` if the question does
+/// not read to its end (``dnsQuestionTypeOffset(_:)``).
+func dnsQuestionName(_ message: [UInt8]) -> String? {
+  guard let end = dnsQuestionTypeOffset(message) else { return nil }
+  var labels: [String] = []
+  var offset = 12
+  while offset < end - 1 {
+    let length = Int(message[offset])
+    labels.append(String(decoding: message[offset + 1..<offset + 1 + length], as: UTF8.self))
+    offset += 1 + length
+  }
+  return labels.joined(separator: ".")
+}
+
+/// What a late sender elsewhere in the suite can put on a freshly bound port: a datagram shorter
+/// than any header a script reads (a silent STUN server's garbage reply), and an empty one.
+enum Strays {
+  static let short: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF]
+  static let empty: [UInt8] = []
+
+  /// Sends ``short`` then ``empty`` to `port` on loopback. Returns whether both left whole.
+  static func send(to port: UInt16, family: Int32 = AF_INET) -> Bool {
+    let sender = socket(family, SOCK_DGRAM, IPPROTO_UDP)
+    guard sender >= 0 else { return false }
+    defer { close(sender) }
+    var (address, length) = loopbackAddress(family: family, port: port)
+    return [short, empty].allSatisfy { datagram in
+      datagram.withUnsafeBytes { raw in
+        withUnsafePointer(to: &address) {
+          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            sendto(sender, raw.baseAddress, raw.count, 0, $0, length)
+          }
+        }
+      } == datagram.count
+    }
+  }
+}
+
 // MARK: - Loopback UDP responder
 
-/// A loopback UDP server that answers each datagram as a test scripts: not at all, late, or with
-/// arbitrary bytes.
+/// A loopback UDP server that answers each request its filter accepts as a test scripts: not at
+/// all, late, or with arbitrary bytes. Every other datagram is counted in ``ignored`` and left
+/// unanswered (see ``DatagramFilter``).
 final class LoopbackUDPResponder: @unchecked Sendable {
   typealias Script = @Sendable (_ request: [UInt8]) -> (reply: [UInt8], delay: TimeInterval)?
 
   let port: UInt16
   let family: Int32
+  /// Requests the filter accepted, each handed to the script.
   let requests = FaultCounter()
+  /// Datagrams the filter turned away.
+  let ignored = FaultCounter()
 
   /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
+  private let filter: DatagramFilter
   private let script: Script
   private let lock = NSLock()
   private var stopped = false
 
-  init(family: Int32 = AF_INET, script: @escaping Script) throws {
+  /// - Parameter gate: when given, the serve thread reads nothing until it opens, so a test can
+  ///   queue datagrams ahead of its request.
+  init(
+    family: Int32 = AF_INET, accepts filter: DatagramFilter, readsAfter gate: StallGate? = nil,
+    script: @escaping Script
+  ) throws {
     self.family = family
+    self.filter = filter
     self.script = script
     (fd, port) = try bindLoopback(family: family, type: SOCK_DGRAM)
     setReceiveTimeout(fd, seconds: 0.02)
-    let thread = Thread { [self] in self.serve() }
+    let thread = Thread { [self] in
+      gate?.wait(limit: 60)
+      self.serve()
+    }
     thread.start()
+  }
+
+  /// Datagrams waiting on the socket (`SO_NUMRCVPKT`), or -1 once stopped.
+  var queued: Int32 {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopped ? -1 : queuedDatagrams(fd)
   }
 
   deinit { stop() }
@@ -1014,10 +1125,15 @@ final class LoopbackUDPResponder: @unchecked Sendable {
       }
       // A request that arrives after `stop()` is neither counted nor scripted.
       if isStopped { return }
-      // A zero-byte datagram is a valid request; only a failed or timed-out receive is not.
+      // A zero-byte datagram is read like any other; only a failed or timed-out receive is not.
       guard n >= 0 else { continue }
+      let request = Array(buffer.prefix(n))
+      guard filter.accepts(request) else {
+        ignored.increment()
+        continue
+      }
       requests.increment()
-      guard let (reply, delay) = script(Array(buffer.prefix(n))) else { continue }
+      guard let (reply, delay) = script(request) else { continue }
       let deliver: @Sendable () -> Void = { [self, source, length] in
         self.lock.lock()
         defer { self.lock.unlock() }

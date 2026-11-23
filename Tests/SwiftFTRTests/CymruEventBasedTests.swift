@@ -11,7 +11,7 @@ struct CymruEventBasedTests {
 
   @Test("With every blocking-I/O worker held, a Cymru lookup still resolves")
   func resolvesWithEveryWorkerHeld() async throws {
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: CymruFixture.query) { query in
       CymruFixture.answer(query)
     }
     defer { server.stop() }
@@ -73,6 +73,12 @@ struct CymruEventBasedTests {
 enum CymruFixture {
   static let origin = "15169 | 8.8.8.0/24 | US | arin | 2023-12-28"
   static let asName = "15169 | US | arin | 2000-03-30 | GOOGLE, US"
+
+  /// A query for one of the two names ``answer(_:)`` knows, the only datagrams a Cymru fixture
+  /// answers or counts.
+  static let query = DatagramFilter { datagram in
+    DatagramFilter.dnsQuery().accepts(datagram) && answer(datagram) != nil
+  }
 
   static func answer(_ query: [UInt8]) -> (reply: [UInt8], delay: TimeInterval)? {
     let text: String

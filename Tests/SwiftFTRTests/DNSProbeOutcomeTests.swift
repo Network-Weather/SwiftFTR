@@ -30,7 +30,7 @@ struct DNSProbeOutcomeTests {
   }
 
   static func answering(rcode: UInt8 = 0, family: Int32 = AF_INET) throws -> LoopbackUDPResponder {
-    try LoopbackUDPResponder(family: family) { query in
+    try LoopbackUDPResponder(family: family, accepts: .dnsQuery()) { query in
       (
         FaultInjectionWireTests.dnsResponse(
           to: query, rcode: rcode, answerCount: rcode == 0 ? 1 : 0,
@@ -85,7 +85,7 @@ struct DNSProbeOutcomeTests {
 
   @Test("Silence until the timeout is timedOut, with no timing")
   func timedOut() async throws {
-    let server = try LoopbackUDPResponder { _ in nil }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "outcome.example")) { _ in nil }
     defer { server.stop() }
 
     let result = try await Self.probe(port: server.port, timeout: 0.3)
@@ -99,7 +99,9 @@ struct DNSProbeOutcomeTests {
 
   @Test("A short datagram with the query's ID is malformedReply, reachable, rtt equals elapsed")
   func malformedReply() async throws {
-    let server = try LoopbackUDPResponder { query in (Array(query.prefix(2)) + [0x81, 0x80], 0) }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "outcome.example")) { query in
+      (Array(query.prefix(2)) + [0x81, 0x80], 0)
+    }
     defer { server.stop() }
 
     let result = try await Self.probe(port: server.port)
@@ -236,7 +238,7 @@ struct DNSProbeOutcomeTests {
 
   @Test("Cancelling dnsProbe mid-probe throws CancellationError instead of returning a result")
   func cancellation() async throws {
-    let server = try LoopbackUDPResponder { _ in nil }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "cancel.example")) { _ in nil }
     defer { server.stop() }
     let task = Task {
       try await TestSeams.$dnsServerPort.withValue(server.port) {
@@ -307,7 +309,8 @@ struct DNSProbeOutcomeTests {
 
   @Test("A TXT lookup whose connect has no route moves on to the next server")
   func txtConnectFailureFallsThrough() async throws {
-    let server = try LoopbackUDPResponder { query in CymruFixture.answer(query) }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "8.8.8.8.origin.asn.cymru.com"))
+    { query in CymruFixture.answer(query) }
     defer { server.stop() }
     let connects = FaultCounter()
     let connect: TestSeams.ConnectSocket = { fd, address, length in
@@ -348,7 +351,8 @@ struct DNSProbeOutcomeTests {
     "A TXT lookup refused or unreachable at the first server moves on to the next",
     arguments: DeliveredFailure.allCases)
   func txtDeliveredFailureFallsThrough(failure: DeliveredFailure) async throws {
-    let server = try LoopbackUDPResponder { query in CymruFixture.answer(query) }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "8.8.8.8.origin.asn.cymru.com"))
+    { query in CymruFixture.answer(query) }
     defer { server.stop() }
     // The first exchange's read reports the failure in place of its reply; later reads are plain.
     let reads = FaultCounter()

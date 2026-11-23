@@ -1,4 +1,5 @@
 import Foundation
+@_spi(Test) import SwiftFTR
 import Testing
 
 @testable import SwiftFTR
@@ -158,7 +159,7 @@ struct FaultInjectionFixtureTests {
 
   @Test("The UDP responder hands a zero-byte request to its script")
   func udpZeroByteRequest() async throws {
-    let responder = try LoopbackUDPResponder { _ in ([0x2A], 0) }
+    let responder = try LoopbackUDPResponder(accepts: .payload([])) { _ in ([0x2A], 0) }
     defer { responder.stop() }
     let client = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
     defer { close(client) }
@@ -172,6 +173,52 @@ struct FaultInjectionFixtureTests {
     let received = recv(client, &reply, reply.count, 0)
     #expect(received == 1)
     #expect(responder.requests.value == 1)
+  }
+
+  @Test("The UDP responder answers its query after a short and an empty stray queued ahead")
+  func udpResponderIgnoresStrays() async throws {
+    // The DNS fault script writes into the request's header, so a stray shorter than one handed
+    // to it would end the test process (#169).
+    let gate = StallGate()
+    defer { gate.open() }
+    let name = "stray.example"
+    let responder = try LoopbackUDPResponder(accepts: .dnsQuery(named: name), readsAfter: gate) {
+      query in
+      (FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord), 0)
+    }
+    defer { responder.stop() }
+    #expect(Strays.send(to: responder.port))
+    try #require(
+      await eventually(within: 10) { responder.queued >= 2 }, "queued: \(responder.queued)")
+    gate.open()
+
+    let (answers, _) = try await measure(within: 20) {
+      try await __dnsQuery(
+        server: "127.0.0.1", port: responder.port, name: name, type: 1, timeout: 10)
+    }
+    #expect(answers.first?.rdata == Data([192, 0, 2, 9]))
+    #expect(responder.requests.value == 1)
+    #expect(responder.ignored.value >= 2, "ignored: \(responder.ignored.value)")
+  }
+
+  @Test("The DNS filter takes a query for its name and nothing shorter, other or malformed")
+  func dnsQueryFilter() {
+    let query = Array(
+      Data([0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0]) + __dnsEncodeQName("Stray.Example")
+        + Data([0, 1, 0, 1]))
+    let filter = DatagramFilter.dnsQuery(named: "stray.example")
+    #expect(filter.accepts(query))
+    #expect(DatagramFilter.dnsQuery().accepts(query))
+    #expect(!DatagramFilter.dnsQuery(named: "other.example").accepts(query))
+    // Every prefix is too short to carry the question's type and class.
+    for length in 0..<query.count { #expect(!filter.accepts(Array(query.prefix(length)))) }
+    var reply = query
+    reply[2] |= 0x80
+    #expect(!filter.accepts(reply), "a response is not a query")
+    let echoReply: [UInt8] = [0, 0, 0, 0, 0, 1, 0, 1] + [UInt8](repeating: 0x61, count: 8)
+    #expect(!DatagramFilter.dnsQuery().accepts(echoReply))
+    let root: [UInt8] = [0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1]
+    #expect(!DatagramFilter.dnsQuery().accepts(root), "a query for the root has no label to read")
   }
 
   @Test("The refusing TCP port resets connections and stays reserved")
@@ -347,7 +394,7 @@ struct FaultInjectionFixtureTests {
 
   @Test("A stopped UDP fixture's own thread closes its socket")
   func udpFixtureThreadClosesItsSocket() async throws {
-    let responder = try LoopbackUDPResponder { _ in nil }
+    let responder = try LoopbackUDPResponder(accepts: .payload([])) { _ in nil }
     let network = try FakeICMPNetwork { _ in [] }
     let ports = [responder.port, network.port]
     #expect(!ports.contains { Self.canBind(type: SOCK_DGRAM, port: $0) }, "a port was not held")

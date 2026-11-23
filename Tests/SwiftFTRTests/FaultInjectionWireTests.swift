@@ -62,7 +62,7 @@ struct FaultInjectionWireTests {
 
   @Test("STUN accepts a well-formed binding response from the fixture")
   func stunPositiveControl() async throws {
-    let server = try LoopbackUDPResponder { request in
+    let server = try LoopbackUDPResponder(accepts: .stunBindingRequest) { request in
       Self.stunSuccess(for: request, ip: [198, 51, 100, 7]).map { ($0, 0) }
     }
     defer { server.stop() }
@@ -72,7 +72,7 @@ struct FaultInjectionWireTests {
 
   @Test("STUN gives up within its timeout on a faulty server", arguments: STUNFault.allCases)
   func stunFaults(fault: STUNFault) async throws {
-    let server = try LoopbackUDPResponder { request in
+    let server = try LoopbackUDPResponder(accepts: .stunBindingRequest) { request in
       switch fault {
       case .silent: return nil
       case .garbage: return ([0xDE, 0xAD, 0xBE, 0xEF], 0)
@@ -95,7 +95,7 @@ struct FaultInjectionWireTests {
 
   @Test("A sub-microsecond STUN timeout is still a timeout, not an unbounded wait")
   func stunTinyTimeout() async throws {
-    let server = try LoopbackUDPResponder { _ in nil }
+    let server = try LoopbackUDPResponder(accepts: .stunBindingRequest) { _ in nil }
     defer { server.stop() }
     // The failure is a wait with no end, so any finite watchdog tells them apart.
     let (address, length) = server.address
@@ -120,6 +120,9 @@ struct FaultInjectionWireTests {
   static func dnsResponse(
     to query: [UInt8], rcode: UInt8 = 0, answerCount: UInt16 = 1, answers: [UInt8]
   ) -> [UInt8] {
+    // A fixture's filter hands its script only well-formed queries; anything shorter than a
+    // header gets an empty reply rather than an index out of range.
+    guard query.count >= 12 else { return [] }
     var header = Array(query.prefix(12))
     header[2] = 0x81
     header[3] = 0x80 | rcode
@@ -128,6 +131,9 @@ struct FaultInjectionWireTests {
     return header + Array(query.dropFirst(12)) + answers
   }
 
+  /// The name every DNS test here asks for, and the only one its fixture answers.
+  static let dnsName = "fault.example"
+
   static let aRecord: [UInt8] = [0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 9]
 
   /// The outcome of a DNS query, or `nil` if it was still running after ``watchdog``.
@@ -135,7 +141,7 @@ struct FaultInjectionWireTests {
     let outcome = try? await measure(within: watchdog) {
       await Result.capture {
         try await __dnsQuery(
-          server: "127.0.0.1", port: port, name: "fault.example", type: 1, timeout: timeout)
+          server: "127.0.0.1", port: port, name: dnsName, type: 1, timeout: timeout)
       }
     }
     return outcome?.0
@@ -143,7 +149,7 @@ struct FaultInjectionWireTests {
 
   @Test("DNS accepts a well-formed answer from the fixture")
   func dnsPositiveControl() async throws {
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: Self.dnsName)) { query in
       (Self.dnsResponse(to: query, answers: Self.aRecord), 0)
     }
     defer { server.stop() }
@@ -154,7 +160,7 @@ struct FaultInjectionWireTests {
 
   @Test("DNS fails within its timeout on a faulty server", arguments: DNSFault.allCases)
   func dnsFaults(fault: DNSFault) async throws {
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: Self.dnsName)) { query in
       switch fault {
       case .silent: return nil
       case .nxdomain: return (Self.dnsResponse(to: query, rcode: 3, answerCount: 0, answers: []), 0)
@@ -240,16 +246,18 @@ struct FaultInjectionWireTests {
 
   @Test("UDP probe distinguishes a reply, a closed port and silence, each within its timeout")
   func udpOutcomes() async throws {
-    let echo = try LoopbackUDPResponder { request in (request, 0) }
+    let payload = Data("ping".utf8)
+    let echo = try LoopbackUDPResponder(accepts: .payload(Array(payload))) { request in
+      (request, 0)
+    }
     defer { echo.stop() }
-    let silent = try LoopbackUDPResponder { _ in nil }
+    let silent = try LoopbackUDPResponder(accepts: .payload(Array(payload))) { _ in nil }
     defer { silent.stop() }
     // A port that answers with ICMP port-unreachable, reserved for the whole test.
     let closed = try RefusingUDPPort()
     let closedPort = closed.port
     defer { withExtendedLifetime(closed) {} }
 
-    let payload = Data("ping".utf8)
     let replied = try await udpProbe(
       config: UDPProbeConfig(host: "127.0.0.1", port: Int(echo.port), timeout: 1, payload: payload))
     #expect(replied.responseType == "udp_reply")
