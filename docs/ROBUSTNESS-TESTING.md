@@ -70,7 +70,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Probe socket | creation fails the way `socket(2)` does; every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `ProbeWindow` |
 | Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
-| Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
+| Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
@@ -325,7 +325,14 @@ numbers are as of the commit that added this section.
     lost nothing. A reply to a sequence not yet sent was kept as that probe's reply, with an RTT
     of -1.0 s and the unanswered probe counted as received. A duplicate replaced the first reply's
     RTT and TTL (0.104 s for a 0.2 ms reply). Ping now counts only the first reply to a request it
-    has sent and drops the rest like replies for another identifier. A reply to an earlier probe
+    has sent and drops the rest like replies for another identifier. A send time recorded before a
+    read does not prove the reply came after the send: a reply queued while the send was still
+    retrying buffer pressure on the ping's queue was read after the send time was set, kept, and
+    the genuine reply dropped as its duplicate (TTLs 9, 7, 9 for three genuine replies marked 9).
+    Ping now reads the kernel's arrival stamp (`SO_TIMESTAMP_MONOTONIC`, delivered on this macOS
+    for unprivileged ICMP and ICMPv6 datagram sockets and on the clock ping stamps its sends with)
+    and ignores a reply that arrived before its request's successful send. Without a stamp the
+    reply is judged as before. A reply to an earlier probe
     that arrives after `timeout` but before the ping's last reply window ends still counts, as
     `PingConfig.timeout` documents. Tests: `PingReplyMatchingTests`, IPv4 and IPv6.
 

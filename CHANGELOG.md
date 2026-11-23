@@ -13,7 +13,9 @@ Unreleased
   as many as it sends. A reply to a sequence never sent could end a ping after its first probe
   with no loss reported, or before a later probe's reply with loss reported on a clean path; a
   reply to a sequence not yet sent was taken as that probe's reply, with a negative RTT; a
-  duplicate replaced the first reply's RTT and TTL. Such replies are now ignored. On a network
+  duplicate replaced the first reply's RTT and TTL. Such replies are now ignored, including one
+  that reached the socket before its request left (while the send was retrying buffer
+  pressure), judged by the kernel's arrival stamp (`SO_TIMESTAMP_MONOTONIC`). On a network
   that sends them, `received`, `packetLoss` and the RTTs can differ from 0.18.0, which
   misreported them. `PingConfig.timeout` is now documented as what it always was: the reply
   window after the last request, within which a reply to any earlier request still counts.
