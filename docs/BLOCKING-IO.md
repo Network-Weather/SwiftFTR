@@ -58,8 +58,8 @@ on.
 ## What stays
 
 - Every public signature and error case, except the breaks decision 10 allows and Release
-  0.19.0 names: two `DNSError` cases, one `TracerouteError` case, and new defaulted parameters on
-  existing initializers.
+  0.19.0 names: two `DNSError` cases and one `TracerouteError` case. New options are added as
+  further initializers, so existing calls keep their exact function type.
 - The fault-injection approach from #94: task-local seams, loopback fixtures, negative controls.
   The seam closure types for resolution and public-IP discovery are synchronous today and become
   async with the code they replace, so the tests that bind them change.
@@ -238,8 +238,11 @@ source-breaking error cases this plan had deferred. David's decisions for this r
 point where the work it is waiting on can be abandoned, and until Resolution Off The Actor lands
 a trace calls `getaddrinfo` on the tracer actor, where no timer can interrupt it; a deadline
 built before that would be a bound the library could not keep (both reviewers, from the code).
-With everything before it event-based or behind a deadline, expiry stops the work instead of
-abandoning it, and the default deadline is a sum of caps that all exist. The order is otherwise
+With everything before it event-based or behind a deadline, the caller's wait is bounded in
+every phase and the default deadline is a sum of caps that all exist. Expiry stops the
+event-based work outright. It does not stop a `getaddrinfo` already running: that caller is
+released while the call finishes in its executor slot, which is the residual Resolution Off The
+Actor accepts. The order is otherwise
 the risk order above: the UDP transports, then reverse DNS, then forward resolution.
 
 Each row is one pull request under about 2,000 changed lines. The rows are not independent:
@@ -254,7 +257,7 @@ overlap in time; the "After" column is what must have landed first.
 | Upload Default | | Bufferbloat's default upload URL (decision 11, #89). |
 | Test Hygiene | | #135 (a watchdog on the ASN-enrichment cancellation test), #129 (fixture teardown that does not block an async test), the stronger `cancelledLookupNotCached` (ROADMAP). Tests only. |
 | DNS Error Cases | Small Fixes | `DNSError.connectionRefused` and `DNSError.unreachable`, mapped by where the failure came from: a refusal received after the send (`sendFailed` today), an unreachable received after the send (`timeout` today), and a local routing failure on connect or send (`sendFailed` today). `dnsProbe`'s result for each origin does not change. Adds the API allowlist and runs the API check in CI. |
-| Async Public-IP Discovery | | The stage below. STUN server names and each STUN attempt run as executor requests under one absolute discovery deadline; nothing moves onto the cooperative pool. Deletes the blocking DNS path, so it lands after Small Fixes has touched it. |
+| Async Public-IP Discovery | Small Fixes | The stage below. STUN server names and each STUN attempt run as executor requests under one absolute discovery deadline; nothing moves onto the cooperative pool. Deletes the blocking DNS path, so it lands after Small Fixes has touched it. |
 | Event-Based STUN | Async Public-IP Discovery | The stage below, including a cancellable, bounded wait on each server-name lookup so a stalled name cannot hold discovery, and a stated rule for an empty datagram (today `recvTimeout`). |
 | Reverse-DNS Lookup | | The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test, the descriptor-count test at a lowered limit and the gated live comparison. Unused until the next row; the two are released together. |
 | Reverse-DNS Cache | Reverse-DNS Lookup | `RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker, and `withTraceCancellation` around the multipath flow's reverse-DNS wait. |
@@ -262,14 +265,15 @@ overlap in time; the "After" column is what must have landed first.
 | Enrichment Lifetimes | Async Public-IP Discovery | A public-IP discovery that was attempted and failed is remembered for the rest of the call, so the classifier does not pay for it again. The ASN lookup's timeout reaches every resolver it passes through (`HybridASNResolver` ignores it today), and a caller leaving a shared ASN database load neither cancels it for others nor leaves the resolver latched as failed. |
 | Deadline For Traces | Resolution Off The Actor, Enrichment Lifetimes | The deadline clock, the phase bookkeeping and its lock, the `TracerouteError` deadline case (decision 6), the result field naming the phase, and the new configuration option, for `traceClassified`. Measured hops are committed when the receive window completes, so expiry in any later phase can return them. Every phase the default sums has a cap: both reverse-DNS waves, classification, and the scheduling allowance. |
 | Deadline For Multipath | Deadline For Traces | `discoverPaths` and its per-flow pipeline: the phase is reported on the topology, paths from finished batches are returned, and the actor-side publication check still rejects a result from before a network change. |
-| Offline Tripwire | every row above | A test-only check on each real network path that fails an offline test entering it (ROADMAP). Last, because it touches the paths the other rows rewrite, and some offline tests still open real loopback sockets and need substitutes first. |
+| Offline Tripwire | every row above | A test-only check on each real network path that fails an offline test reaching anything but loopback or a fixture the test bound itself (ROADMAP). Tests that deliberately exercise the real transport against a loopback fixture keep doing so. Last, because it touches the paths the other rows rewrite. |
 | Release 0.19.0 | all | Version, changelog section, `MigratingTo019.md` complete, release notes. |
 
-**New options without ambiguity.** Every parameter of `SwiftFTRConfig.init` has a default, so a
-second initializer whose extra parameter is also defaulted would make `SwiftFTRConfig()`
-ambiguous. New options are therefore added to the existing initializer with defaults. Ordinary
-calls compile unchanged; a caller that uses the initializer as a function value does not. If the
-API check reports the changed initializer, that line joins the allowlist under decision 10.
+**New options keep existing calls exact.** A new option is added as a further initializer that
+repeats the existing parameters and adds the new one, all defaulted. Swift resolves a call that
+names none of the new parameters to the initializer with the fewest defaulted parameters, so
+`SwiftFTRConfig()` and every existing call, including one that uses the initializer as a function
+value, compile unchanged and mean what they meant (checked with three such initializers on Swift
+6.4; CI compiles the same shape on 6.1). No initializer signature is changed or removed.
 
 **What must ship together.** Reverse-DNS Lookup with Reverse-DNS Cache. Enrichment Lifetimes
 before either Deadline row, or the default deadline budgets one discovery and the call spends
@@ -403,8 +407,9 @@ resolver.
 
 The #84 contract, for `traceClassified` and `discoverPaths` (including the per-flow pipeline in
 `performClassifiedTraceWithFlowID`). It extends the cancel state from Consistent Cancellation
-and lands after the event-based stages and Resolution Off The Actor, so that expiry stops the
-work instead of abandoning it and no phase can hold the actor past the deadline.
+and lands after the event-based stages and Resolution Off The Actor, so that no phase can hold
+the actor past the deadline. The deadline bounds the caller's wait; event-based work is stopped
+at expiry, and a blocking `getaddrinfo` already under way runs on in its slot.
 
 - One absolute deadline on one monotonic clock, the one Dispatch timers use, started on entry to
   the actor-isolated method.
@@ -453,7 +458,7 @@ swift package --allow-writing-to-directory docc generate-documentation --target 
   an object kept alive only by a callback context is freed early.
 - The API check runs against `v0.18.1`. The only breakages allowlisted are the ones this plan
   names: the two `DNSError` cases and the `TracerouteError` deadline case (decision 6). Any other
-  reported breakage fails the gate.
+  reported breakage, a changed initializer included, fails the gate.
 - Each event-based stage adds one more: with every executor slot held by a gated blocker, the
   operation it converts still completes against a healthy loopback fixture reached by a literal
   address.
@@ -609,9 +614,12 @@ in:
   latches the resolver as failed (both). Hence Enrichment Lifetimes.
 - The first deadline slice must commit measured hops at receive completion and cap every phase
   it sums (Codex).
-- A defaulted second initializer is ambiguous; new options extend the existing initializer
-  (Gemini). Codex measured that the API check reports added enum cases and accepts one exact
-  line per allowlist entry.
+- Codex measured that the API check reports added enum cases and accepts one exact line per
+  allowlist entry, and reports nothing for an added initializer.
+- Gemini reported that a second initializer with a defaulted extra parameter makes
+  `SwiftFTRConfig()` ambiguous. That is wrong: Swift picks the initializer with the fewest
+  defaulted parameters (measured by Codex and by the author). New options stay further
+  initializers.
 - The resolution seam is shared by traces and probes, so resolution is one change (Gemini).
 - The "stopping short" claim was false; replaced by what must ship together (both).
 - Nothing ran the API check in CI, and the exhaustive-switch test decision 6 cited did not
