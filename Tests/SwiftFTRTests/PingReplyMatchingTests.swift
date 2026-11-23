@@ -594,17 +594,23 @@ final class DirectPing: @unchecked Sendable {
   }
 
   /// Waits, blocking this thread for at most `limit` seconds, until the network has sent at least
-  /// `count` replies and every reply it sent to `fd` is queued there or read. Called from a send
-  /// hook, it holds that send until earlier replies have crossed loopback, so a reply window that
-  /// starts at the send does not depend on how fast loopback delivers. Returns whether that
-  /// happened.
+  /// `count` replies and at least as many datagrams as it sent to `fd` are queued there or read.
+  /// Called from a send hook, it holds that send until earlier replies have crossed loopback, so a
+  /// reply window that starts at the send does not depend on how fast loopback delivers. Returns
+  /// whether that happened.
+  ///
+  /// "At least", unlike ``waitUntilEveryReplyQueuedOrRead(_:limit:)``: another test's late
+  /// datagram can land on the probe socket's recycled port, and an exact count would then never
+  /// be met. Such a stray can stand in for a reply only if it lands while that reply is still in
+  /// flight.
   func waitUntilReplied(_ count: Int, _ fd: Int32, limit: TimeInterval = 10) -> Bool {
     let giveUp = monotonicNow() + limit
-    while network.repliesSent.value < count {
+    while true {
+      let sent = network.repliesSent.value
+      if sent >= count && Int(queuedDatagrams(fd)) + clock.readingCount >= sent { return true }
       if monotonicNow() >= giveUp { return false }
       usleep(500)
     }
-    return waitUntilEveryReplyQueuedOrRead(fd, limit: max(0, giveUp - monotonicNow()))
   }
 
   init(family: Int32, config: PingConfig, script: @escaping FakeICMPNetwork.Script) throws {
