@@ -420,14 +420,9 @@ let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))
 After:
 
 ```swift
-struct GatewayResolver: PublicIPResolver {
-  func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation? {
-    guard let wan = await gatewayWANAddress(family: request.family) else { return nil }  // yours
-    return PublicIPObservation(address: wan, family: request.family, source: .gatewayReported)
-  }
-}
+// `myResolver` conforms to PublicIPResolver (an example is in docs/guides/EXAMPLES.md).
 let tracer = SwiftFTR(
-  config: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(GatewayResolver())))
+  config: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(myResolver)))
 // or: SwiftFTRConfig(interface: "en0", publicIPResolver: .disabled)
 ```
 

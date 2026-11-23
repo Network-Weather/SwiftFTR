@@ -169,8 +169,7 @@ public struct PublicIPRequest: Sendable {
 public struct PublicIPObservation: Sendable, Hashable, Codable {
     public let address: String
     public let family: IPAddressFamily
-    public let source: PublicIPObservationSource  // .configured, .validatedCallerCache,
-                                                  // .gatewayReported, .stun, .dnsWhoami, or the caller's own
+    public let source: PublicIPObservationSource  // .configured, .stun, a seed's, the caller's...
 }
 ```
 
@@ -309,8 +308,8 @@ resolver is IPv4 STUN then a DNS TXT query to `whoami.ds.akahelp.net`, or IPv6 S
 `publicIPDiscoveryTimeout` deadline shared by every name lookup, STUN attempt and DNS query (STUN
 stops at its own share, servers × per-server timeout, so the DNS fallback always gets time). A
 caller's resolver is held to the same deadline by the tracer: one that never returns or ignores
-cancellation is abandoned there, and its late answer is never cached. Every answer must be a
-globally routable address of the family asked for. A miss is not cached, so the next trace asks
+cancellation is abandoned there, and an answer handled after it is a miss, never cached. Every
+answer must be a globally routable address of the family asked for (`::ffff:a.b.c.d` is IPv4). A miss is not cached, so the next trace asks
 again; the classifier itself (`TraceClassifier.classify(trace:destinationIP:resolver:timeout:publicIP:vpnContext:)`,
 `publicIP` required) never discovers, so a failed question costs one budget, not two. The result's
 `publicIPSource` says where the address came from.

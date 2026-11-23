@@ -31,8 +31,8 @@ Unreleased
   that never returns or ignores cancellation is abandoned there and its task cancelled, and an
   answer handled once the clock has reached the deadline is a miss, never used or cached, whatever
   else happened first. A tracer whose `sourceIP` cannot be bound for the family asked asks
-  nothing. The option comes as a further
-  `SwiftFTRConfig` initializer, so existing calls resolve as before.
+  nothing. The option comes as a further `SwiftFTRConfig` initializer, so existing calls resolve
+  as before.
 - **`ClassifiedTrace.publicIPSource`** (`PublicIPObservationSource?`) says where `publicIP` came
   from: `.configured`, `.validatedCallerCache` or `.gatewayReported` (a seed), `.stun` or
   `.dnsWhoami` (the library's resolver), or whatever a caller's resolver names. It is encoded
@@ -127,14 +127,10 @@ Unreleased
   traces of its own family (a trace of the other family asks the strategy, which by default sends
   STUN). An address that is not globally routable, whether configured, returned by a resolver or
   found by the library's discovery, is not used: a configured private or documentation address is
-  ignored where 0.18 used it, and the trace asks the strategy instead.
-- **An IPv4-mapped public address is IPv4.** A seed, configured address or resolver answer of the
-  form `::ffff:a.b.c.d` is kept as `a.b.c.d` and answers IPv4 traces only; 0.18 stored the mapped
-  form, which then labelled traces of either family.
+  ignored where 0.18 used it, and the trace asks the strategy instead. An IPv4-mapped address
+  (`::ffff:a.b.c.d`) from any of them is IPv4, kept as `a.b.c.d`.
 - **`swift-ftr trace` and `multipath` with `--public-ip` send no discovery traffic** whatever the
   address; one the library refuses, or of the other family, means no public address.
-- **A seed's `PublicIPSource` is kept**, and reported as `ClassifiedTrace.publicIPSource` by the
-  traces that use it.
 
 ### Bug fixes
 

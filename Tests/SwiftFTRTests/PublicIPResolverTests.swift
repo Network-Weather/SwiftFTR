@@ -3,10 +3,6 @@ import Testing
 
 @testable import SwiftFTR
 
-#if canImport(Darwin)
-  import Darwin
-#endif
-
 /// A caller's public-IP resolver whose answer each test scripts, recording every request.
 final class ScriptedPublicIPResolver: PublicIPResolver, @unchecked Sendable {
   enum Behavior: Sendable {
@@ -38,16 +34,10 @@ final class ScriptedPublicIPResolver: PublicIPResolver, @unchecked Sendable {
     self.onAsk = onAsk
   }
 
-  var requests: [PublicIPRequest] {
-    lock.lock()
-    defer { lock.unlock() }
-    return recorded
-  }
+  var requests: [PublicIPRequest] { lock.withLock { recorded } }
 
   private func record(_ request: PublicIPRequest) {
-    lock.lock()
-    recorded.append(request)
-    lock.unlock()
+    lock.withLock { recorded.append(request) }
   }
 
   func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation? {
