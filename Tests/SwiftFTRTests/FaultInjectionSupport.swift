@@ -316,6 +316,9 @@ final class FakeICMPNetwork: @unchecked Sendable {
   /// Datagrams this peer has sent, scripted replies and injected ones alike, counted once
   /// `sendto` has returned.
   let repliesSent = FaultCounter()
+  /// Echo requests from a socket this network did not make (another test's late probe to a
+  /// recycled port), neither counted as probes nor scripted.
+  let foreignProbes = FaultCounter()
 
   /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
@@ -390,8 +393,14 @@ final class FakeICMPNetwork: @unchecked Sendable {
   /// Public-IP discovery is substituted too: by the test's own substitute when one is bound, and
   /// otherwise by one that fails at once, so a classified trace inside `body` can never fall
   /// through to real STUN traffic.
+  ///
+  /// When `isolated` (the default), probes go out through ``connectingSend``, which connects each
+  /// probe socket to this network before its first send: the kernel then delivers to the socket
+  /// only what this network sends, so no other test's late datagram can reach it. A test whose
+  /// factory connects the socket itself, to make the library's `sendto` fail, passes `false`.
   func install<T>(
-    socketFactory: TestSeams.MakeICMPSocket? = nil, _ body: () async throws -> T
+    socketFactory: TestSeams.MakeICMPSocket? = nil, isolated: Bool = true,
+    _ body: () async throws -> T
   ) async rethrows -> T {
     let resolved = self.resolved
     let resolve: TestSeams.ResolveHost = { _, _ in resolved }
@@ -403,10 +412,65 @@ final class FakeICMPNetwork: @unchecked Sendable {
     return try await TestSeams.$resolveHost.withValue(resolve) {
       try await TestSeams.$makeICMPSocket.withValue(makeSocket) {
         try await TestSeams.$discoverPublicIPv4.withValue(discover) {
-          try await body()
+          try await TestSeams.$sendProbe.withValue(isolated ? Self.connectingSend : nil) {
+            try await body()
+          }
         }
       }
     }
+  }
+
+  /// The library's probe send on a socket connected to the destination: `connect(2)` on the
+  /// first send, then `send(2)`, since Darwin refuses a `sendto` that names an address on a
+  /// connected datagram socket (EISCONN). Every probe in a test goes to the fake network's own
+  /// address, so connecting to it changes nothing the library sees except that only the network
+  /// can reach the socket. Production ICMP sockets are never connected; a connected one whose peer
+  /// is gone reports ECONNREFUSED once on `recv`, which trace and ping both read as "nothing more
+  /// to read now", and no test stops its network before the operation has closed its socket.
+  static let connectingSend: TestSeams.SendProbe = { fd, bytes, destination, length in
+    var peer = sockaddr_storage()
+    var peerLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let connected = withUnsafeMutablePointer(to: &peer) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fd, $0, &peerLength) }
+    }
+    if connected != 0, connect(fd, destination, length) != 0 { return -1 }
+    return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+  }
+
+  /// Connects `fd`, a socket a test's factory has already bound, to this network, so nothing
+  /// else can queue datagrams on it between the bind and the first send.
+  func connectProbe(_ fd: Int32) throws {
+    var (address, length) = loopbackAddress(family: family, port: port)
+    let connected = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
+    }
+    guard connected == 0 else { throw FixtureError.socket("connect probe socket", errno) }
+  }
+
+  /// Sends `bytes` now, from this network's address, to loopback port `port`: the only source a
+  /// connected probe socket accepts. Returns whether the whole datagram was sent.
+  @discardableResult
+  func send(_ bytes: [UInt8], toPort port: UInt16) -> Bool {
+    let (destination, _) = loopbackAddress(family: family, port: port)
+    return send(bytes, to: destination, hopLimit: nil)
+  }
+
+  /// The local ports of the sockets ``makeSocket(_:)`` opened and this network still holds, read
+  /// now, so a socket the library bound after it was made is included.
+  private func ownPorts() -> Set<UInt16> {
+    lock.lock()
+    let held = heldSockets
+    lock.unlock()
+    var ports = Set<UInt16>()
+    for fd in held {
+      var local = sockaddr_storage()
+      var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      let named = withUnsafeMutablePointer(to: &local) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+      }
+      if named == 0 { ports.insert(Self.port(of: local)) }
+    }
+    return ports
   }
 
   /// Stops answering, without waiting: no reply is sent once this returns, and the serve thread
@@ -470,6 +534,13 @@ final class FakeICMPNetwork: @unchecked Sendable {
       let bytes = Array(buffer.prefix(received))
       let requestType: UInt8 = family == AF_INET6 ? 128 : 8
       guard bytes[0] == requestType else { continue }
+      // Only this network's own sockets are answered: a request from any other port is another
+      // test's late probe to this recycled port number.
+      guard ownPorts().contains(Self.port(of: source)) else {
+        foreignProbes.increment()
+        record("foreign probe from port \(Self.port(of: source)) ignored")
+        continue
+      }
       let probe = Probe(
         identifier: UInt16(bytes[4]) << 8 | UInt16(bytes[5]),
         sequence: UInt16(bytes[6]) << 8 | UInt16(bytes[7]),

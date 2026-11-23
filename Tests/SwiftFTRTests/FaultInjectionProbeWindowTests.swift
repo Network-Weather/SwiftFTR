@@ -268,7 +268,7 @@ struct FaultInjectionProbeWindowTests {
       }
     }
 
-    try await network.install(socketFactory: connectedFactory) {
+    try await network.install(socketFactory: connectedFactory, isolated: false) {
       await expectSendFailure("trace") { _ = try await tracer.trace(to: "fake.test") }
       await expectSendFailure("traceClassified") {
         _ = try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
@@ -304,7 +304,9 @@ struct FaultInjectionProbeWindowTests {
     // A ping that counted its failed sends would wait out their reply window, which outlasts the
     // watchdog.
     let (result, _) = try await measure(within: Self.watchdog) {
-      try await network.install(socketFactory: Self.connectedSocketFactory(network)) {
+      try await network.install(
+        socketFactory: Self.connectedSocketFactory(network), isolated: false
+      ) {
         try await tracer.ping(
           to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: timeout))
       }

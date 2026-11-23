@@ -248,7 +248,9 @@ struct PingExecutor: Sendable {
     // 4c. Unique identifier per ping session to avoid cross-socket collisions.
     let identifier = generateIdentifier()
 
-    // 5. Delegate to PingOperation (which knows the family for parse-time dispatch).
+    // 5. Delegate to PingOperation (which knows the family for parse-time dispatch). Its sends
+    // run on a dispatch queue, so the send seam is read here.
+    let sendProbe = TestSeams.sendProbe
     let operation = PingOperation(
       sockfd: sockfd,
       target: target,
@@ -256,7 +258,7 @@ struct PingExecutor: Sendable {
       config: config,
       identifier: identifier,
       sendPacket: { sockfd, packet, resolved in
-        try self.sendPacket(sockfd: sockfd, packet: packet, to: resolved)
+        try self.sendPacket(sockfd: sockfd, packet: packet, to: resolved, sendProbe: sendProbe)
       },
       monotonicTime: { self.monotonicTime() },
       closeSocket: closeSocket
@@ -397,7 +399,8 @@ struct PingExecutor: Sendable {
   // monotonic timestamp of the attempt that reached the wire, so the caller
   // records a send time that excludes any waiting.
   internal func sendPacket(
-    sockfd: Int32, packet: [UInt8], to resolved: ResolvedHost
+    sockfd: Int32, packet: [UInt8], to resolved: ResolvedHost,
+    sendProbe: TestSeams.SendProbe? = nil
   ) throws -> TimeInterval {
     var addr = resolved.address
     var sendTime: TimeInterval = 0
@@ -408,7 +411,8 @@ struct PingExecutor: Sendable {
       return withUnsafePointer(to: &addr) { destPtr in
         destPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
           packet.withUnsafeBytes { bufPtr in
-            sendto(
+            if let sendProbe { return sendProbe(sockfd, bufPtr, sa, resolved.addressLen) }
+            return sendto(
               sockfd, bufPtr.baseAddress, packet.count, 0, sa, resolved.addressLen)
           }
         }

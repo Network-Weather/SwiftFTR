@@ -45,6 +45,8 @@ final class EndlessReplies: @unchecked Sendable {
   private var senderGone = false
   private var lastSend: TimeInterval?
   private var longestGap: TimeInterval = 0
+  /// The network whose socket the replies leave from, set by ``socketFactory(_:)``.
+  private var network: FakeICMPNetwork?
 
   init(family: Int32 = AF_INET) {
     self.family = family
@@ -78,6 +80,9 @@ final class EndlessReplies: @unchecked Sendable {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, length) }
       }
       guard bound == 0 else { throw FixtureError.socket("bind probe socket", errno) }
+      // Connected at once, so only the network can queue anything on it; the replies come from
+      // the network's own socket for that reason.
+      try network.connectProbe(fd)
       var actual = sockaddr_storage()
       var actualLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
       _ = withUnsafeMutablePointer(to: &actual) {
@@ -90,6 +95,7 @@ final class EndlessReplies: @unchecked Sendable {
       lock.lock()
       socketCopy = dup(fd)
       port = boundPort
+      self.network = network
       lock.unlock()
       handedOver = true
       return fd
@@ -214,14 +220,10 @@ final class EndlessReplies: @unchecked Sendable {
   }
 
   private func send(_ datagram: [UInt8], to port: UInt16) {
-    let s = socket(family, SOCK_DGRAM, IPPROTO_UDP)
-    guard s >= 0 else { return }
-    defer { close(s) }
-    var (destination, length) = loopbackAddress(family: family, port: port)
-    let connected = withUnsafePointer(to: &destination) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(s, $0, length) }
-    }
-    guard connected == 0 else { return }
+    lock.lock()
+    let network = self.network
+    lock.unlock()
+    guard let network else { return }
     // A test that forgets to stop the replies must not leave them running for the whole suite.
     let safetyStop = monotonicNow() + 60
     while monotonicNow() < safetyStop {
@@ -229,7 +231,7 @@ final class EndlessReplies: @unchecked Sendable {
       let done = stopped
       lock.unlock()
       if done { return }
-      if datagram.withUnsafeBytes({ Darwin.send(s, $0.baseAddress, $0.count, 0) }) > 0 {
+      if network.send(datagram, toPort: port) {
         let now = monotonicNow()
         lock.lock()
         sentCount += 1
@@ -431,26 +433,20 @@ struct FaultInjectionReceiveLoopTests {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, length) }
       }
       guard bound == 0 else { throw FixtureError.socket("bind probe socket", errno) }
+      // Connected at once, so the backlog below is all that can be queued on it.
+      try network.connectProbe(fd)
       var actual = sockaddr_storage()
       var actualLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
       _ = withUnsafeMutablePointer(to: &actual) {
         $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &actualLength) }
       }
+      let probePort = withUnsafeBytes(of: actual) {
+        UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+      }
       let foreign = ICMPWire.echoReply(family: family, id: identifier &+ 1, seq: 1)
       let valid = ICMPWire.echoReply(family: family, id: identifier, seq: 1)
       let datagrams = Array(repeating: foreign, count: backlog) + [valid]
-      let sender = socket(family, SOCK_DGRAM, IPPROTO_UDP)
-      guard sender >= 0 else { throw FixtureError.socket("socket", errno) }
-      defer { close(sender) }
-      for datagram in datagrams {
-        _ = datagram.withUnsafeBytes { raw in
-          withUnsafePointer(to: &actual) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-              sendto(sender, raw.baseAddress, raw.count, 0, $0, actualLength)
-            }
-          }
-        }
-      }
+      for datagram in datagrams { network.send(datagram, toPort: probePort) }
       // Loopback delivers on its own thread, so wait until every datagram is queued. Count
       // datagrams, not bytes: Darwin's FIONREAD on a datagram socket includes each datagram's
       // address, so a byte count is reached with only part of the backlog queued.
@@ -465,9 +461,7 @@ struct FaultInjectionReceiveLoopTests {
         usleep(1000)
       } while monotonicNow() < giveUp
       queuedAtHandover.set(Int(queued))
-      // More is a stray another test's late sender queued too, which the trace ignores like the
-      // foreign replies (docs/ROBUSTNESS-TESTING.md); the backlog is still all there.
-      guard queued >= datagramCount else {
+      guard queued == datagramCount else {
         throw FixtureError.socket("backlog: \(queued) of \(datagramCount) datagrams queued", 0)
       }
       handedOver = true
@@ -482,7 +476,7 @@ struct FaultInjectionReceiveLoopTests {
       }
     }
     #expect(
-      queuedAtHandover.value >= datagramCount,
+      queuedAtHandover.value == datagramCount,
       "\(queuedAtHandover.value) of \(datagramCount) datagrams were queued before the trace read")
     #expect(datagramCount > receiveBatchLimit, "the backlog fits in one read callback")
     #expect(
