@@ -443,3 +443,22 @@ Observations that are not defects of the library:
   the port. When a ping reply-matching test hits its watchdog it reports the fake network's
   journal of probes received and replies sent. Test:
   `FaultInjectionFixtureTests.loopbackFixtureKeepsOffWildcardPorts`.
+- An IPv4 refusing UDP port could stop refusing. `RefusingUDPPort` binds `127.0.0.1` and connects
+  the socket elsewhere, so the kernel answers other senders with port-unreachable. Darwin picks
+  an IPv6 ephemeral port without checking IPv4 sockets, so a dual-stack socket bound to `[::]`
+  could be handed the same number (about 260 of 2,000 such binds against 2,000 refusing ports),
+  and IPv4 datagrams to the port then went to it: no refusal. `EventBasedDNSTests.refusedPort`
+  waited out its watchdog, and `refusalBeforeTheSendIsIgnored`, whose
+  `RefusingThenAnsweringUDPPort` refuses the same way, failed with `sendFailed`, each about once
+  in fifteen full debug runs. Both fixtures now bind through `bindRefusingUDP(family:)`, which
+  for IPv4 also holds a v6-only socket on `[::]` with the same number.
+  Port-unreachable rate limiting is not the cause: Darwin suppresses only repeats for the same
+  flow within 100 ms (`net.inet.udp.port_unreach_rlc_*`), and refusals kept arriving during a
+  flood of 63,000 sends to other closed ports. Test:
+  `FaultInjectionFixtureTests.refusingUDPPortKeepsOffDualStack`.
+- A ping test's precondition could be met by the wrong datagram.
+  `PingReplyMatchingTests.replyQueuedBeforeSendIsIgnored` took "a datagram is queued" as proof
+  that its injected early reply had landed before probe 2 left, but probe 1's own reply, still
+  unread, met that while the injected one was in flight on loopback. Landing after the send, the
+  injected reply was rightly kept. The test now waits until every datagram the fake network sent
+  to the socket is queued or read.

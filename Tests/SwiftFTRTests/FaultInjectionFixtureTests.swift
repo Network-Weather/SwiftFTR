@@ -102,6 +102,47 @@ struct FaultInjectionFixtureTests {
     #expect(collisions.isEmpty, "fixtures were handed held ports: \(collisions)")
   }
 
+  @Test("An IPv4 refusing UDP port is never handed to a dual-stack IPv6 socket")
+  func refusingUDPPortKeepsOffDualStack() throws {
+    // A dual-stack socket bound to [::] on a refusing port's number would receive the IPv4
+    // datagrams meant to be refused, and the operation under test would see silence. Hold
+    // `held` refusing ports and bind `binds` dual-stack sockets one at a time: were the kernel
+    // free to hand out the held numbers, about held * binds / 16384 (some 16) would collide.
+    let held = 64
+    let binds = 4000
+    let refusing = try (0..<held).map { _ in try RefusingUDPPort(family: AF_INET) }
+    let heldPorts = Set(refusing.map(\.port))
+    var collisions: [UInt16] = []
+    for _ in 0..<binds {
+      let fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+      guard fd >= 0 else { throw FixtureError.socket("socket", errno) }
+      defer { close(fd) }
+      var off: Int32 = 0
+      _ = setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &off, socklen_t(MemoryLayout<Int32>.size))
+      var any = sockaddr_in6()
+      any.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+      any.sin6_family = sa_family_t(AF_INET6)
+      let bound = withUnsafePointer(to: &any) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size))
+        }
+      }
+      guard bound == 0 else { throw FixtureError.socket("bind", errno) }
+      var actual = sockaddr_storage()
+      var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      _ = withUnsafeMutablePointer(to: &actual) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+      }
+      let port = withUnsafeBytes(of: actual) {
+        UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+      }
+      if heldPorts.contains(port) { collisions.append(port) }
+    }
+    #expect(heldPorts.count == held)
+    #expect(collisions.isEmpty, "dual-stack sockets were handed refusing ports: \(collisions)")
+    withExtendedLifetime(refusing) {}
+  }
+
   @Test("The UDP responder hands a zero-byte request to its script")
   func udpZeroByteRequest() async throws {
     let responder = try LoopbackUDPResponder { _ in ([0x2A], 0) }
