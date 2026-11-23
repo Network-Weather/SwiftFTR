@@ -39,7 +39,8 @@ struct UDPExchangeReply: Sendable {
 /// once. This type knows nothing about the protocol: it sends bytes and returns the first
 /// datagram the caller's `accepts` check takes as addressed to this request, or a
 /// ``UDPExchangeFailure``. The check answers only that question (for DNS, whether the datagram
-/// carries the query's transaction ID); the caller validates the rest of what comes back.
+/// carries the query's transaction ID and does not echo another question); the caller validates
+/// the rest of what comes back.
 ///
 /// Descriptor ownership: ``perform(family:request:timeout:receiveCapacity:accepts:configure:)`` owns the
 /// socket until the read source exists and closes it itself if setup fails. From then on the

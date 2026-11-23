@@ -78,8 +78,8 @@ private func _validateDNSSourceFamily(_ sourceIP: String?, serverFamily: Int32) 
 /// which reports it as `DNSError.malformedResponse`.
 private let dnsReceiveCapacity = 2048
 
-/// The first datagram a DNS server sent back carrying the query's transaction ID, not yet
-/// validated otherwise.
+/// The first datagram a DNS server sent back addressed to the query (its transaction ID, and no
+/// other question echoed), not yet validated otherwise.
 private struct DNSReply {
   let message: Data
   let expectedID: UInt16
@@ -92,8 +92,9 @@ private struct DNSReply {
 }
 
 /// Sends one DNS query over a ``UDPExchange`` and returns the first datagram back that carries
-/// the query's transaction ID, otherwise unvalidated. Any other datagram is ignored and the wait
-/// goes on to the same deadline (``DNSClient/carriesTransactionID(_:_:)``).
+/// the query's transaction ID and does not echo another question, otherwise unvalidated. Any
+/// other datagram is ignored and the wait goes on to the same deadline
+/// (``DNSClient/isAddressed(to:_:)``).
 ///
 /// The checks that need no I/O (`invalidTimeout`, `invalidHostname`, `invalidIP`, and
 /// `bindFailed` for a source address of the wrong family) run first, before any socket is
@@ -122,7 +123,7 @@ private func exchangeDNSQuery(
   let (request, id) = makeDNSQueryMessage(encodedQuery: encodedQuery, queryType: queryType)
   let reply = try await UDPExchange.perform(
     family: family, request: request, timeout: timeout, receiveCapacity: dnsReceiveCapacity,
-    accepts: { DNSClient.carriesTransactionID(id, $0) },
+    accepts: { DNSClient.isAddressed(to: request, $0) },
     configure: { fd in
       try bindDNSSocket(fd, family: family, interface: interface, sourceIP: sourceIP)
       // A connected UDP socket only receives responses from this DNS server and port.
@@ -925,7 +926,8 @@ public struct DNSProbeOutcome: RawRepresentable, Hashable, Sendable, Codable,
   /// The host is up, but no DNS server answered, so ``DNSProbeResult/isReachable`` is `false`.
   public static let refused = DNSProbeOutcome(rawValue: "refused")
   /// No datagram carrying the query's transaction ID arrived before the timeout. Datagrams for
-  /// another query, and ones too short to carry an ID, are ignored and do not end the wait.
+  /// another query (another transaction ID, or an echoed question with another name, type or
+  /// class), and ones too short to carry an ID, are ignored and do not end the wait.
   public static let timedOut = DNSProbeOutcome(rawValue: "timedOut")
   /// A datagram carried the query's transaction ID but was not a valid DNS response, such as a
   /// truncated one. The server is reachable: ``DNSProbeResult/isReachable`` is `true`.
@@ -1816,8 +1818,8 @@ private func makeDNSQueryMessage(encodedQuery: [UInt8], queryType: UInt16) -> (
 /// fallback in `getPublicIPv4ViaDNS`, which runs inside a blocking public-IP closure and cannot
 /// await. Every other DNS query uses the event-based ``exchangeDNSQuery``. Refusals and host and
 /// network unreachable are all `DNSError.timeout` here. As on the event-based path, a datagram
-/// without the query's transaction ID (an empty one included) is ignored, and the wait goes on
-/// with the time left.
+/// without the query's transaction ID (an empty one included), or echoing another question, is
+/// ignored, and the wait goes on with the time left.
 private func performDNSQueryBlocking(
   server: String,
   query: String,
@@ -1862,7 +1864,7 @@ private func performDNSQueryBlocking(
     throw DNSError.sendFailed
   }
 
-  // Receive from the connected peer until a datagram carries this query's transaction ID. Read on
+  // Receive from the connected peer until a datagram is addressed to this query. Read on
   // the calling thread, so a test's task-local seam is visible here; production has none.
   let receiveDatagram =
     TestSeams.receiveDatagram ?? { fd, buffer in recv(fd, buffer.baseAddress, buffer.count, 0) }
@@ -1874,7 +1876,7 @@ private func performDNSQueryBlocking(
     // once the datagram is there, so the stamp taken on return is the earliest one that bounds its
     // arrival; one past the deadline is a timeout, on the first read as on any later one.
     guard n >= 0, monotonicNow() <= deadline else { throw DNSError.timeout }
-    if DNSClient.carriesTransactionID(id, buf.prefix(n)) {
+    if DNSClient.isAddressed(to: msg, buf.prefix(n)) {
       return try DNSClient.validateResponse(message: Data(buf.prefix(n)), expectedID: id)
     }
     // Not this query's reply: wait again, for the time left rather than a fresh timeout.
@@ -2072,10 +2074,57 @@ struct DNSClient {
     return out.isEmpty ? nil : out
   }
 
-  /// Whether `datagram` is addressed to the query with transaction ID `id`: it is at least the two
-  /// bytes of an ID, and they are `id`. A datagram that fails this cannot be attributed to the
-  /// query (a stale reply to an earlier one on the same port, or noise), so it is ignored rather
-  /// than reported as a malformed reply. Every other check stays in ``validateResponse``.
+  /// Whether `datagram` is addressed to `query`, the request as sent: it carries the query's
+  /// transaction ID (``carriesTransactionID(_:_:)``) and does not echo a different question
+  /// (``echoesOtherQuestion(_:_:)``). A datagram that fails this cannot be attributed to the query
+  /// (a stale reply to an earlier one on the same port, a reply to another question, or noise), so
+  /// it is ignored and the wait goes on, rather than reported as a malformed reply. RFC 5452
+  /// section 9.1 lists the ID, the query name and its class and type together as what a response
+  /// must match; section 3 accepts the first response that does. Every other check stays in
+  /// ``validateResponse``.
+  static func isAddressed(to query: [UInt8], _ datagram: ArraySlice<UInt8>) -> Bool {
+    guard query.count >= 2 else { return false }
+    let id = UInt16(query[0]) << 8 | UInt16(query[1])
+    return carriesTransactionID(id, datagram) && !echoesOtherQuestion(query, datagram)
+  }
+
+  /// Whether the datagram's first question is present, readable, and not the one `query` asked:
+  /// another name (compared without regard to ASCII case, RFC 4343), type or class.
+  ///
+  /// A datagram that declares no question (QDCOUNT 0, as some REFUSED and FORMERR replies are
+  /// sent) does not, and neither does one whose question cannot be read (a header or name cut
+  /// short, or a name that starts with a compression pointer, which can only point back into the
+  /// header): such a datagram is left to ``validateResponse``, which rejects the unreadable ones as
+  /// malformed. `query` is a request built here, with one uncompressed question after the header.
+  static func echoesOtherQuestion(_ query: [UInt8], _ datagram: ArraySlice<UInt8>) -> Bool {
+    let reply = Array(datagram)
+    guard reply.count >= 12, reply[4] != 0 || reply[5] != 0 else { return false }
+    // The end of the first question's name in `message`, from offset 12, if it is all plain labels.
+    func nameEnd(_ message: [UInt8]) -> Int? {
+      var offset = 12
+      while offset < message.count {
+        let length = Int(message[offset])
+        if length == 0 { return offset + 1 }
+        guard length & 0xC0 == 0 else { return nil }
+        offset += 1 + length
+      }
+      return nil
+    }
+    guard let replyEnd = nameEnd(reply), replyEnd + 4 <= reply.count,
+      let queryEnd = nameEnd(query), queryEnd + 4 <= query.count
+    else { return false }
+    func folded(_ byte: UInt8) -> UInt8 { (0x41...0x5A).contains(byte) ? byte | 0x20 : byte }
+    let sameName =
+      replyEnd == queryEnd
+      && zip(reply[12..<replyEnd], query[12..<queryEnd]).allSatisfy {
+        folded($0) == folded($1)
+      }
+    let sameTypeAndClass = reply[replyEnd..<replyEnd + 4] == query[queryEnd..<queryEnd + 4]
+    return !(sameName && sameTypeAndClass)
+  }
+
+  /// Whether `datagram` carries the transaction ID `id`: it is at least the two bytes of an ID,
+  /// and they are `id`.
   static func carriesTransactionID(_ id: UInt16, _ datagram: ArraySlice<UInt8>) -> Bool {
     guard datagram.count >= 2 else { return false }
     let start = datagram.startIndex
