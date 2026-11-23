@@ -48,6 +48,22 @@ func _validateDNSTimeout(_ timeout: TimeInterval) throws {
   }
 }
 
+private func _dnsSocketTimeout(_ timeout: TimeInterval) throws -> timeval {
+  try _validateDNSTimeout(timeout)
+
+  let wholeSeconds = floor(timeout)
+  let seconds = Int(wholeSeconds)
+  var microseconds = Int((timeout - wholeSeconds) * 1_000_000)
+
+  // A positive sub-microsecond duration would otherwise become a zero timeval,
+  // which disables SO_RCVTIMEO/SO_SNDTIMEO instead of setting a short timeout.
+  if seconds == 0, microseconds == 0 {
+    microseconds = 1
+  }
+
+  return timeval(tv_sec: seconds, tv_usec: __darwin_suseconds_t(microseconds))
+}
+
 /// Rejects a source address whose family cannot reach `serverFamily`, before any socket exists.
 private func _validateDNSSourceFamily(_ sourceIP: String?, serverFamily: Int32) throws {
   guard let sourceIP else { return }
@@ -152,6 +168,27 @@ private func runDNSQuery(
     throw DNSError.sendFailed
   }
   return (try reply.answers(), reply.rtt)
+}
+
+/// Applies `timeout` as both socket timeouts. Kept only behind the `@_spi(Test)` wrapper
+/// `__dnsApplySocketTimeout`, which is part of the API surface; no query path uses it.
+private func _applyDNSSocketTimeout(fd: Int32, timeout: TimeInterval) throws {
+  var socketTimeout = try _dnsSocketTimeout(timeout)
+  let optionSize = socklen_t(MemoryLayout<timeval>.size)
+  let options = [
+    (value: SO_RCVTIMEO, name: "SO_RCVTIMEO"),
+    (value: SO_SNDTIMEO, name: "SO_SNDTIMEO"),
+  ]
+
+  for option in options {
+    let result = withUnsafePointer(to: &socketTimeout) { pointer in
+      setsockopt(fd, SOL_SOCKET, option.value, pointer, optionSize)
+    }
+    if result != 0 {
+      let errorCode = errno
+      throw DNSError.setsockoptFailed(option: option.name, errno: errorCode)
+    }
+  }
 }
 
 /// DNS record types supported by SwiftFTR
@@ -2465,6 +2502,12 @@ public func __dnsEncodeQName(_ name: String) -> [UInt8] {
   // Preserve the original nonthrowing SPI used by parser fixtures. Production query paths call
   // the throwing encoder directly and surface invalid names as `DNSError.invalidHostname`.
   (try? _encodeQName(name)) ?? []
+}
+
+// swift-format-ignore: AlwaysUseLowerCamelCase
+@_spi(Test)
+public func __dnsApplySocketTimeout(fd: Int32, timeout: TimeInterval) throws {
+  try _applyDNSSocketTimeout(fd: fd, timeout: timeout)
 }
 
 // swift-format-ignore: AlwaysUseLowerCamelCase

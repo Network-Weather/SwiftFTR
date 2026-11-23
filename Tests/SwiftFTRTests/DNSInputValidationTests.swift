@@ -145,6 +145,24 @@ struct DNSInputValidationTests {
     }
   }
 
+  @Test("Socket timeout option failures are surfaced")
+  func socketTimeoutOptionFailure() {
+    do {
+      try __dnsApplySocketTimeout(fd: -1, timeout: 1)
+      Issue.record("Applying DNS timeouts to an invalid descriptor unexpectedly succeeded")
+    } catch let error as DNSError {
+      guard case .setsockoptFailed(let option, let errorCode) = error else {
+        Issue.record("Socket timeout setup threw the wrong DNS error: \(error)")
+        return
+      }
+
+      #expect(option == "SO_RCVTIMEO")
+      #expect(errorCode == EBADF)
+    } catch {
+      Issue.record("Socket timeout setup threw an unexpected error: \(error)")
+    }
+  }
+
   @Test("QNAME encoding rejects invalid labels", arguments: invalidQNames)
   func invalidQName(name: String) async {
     do {

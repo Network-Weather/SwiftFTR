@@ -28,8 +28,7 @@ Unreleased
 
 ### Tooling
 
-- The blocking DNS query behind the whoami fallback, and its socket-timeout helpers, are removed,
-  with the `@_spi(Test)` function `__dnsApplySocketTimeout`. Every DNS query now uses the
+- The blocking DNS query behind the whoami fallback is removed; every DNS query now uses the
   event-based transport. The public-IP test seam is async, and new task-local seams point STUN
   and the whoami fallback at loopback fixtures.
 
