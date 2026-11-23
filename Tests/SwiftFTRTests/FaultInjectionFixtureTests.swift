@@ -429,10 +429,10 @@ struct FaultInjectionFixtureTests {
     "A probe socket the fake network connects receives only what the network sends",
     arguments: [true, false])
   func isolatedProbeSocketRefusesStrays(isolated: Bool) async throws {
-    // Isolated: the socket is connected to the network on its first send, so the kernel drops a
-    // short and an empty stray from another socket. Not isolated (main's behaviour, the control):
-    // both are queued. The network's own reply is sent after the strays, and loopback delivers in
-    // order, so once it is queued the strays have arrived if they were going to.
+    // Isolated: the socket is connected to the network on its first send, so the kernel refuses
+    // a short and an empty stray from another socket; the stray's sender is connected to the
+    // probe's port, so the refusal comes back to it as ECONNREFUSED. Not isolated (main's
+    // behaviour, the control): both strays are queued beside the network's own reply.
     let network = try FakeICMPNetwork { _ in [] }
     defer { network.stop() }
     let probe = try network.makeSocket(AF_INET)
@@ -441,11 +441,33 @@ struct FaultInjectionFixtureTests {
     let request = Self.echoRequest(seq: 1)
     #expect(Self.sendProbe(request, on: probe, to: network, with: send) == request.count)
     #expect(await eventually(within: 10) { network.probes.value == 1 })
-    #expect(Strays.send(to: Self.localPort(probe)))
+
+    let stray = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    defer { close(stray) }
+    var (address, length) = loopbackAddress(family: AF_INET, port: Self.localPort(probe))
+    let connected = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(stray, $0, length) }
+    }
+    try #require(connected == 0)
+    for datagram in [Strays.short, Strays.empty] {
+      #expect(datagram.withUnsafeBytes { Darwin.send(stray, $0.baseAddress, $0.count, 0) } >= 0)
+    }
     #expect(
       network.inject(.init(ICMPWire.echoReply(family: AF_INET, id: 0x1234, seq: 1)), to: probe))
-    #expect(await eventually(within: 10) { queuedDatagrams(probe) >= 1 })
-    #expect(queuedDatagrams(probe) == (isolated ? 1 : 3), "queued: \(queuedDatagrams(probe))")
+
+    if isolated {
+      let refused = await eventually(within: 10) {
+        var byte: UInt8 = 0
+        return recv(stray, &byte, 1, MSG_DONTWAIT) < 0 && errno == ECONNREFUSED
+      }
+      #expect(refused, "the probe socket's port never refused the stray")
+      #expect(await eventually(within: 10) { queuedDatagrams(probe) >= 1 })
+      #expect(queuedDatagrams(probe) == 1, "queued: \(queuedDatagrams(probe))")
+    } else {
+      #expect(
+        await eventually(within: 10) { queuedDatagrams(probe) == 3 },
+        "queued: \(queuedDatagrams(probe))")
+    }
   }
 
   @Test("A fake network answers only the sockets it made, however they were bound")
