@@ -41,22 +41,22 @@ struct CacheGenerationTests {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
 
     let task = Task {
-      await tracer.effectivePublicIPForClassification {
+      await tracer.effectivePublicIPv4 {
         await lookup.resolve("public-ip")
       }
     }
     try await lookup.waitUntilStarted()
     await tracer.invalidatePublicIP()
-    await lookup.resume(returning: "198.51.100.7")
+    await lookup.resume(returning: "8.8.4.7")
 
     #expect(await task.value == nil)
-    #expect(await tracer.publicIP == nil)
+    #expect(await tracer.publicIP(for: .v4)?.address == nil)
 
-    let current = await tracer.effectivePublicIPForClassification {
-      "198.51.100.8"
+    let current = await tracer.effectivePublicIPv4 {
+      "8.8.4.8"
     }
-    #expect(current == "198.51.100.8")
-    #expect(await tracer.publicIP == "198.51.100.8")
+    #expect(current == "8.8.4.8")
+    #expect(await tracer.publicIP(for: .v4)?.address == "8.8.4.8")
   }
 
   @Test("invalidateNetworkScoped evicts only non-global entries and preserves global ones")
@@ -189,7 +189,7 @@ struct CacheGenerationTests {
     // Lookups answer from a local stub, so populating the cache sends no reverse-DNS query.
     let tracer = SwiftFTR(
       config: SwiftFTRConfig(noReverseDNS: false), rdnsCache: RDNSCache { _ in "name.example" },
-      asnResolver: EmptyASNResolver(), cachedPublicIP: nil)
+      asnResolver: EmptyASNResolver(), publicIPCache: [:])
     _ = await tracer.rdnsCache.lookup("192.168.1.1")
     _ = await tracer.rdnsCache.lookup("1.1.1.1")
     #expect(await tracer.rdnsCache.count == 2)
@@ -203,40 +203,40 @@ struct CacheGenerationTests {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
 
     #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "1.1.1.1")
+    #expect(await tracer.publicIP(for: .v4)?.address == "1.1.1.1")
 
     #expect(
       await tracer.seedPublicIP("2606:4700:4700:0:0:0:0:1111", source: .gatewayReported))
-    #expect(await tracer.publicIP == "2606:4700:4700::1111")
+    #expect(await tracer.publicIP(for: .v6)?.address == "2606:4700:4700::1111")
 
     // IANA Special-Purpose registry entries marked Globally Reachable
     #expect(await tracer.seedPublicIP("192.0.0.9", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "192.0.0.9")
+    #expect(await tracer.publicIP(for: .v4)?.address == "192.0.0.9")
     #expect(await tracer.seedPublicIP("192.0.0.10", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "192.0.0.10")
+    #expect(await tracer.publicIP(for: .v4)?.address == "192.0.0.10")
     // NAT64 well-known prefix, accepted only for a public embedded IPv4 address (RFC 6052 3.1):
     // 64:ff9b::1 embeds 0.0.0.1, in 0.0.0.0/8, and is rejected with the cache left as it was.
     #expect(await tracer.seedPublicIP("64:ff9b::101:101", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "64:ff9b::101:101")
+    #expect(await tracer.publicIP(for: .v6)?.address == "64:ff9b::101:101")
     #expect(await tracer.seedPublicIP("64:ff9b::1", source: .validatedCallerCache) == false)
-    #expect(await tracer.publicIP == "64:ff9b::101:101")
+    #expect(await tracer.publicIP(for: .v6)?.address == "64:ff9b::101:101")
     #expect(await tracer.seedPublicIP("2001:1::1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "2001:1::1")
+    #expect(await tracer.publicIP(for: .v6)?.address == "2001:1::1")
     #expect(await tracer.seedPublicIP("2001:3::1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "2001:3::1")
+    #expect(await tracer.publicIP(for: .v6)?.address == "2001:3::1")
     #expect(await tracer.seedPublicIP("2001:4:112::1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "2001:4:112::1")
+    #expect(await tracer.publicIP(for: .v6)?.address == "2001:4:112::1")
     #expect(await tracer.seedPublicIP("2001:20::1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "2001:20::1")
+    #expect(await tracer.publicIP(for: .v6)?.address == "2001:20::1")
     #expect(await tracer.seedPublicIP("2001:30::1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "2001:30::1")
+    #expect(await tracer.publicIP(for: .v6)?.address == "2001:30::1")
   }
 
   @Test("seedPublicIP rejects non-global, malformed, and sentinel strings")
   func seedRejectsNonGlobalAndSentinels() async {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
     #expect(await tracer.seedPublicIP("8.8.8.8", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "8.8.8.8")
+    #expect(await tracer.publicIP(for: .v4)?.address == "8.8.8.8")
 
     let invalidSeeds = [
       "unknown",
@@ -279,7 +279,7 @@ struct CacheGenerationTests {
       let accepted = await tracer.seedPublicIP(seed, source: .validatedCallerCache)
       #expect(!accepted, Comment(rawValue: "\(seed) should have been rejected by seedPublicIP"))
       // Existing seed remains untouched
-      #expect(await tracer.publicIP == "8.8.8.8")
+      #expect(await tracer.publicIP(for: .v4)?.address == "8.8.8.8")
     }
   }
 
@@ -289,7 +289,7 @@ struct CacheGenerationTests {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
 
     let task = Task {
-      await tracer.effectivePublicIPForClassification {
+      await tracer.effectivePublicIPv4 {
         await lookup.resolve("public-ip")
       }
     }
@@ -297,7 +297,7 @@ struct CacheGenerationTests {
 
     // Caller seeds a newer public IP while discovery is in-flight
     #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "1.1.1.1")
+    #expect(await tracer.publicIP(for: .v4)?.address == "1.1.1.1")
 
     // Older discovery now finishes with a different IP
     await lookup.resume(returning: "8.8.8.8")
@@ -305,7 +305,7 @@ struct CacheGenerationTests {
     let result = await task.value
     // Should return the newer seed, NOT the discovered IP
     #expect(result == "1.1.1.1")
-    #expect(await tracer.publicIP == "1.1.1.1")
+    #expect(await tracer.publicIP(for: .v4)?.address == "1.1.1.1")
   }
 
   @Test("seedPublicIP does not survive invalidation, clear, or network change")
@@ -314,29 +314,29 @@ struct CacheGenerationTests {
 
     // Test invalidatePublicIP
     #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "1.1.1.1")
+    #expect(await tracer.publicIP(for: .v4)?.address == "1.1.1.1")
     await tracer.invalidatePublicIP()
-    #expect(await tracer.publicIP == nil)
+    #expect(await tracer.publicIP(for: .v4)?.address == nil)
 
     // Test clearCaches
     #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "1.1.1.1")
+    #expect(await tracer.publicIP(for: .v4)?.address == "1.1.1.1")
     await tracer.clearCaches()
-    #expect(await tracer.publicIP == nil)
+    #expect(await tracer.publicIP(for: .v4)?.address == nil)
 
     // Test networkChanged
     #expect(await tracer.seedPublicIP("1.1.1.1", source: .validatedCallerCache))
-    #expect(await tracer.publicIP == "1.1.1.1")
+    #expect(await tracer.publicIP(for: .v4)?.address == "1.1.1.1")
     await tracer.networkChanged()
-    #expect(await tracer.publicIP == nil)
+    #expect(await tracer.publicIP(for: .v4)?.address == nil)
   }
 
-  @Test("seedPublicIP bypasses discovery in effectivePublicIPForClassification")
+  @Test("seedPublicIP bypasses discovery in effectivePublicIPv4")
   func seedBypassesDiscovery() async {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
     #expect(await tracer.seedPublicIP("9.9.9.9", source: .validatedCallerCache))
 
-    let discovered = await tracer.effectivePublicIPForClassification {
+    let discovered = await tracer.effectivePublicIPv4 {
       Issue.record("Discovery should not run when seeded")
       return "1.2.3.4"
     }

@@ -137,9 +137,9 @@ public struct TraceOptions: Sendable, Equatable {
 /// Origin of a dynamically seeded public IP address.
 ///
 /// ``SwiftFTR/seedPublicIP(_:source:)`` requires the caller to state where a seeded address came
-/// from, but does not retain the value: a seeded address is cached the same way whatever its
-/// source, and the library exposes no way to read the source back. Whether to persist it and act
-/// on the difference is an open question recorded in the lifecycle design document.
+/// from. The seed is cached with it, and a classified trace or multipath run that uses the seed
+/// reports it as ``ClassifiedTrace/publicIPSource`` (``PublicIPObservationSource/validatedCallerCache``
+/// or ``PublicIPObservationSource/gatewayReported``).
 public enum PublicIPSource: Sendable, Equatable {
   /// Seeded from a validated caller-side cache or observation.
   case validatedCallerCache
@@ -210,7 +210,8 @@ public enum TracerouteError: Error, CustomStringConvertible {
 /// the DNS lookup cache is process-wide, so extra instances cost neither another database load
 /// nor another copy in memory.
 public struct SwiftFTRConfig: Sendable {
-  /// Default budget for public-IP discovery (STUN, with DNS fallback), in seconds.
+  /// Default budget for one public-IP question (to the library's resolver or the caller's), in
+  /// seconds.
   ///
   /// The per-socket timeouts inside discovery do not cover resolving each STUN hostname, and the
   /// server list is walked serially, so the enclosing call needs a bound of its own. Sized to admit
@@ -232,10 +233,13 @@ public struct SwiftFTRConfig: Sendable {
   public let payloadSize: Int
   /// Authoritative public-address override for classified trace and multipath enrichment.
   ///
-  /// When set, this is an immutable configuration override that permanently bypasses
-  /// public-IP discovery for the lifetime of the actor. It is not a cache-seeding mechanism.
-  /// To provide a known-valid public IP dynamically across network transitions without
-  /// disabling discovery permanently, use ``SwiftFTR/seedPublicIP(_:source:)`` instead.
+  /// When set, this is an immutable configuration override that bypasses public-IP discovery,
+  /// for the lifetime of the actor, for traces of its own address family. A trace of the other
+  /// family asks the ``publicIPResolver`` strategy as if nothing were configured; use
+  /// ``PublicIPResolverStrategy/disabled`` to send nothing. An address that is not globally
+  /// routable is not used. It is not a cache-seeding mechanism. To provide a known-valid public IP
+  /// dynamically across network transitions without disabling discovery permanently, use
+  /// ``SwiftFTR/seedPublicIP(_:source:)`` instead.
   ///
   /// The standalone ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` function
   /// and ``SwiftFTR/discoverPublicIPWithHostname()`` do not use this value.
@@ -257,11 +261,13 @@ public struct SwiftFTRConfig: Sendable {
   ///
   /// Raise it on links whose legitimate resolver latency is high. `nil` uses the default of 5s.
   public let rdnsLookupTimeout: TimeInterval?
-  /// How long public-IP discovery (STUN, with DNS fallback) may take before the trace gives up.
+  /// How long one public-IP question may take before the trace gives up on it.
   ///
-  /// This bounds the whole discovery, including resolving each STUN hostname — which the
-  /// per-socket timeouts inside discovery do not cover. Classification proceeds without a public
-  /// address when it elapses. `nil` uses the default of 6s.
+  /// It is the deadline of the ``PublicIPRequest`` the ``publicIPResolver`` strategy is asked.
+  /// The library's resolver holds it itself, including resolving each STUN hostname, which the
+  /// per-socket timeouts inside discovery do not cover; the tracer holds a caller's resolver to
+  /// it. Classification proceeds without a public address when it elapses. `nil` uses the default
+  /// of 6s.
   public let publicIPDiscoveryTimeout: TimeInterval?
   /// Default BSD interface name for operations that support binding.
   /// If nil, those operations use system routing.
@@ -331,6 +337,11 @@ public struct SwiftFTRConfig: Sendable {
   /// added in Stage 1. See [docs/IPV6.md](../../docs/IPV6.md).
   public let preferredFamily: PreferredFamily
 
+  /// How a classified trace or a multipath run finds its public address when none of the trace's
+  /// family is configured (``publicIP``), seeded or cached. Default:
+  /// ``PublicIPResolverStrategy/library``.
+  public let publicIPResolver: PublicIPResolverStrategy
+
   /// Creates a new SwiftFTR configuration.
   ///
   /// - Parameters:
@@ -368,6 +379,39 @@ public struct SwiftFTRConfig: Sendable {
     asnResolverStrategy: ASNResolverStrategy = .hybrid(.embedded),
     preferredFamily: PreferredFamily = .auto
   ) {
+    self.init(
+      maxHops: maxHops, maxWaitMs: maxWaitMs, payloadSize: payloadSize, publicIP: publicIP,
+      enableLogging: enableLogging, noReverseDNS: noReverseDNS, rdnsCacheTTL: rdnsCacheTTL,
+      rdnsCacheSize: rdnsCacheSize, rdnsLookupTimeout: rdnsLookupTimeout,
+      publicIPDiscoveryTimeout: publicIPDiscoveryTimeout, interface: interface,
+      sourceIP: sourceIP, asnResolverStrategy: asnResolverStrategy,
+      preferredFamily: preferredFamily, publicIPResolver: .library)
+  }
+
+  /// Creates a new SwiftFTR configuration with a public-IP resolver strategy.
+  ///
+  /// The parameters are those of
+  /// ``init(maxHops:maxWaitMs:payloadSize:publicIP:enableLogging:noReverseDNS:rdnsCacheTTL:rdnsCacheSize:rdnsLookupTimeout:publicIPDiscoveryTimeout:interface:sourceIP:asnResolverStrategy:preferredFamily:)``,
+  /// plus:
+  ///   - publicIPResolver: How a classified trace or multipath run finds its public address
+  ///     (default: ``PublicIPResolverStrategy/library``).
+  public init(
+    maxHops: Int = 40,
+    maxWaitMs: Int = 1000,
+    payloadSize: Int = 56,
+    publicIP: String? = nil,
+    enableLogging: Bool = false,
+    noReverseDNS: Bool = false,
+    rdnsCacheTTL: TimeInterval? = nil,
+    rdnsCacheSize: Int? = nil,
+    rdnsLookupTimeout: TimeInterval? = nil,
+    publicIPDiscoveryTimeout: TimeInterval? = nil,
+    interface: String? = nil,
+    sourceIP: String? = nil,
+    asnResolverStrategy: ASNResolverStrategy = .hybrid(.embedded),
+    preferredFamily: PreferredFamily = .auto,
+    publicIPResolver: PublicIPResolverStrategy = .library
+  ) {
     self.maxHops = maxHops
     self.maxWaitMs = maxWaitMs
     self.payloadSize = payloadSize
@@ -382,6 +426,7 @@ public struct SwiftFTRConfig: Sendable {
     self.sourceIP = sourceIP
     self.asnResolverStrategy = asnResolverStrategy
     self.preferredFamily = preferredFamily
+    self.publicIPResolver = publicIPResolver
   }
 }
 
@@ -393,9 +438,9 @@ public struct SwiftFTRConfig: Sendable {
 public actor SwiftFTR {
   internal nonisolated let config: SwiftFTRConfig
 
-  // Cache storage
-  internal var cachedPublicIP: String?
-  private var cacheGeneration: UInt64 = 0
+  // Cache storage: one public-address observation per family, each with its own generation.
+  internal var publicIPCache: [IPAddressFamily: PublicIPObservation]
+  private var publicIPGenerations: [IPAddressFamily: UInt64] = [:]
   internal let rdnsCache: RDNSCache
   internal let asnResolver: ASNResolver
 
@@ -422,6 +467,7 @@ public actor SwiftFTR {
   /// - Parameter config: Configuration for traceroute behavior
   public init(config: SwiftFTRConfig = SwiftFTRConfig()) {
     self.config = config
+    self.publicIPCache = [:]
     self.rdnsCache = RDNSCache(
       ttl: config.cacheTTLForConstruction,
       maxSize: config.cacheSizeForConstruction,
@@ -474,12 +520,12 @@ public actor SwiftFTR {
     config: SwiftFTRConfig,
     rdnsCache: RDNSCache,
     asnResolver: ASNResolver,
-    cachedPublicIP: String?
+    publicIPCache: [IPAddressFamily: PublicIPObservation]
   ) {
     self.config = config
     self.rdnsCache = rdnsCache
     self.asnResolver = asnResolver
-    self.cachedPublicIP = cachedPublicIP
+    self.publicIPCache = publicIPCache
   }
 
   /// Perform a fast traceroute by sending one ICMP Echo per TTL and waiting once.
@@ -966,8 +1012,10 @@ public actor SwiftFTR {
 
   /// Perform a traceroute and enrich results with ASN-based categorization.
   ///
-  /// This variant obtains the client's public address from configuration, the actor cache, or fresh
-  /// IPv4 discovery (STUN followed by DNS fallback). It resolves origin ASNs for relevant IP
+  /// This variant obtains the client's public address, of the family the trace probed, from
+  /// configuration, a seed or the actor cache, or else asks the configured
+  /// ``SwiftFTRConfig/publicIPResolver`` strategy once, after the probes have returned. It resolves
+  /// origin ASNs for relevant IP
   /// addresses using the provided resolver and labels
   /// each hop as LOCAL, ISP, TRANSIT, or DESTINATION. Missing stretches between
   /// identical segments are interpolated for readability.
@@ -1053,13 +1101,6 @@ public actor SwiftFTR {
 
       try handle.checkCancellation()
 
-      let effectivePublicIP = await effectivePublicIPForClassification {
-        if handle.cancellationError() != nil { return nil }
-        return try? await self.discoverPublicIP(handle: handle)
-      }
-
-      try handle.checkCancellation()
-
       // Perform base trace using the classified trace's handle
       let tr = try await performTrace(to: host, handle: handle, maxHopsOverride: options.maxHops)
 
@@ -1067,6 +1108,11 @@ public actor SwiftFTR {
         throw TracerouteError.resolutionFailed(
           host: host, details: "Trace completed without a resolved destination address")
       }
+
+      // Asked once the probes have returned, for the family they used.
+      let family = IPAddressFamily(address: destIP) ?? .v4
+      let observation = try await publicIPObservation(for: family, handle: handle)
+      let effectivePublicIP = observation?.address
 
       // Collect IPs for batch operations
       var allIPs = Set(tr.hops.compactMap { $0.ipAddress })
@@ -1116,11 +1162,7 @@ public actor SwiftFTR {
           resolver: effectiveResolver,
           timeout: 1.5,
           publicIP: effectivePublicIP,
-          interface: self.config.interface,
-          sourceIP: self.config.sourceIP,
-          vpnContext: effectiveVPNContext,
-          enableLogging: self.config.enableLogging,
-          publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeoutForOperation
+          vpnContext: effectiveVPNContext
         )
       }
 
@@ -1147,6 +1189,7 @@ public actor SwiftFTR {
         destinationIP: baseClassified.destinationIP,
         destinationHostname: hostnameMap[destIP],
         publicIP: baseClassified.publicIP,
+        publicIPSource: observation?.source,
         publicHostname: effectivePublicIP.flatMap { hostnameMap[$0] },
         clientASN: baseClassified.clientASN,
         clientASName: baseClassified.clientASName,
@@ -1246,7 +1289,7 @@ public actor SwiftFTR {
     return try await runner.run()
   }
 
-  /// Discover public IP via STUN (with DNS fallback)
+  /// Discover public IPv4 with the library's discovery: STUN, with the DNS whoami fallback.
   internal func discoverPublicIP(handle: TraceHandle? = nil) async throws -> String {
     let interface = config.interface
     let sourceIP = config.sourceIP
@@ -1255,35 +1298,96 @@ public actor SwiftFTR {
     let budget = config.publicIPDiscoveryTimeoutForOperation
 
     return try await withTraceCancellation(handle: handle) {
-      try await publicIPv4Discovery(
+      try await publicIPDiscovery(
+        family: .v4,
         stunTimeout: 2.0,
         dnsTimeout: 3.0,
         interface: interface,
         sourceIP: sourceIP,
         enableLogging: enableLogging,
         budget: budget
-      ).ip
+      ).address
     }
   }
 
-  /// Returns a configured/cached public IP or discovers one for the current
-  /// cache generation. A network change while discovery is suspended makes the
-  /// result stale, so it is neither returned nor cached.
-  internal func effectivePublicIPForClassification(
-    discover: @Sendable () async -> String?
-  ) async -> String? {
-    if let configured = config.publicIP { return configured }
-    if let cachedPublicIP { return cachedPublicIP }
-
-    let discoveryGeneration = cacheGeneration
-    guard let discovered = await discover() else { return cachedPublicIP }
-    // If cache was seeded or invalidated while discovery was in flight, do not overwrite the newer value.
-    guard discoveryGeneration == cacheGeneration, cachedPublicIP == nil else {
-      return cachedPublicIP
+  /// ``SwiftFTRConfig/publicIP`` as an observation of `family`, if it is a globally routable
+  /// address of that family.
+  private func configuredPublicIP(for family: IPAddressFamily) -> PublicIPObservation? {
+    config.publicIP.flatMap {
+      validatedPublicIP(
+        PublicIPObservation(address: $0, family: family, source: .configured), for: family)
     }
+  }
 
-    cachedPublicIP = discovered
-    return discovered
+  /// The public address of `family` for one classified trace or multipath run, asking the
+  /// configured strategy once when nothing of that family is configured, seeded or cached.
+  ///
+  /// The question runs inside `handle`'s cancellation: the caller's cancellation, a network change
+  /// or ``cancelActiveTraces()`` ends it at once and is thrown. The library's resolver holds its
+  /// deadline itself; a caller's resolver is held to it by ``askWithinDeadline(_:_:)``. Any other
+  /// failure, a late answer and an answer that is not a globally routable address of `family` are
+  /// a miss: `nil`, not cached.
+  internal func publicIPObservation(for family: IPAddressFamily, handle: TraceHandle?)
+    async throws -> PublicIPObservation?
+  {
+    let strategy = config.publicIPResolver
+    let enableLogging = config.enableLogging
+    return try await effectivePublicIP(for: family) { request in
+      let ask: @Sendable () async throws -> PublicIPObservation?
+      switch strategy {
+      case .disabled:
+        return nil
+      case .library:
+        ask = {
+          try await LibraryPublicIPResolver(enableLogging: enableLogging).publicIP(for: request)
+        }
+      case .custom(let resolver):
+        ask = { try await askWithinDeadline(resolver, request) }
+      }
+      return try await withTraceCancellation(handle: handle) {
+        do {
+          return try await ask()
+        } catch {
+          // Only a cancellation ends the call; every other failure is a miss.
+          if let reason = handle?.cancellationError() { throw reason }
+          if Task.isCancelled { throw CancellationError() }
+          return nil
+        }
+      }
+    }
+  }
+
+  /// The configured, seeded or cached observation of `family`, or else `ask`'s answer to a request
+  /// built from the configuration, validated and cached for the current generation of `family`. A
+  /// seed or invalidation while `ask` is suspended makes the answer stale, so it is neither
+  /// returned nor cached; the newer cached value, if any, is returned instead.
+  internal func effectivePublicIP(
+    for family: IPAddressFamily,
+    ask: @Sendable (PublicIPRequest) async throws -> PublicIPObservation?
+  ) async throws -> PublicIPObservation? {
+    if let configured = configuredPublicIP(for: family) { return configured }
+    if let cached = publicIPCache[family] { return cached }
+
+    let generation = publicIPGenerations[family, default: 0]
+    let sourceIP = config.sourceIP.flatMap { IPAddressFamily(address: $0) == family ? $0 : nil }
+    let request = PublicIPRequest(
+      family: family, interface: config.interface, sourceIP: sourceIP,
+      deadline: .now + .seconds(config.publicIPDiscoveryTimeoutForOperation))
+    let answer = try await ask(request)
+    guard generation == publicIPGenerations[family, default: 0], publicIPCache[family] == nil
+    else { return publicIPCache[family] }
+    guard let accepted = answer.flatMap({ validatedPublicIP($0, for: family) }) else { return nil }
+    publicIPCache[family] = accepted
+    return accepted
+  }
+
+  /// Starts a new cache generation for each of `families` and forgets their observations, so an
+  /// answer to a question asked before this call is neither returned nor cached.
+  private func invalidatePublicIPCache(_ families: [IPAddressFamily] = IPAddressFamily.allCases) {
+    for family in families {
+      publicIPGenerations[family, default: 0] &+= 1
+      publicIPCache[family] = nil
+    }
   }
 
   // MARK: - Network Interface Discovery
@@ -1392,36 +1496,33 @@ public actor SwiftFTR {
     // Snapshot and remove the current generation before awaiting another actor.
     // Traces registered while cancellation is in progress remain tracked for a
     // subsequent network change instead of being silently removed.
-    cacheGeneration &+= 1
-    cachedPublicIP = nil
+    invalidatePublicIPCache()
     await cancelActiveTraces()
     await rdnsCache.clear()
 
     // Note: ASN cache could optionally be cleared too
   }
 
-  /// Get the effective public IP (configured or cached).
-  ///
-  /// This returns the configured public IP if set, otherwise the cached discovered IP.
-  public var publicIP: String? {
-    config.publicIP ?? cachedPublicIP
+  /// The public address of `family` a classified trace would use now without asking: the
+  /// configured ``SwiftFTRConfig/publicIP`` if it is a globally routable address of `family`,
+  /// otherwise the seeded or cached observation of `family`, or `nil`.
+  public func publicIP(for family: IPAddressFamily) -> PublicIPObservation? {
+    configuredPublicIP(for: family) ?? publicIPCache[family]
   }
 
   /// Clear all caches (convenience method).
   ///
   /// This clears both the public IP cache and the rDNS cache.
   public func clearCaches() async {
-    cacheGeneration &+= 1
-    cachedPublicIP = nil
+    invalidatePublicIPCache()
     await rdnsCache.clear()
   }
 
-  /// Invalidate just the public IP cache.
+  /// Invalidate just the public IP cache, both families.
   ///
   /// Forces fresh discovery during the next classified trace or multipath enrichment that needs it.
   public func invalidatePublicIP() {
-    cacheGeneration &+= 1
-    cachedPublicIP = nil
+    invalidatePublicIPCache()
   }
 
   /// Invalidate network-scoped reverse DNS cache entries.
@@ -1434,11 +1535,13 @@ public actor SwiftFTR {
     await rdnsCache.invalidateNetworkScoped()
   }
 
-  /// Dynamically seeds a validated public IP address for the current cache generation.
+  /// Dynamically seeds a validated public IP address for the current cache generation of its
+  /// family.
   ///
   /// This provides a known-valid public IP so the next classified trace or multipath
-  /// enrichment can skip discovery, without permanently overriding discovery like
-  /// ``SwiftFTRConfig/publicIP`` does.
+  /// enrichment of the same address family can skip discovery, without permanently overriding
+  /// discovery like ``SwiftFTRConfig/publicIP`` does. An IPv4 seed fills only the IPv4 slot and
+  /// an IPv6 seed only the IPv6 slot; a trace of the other family still asks for its own.
   ///
   /// The address must be a syntactically valid, globally routable IPv4 or IPv6 address.
   /// Private (RFC 1918), carrier-grade NAT (100.64.0.0/10), link-local, loopback,
@@ -1455,23 +1558,23 @@ public actor SwiftFTR {
   ///
   /// - Parameters:
   ///   - address: The public IP address string to seed.
-  ///   - source: The origin of this observation. Stating it is required; the library does not
-  ///     retain it and treats every accepted address identically. See ``PublicIPSource``.
+  ///   - source: The origin of this observation. It is cached with the address and reported as
+  ///     ``ClassifiedTrace/publicIPSource`` by the traces that use it. See ``PublicIPSource``.
   /// - Returns: `true` if the address was accepted and cached; `false` if rejected.
   @discardableResult
   public func seedPublicIP(
     _ address: String,
     source: PublicIPSource
   ) -> Bool {
-    guard isGloballyRoutablePublicIP(address) else {
+    guard isGloballyRoutablePublicIP(address), let canonical = canonicalIPAddress(address),
+      let family = IPAddressFamily(address: canonical)
+    else {
       return false
     }
-    guard let canonical = canonicalIPAddress(address) else {
-      return false
-    }
-    // Increment generation so any older in-flight discovery is superseded and cannot overwrite this seed
-    cacheGeneration &+= 1
-    cachedPublicIP = canonical
+    // A new generation of this family, so an older question in flight cannot overwrite the seed.
+    invalidatePublicIPCache([family])
+    publicIPCache[family] = PublicIPObservation(
+      address: canonical, family: family, source: source.observationSource)
     return true
   }
 }

@@ -70,7 +70,13 @@ public struct ClassifiedTrace: Sendable, Codable {
   public let destinationIP: String
   /// Hostname of the destination IP from reverse DNS
   public let destinationHostname: String?
+  /// The public address the hops were classified with, or `nil` if there was none.
   public let publicIP: String?
+  /// Where ``publicIP`` came from: the configuration, a seed, the library's resolver or the
+  /// caller's. `nil` when there is no public address, or when the caller of
+  /// ``TraceClassifier/classify(trace:destinationIP:resolver:timeout:publicIP:vpnContext:)`` built
+  /// this result and so knows the source itself.
+  public let publicIPSource: PublicIPObservationSource?
   /// Hostname of the public IP from reverse DNS
   public let publicHostname: String?
   public let clientASN: Int?
@@ -91,10 +97,32 @@ public struct ClassifiedTrace: Sendable, Codable {
     destinationASName: String? = nil,
     hops: [ClassifiedHop]
   ) {
+    self.init(
+      destinationHost: destinationHost, destinationIP: destinationIP,
+      destinationHostname: destinationHostname, publicIP: publicIP, publicIPSource: nil,
+      publicHostname: publicHostname, clientASN: clientASN, clientASName: clientASName,
+      destinationASN: destinationASN, destinationASName: destinationASName, hops: hops)
+  }
+
+  /// Creates a classified trace whose public address names its source.
+  public init(
+    destinationHost: String,
+    destinationIP: String,
+    destinationHostname: String? = nil,
+    publicIP: String? = nil,
+    publicIPSource: PublicIPObservationSource?,
+    publicHostname: String? = nil,
+    clientASN: Int? = nil,
+    clientASName: String? = nil,
+    destinationASN: Int? = nil,
+    destinationASName: String? = nil,
+    hops: [ClassifiedHop]
+  ) {
     self.destinationHost = destinationHost
     self.destinationIP = destinationIP
     self.destinationHostname = destinationHostname
     self.publicIP = publicIP
+    self.publicIPSource = publicIPSource
     self.publicHostname = publicHostname
     self.clientASN = clientASN
     self.clientASName = clientASName
@@ -193,51 +221,34 @@ public struct TraceClassifier: Sendable {
   public init() {}
 
   /// Classify a TraceResult into segments using ASN lookups and heuristics.
+  ///
+  /// The classifier sends nothing to find the public address: it classifies with the one it is
+  /// given, or without one. ``SwiftFTR/traceClassified(to:vpnContext:resolver:)`` asks the
+  /// configured ``PublicIPResolverStrategy`` for it once, before classifying.
   /// - Parameters:
   ///   - trace: Plain traceroute output to classify.
   ///   - destinationIP: Destination IPv4 or IPv6 address (numeric string) for ASN matching.
   ///   - resolver: ASN resolver to use (DNS- or WHOIS-based).
   ///   - timeout: Per-lookup timeout in seconds.
-  ///   - publicIP: Override public IP (bypasses STUN if provided).
-  ///   - interface: Network interface to use for STUN discovery (if needed).
-  ///   - sourceIP: Source IP address to bind to for STUN discovery (if needed).
+  ///   - publicIP: The client's public address, of the trace's family, or `nil` to classify
+  ///     without one (hops of the client's own network are then labelled TRANSIT, not ISP).
   ///   - vpnContext: Context for VPN-aware classification (optional).
-  ///   - enableLogging: Enable verbose logging for debugging
-  ///   - publicIPDiscoveryTimeout: Budget for discovering the public address when `publicIP` is
-  ///     not supplied. Classification proceeds without one when it elapses..
   /// - Returns: A ClassifiedTrace with per-hop categories and ASNs when available.
   public func classify(
     trace: TraceResult,
     destinationIP: String,
     resolver: ASNResolver,
     timeout: TimeInterval = 1.5,
-    publicIP: String? = nil,
-    interface: String? = nil,
-    sourceIP: String? = nil,
-    vpnContext: VPNContext? = nil,
-    enableLogging: Bool = false,
-    publicIPDiscoveryTimeout: TimeInterval = SwiftFTRConfig.defaultPublicIPDiscoveryTimeout
+    publicIP: String?,
+    vpnContext: VPNContext? = nil
   ) async throws -> ClassifiedTrace {
     // Gather IPs
     let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
     var allIPs = Set(hopIPs)
     allIPs.insert(destinationIP)
-    var resolvedPublicIP: String? = publicIP
+    let resolvedPublicIP: String? = publicIP
     if let providedIP = publicIP {
       allIPs.insert(providedIP)
-    } else {
-      // Try to discover public IP (STUN with DNS fallback) if not provided. The budget bounds
-      // the whole discovery, resolving the STUN hostnames included, which the per-attempt
-      // timeouts do not: `getaddrinfo` can hold its worker for 30 seconds against an unresponsive
-      // resolver. Classification degrades without a public IP, so a timeout here costs
-      // enrichment detail rather than the trace.
-      if let pub = try? await publicIPv4Discovery(
-        stunTimeout: 0.8, dnsTimeout: 2.0, interface: interface, sourceIP: sourceIP,
-        enableLogging: enableLogging, budget: publicIPDiscoveryTimeout)
-      {
-        resolvedPublicIP = pub.ip
-        allIPs.insert(pub.ip)
-      }
     }
 
     // Lookup only globally routable addresses. Private and other non-global

@@ -14,18 +14,19 @@ private struct MockASNResolver: ASNResolver {
 }
 
 final class SwiftFTRClassificationTests: XCTestCase {
-  /// Classifies `trace` with no public address, as the tests that call it intend. Discovery is
-  /// substituted by one that finds nothing, so the classifier never reaches live STUN; the library
-  /// does not read `PTR_SKIP_STUN`.
+  /// Classifies `trace` with no public address, as the tests that call it intend, and checks that
+  /// the classifier did not set out to find one: discovery is substituted by a counting one, which
+  /// also keeps a classifier that did ask off the network.
   private func classifyWithoutPublicIP(
     _ trace: TraceResult, destinationIP: String, resolver: ASNResolver
   ) async throws -> ClassifiedTrace {
     let discovery = OfflinePublicIPDiscovery()
     let classified = try await discovery.install {
       try await TraceClassifier().classify(
-        trace: trace, destinationIP: destinationIP, resolver: resolver, timeout: 0.1)
+        trace: trace, destinationIP: destinationIP, resolver: resolver, timeout: 0.1,
+        publicIP: nil)
     }
-    XCTAssertEqual(discovery.calls.value, 1, "classification did not ask for a public address")
+    XCTAssertEqual(discovery.calls.value, 0, "the classifier set out to discover a public address")
     return classified
   }
 

@@ -18,9 +18,9 @@ enum TestSeams {
   /// socket for `family`.
   typealias MakeICMPSocket = @Sendable (_ family: Int32) throws -> Int32
 
-  /// IPv4 public-address discovery for the trace family, in place of STUN with its DNS fallback.
-  /// It runs under the discovery budget, which cancels it when it passes.
-  typealias DiscoverPublicIPv4 = @Sendable () async throws -> STUNPublicIP
+  /// The library resolver's public-address discovery of one family, in place of STUN (with its
+  /// DNS fallback for IPv4). It runs under the discovery budget, which cancels it when it passes.
+  typealias DiscoverPublicIP = @Sendable (_ family: IPAddressFamily) async throws -> STUNPublicIP
 
   /// The STUN servers to try, in order, for one address family.
   typealias STUNServers = @Sendable (_ family: Int32) -> [(host: String, port: UInt16)]
@@ -69,7 +69,7 @@ enum TestSeams {
 
   @TaskLocal static var makeICMPSocket: MakeICMPSocket?
 
-  @TaskLocal static var discoverPublicIPv4: DiscoverPublicIPv4?
+  @TaskLocal static var discoverPublicIP: DiscoverPublicIP?
 
   /// The STUN servers a sweep of address family `family` tries, in place of the built-in list, so
   /// a test can point each family at loopback fixtures by numeric address.

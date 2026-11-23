@@ -65,7 +65,7 @@ struct MultipathWorkerConfigTests {
       config: SwiftFTRConfig(maxHops: 4, noReverseDNS: true, asnResolverStrategy: .embedded),
       rdnsCache: RDNSCache { _ in nil },
       asnResolver: resolver,
-      cachedPublicIP: publicIP)
+      publicIPCache: testPublicIPCache(publicIP))
     let config = MultipathConfig(
       flowVariations: 1, maxPaths: 4, earlyStopThreshold: 1, timeoutMs: 2000, maxHops: 4)
 
@@ -85,7 +85,7 @@ struct MultipathWorkerConfigTests {
   static let configFields: Set<String> = [
     "maxHops", "maxWaitMs", "payloadSize", "publicIP", "enableLogging", "noReverseDNS",
     "rdnsCacheTTL", "rdnsCacheSize", "rdnsLookupTimeout", "publicIPDiscoveryTimeout",
-    "interface", "sourceIP", "asnResolverStrategy", "preferredFamily",
+    "interface", "sourceIP", "asnResolverStrategy", "preferredFamily", "publicIPResolver",
   ]
 
   /// A caller configuration with every field away from its default.
@@ -93,7 +93,7 @@ struct MultipathWorkerConfigTests {
     maxHops: 17,
     maxWaitMs: 1234,
     payloadSize: 99,
-    publicIP: "198.51.100.10",
+    publicIP: "9.9.9.9",
     enableLogging: true,
     noReverseDNS: true,
     rdnsCacheTTL: 42,
@@ -103,7 +103,8 @@ struct MultipathWorkerConfigTests {
     interface: "lo0",
     sourceIP: "127.0.0.1",
     asnResolverStrategy: .dns,
-    preferredFamily: .auto
+    preferredFamily: .auto,
+    publicIPResolver: .disabled
   )
 
   static func fields(of config: SwiftFTRConfig) -> [String: String] {
@@ -131,7 +132,7 @@ struct MultipathWorkerConfigTests {
     let resolver = MultipathRecordingASNResolver(mapping: [:])
     let spawner = SwiftFTR.MultipathWorkerSpawner(
       baseConfig: Self.callerConfig, rdnsCache: rdns, asnResolver: resolver,
-      cachedPublicIP: nil)
+      publicIPCache: [:])
     let flow = spawner.makeFlowTracer(maxHops: 5, timeoutMs: 321)
     let worker = Self.fields(of: flow.config)
 
@@ -150,16 +151,16 @@ struct MultipathWorkerConfigTests {
     let sharesResolver = (flowResolver as AnyObject) === (resolver as AnyObject)
     #expect(sharesCache, "a flow must share the caller's reverse-DNS cache")
     #expect(sharesResolver, "a flow must use the caller's ASN resolver")
-    #expect(await flow.cachedPublicIP == "198.51.100.10")
+    #expect(await flow.publicIP(for: .v4)?.address == "9.9.9.9")
   }
 
   @Test("A flow starts from the caller's cached public address")
   func flowStartsFromCallerPublicIPCache() async {
     let spawner = SwiftFTR.MultipathWorkerSpawner(
       baseConfig: SwiftFTRConfig(), rdnsCache: RDNSCache { _ in nil },
-      asnResolver: EmptyASNResolver(), cachedPublicIP: "203.0.113.9")
+      asnResolver: EmptyASNResolver(), publicIPCache: testPublicIPCache("203.0.113.9"))
     let flow = spawner.makeFlowTracer(maxHops: 4, timeoutMs: 1000)
-    #expect(await flow.cachedPublicIP == "203.0.113.9")
+    #expect(await flow.publicIPCache[.v4]?.address == "203.0.113.9")
   }
 }
 

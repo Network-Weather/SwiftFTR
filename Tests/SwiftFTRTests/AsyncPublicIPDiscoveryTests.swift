@@ -312,12 +312,13 @@ struct AsyncPublicIPDiscoveryTests {
         servers: Self.servers(v4: [(silent.host, silent.port)]), whoamiPort: whoami.port,
         executor: executor
       ) {
-        try await publicIPv4Discovery(
+        try await publicIPDiscovery(
+          family: .v4,
           stunTimeout: 0.2, dnsTimeout: 3 * Self.watchdog, interface: nil, sourceIP: nil,
           enableLogging: false, budget: 3 * Self.watchdog)
       }
     }
-    #expect(found.ip == "198.51.100.42")
+    #expect(found.address == "198.51.100.42")
     #expect(released.value == 0, "discovery waited for the occupant to free its slot")
     #expect(silent.requests.value == 0, "the STUN attempt ran although no slot was free")
     #expect(whoami.requests.value == 1)
@@ -342,8 +343,9 @@ struct AsyncPublicIPDiscoveryTests {
     let outcome = try await measure(within: Self.watchdog) {
       await Self.withFixtures(servers: servers, whoamiPort: whoami.port, executor: executor) {
         do {
-          return Result<STUNPublicIP, Error>.success(
-            try await publicIPv4Discovery(
+          return Result<PublicIPObservation, Error>.success(
+            try await publicIPDiscovery(
+              family: .v4,
               stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
               interface: nil, sourceIP: nil, enableLogging: false, budget: 1))
         } catch {
@@ -390,7 +392,7 @@ struct AsyncPublicIPDiscoveryTests {
     let outcome = try await measure(within: Self.watchdog) {
       await Self.withFixtures(servers: servers, whoamiPort: whoami.port, executor: executor) {
         do {
-          return Result<STUNPublicIP, Error>.success(
+          return Result<PublicIPObservation, Error>.success(
             try await getPublicIPv4(
               stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
               deadline: monotonicNow() + 1))
@@ -468,12 +470,13 @@ struct AsyncPublicIPDiscoveryTests {
         servers: Self.servers(v4: names.map { ($0, 3478) }), whoamiPort: whoami.port,
         executor: executor
       ) {
-        try await publicIPv4Discovery(
+        try await publicIPDiscovery(
+          family: .v4,
           stunTimeout: 0.5, dnsTimeout: 3 * Self.watchdog, interface: nil, sourceIP: nil,
           enableLogging: false, budget: 3 * Self.watchdog)
       }
     }
-    #expect(found.ip == "198.51.100.43")
+    #expect(found.address == "198.51.100.43")
     #expect(released.value == 0, "the lookups ran, so they were not waiting for the held slot")
     #expect(whoami.requests.value == 1)
   }
@@ -515,7 +518,8 @@ struct AsyncPublicIPDiscoveryTests {
     // The timer child's own timeout, before the clock read reaches the deadline, stays a timeout.
     #expect(throws: PublicIPDiscoveryTimeout.self) {
       try publicIPDiscoveryOutcome(
-        .failure(PublicIPDiscoveryTimeout()), now: 9.999, deadline: 10, cancelled: false)
+        Result<STUNPublicIP, Error>.failure(PublicIPDiscoveryTimeout()), now: 9.999, deadline: 10,
+        cancelled: false)
     }
     // The caller's cancellation comes first.
     #expect(throws: CancellationError.self) {
@@ -649,7 +653,8 @@ struct AsyncPublicIPDiscoveryTests {
       ) {
         await TestSeams.$whoamiServers.withValue(["127.0.0.1", "127.0.0.1"]) { () -> Error? in
           do {
-            _ = try await publicIPv4Discovery(
+            _ = try await publicIPDiscovery(
+              family: .v4,
               stunTimeout: 0.2, dnsTimeout: 3 * Self.watchdog, interface: nil, sourceIP: nil,
               enableLogging: false, budget: 3 * Self.watchdog)
             return nil

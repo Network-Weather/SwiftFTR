@@ -23,8 +23,8 @@ struct TraceLifecycleTests {
     #expect(await tracer.rdnsCache.count == 1)
 
     // Set a cached public IP directly or via effective discovery
-    let _ = await tracer.effectivePublicIPForClassification { "198.51.100.1" }
-    #expect(await tracer.publicIP == "198.51.100.1")
+    let _ = await tracer.effectivePublicIPv4 { "9.9.9.10" }
+    #expect(await tracer.publicIP(for: .v4)?.address == "9.9.9.10")
 
     let streamConfig = StreamingTraceConfig(
       probeTimeout: 3 * lifecycleWatchdog,
@@ -68,12 +68,12 @@ struct TraceLifecycleTests {
     }
 
     // Verify caches are still intact!
-    #expect(await tracer.publicIP == "198.51.100.1")
+    #expect(await tracer.publicIP(for: .v4)?.address == "9.9.9.10")
     #expect(await tracer.rdnsCache.count == 1)
 
     // Now call networkChanged() and verify it DOES clear the public IP and rDNS
     await tracer.networkChanged()
-    #expect(await tracer.publicIP == nil)
+    #expect(await tracer.publicIP(for: .v4)?.address == nil)
     #expect(await tracer.rdnsCache.count == 0)
   }
 
@@ -200,7 +200,7 @@ struct TraceLifecycleTests {
         maxHops: 1,
         maxWaitMs: 100,
         // Configured, so classification reaches the resolver without public-IP discovery.
-        publicIP: "198.51.100.1",
+        publicIP: "9.9.9.10",
         enableLogging: false,
         noReverseDNS: true
       )

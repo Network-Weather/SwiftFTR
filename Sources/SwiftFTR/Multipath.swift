@@ -110,7 +110,8 @@ extension SwiftFTRConfig {
       interface: interface,
       sourceIP: sourceIP,
       asnResolverStrategy: asnResolverStrategy,
-      preferredFamily: .v4
+      preferredFamily: .v4,
+      publicIPResolver: publicIPResolver
     )
   }
 }
@@ -528,6 +529,7 @@ struct MultipathDiscovery<Worker: MultipathFlowRunning>: Sendable {
       destinationIP: canonical.destinationIP,
       destinationHostname: canonical.destinationHostname,
       publicIP: canonical.publicIP,
+      publicIPSource: canonical.publicIPSource,
       publicHostname: canonical.publicHostname,
       clientASN: canonical.clientASN,
       clientASName: canonical.clientASName,
@@ -598,7 +600,7 @@ extension SwiftFTR {
       baseConfig: swiftConfig,
       rdnsCache: self.rdnsCache,
       asnResolver: self.asnResolver,
-      cachedPublicIP: self.cachedPublicIP
+      publicIPCache: self.publicIPCache
     )
     let discovery = MultipathDiscovery(worker: worker, config: swiftConfig)
 
@@ -648,7 +650,7 @@ extension SwiftFTR {
     let baseConfig: SwiftFTRConfig
     let rdnsCache: RDNSCache
     let asnResolver: ASNResolver
-    let cachedPublicIP: String?
+    let publicIPCache: [IPAddressFamily: PublicIPObservation]
 
     func runMultipathFlow(
       target: String,
@@ -675,7 +677,7 @@ extension SwiftFTR {
         config: baseConfig.multipathFlowConfig(maxHops: maxHops, timeoutMs: timeoutMs),
         rdnsCache: rdnsCache,
         asnResolver: asnResolver,
-        cachedPublicIP: baseConfig.publicIP ?? cachedPublicIP
+        publicIPCache: publicIPCache
       )
     }
   }
@@ -694,7 +696,7 @@ extension SwiftFTR {
       baseConfig: self.config,
       rdnsCache: self.rdnsCache,
       asnResolver: self.asnResolver,
-      cachedPublicIP: self.cachedPublicIP
+      publicIPCache: self.publicIPCache
     ).makeFlowTracer(maxHops: maxHops, timeoutMs: timeoutMs)
 
     return try await tempTracer.performClassifiedTraceWithFlowID(
@@ -720,11 +722,9 @@ extension SwiftFTR {
       _ = try validateInterface(interfaceName)
     }
 
-    let effectivePublicIP = await effectivePublicIPForClassification {
-      try? await self.discoverPublicIP()
-    }
-    // Discovery swallows its own cancellation; do not start resolving a destination for a flow
-    // whose discovery has already been cancelled.
+    let observation = try await publicIPObservation(for: .v4, handle: handle)
+    let effectivePublicIP = observation?.address
+    // Do not start resolving a destination for a flow whose question was cancelled.
     try Task.checkCancellation()
 
     // Perform base trace with flow ID
@@ -778,11 +778,7 @@ extension SwiftFTR {
         destinationIP: destIP,
         resolver: effectiveResolver,
         timeout: 1.5,
-        publicIP: effectivePublicIP,
-        interface: self.config.interface,
-        sourceIP: self.config.sourceIP,
-        enableLogging: self.config.enableLogging,
-        publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeoutForOperation
+        publicIP: effectivePublicIP
       )
     }
 
@@ -816,6 +812,7 @@ extension SwiftFTR {
       destinationIP: baseClassified.destinationIP,
       destinationHostname: hostnameMap[destIP],
       publicIP: baseClassified.publicIP,
+      publicIPSource: observation?.source,
       publicHostname: effectivePublicIP.flatMap { hostnameMap[$0] },
       clientASN: baseClassified.clientASN,
       clientASName: baseClassified.clientASName,
