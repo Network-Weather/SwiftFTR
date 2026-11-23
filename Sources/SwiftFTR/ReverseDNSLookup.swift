@@ -71,8 +71,10 @@ struct ReverseDNSQuestion: Sendable, Equatable {
 
 /// How one reverse-DNS lookup ended.
 enum ReverseDNSLookupOutcome: Sendable, Equatable {
-  /// The first PTR record the daemon added, as a hostname without the trailing dot, the form
-  /// `getnameinfo` returns.
+  /// The first PTR record the daemon added, as a hostname without the trailing dot, in DNS
+  /// presentation form: printable ASCII only, with `.` and `\` inside a label and every other
+  /// byte outside `!` to `~` escaped (see ``ReverseDNSLookup/hostname(fromPTR:)``). An ordinary
+  /// hostname is the string `getnameinfo` returns.
   case answer(String)
   /// The daemon reported that no PTR record exists (`kDNSServiceErr_NoSuchRecord`, or
   /// `kDNSServiceErr_NoSuchName`).
@@ -121,7 +123,8 @@ enum ReverseDNSLookupError: Sendable, Equatable {
   /// The daemon delivered this error to the callback, for example
   /// `kDNSServiceErr_ServiceNotRunning` or `kDNSServiceErr_DefunctConnection`.
   case daemon(DNSServiceErrorType)
-  /// The daemon added a PTR record whose data is not a well-formed domain name.
+  /// The daemon added a PTR record whose data is not one well-formed, uncompressed domain name.
+  /// Says nothing about the address's name, so it is not cached.
   case malformedRecord
 }
 
@@ -386,9 +389,9 @@ final class ReverseDNSLookup: @unchecked Sendable {
       tearDown()
       return
     }
-    // The deadline or a cancellation that arrived during the start call has already released
-    // the caller; dispose of the query it made.
-    if isResolved { tearDown() }
+    // A deadline or cancellation that arrived during the start call has already released the
+    // caller, and the teardown it queued runs after this block, so it deallocates the reference
+    // just made.
   }
 
   /// Deallocates the reference, then releases the callback context. Runs once.
@@ -433,19 +436,51 @@ final class ReverseDNSLookup: @unchecked Sendable {
     resolve(result, onQueue: true)
   }
 
-  /// The hostname a PTR record's data names, without the trailing dot, or `nil` when the data
-  /// is not exactly one well-formed domain name.
+  /// The hostname a PTR record's data names, in DNS presentation form without the trailing dot,
+  /// or `nil` when the data is not exactly one well-formed, uncompressed domain name.
   ///
   /// The daemon delivers the name in wire form, uncompressed (measured: `one.one.one.one` arrives
-  /// as `03 6f6e65 03 6f6e65 03 6f6e65 03 6f6e65 00`). The name decoder is the DNS client's, given
-  /// the data as its own message so no pointer can reach outside it.
+  /// as `03 6f6e65 03 6f6e65 03 6f6e65 03 6f6e65 00`), so a compression pointer is malformed
+  /// here, as are reserved label types, a label running past the data, data after the root label,
+  /// a wire length over 255 bytes, and the root name alone.
+  ///
+  /// Labels are chosen by whoever runs the address's reverse zone, and may hold any byte. The
+  /// result is printable ASCII only, and one label always reads as one label: `.` and `\` in a
+  /// label are written `\.` and `\\`, and every byte outside `!` to `~` (space, control bytes,
+  /// NUL, and each byte of non-ASCII UTF-8) is written `\DDD` in decimal. These are the escaping
+  /// rules of `dns_sd.h` ("Notes on DNS Name Escaping"). An ordinary hostname (letters, digits,
+  /// hyphens, underscores) is unchanged, and so equals what `getnameinfo` returns; `getnameinfo`
+  /// itself escapes only `.`, and returns the other bytes raw and stops at a NUL (measured).
   static func hostname(fromPTR rdata: UnsafeRawBufferPointer) -> String? {
-    let data = Data(rdata)
-    guard
-      let name = DNSClient.parsePTR(rdata: data, rdataOffsetInMessage: 0, fullMessage: data),
-      !name.isEmpty
-    else { return nil }
-    return name
+    let bytes = Array(rdata)
+    guard bytes.count <= 255 else { return nil }
+    var labels: [String] = []
+    var offset = 0
+    while true {
+      guard offset < bytes.count else { return nil }
+      let length = Int(bytes[offset])
+      offset += 1
+      if length == 0 { break }
+      // 0xC0 is a compression pointer; 0x40 and 0x80 are reserved label types.
+      guard length & 0xC0 == 0, offset + length <= bytes.count else { return nil }
+      var label = ""
+      for byte in bytes[offset..<(offset + length)] {
+        switch byte {
+        case UInt8(ascii: "."), UInt8(ascii: "\\"):
+          label.append("\\")
+          label.append(Character(Unicode.Scalar(byte)))
+        case 0x21...0x7E:
+          label.append(Character(Unicode.Scalar(byte)))
+        default:
+          let decimal = String(byte)
+          label.append("\\" + String(repeating: "0", count: 3 - decimal.count) + decimal)
+        }
+      }
+      labels.append(label)
+      offset += length
+    }
+    guard offset == bytes.count, !labels.isEmpty else { return nil }
+    return labels.joined(separator: ".")
   }
 
   /// The callback `DNSServiceQueryRecord` is given. Its context is the lookup, retained.

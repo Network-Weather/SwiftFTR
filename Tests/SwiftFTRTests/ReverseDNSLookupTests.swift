@@ -71,6 +71,76 @@ struct ReverseDNSLookupTests {
     #expect(decode([0x40, 0x00]) == nil, "a reserved label type")
   }
 
+  @Test("Labels from the reverse zone are escaped: printable ASCII only, one label reads as one")
+  func hostileLabels() {
+    func decode(_ labels: [[UInt8]]) -> String? {
+      var wire: [UInt8] = []
+      for label in labels {
+        wire.append(UInt8(label.count))
+        wire.append(contentsOf: label)
+      }
+      wire.append(0)
+      return wire.withUnsafeBytes { ReverseDNSLookup.hostname(fromPTR: $0) }
+    }
+    let net = Array("net".utf8)
+    #expect(decode([Array("evil.example".utf8), net]) == #"evil\.example.net"#)
+    #expect(decode([Array(#"a\b"#.utf8), net]) == #"a\\b.net"#)
+    #expect(decode([Array("a b".utf8), net]) == #"a\032b.net"#)
+    #expect(decode([[0x61, 0x00, 0x62], net]) == #"a\000b.net"#)
+    #expect(decode([Array("\u{1B}[31m".utf8), net]) == #"\027[31m.net"#)
+    #expect(decode([[0x61, 0xFF, 0x62], net]) == #"a\255b.net"#, "invalid UTF-8")
+    #expect(decode([Array("aéb".utf8), net]) == #"a\195\169b.net"#, "UTF-8 outside ASCII")
+    #expect(decode([[0x7F], net]) == #"\127.net"#)
+    #expect(decode([Array("host-1_a".utf8), Array("Example".utf8), net]) == "host-1_a.Example.net")
+
+    let label63 = [UInt8](repeating: 0x61, count: 63)
+    #expect(decode([label63, net]) == String(repeating: "a", count: 63) + ".net")
+    // 63 + 63 + 63 + 61 bytes of labels, four length bytes and the root: 255, the maximum.
+    let longest = [label63, label63, label63, [UInt8](repeating: 0x62, count: 61)]
+    let longestLength = 63 * 3 + 61 + 3
+    #expect(decode(longest)?.count == longestLength)
+    let tooLong = [label63, label63, label63, [UInt8](repeating: 0x62, count: 62)]
+    #expect(decode(tooLong) == nil, "256 bytes in wire form")
+    #expect(decode([[UInt8](repeating: 0x61, count: 64)]) == nil, "a 64-byte label")
+    #expect(
+      [UInt8]([1, 0x61, 0xC0, 0x00]).withUnsafeBytes { ReverseDNSLookup.hostname(fromPTR: $0) }
+        == nil, "a compression pointer after a label")
+
+    // Whatever the bytes, the result is printable ASCII, and its unescaped dots separate
+    // exactly the labels the data had.
+    var generator = SystemRandomNumberGenerator()
+    for _ in 0..<500 {
+      let labels = (0..<Int.random(in: 1...4, using: &generator)).map { _ in
+        (0..<Int.random(in: 1...20, using: &generator)).map { _ in
+          UInt8.random(in: 0...255, using: &generator)
+        }
+      }
+      guard let name = decode(labels) else {
+        Issue.record("well-formed labels were rejected: \(labels)")
+        continue
+      }
+      let printable = name.unicodeScalars.allSatisfy { (0x21...0x7E).contains($0.value) }
+      #expect(printable, "\(name)")
+      #expect(Self.unescapedDots(name) == labels.count - 1, "\(name)")
+    }
+  }
+
+  /// The dots in `name` that are not escaped by a backslash.
+  static func unescapedDots(_ name: String) -> Int {
+    var count = 0
+    var escaped = false
+    for character in name {
+      if escaped {
+        escaped = false
+      } else if character == "\\" {
+        escaped = true
+      } else if character == "." {
+        count += 1
+      }
+    }
+    return count
+  }
+
   @Test("An address that is not a literal makes no query")
   func invalidAddressMakesNoQuery() async {
     let fake = FakeDNSService()
@@ -131,6 +201,21 @@ struct ReverseDNSLookupTests {
       fake.deliver(error: DNSServiceStatus.timeout)
     }
     #expect(outcome == .timedOut)
+    try await Self.expectTornDown(fake, references: 1)
+  }
+
+  @Test("An answer whose label holds a dot reaches the caller escaped")
+  func escapedAnswer() async throws {
+    let fake = FakeDNSService()
+    var rdata: [UInt8] = [12]
+    rdata.append(contentsOf: "evil.example".utf8)
+    rdata.append(3)
+    rdata.append(contentsOf: "net".utf8)
+    rdata.append(0)
+    let outcome = try await Self.run(fake, "192.0.2.1") { [rdata] in
+      fake.deliver(rdata: rdata)
+    }
+    #expect(outcome == .answer(#"evil\.example.net"#))
     try await Self.expectTornDown(fake, references: 1)
   }
 

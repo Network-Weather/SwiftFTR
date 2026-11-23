@@ -74,6 +74,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
+| Reverse-DNS lookup (`DNSServiceQueryRecord`, not yet used by `RDNSCache`) | the PTR question for IPv4, IPv6, IPv4-mapped and zoned link-local addresses; PTR data that is not one well-formed, uncompressed name (a compression pointer, a reserved label type, truncation, trailing data, over 255 bytes, the root alone); labels from the reverse zone holding `.`, `\`, space, NUL, ESC, DEL, invalid and non-ASCII UTF-8, escaped to printable ASCII with one label reading as one, also over 500 random names; each outcome (an added PTR, no such record and no such name, daemon errors, the daemon's timeout, intermediate CNAMEs and remove events ignored); the start call or the queue call failing; the deadline; cancellation before the start, during a start stalled in the daemon, after the start, racing a reply and racing the deadline, each with one outcome and one deallocate per reference on the lookup's queue; a start stalled past the deadline releasing the caller and deallocating when it returns; the cap on lookups in flight, whose permit is held until the reference is gone; with every executor slot held; a stress loop of 3,000 answered, cancelled and expiring lookups against the real daemon; a live comparison with `getnameinfo` | `ReverseDNSLookup.lookup` | `ReverseDNSLookupTests`, `ReverseDNSLookupDaemonTests` |
 | ASN | resolver that stalls and ignores its timeout, or ignores cancellation | traceClassified, discoverPaths | `Cancellation` |
 | DNS wire | silence, slow, NXDOMAIN, SERVFAIL, garbage without the query's transaction ID (ignored, so a timeout), oversized, compression loop, overstated answer count (both incomplete answer sections are `malformedResponse`) | the `__dnsQuery` SPI | `Wire` |
 | DNS transport | refused port (IPv4 and IPv6); empty datagram (ignored, so a timeout); `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
@@ -89,13 +90,11 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
 | The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP teardown joins its handlers | fixtures | `Fixture` |
 
-Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`
-and `DNSForeignReplyTests` for the event-based DNS transport, `CymruEventBasedTests` for the
-Team Cymru lookups on it, and `ProbeNonBlockingSetupTests` for the TCP and UDP probes' socket
-setup. Every timed operation runs under a watchdog
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`,
-`DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport, and `CymruEventBasedTests` for the
-Team Cymru lookups on it. Every timed operation runs under a watchdog
+`DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport,
+`CymruEventBasedTests` for the Team Cymru lookups on it, `ProbeNonBlockingSetupTests` for the TCP
+and UDP probes' socket setup, and `ReverseDNSLookupTests` and `ReverseDNSLookupDaemonTests` for
+the `DNSServiceQueryRecord` reverse lookup. Every timed operation runs under a watchdog
 (`measure(within:)`), so an operation that never returns fails its test instead of hanging the run.
 
 Not covered, and why:
@@ -136,6 +135,14 @@ Not covered, and why:
   resolver. `CymruEventBasedTests` runs `CymruDNSResolver` against a loopback responder; the
   battery passes a stub resolver to every classified trace so no test reaches it.
 - **A TCP port that drops SYNs (filtered).** Producing one needs a firewall rule.
+- **The order of the reverse lookup's deallocate and its context release.** The context is the
+  lookup itself, retained, and something else always holds the lookup while it tears down (the
+  block running the teardown), so releasing the context first frees nothing a test can observe.
+  The stress loop would expose a callback reaching a freed lookup only as a crash, and only if
+  the lookup were freed early.
+- **The reverse lookup against a stopped or stalled daemon.** `kDNSServiceErr_ServiceNotRunning`
+  and `kDNSServiceErr_DefunctConnection` are delivered through the substitute daemon; stopping the
+  system's needs root.
 
 ## Out of scope
 
