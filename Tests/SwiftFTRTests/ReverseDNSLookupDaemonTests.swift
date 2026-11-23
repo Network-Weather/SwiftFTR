@@ -163,11 +163,12 @@ struct ReverseDNSLookupDaemonTests {
       Issue.record("cannot rerun the test bundle: no --test-bundle-path in \(arguments)")
       return
     }
-    // The same runner and bundle, with only the child suite selected.
+    // The same runner and bundle, with only the child suite selected, once.
+    let dropped: Set<String> = ["--filter", "--skip", "--maximum-repetitions", "--repeat-until"]
     var childArguments: [String] = []
     var index = 1
     while index < arguments.count {
-      if arguments[index] == "--filter" || arguments[index] == "--skip" {
+      if dropped.contains(arguments[index]) {
         index += 2
         continue
       }
