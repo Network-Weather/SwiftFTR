@@ -338,14 +338,15 @@ struct AsyncPublicIPDiscoveryTests {
     let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
 
     // Each attempt and the fallback could each run past the watchdog on their own; only the
-    // budget can end discovery inside it.
+    // budget can end discovery inside it. The budget leaves the fallback two seconds after STUN's
+    // share ends, so a slow runner still reaches the fallback before the budget does.
     let outcome = try await measure(within: Self.watchdog) {
       await Self.withFixtures(servers: servers, whoamiPort: whoami.port, executor: executor) {
         do {
           return Result<STUNPublicIP, Error>.success(
             try await publicIPv4Discovery(
               stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
-              interface: nil, sourceIP: nil, enableLogging: false, budget: 1))
+              interface: nil, sourceIP: nil, enableLogging: false, budget: 4))
         } catch {
           return .failure(error)
         }
@@ -356,9 +357,11 @@ struct AsyncPublicIPDiscoveryTests {
     #expect(first.requests.value == 1)
 
     // STUN's share of the budget ends at half of it, so the fallback was asked inside the
-    // budget, and the second server never got time.
+    // budget, and the second server never got time. The fallback's query was sent before
+    // discovery ended, but its responder counts it on its own thread, so wait for the count.
     #expect(second.requests.value == 0)
-    #expect(whoami.requests.value == 1)
+    let fallbackAsked = await eventually(within: 10) { whoami.requests.value == 1 }
+    #expect(fallbackAsked, "the fallback was asked \(whoami.requests.value) times")
 
     // The discovery itself ended, not only the wait for it: once the stalled attempt lets go of
     // its slot, nothing goes on to the next server or asks the fallback again.
