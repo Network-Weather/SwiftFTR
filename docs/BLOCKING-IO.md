@@ -254,15 +254,15 @@ overlap in time; the "After" column is what must have landed first.
 
 | Slice | After | Contents |
 |---|---|---|
-| Small Fixes | | #138 (a ping whose send failed ends once every sent probe is answered), #139 (`seedPublicIP` and the shared address parsers: a NAT64 address wrapping a non-global IPv4 address, a string with an embedded NUL), #128 (a DNS reply's question is compared with the query; a reply with no question section stays acceptable), #140 (CLI wording for a failed receive), #136 (README). Each caller-visible change gets an upgrade-guide entry. |
-| Upload Default | | Bufferbloat's default upload URL (decision 11, #89). |
-| Test Hygiene | | #135 (a watchdog on the ASN-enrichment cancellation test), #129 (fixture teardown that does not block an async test), the stronger `cancelledLookupNotCached` (ROADMAP). Tests only. |
-| DNS Error Cases | Small Fixes | `DNSError.connectionRefused` and `DNSError.unreachable`, mapped by where the failure came from: a refusal received after the send (`sendFailed` today), an unreachable received after the send (`timeout` today), and a local routing failure on connect or send (`sendFailed` today). `dnsProbe`'s result for each origin does not change. Adds the API allowlist and runs the API check in CI. |
+| ~~Small Fixes~~ | | #138 (a ping whose send failed ends once every sent probe is answered), #139 (`seedPublicIP` and the shared address parsers: a NAT64 address wrapping a non-global IPv4 address, a string with an embedded NUL), #128 (a DNS reply's question is compared with the query; a reply with no question section stays acceptable), #140 (CLI wording for a failed receive), #136 (README). Each caller-visible change gets an upgrade-guide entry. | ~~~~ Landed. |
+| ~~Upload Default~~ | | Bufferbloat's default upload URL (decision 11, #89). | ~~~~ Landed. |
+| ~~Test Hygiene~~ | | #135 (a watchdog on the ASN-enrichment cancellation test), #129 (fixture teardown that does not block an async test), the stronger `cancelledLookupNotCached` (ROADMAP). Tests only. | ~~~~ Landed. |
+| ~~DNS Error Cases~~ | Small Fixes | ~~`DNSError.connectionRefused` and `DNSError.unreachable`, mapped by where the failure came from: a refusal received after the send (`sendFailed` today), an unreachable received after the send (`timeout` today), and a local routing failure on connect or send (`sendFailed` today). `dnsProbe`'s result for each origin does not change. Adds the API allowlist and runs the API check in CI.~~ Landed. |
 | Async Public-IP Discovery | Small Fixes | The stage below. STUN server names and each STUN attempt run as executor requests under one absolute discovery deadline; nothing moves onto the cooperative pool. Deletes the blocking DNS path, so it lands after Small Fixes has touched it. |
 | Resolver Seam | Async Public-IP Discovery | First half of the stage below: the `PublicIPResolver` protocol and strategy, a per-family cache, the tracer-enforced deadline, one question per call asked after the family is known, no discovery in the classifier or in flows, the source reported on results, and the source breaks. |
 | Library Resolver | Resolver Seam | Second half: the library's STUN-only resolver in its own file, bound before anything is sent (#151), the whoami query through recursive resolvers deleted (#153), `getPublicIPs` and `discoverPublicIPWithHostname()` on it. |
 | Event-Based STUN | Library Resolver | The stage below: STUN on the event-based transport, servers tried at once, foreign replies ignored, a cancellable, bounded wait on each server-name lookup, and the rule for which answer is believed (decision 16). |
-| Reverse-DNS Lookup | | The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test, the descriptor-count test at a lowered limit and the gated live comparison. Unused until the next row; the two are released together. |
+| Reverse-DNS Lookup | | The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test, the descriptor-count test at a lowered limit and the gated live comparison. Unused until the next row; the two are released together. One recorded deadline decides every outcome: the start makes no query once it has passed, and a reply that arrives after it is a timeout, not an answer; neither waits for the timer's handler to run (found in review of the first attempt, which was taken back out of `main` before release). |
 | Reverse-DNS Cache | Reverse-DNS Lookup | `RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker, and `withTraceCancellation` around the multipath flow's reverse-DNS wait. |
 | Resolution Off The Actor | Event-Based STUN, Reverse-DNS Cache | The stage below, as one change: the resolution seam is one closure shared by trace, streaming trace, ping and the probes, so it becomes async for all of them together. If it outgrows the cap, the second pull request is the forward-resolution budget option (decision 7) and `discoverPaths` resolving once. |
 | Enrichment Lifetimes | Resolver Seam | The ASN lookup's timeout reaches every resolver it passes through (`HybridASNResolver` ignores it today), and a caller leaving a shared ASN database load neither cancels it for others nor leaves the resolver latched as failed. (Remembering a failed public-IP attempt moved to Resolver Seam.) |
@@ -542,9 +542,8 @@ A stage is done when these pass on its branch, with the output in the PR body:
 swift format lint --strict -r Sources Tests
 SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug          # twice in a row
 SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c release
-swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR
-# once the DNS Error Cases slice has landed, add:
-#   --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt"
+swift package diagnose-api-breaking-changes v0.18.1 --products SwiftFTR \
+  --breakage-allowlist-path "$PWD/api-breakage-allowlist.txt"
 # (one exact diagnostic per line; the file takes no comments)
 swift package --allow-writing-to-directory docc generate-documentation --target SwiftFTR \
   --output-path docc --transform-for-static-hosting --warnings-as-errors
