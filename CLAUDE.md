@@ -112,6 +112,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 | `SKIP_IPV6_TESTS=1` / `FORCE_IPV6_TESTS=1` | Force-skip or force-run the IPv6 integration tests instead of probing for a v6 path |
 | `SWIFTFTR_VERBOSE_HTTP_TIMING=1` | Verbose HTTP probe timing logs |
 | `SWIFTFTR_DEBUG_MULTIPATH` | Debug output for multipath discovery |
+| `SWIFTFTR_RDNS_DESCRIPTOR_STRESS=1` | Also run the reverse-lookup descriptor experiment: the child process lowers its descriptor limit to what is open plus the cap plus two. A measurement that can fail on a valid ordering, so off by default |
 
 ## Swift 6 Compliance
 

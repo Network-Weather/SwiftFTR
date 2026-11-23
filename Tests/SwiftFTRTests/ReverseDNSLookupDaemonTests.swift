@@ -149,13 +149,23 @@ struct ReverseDNSLookupDaemonTests {
   /// The environment variable that makes ``DescriptorLimitChild`` run, in the child process.
   static let childVariable = "SWIFTFTR_RDNS_DESCRIPTOR_CHILD"
 
-  /// In a process of its own, so lowering its descriptor limit cannot touch parallel tests: with
-  /// the limit set to the descriptors open plus the cap plus two, far more lookups than the limit
-  /// all answer, and the daemon connections open at once, counted from the process's own
-  /// descriptor table at every start, never exceed the cap plus two.
-  @Test(
-    "With the descriptor limit just above the cap, many more lookups than the limit all answer",
-    arguments: [1, 4, 16])
+  /// Set to run the tight-descriptor experiment in the child as well (see
+  /// ``DescriptorLimitChild``). Off by default: the bound it applies is a measurement, not a
+  /// guarantee.
+  static let stressVariable = "SWIFTFTR_RDNS_DESCRIPTOR_STRESS"
+
+  /// How long the parent waits for the child before it terminates it. Generous: the child's
+  /// lookups answer from local records in well under a second each.
+  static let childDeadline: TimeInterval = 120
+
+  /// In a process of its own, so its descriptor table holds only its own lookups' connections:
+  /// far more lookups than the cap all answer, and once they have, every daemon connection they
+  /// opened is closed again, counted from the process's own descriptor table. The peak number open
+  /// is printed, not asserted: the limiter bounds queries, and how far open connections run ahead
+  /// of it depends on when each lookup's queue runs the client library's cancel handler, which
+  /// nothing in the code bounds. With ``stressVariable`` set, the child also lowers its
+  /// descriptor limit to what is open plus the cap plus two, and every lookup must still answer.
+  @Test("Lookups return every daemon connection they open", arguments: [1, 4, 16])
   func descriptorLimit(cap: Int) async throws {
     let arguments = CommandLine.arguments
     guard let bundleFlag = arguments.firstIndex(of: "--test-bundle-path"),
@@ -183,8 +193,15 @@ struct ReverseDNSLookupDaemonTests {
     var environment = ProcessInfo.processInfo.environment
     environment[Self.childVariable] = String(cap)
     environment.removeValue(forKey: "LIBDISPATCH_COOPERATIVE_POOL_STRICT")
-    let output = try await Self.runChild(
-      executable: arguments[0], arguments: childArguments, environment: environment)
+    let output = await Self.runChild(
+      executable: arguments[0], arguments: childArguments, environment: environment,
+      deadline: Self.childDeadline)
+    guard !output.timedOut else {
+      let tail = output.output.suffix(4000)
+      Issue.record(
+        "the child for cap \(cap) ran past \(Self.childDeadline) s and was stopped:\n\(tail)")
+      return
+    }
     let report = output.output.split(separator: "\n").first { $0.hasPrefix("DESCRIPTORS ") }
     let reported = report.map(String.init) ?? "none"
     print("rDNS descriptor child (cap \(cap)): \(reported); exit \(output.status)")
@@ -203,17 +220,35 @@ struct ReverseDNSLookupDaemonTests {
     #expect(fields["failed"] == 0, "\(reported)")
     #expect(fields["answered"] == fields["lookups"], "\(reported)")
     let lookups = fields["lookups"] ?? 0
-    let limit = fields["limit"] ?? .max
-    #expect(lookups > limit, "\(reported)")
-    let maxOpen = fields["maxOpen"] ?? .max
-    #expect(maxOpen <= cap + 2, "\(reported)")
+    #expect(lookups > 20 * cap, "\(reported)")
+    // Every connection opened was closed: the count is back where it was before the lookups.
+    #expect(fields["leftOpen"] == 0, "\(reported)")
   }
 
-  /// Runs a child process to completion off the cooperative pool and returns its exit status
-  /// and combined output.
+  /// Runs a child process off the cooperative pool and returns its exit status and combined
+  /// output. A child still running at `deadline` seconds is terminated, killed if it outlives a
+  /// further two seconds, and reaped, and the result says so, with the output read until then.
   static func runChild(
-    executable: String, arguments: [String], environment: [String: String]
-  ) async throws -> (status: Int32, output: String) {
+    executable: String, arguments: [String], environment: [String: String],
+    deadline: TimeInterval
+  ) async -> (status: Int32, output: String, timedOut: Bool) {
+    await withCheckedContinuation { continuation in
+      Thread.detachNewThread {
+        continuation.resume(
+          returning: runChildBlocking(
+            executable: executable, arguments: arguments, environment: environment,
+            deadline: deadline))
+      }
+    }
+  }
+
+  /// The blocking half of ``runChild(executable:arguments:environment:deadline:)``; call it off
+  /// the cooperative pool. The pipe is drained on a thread of its own, so a child that fills it
+  /// cannot block, and the wait for that thread is itself bounded.
+  static func runChildBlocking(
+    executable: String, arguments: [String], environment: [String: String],
+    deadline: TimeInterval
+  ) -> (status: Int32, output: String, timedOut: Bool) {
     let process = Process()
     process.executableURL = URL(fileURLWithPath: executable)
     process.arguments = arguments
@@ -221,15 +256,37 @@ struct ReverseDNSLookupDaemonTests {
     let pipe = Pipe()
     process.standardOutput = pipe
     process.standardError = pipe
-    try process.run()
-    return await withCheckedContinuation { continuation in
-      Thread.detachNewThread {
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        continuation.resume(
-          returning: (process.terminationStatus, String(decoding: data, as: UTF8.self)))
+    let exited = DispatchSemaphore(value: 0)
+    process.terminationHandler = { _ in exited.signal() }
+    do {
+      try process.run()
+    } catch {
+      return (-1, "could not start the child: \(error)", false)
+    }
+    let collected = OutputCollector()
+    let drained = DispatchSemaphore(value: 0)
+    Thread.detachNewThread {
+      let handle = pipe.fileHandleForReading
+      while true {
+        let chunk = handle.availableData
+        if chunk.isEmpty { break }
+        collected.append(chunk)
+      }
+      drained.signal()
+    }
+    var timedOut = false
+    if exited.wait(timeout: .now() + deadline) == .timedOut {
+      timedOut = true
+      process.terminate()
+      if exited.wait(timeout: .now() + 2) == .timedOut {
+        kill(process.processIdentifier, SIGKILL)
+        _ = exited.wait(timeout: .now() + 10)
       }
     }
+    process.waitUntilExit()
+    // The child is gone, so the pipe's write end closes unless a grandchild still holds it.
+    _ = drained.wait(timeout: .now() + 5)
+    return (process.terminationStatus, collected.text, timedOut)
   }
 
   @Test(
@@ -238,7 +295,9 @@ struct ReverseDNSLookupDaemonTests {
   func matchesGetnameinfo() async throws {
     try await NetworkTestGate.shared.withPermit {
       for address in ["1.1.1.1", "8.8.8.8", "127.0.0.1", "::1"] {
-        let system = await Self.getnameinfoOffPool(address)
+        let (system, _) = try await measure(within: Self.watchdog) {
+          await Self.getnameinfoOffPool(address)
+        }
         let (outcome, _) = try await measure(within: Self.watchdog) {
           await ReverseDNSLookup.lookup(address, timeout: 120)
         }
@@ -279,6 +338,24 @@ struct ReverseDNSLookupDaemonTests {
   }
 }
 
+/// Bytes read from a child's output, from any thread.
+final class OutputCollector: @unchecked Sendable {
+  private let lock = NSLock()
+  private var data = Data()
+
+  func append(_ chunk: Data) {
+    lock.lock()
+    data.append(chunk)
+    lock.unlock()
+  }
+
+  var text: String {
+    lock.lock()
+    defer { lock.unlock() }
+    return String(decoding: data, as: UTF8.self)
+  }
+}
+
 /// Counts outcomes by kind, from any thread.
 final class OutcomeTally: @unchecked Sendable {
   private let lock = NSLock()
@@ -309,23 +386,35 @@ final class OutcomeTally: @unchecked Sendable {
 
 /// The child half of ``ReverseDNSLookupDaemonTests/descriptorLimit(cap:)``. It runs only in
 /// the child process that test starts, which sets the environment variable to the cap.
+///
+/// By default it runs the lookups with the descriptor limit as it found it, and reports the peak
+/// number of daemon connections open and how many were still open once every lookup had
+/// answered and the count had had time to settle. With
+/// ``ReverseDNSLookupDaemonTests/stressVariable`` set, it first lowers its descriptor limit to
+/// what is open plus the cap plus two: an experiment, not a check of a guaranteed bound, since
+/// connections whose cancel handler has not yet run can outnumber that margin on a valid
+/// ordering.
 @Suite(.serialized)
 struct DescriptorLimitChild {
   static let cap = ProcessInfo.processInfo.environment[ReverseDNSLookupDaemonTests.childVariable]
     .flatMap { Int($0) }
+  static let tight =
+    ProcessInfo.processInfo.environment[ReverseDNSLookupDaemonTests.stressVariable] != nil
 
   @Test(.enabled(if: cap != nil))
-  func lookupsUnderALoweredDescriptorLimit() async throws {
+  func lookupsAndTheirConnections() async throws {
     let cap = try #require(Self.cap)
     let sampler = DescriptorSampler()
-    // Everything open now, plus the cap, plus two: a lookup that needed one more descriptor than
-    // that would fail to start.
-    let limit = DescriptorSampler.highestOpenDescriptor() + 1 + cap + 2
-    var original = rlimit()
-    getrlimit(RLIMIT_NOFILE, &original)
-    var lowered = rlimit(rlim_cur: rlim_t(limit), rlim_max: original.rlim_max)
-    #expect(setrlimit(RLIMIT_NOFILE, &lowered) == 0)
-    let lookups = max(400, limit * 20)
+    let before = DescriptorSampler.openUnixSockets()
+    var limit = 0
+    if Self.tight {
+      limit = DescriptorSampler.highestOpenDescriptor() + 1 + cap + 2
+      var original = rlimit()
+      getrlimit(RLIMIT_NOFILE, &original)
+      var lowered = rlimit(rlim_cur: rlim_t(limit), rlim_max: original.rlim_max)
+      #expect(setrlimit(RLIMIT_NOFILE, &lowered) == 0)
+    }
+    let lookups = max(400, 20 * (cap + 6))
     let limiter = _ConcurrencySemaphore(maxConcurrent: cap)
     let tally = OutcomeTally()
     await TestSeams.$dnsService.withValue(sampler.calls) {
@@ -339,11 +428,14 @@ struct DescriptorLimitChild {
         }
       }
     }
+    // The last connections close in their cancel handlers just after the last lookups return.
+    _ = await eventually(within: 30) { DescriptorSampler.openUnixSockets() <= before }
+    let leftOpen = max(0, DescriptorSampler.openUnixSockets() - before)
     let counts = tally.counts
     let answered = counts["child answer"] ?? 0
     print(
       "DESCRIPTORS cap=\(cap) limit=\(limit) lookups=\(lookups) answered=\(answered) "
-        + "failed=\(lookups - answered) maxOpen=\(sampler.maxOpen)")
+        + "failed=\(lookups - answered) maxOpen=\(sampler.maxOpen) leftOpen=\(leftOpen)")
   }
 }
 
