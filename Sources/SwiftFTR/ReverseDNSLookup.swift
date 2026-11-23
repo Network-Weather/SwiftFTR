@@ -435,8 +435,9 @@ final class ReverseDNSLookup: @unchecked Sendable {
   }
 
   /// The deadline `timeout` from now on the monotonic clock, with a timer on ``timerQueue`` that
-  /// wakes the lookup at it. The timer is scheduled on the same clock `hasPassed` reads, and a
-  /// Dispatch timer does not fire before its deadline.
+  /// wakes the lookup at it. The timer is scheduled on the clock `hasPassed` reads, and its
+  /// handler wakes the lookup only once that clock says the deadline has passed (rescheduling
+  /// itself otherwise), so the wake-up never commits a timeout early, whatever the timer does.
   private static func timerDeadline(
     _ timeout: TimeInterval, wake: @escaping @Sendable () -> Void
   ) -> ReverseDNSDeadline {
@@ -445,7 +446,13 @@ final class ReverseDNSLookup: @unchecked Sendable {
     let at = DispatchTime.now().uptimeNanoseconds + nanoseconds
     let timer = DispatchSource.makeTimerSource(queue: timerQueue)
     timer.schedule(deadline: DispatchTime(uptimeNanoseconds: at))
-    timer.setEventHandler(handler: wake)
+    timer.setEventHandler {
+      if DispatchTime.now().uptimeNanoseconds >= at {
+        wake()
+      } else {
+        timer.schedule(deadline: DispatchTime(uptimeNanoseconds: at))
+      }
+    }
     // Activated before it can be cancelled: libdispatch traps on releasing a source that was
     // never activated.
     timer.activate()

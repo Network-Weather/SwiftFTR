@@ -380,16 +380,20 @@ struct ReverseDNSLookupTests {
     let fake = FakeDNSService(deadline: .timer)
     let limiter = _ConcurrencySemaphore(maxConcurrent: 1)
     let timeout: TimeInterval = 0.3
-    let (outcome, elapsed) = try await measure(within: Self.watchdog) {
-      await fake.install {
+    // Timed on the clock the lookup's deadline is kept on, around the call itself.
+    let ((outcome, elapsed), _) = try await measure(within: Self.watchdog) {
+      () -> (ReverseDNSLookupOutcome, UInt64) in
+      let start = DispatchTime.now().uptimeNanoseconds
+      let outcome = await fake.install {
         await ReverseDNSLookup.lookup("192.0.2.1", timeout: timeout, limiter: limiter)
       }
+      return (outcome, DispatchTime.now().uptimeNanoseconds - start)
     }
     // Which of the two depends on whether the lookup's queue ran the start within the timeout;
     // either way the caller was not released early.
     let timedOut = outcome == .timedOut || outcome == .timedOutBeforeQuery
     #expect(timedOut, "\(outcome)")
-    #expect(elapsed >= timeout)
+    #expect(elapsed >= UInt64(timeout * 1_000_000_000), "\(elapsed) ns")
     try await waitBounded("the permit returned", within: Self.watchdog) {
       try? await limiter.wait()
     }
