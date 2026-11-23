@@ -357,4 +357,69 @@ struct AsyncPublicIPDiscoveryTests {
     }
     #expect(!carriedOn, "the abandoned discovery went on after its budget")
   }
+
+  @Test("Every step of discovery shares one deadline, so their sum cannot pass it")
+  func stepsShareOneDeadline() async throws {
+    let first = try HeldUDPServer(family: AF_INET)
+    let second = try HeldUDPServer(family: AF_INET)
+    defer {
+      first.stop()
+      second.stop()
+    }
+    let whoami = try LoopbackUDPResponder { _ in nil }
+    defer { whoami.stop() }
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-deadline")
+    let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
+
+    // No outer race here: only the deadline handed to each step can end this inside the watchdog,
+    // since each attempt and each DNS query could run past it alone.
+    let outcome = try await measure(within: Self.watchdog) {
+      await Self.withFixtures(servers: servers, whoamiPort: whoami.port, executor: executor) {
+        do {
+          return Result<STUNPublicIP, Error>.success(
+            try await getPublicIPv4(
+              stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
+              deadline: monotonicNow() + 1))
+        } catch {
+          return .failure(error)
+        }
+      }
+    }.0
+    #expect(throws: PublicIPError.self) { try outcome.get() }
+    #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
+  }
+
+  @Test("A STUN name lookup that cannot get an executor slot is abandoned at the deadline")
+  func nameLookupBoundedByDeadline() async throws {
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-lookup")
+    let occupant = StallGate()
+    defer { occupant.open() }
+    let occupied = FaultCounter()
+    let released = FaultCounter()
+    Task {
+      try? await executor.run(priority: .userInitiated) {
+        occupied.increment()
+        occupant.wait(limit: 3 * Self.watchdog)
+        released.increment()
+      }
+    }
+    #expect(await eventually(within: Self.watchdog) { occupied.value > 0 })
+
+    // A name, so it needs the resolver and a slot. Its 64-character label is rejected by the
+    // resolver without a query, should the lookup ever run.
+    let name = String(repeating: "a", count: 64) + ".example"
+    let outcome = try await measure(within: Self.watchdog) {
+      await Self.withFixtures(servers: Self.servers(v4: [(name, 3478)]), executor: executor) {
+        do {
+          return Result<STUNPublicIP, Error>.success(
+            try await stunGetPublicIPWithFallback(
+              family: AF_INET, timeout: Self.longSTUNTimeout, deadline: monotonicNow() + 0.5))
+        } catch {
+          return .failure(error)
+        }
+      }
+    }.0
+    #expect(throws: STUNError.self) { try outcome.get() }
+    #expect(released.value == 0, "the lookup waited for the occupant to free its slot")
+  }
 }

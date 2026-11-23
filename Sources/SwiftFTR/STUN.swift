@@ -429,6 +429,12 @@ private struct STUNEndpoint: Sendable {
 /// on at this deadline.
 func stunAttemptDeadline(_ timeout: TimeInterval) -> TimeInterval { 2 * timeout }
 
+/// Seconds from now until `deadline`, an instant on `monotonicNow()`'s clock, and never less than
+/// zero; `nil` when there is no deadline.
+func secondsLeft(until deadline: TimeInterval?) -> TimeInterval? {
+  deadline.map { max($0 - monotonicNow(), 0) }
+}
+
 /// The endpoint for a numeric `host` of `family`, built without the resolver, or `nil` when
 /// `host` is not such a literal.
 private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> STUNEndpoint? {
@@ -459,12 +465,16 @@ private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> S
 }
 
 /// Resolves every server in `servers` for `family` at once, each name as its own executor
-/// request, and returns the endpoints in list order, `nil` where resolution failed. A numeric
-/// address needs no resolver and no executor slot.
+/// request, and returns the endpoints in list order once every lookup has ended, `nil` where
+/// resolution failed. A numeric address needs no resolver and no executor slot.
+///
+/// Each lookup is abandoned at `deadline`, an instant on `monotonicNow()`'s clock, and counts as
+/// failed; its `getaddrinfo` runs on in its executor slot. With no deadline a lookup is waited for
+/// as long as it takes, but cancelling the calling task still ends the wait at once.
 ///
 /// - Throws: `CancellationError` when the calling task is cancelled.
 private func resolveSTUNEndpoints(
-  _ servers: [(host: String, port: UInt16)], family: Int32
+  _ servers: [(host: String, port: UInt16)], family: Int32, deadline: TimeInterval?
 ) async throws -> [STUNEndpoint?] {
   try await withThrowingTaskGroup(of: (Int, STUNEndpoint?).self) { group in
     for (index, server) in servers.enumerated() {
@@ -472,13 +482,17 @@ private func resolveSTUNEndpoints(
         if let literal = literalSTUNEndpoint(host: server.host, port: server.port, family: family) {
           return (index, literal)
         }
-        let resolved = try await runDetachedBlockingIO {
-          resolveSTUNServer(host: server.host, port: server.port, family: family).map {
-            STUNEndpoint(
-              host: server.host, port: server.port, server: $0.server, serverLen: $0.serverLen)
+        do {
+          let resolved = try await runDetachedBlockingIO(deadline: secondsLeft(until: deadline)) {
+            resolveSTUNServer(host: server.host, port: server.port, family: family).map {
+              STUNEndpoint(
+                host: server.host, port: server.port, server: $0.server, serverLen: $0.serverLen)
+            }
           }
+          return (index, resolved)
+        } catch is BlockingIOTimeout {
+          return (index, nil)
         }
-        return (index, resolved)
       }
     }
     var endpoints = [STUNEndpoint?](repeating: nil, count: servers.count)
@@ -495,12 +509,17 @@ private func resolveSTUNEndpoints(
 /// ``stunAttemptDeadline(_:)``, so the sweep waits on no thread, and cancelling the calling task
 /// ends it at once.
 ///
+/// `deadline`, an instant on `monotonicNow()`'s clock, bounds the whole sweep: name lookups and
+/// every attempt are abandoned when it passes, and no attempt starts after it. `nil` leaves only
+/// the per-server bound.
+///
 /// - Parameters:
 ///   - family: `AF_INET` for v4 or `AF_INET6` for v6.
 ///   - timeout: Timeout per server attempt (default 1.0s)
 ///   - interface: Network interface to bind to (optional)
 ///   - sourceIP: Source IP address to bind to (optional)
 ///   - enableLogging: Enable debug logging
+///   - deadline: When the whole sweep gives up, or `nil`
 /// - Returns: Public IP if any server responds
 /// - Throws: The last attempt's error if all servers fail (`STUNError.recvTimeout` for an attempt
 ///   that outlived its deadline), or `CancellationError`.
@@ -509,7 +528,8 @@ internal func stunGetPublicIPWithFallback(
   timeout: TimeInterval = 1.0,
   interface: String? = nil,
   sourceIP: String? = nil,
-  enableLogging: Bool = false
+  enableLogging: Bool = false,
+  deadline: TimeInterval? = nil
 ) async throws -> STUNPublicIP {
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
     throw STUNError.invalidTimeout(timeout)
@@ -522,10 +542,19 @@ internal func stunGetPublicIPWithFallback(
   if enableLogging {
     print("[STUN] Resolving \(servers.count) servers concurrently (\(famName))...")
   }
-  let endpoints = try await resolveSTUNEndpoints(servers, family: family)
+  let endpoints = try await resolveSTUNEndpoints(servers, family: family, deadline: deadline)
 
   for (index, resolved) in endpoints.enumerated() {
     try Task.checkCancellation()
+    var attemptDeadline = stunAttemptDeadline(timeout)
+    if let left = secondsLeft(until: deadline) {
+      guard left > 0 else {
+        if enableLogging { print("[STUN] Discovery deadline passed (\(famName))") }
+        lastError = STUNError.recvTimeout
+        break
+      }
+      attemptDeadline = min(attemptDeadline, left)
+    }
     guard let endpoint = resolved else {
       let (host, port) = servers[index]
       if enableLogging {
@@ -542,7 +571,7 @@ internal func stunGetPublicIPWithFallback(
       print("[STUN] Trying \(label) (\(famName))...")
     }
     do {
-      let result = try await runDetachedBlockingIO(deadline: stunAttemptDeadline(timeout)) {
+      let result = try await runDetachedBlockingIO(deadline: attemptDeadline) {
         try stunGetPublicIP(
           family: family, server: endpoint.server, serverLen: endpoint.serverLen,
           serverLabel: label, timeout: timeout,
@@ -593,25 +622,33 @@ enum DNSPublicIPError: Error, CustomStringConvertible, Sendable {
 ///   - timeout: Query timeout (default 2.0s)
 ///   - servers: DNS servers to try (default: Cloudflare + Google)
 ///   - enableLogging: Enable debug logging
+///   - deadline: An instant on `monotonicNow()`'s clock after which no server is asked, or `nil`
 /// - Returns: Public IP from DNS response
 /// - Throws: DNSPublicIPError on failure, including when the calling task is cancelled
 func getPublicIPv4ViaDNS(
   timeout: TimeInterval = 2.0,
   servers: [String] = DNSClient.defaultTXTServers,
-  enableLogging: Bool = false
+  enableLogging: Bool = false,
+  deadline: TimeInterval? = nil
 ) async throws -> STUNPublicIP {
   if enableLogging {
     print("[DNS-IP] Querying whoami.ds.akahelp.net TXT...")
   }
 
-  // Tries each server in turn; the wait holds no thread, and cancellation ends it.
-  guard
-    let txtRecords = await DNSClient.queryTXT(
-      name: "whoami.ds.akahelp.net",
-      timeout: timeout,
-      servers: TestSeams.whoamiServers ?? servers
-    )
-  else {
+  // Tries each server in turn, each for `timeout` or the time left before `deadline`, whichever
+  // is shorter. The wait holds no thread, and cancellation ends it.
+  var answer: [String]?
+  for server in TestSeams.whoamiServers ?? servers {
+    var serverTimeout = timeout
+    if let left = secondsLeft(until: deadline) {
+      guard left > 0 else { break }
+      serverTimeout = min(serverTimeout, left)
+    }
+    answer = await DNSClient.queryTXT(
+      name: "whoami.ds.akahelp.net", timeout: serverTimeout, servers: [server])
+    if answer != nil { break }
+  }
+  guard let txtRecords = answer else {
     throw DNSPublicIPError.queryFailed("No response from DNS servers")
   }
 
@@ -673,6 +710,8 @@ public enum PublicIPError: Error, CustomStringConvertible, Sendable {
 ///   - interface: Network interface to bind to (optional)
 ///   - sourceIP: Source IP address to bind to (optional)
 ///   - enableLogging: Enable debug logging
+///   - deadline: An instant on `monotonicNow()`'s clock that bounds both tiers together: name
+///     lookups, every STUN attempt and the DNS fallback. `nil` bounds each step on its own.
 /// - Returns: Public IP from first successful method
 /// - Throws: PublicIPError if all methods fail, or `CancellationError` when the calling task is
 ///   cancelled
@@ -681,7 +720,8 @@ func getPublicIPv4(
   dnsTimeout: TimeInterval = 2.0,
   interface: String? = nil,
   sourceIP: String? = nil,
-  enableLogging: Bool = false
+  enableLogging: Bool = false,
+  deadline: TimeInterval? = nil
 ) async throws -> STUNPublicIP {
   // Tier 1: Try STUN (fastest)
   var stunErrorMsg = "Unknown error"
@@ -691,7 +731,8 @@ func getPublicIPv4(
       timeout: stunTimeout,
       interface: interface,
       sourceIP: sourceIP,
-      enableLogging: enableLogging
+      enableLogging: enableLogging,
+      deadline: deadline
     )
   } catch is CancellationError {
     throw CancellationError()
@@ -713,7 +754,8 @@ func getPublicIPv4(
   do {
     return try await getPublicIPv4ViaDNS(
       timeout: dnsTimeout,
-      enableLogging: enableLogging
+      enableLogging: enableLogging,
+      deadline: deadline
     )
   } catch {
     dnsErrorMsg = String(describing: error)
@@ -732,10 +774,13 @@ struct PublicIPDiscoveryTimeout: Error {}
 /// IPv4 public-address discovery for the trace family: the test substitute when one is bound,
 /// otherwise STUN with its DNS fallback, ended once `budget` seconds pass.
 ///
-/// The budget bounds the whole discovery, however many attempts it makes. When it passes, the
-/// discovery is cancelled and awaited, which ends it at once: every wait in it is cancellable, and
-/// a STUN attempt stalled in its blocking `recv` keeps only its executor slot. A `budget` that is
-/// not finite is no bound; one that is not positive ends discovery before it starts.
+/// The budget bounds the whole discovery, however many steps it takes: one absolute deadline,
+/// `budget` seconds from entry, is passed down to every name lookup, STUN attempt and DNS query,
+/// and no step outlives it. The same instant also bounds the discovery as a whole: when it
+/// passes, the discovery (or a test substitute) is cancelled and awaited, which ends it at once,
+/// since every wait in it is cancellable. A STUN attempt or lookup stalled in a blocking call
+/// keeps only its executor slot. A `budget` that is not finite is no bound; one that is not
+/// positive ends discovery before it starts.
 ///
 /// - Throws: ``PublicIPDiscoveryTimeout`` when the budget passes, `CancellationError` when the
 ///   calling task is cancelled, or the discovery's own error.
@@ -747,18 +792,21 @@ func publicIPv4Discovery(
   enableLogging: Bool,
   budget: TimeInterval
 ) async throws -> STUNPublicIP {
+  let bounded = budget.isFinite && budget < 1e9
+  let deadline = bounded ? monotonicNow() + budget : nil
   let discover: TestSeams.DiscoverPublicIPv4 =
     TestSeams.discoverPublicIPv4 ?? {
       try await getPublicIPv4(
         stunTimeout: stunTimeout, dnsTimeout: dnsTimeout, interface: interface,
-        sourceIP: sourceIP, enableLogging: enableLogging)
+        sourceIP: sourceIP, enableLogging: enableLogging, deadline: deadline)
     }
-  guard budget.isFinite, budget < 1e9 else { return try await discover() }
+  guard let deadline else { return try await discover() }
   guard budget > 0 else { throw PublicIPDiscoveryTimeout() }
   return try await withThrowingTaskGroup(of: STUNPublicIP.self) { group in
     group.addTask { try await discover() }
     group.addTask {
-      try await Task.sleep(nanoseconds: UInt64(budget * 1_000_000_000))
+      let left = secondsLeft(until: deadline) ?? 0
+      try await Task.sleep(nanoseconds: UInt64(left * 1_000_000_000))
       throw PublicIPDiscoveryTimeout()
     }
     // Whichever child finishes first decides; the other is cancelled and awaited.
