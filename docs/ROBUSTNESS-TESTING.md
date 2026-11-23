@@ -70,7 +70,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Probe socket | creation fails the way `socket(2)` does; every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `ProbeWindow` |
 | Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
-| Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
+| Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts; with a failed send, the ping ends once every probe that left is answered, whether the last reply or the end of the send loop comes last, does not end before its remaining probes are sent, and still waits out its window for an unanswered probe (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change | traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached and, though it ran past the stall threshold, does not count toward the breaker | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
@@ -79,6 +79,9 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | DNS transport | refused port (IPv4 and IPv6); empty datagram (ignored, so a timeout); `EAGAIN` and `ENOBUFS` on send, retried and persisting; a short send; `fcntl` failure; cancellation while the server is silent; the socket closed exactly once, before the caller resumes, on every way out | `tracer.dns`, dnsProbe, the `__dnsQuery` SPI | `EventBasedDNSTests` |
 | DNS probe outcome | every `DNSProbeOutcome` with the full result (`outcome`, `isReachable`, `rtt`, `elapsed`, `responseCode`, `error`): an answer and NXDOMAIN; a refused port (IPv4 and IPv6); silence; a short datagram with the query's transaction ID (`malformedReply`); `EHOSTUNREACH` and `ENETUNREACH` on receive, through the receive seam; `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` from `connect` (connect seam) and `send`; other connect and send errors, an unclassified receive error and an invalid server; a stall inside the read excluded from the round trip; an unreachable error read before the send ignored; no read once the exchange has finished and closed its socket, with a second reply still queued (answered, timed out, cancelled); cancellation mid-probe; the initializer and 0.17 JSON without `outcome`, and a round trip | dnsProbe, `DNSProbeResult` | `DNSProbeOutcomeTests` |
 | DNS foreign replies | a reply with another transaction ID, then the real one, which answers with its own round trip (IPv4 and IPv6); empty and one-byte datagrams, then the real reply; only foreign replies, read while the query still waits, then a timeout and `timedOut`; a datagram with the query's ID but no valid header, still `malformedResponse` at once; a stale reply queued before the send and read after it; after a foreign datagram, a reply or refusal that comes only after the deadline, which is a timeout because each read event judges at most one datagram (query and dnsProbe); foreign replies that never stop, on a socket that never runs dry, with the deadline (IPv4 and IPv6) and cancellation still ending the query; a Team Cymru lookup answered foreign first; the blocking TXT path: a foreign and an empty datagram before the reply, a wait bounded by the time left after a foreign reply, a reply returned after the deadline (as the first read, or after a foreign one) taken as a timeout and the next server tried, and an endless feed | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, CymruDNSResolver, `DNSClient.queryTXTBlocking` | `DNSForeignReplyTests` |
+| DNS question echo | a reply with the query's ID echoing another name, type or class, then the real reply (IPv4 and IPv6); only such replies, then a timeout and `timedOut`; the name echoed in another letter case answers; a header-only REFUSED still answers with RCODE 5; a question cut short is still `malformedResponse` at once; an endless feed of such replies with the deadline still ending the query (IPv4 and IPv6); the blocking TXT path, with such a reply before the real one and with an endless feed | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe, `DNSClient.queryTXTBlocking` | `DNSQuestionMatchTests` |
+| DNS first-question verdicts | every shape of a same-ID reply's first question (matching, other letter case, other name or type, a compression pointer into the header, a pointer loop, reserved label types 0x40 and 0x80, a label past the end, a name over 255 bytes, a missing terminator, type and class cut short, two questions with the first matching or not, no question with trailing bytes), with its verdict on the query, dnsProbe and the blocking path, and the shared reading the matcher and validator both use | the `__dnsQuery` SPI, dnsProbe, `DNSClient.queryTXTBlocking` | `DNSQuestionVerdictTests` |
+| Address parsing | `seedPublicIP` and the public-address table, for IPv4, IPv4-mapped and NAT64-embedded IPv4 and IPv6; a NUL inside an address or destination string, through every parser and public entry point that reaches one | seedPublicIP, isPrivateIPv4, isCGNATIPv4, reverseIPv6Nibbles, reverseDNS, destination resolution, DNS server and source addresses | `PublicIPValidationTests` |
 | DNS error replies | well-formed NXDOMAIN (SOA in authority; CNAME chain), SERVFAIL and REFUSED (question echoed; header only) keep their response code; the same codes with a declared answer record missing or cut short, or a declared question missing or cut short, are `malformedResponse` and `malformedReply` | the `__dnsQuery` SPI, `tracer.dns`, dnsProbe | `DNSErrorReplyValidationTests` |
 | Full executor | every blocking-I/O slot held while discovery and reverse DNS queue; invalid DNS inputs reported as themselves without waiting for a slot; DNS queries, dnsProbe and Team Cymru lookups answer while every slot is held | traceClassified, queryA, `tracer.dns`, dnsProbe, CymruDNSResolver | `Enrichment`, `EventBasedDNSTests`, `CymruEventBasedTests` |
 | TCP / UDP / HTTP | refused, accept-then-silence, reset mid-response, close without response, slow first byte, 503, cancellation | tcpProbe, udpProbe, httpProbe | `Wire` |
@@ -374,6 +377,33 @@ numbers are as of the commit that added this section.
     reply is judged as before. A reply to an earlier probe
     that arrives after `timeout` but before the ping's last reply window ends still counts, as
     `PingConfig.timeout` documents. Tests: `PingReplyMatchingTests`, IPv4 and IPv6.
+- **A ping whose send failed waited out its whole window** (#138). Confirmed and fixed. Early
+  completion compared the replies with the configured `count`, which a ping with a failed send
+  can never reach: two probes, the first send failing and the second answered at once, ended at
+  the reply deadline. Once the send loop has finished, the ping now compares the replies with the
+  sends that succeeded, both when the loop finishes and when a reply arrives. Tests:
+  `PingReplyMatchingTests` (`failedSend…`), IPv4 and IPv6.
+- **`seedPublicIP` accepted a NAT64 address wrapping a private IPv4 address, and strings with an
+  embedded NUL** (#139). Confirmed and fixed. `64:ff9b::192.168.1.1` was accepted because the
+  well-known prefix was accepted whatever it embedded; RFC 6052 section 3.1 forbids it for
+  non-global IPv4. `"8.8.8.8\u{0}junk"` was accepted as `8.8.8.8` because `inet_pton` reads a C
+  string. The same truncation reached every parser that hands a caller's string to `inet_pton` or
+  `getaddrinfo`: `isPrivateIPv4`, `isCGNATIPv4`, `reverseIPv6Nibbles`, `reverseDNS` (which looked
+  up the address before the NUL), DNS server and source addresses, and destination resolution
+  for ping, trace and the TCP and UDP probes (which resolved and probed the text before the NUL).
+  The parsers and destination resolution now reject such a string. Interface names reach
+  `if_nametoindex` the same way and are not checked. Tests: `PublicIPValidationTests`.
+- **A DNS reply's question was never compared with the query** (#128). Confirmed and fixed. A
+  reply with the query's transaction ID was accepted whatever question it echoed, so its answers
+  were reported for the name asked. A datagram whose first question is readable and names another
+  name (compared without regard to ASCII case), type or class is now ignored like one with a
+  foreign ID, on the event-based and blocking paths, and the query waits on to its deadline.
+  The matcher and the validator read the first question by one rule, so they agree on which
+  questions are unreadable (and so malformed): review of the first version found that its own
+  reader let a compression pointer through, and the validator then read a pointer into the
+  header as the root name and took the reply's REFUSED; and that it had no 255-byte limit, so a
+  malformed reply was ignored as a different question. Tests: `DNSQuestionMatchTests`,
+  `DNSQuestionVerdictTests`.
 
 Observations that are not defects of the library:
 

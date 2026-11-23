@@ -66,7 +66,7 @@ func dnsProbeOutcomeDescription(_ outcome: DNSProbeOutcome) -> String {
   case .timedOut: return "timed out: no reply"
   case .unreachable: return "unreachable: host or network unreachable"
   case .malformedReply: return "malformed reply: the server answered, but not with valid DNS"
-  case .failed: return "failed: the probe could not run"
+  case .failed: return "failed: the probe could not complete"
   default: return outcome.rawValue
   }
 }

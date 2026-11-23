@@ -93,7 +93,7 @@ if let rcode = result.responseCode {
 }
 ```
 
-Any DNS response (even NXDOMAIN) means the server is reachable, and so does a malformed reply, which carries no `responseCode` and says so in `error`. A reply is only read for its response code once the question and answer records its header declares are all there, so an error reply that declares records it does not carry is malformed, not that error; one that declares none, as some REFUSED replies are sent, keeps its code. Only a datagram that carries the query's transaction ID counts as a reply: one with another ID, or too short to carry one, is ignored and the probe keeps waiting. Silence until the timeout, a refused port (the host is up but nothing listens on the DNS port), and local or network errors indicate unreachability. The round-trip time runs from sending the query to reading the reply, and the wait for it holds no thread. Cancelling the calling task throws `CancellationError`.
+Any DNS response (even NXDOMAIN) means the server is reachable, and so does a malformed reply, which carries no `responseCode` and says so in `error`. A reply is only read for its response code once the question and answer records its header declares are all there, so an error reply that declares records it does not carry is malformed, not that error; one that declares none, as some REFUSED replies are sent, keeps its code. Only a datagram that carries the query's transaction ID and does not echo another question counts as a reply: one with another ID, one too short to carry an ID, and one whose question names another name (compared without regard to letter case), type or class are ignored, and the probe keeps waiting. A reply with no question section is still a reply. Silence until the timeout, a refused port (the host is up but nothing listens on the DNS port), and local or network errors indicate unreachability. The round-trip time runs from sending the query to reading the reply, and the wait for it holds no thread. Cancelling the calling task throws `CancellationError`.
 
 ``DNSProbeResult/outcome`` says how the probe ended, so a refusal can be told from silence without reading `error`, which is a message for people. ``DNSProbeOutcome`` is a struct with static members rather than an enum, so a later release can add an outcome without breaking your `switch`; keep a `default` arm:
 
@@ -121,7 +121,7 @@ default:
 | ICMP port unreachable: nothing listens on the port | `refused` | false | nil | set |
 | ICMP host or network unreachable after the send | `unreachable` | false | nil | set |
 | `connect` or `send` fails with `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or `ENETDOWN` | `unreachable` | false | nil | nil |
-| Silence until the timeout, or only datagrams without the query's transaction ID (empty ones included) | `timedOut` | false | nil | nil |
+| Silence until the timeout, or only datagrams without the query's transaction ID (empty ones included) or echoing another question | `timedOut` | false | nil | nil |
 | Any other `connect`, `send` or receive error; socket, bind or input errors | `failed` | false | nil | nil |
 
 For `.unreachable` outcomes, `error` includes the errno.
