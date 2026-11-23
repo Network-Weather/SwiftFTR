@@ -338,9 +338,12 @@ struct FaultInjectionWireTests {
   func httpFaults(fault: HTTPFault) async throws {
     // A refusal, a reset or a close ends the probe itself, so its timeout outlasts the watchdog: a
     // probe that missed the fault and waited trips it. Only a silent or late server leaves the
-    // probe to its own short timeout.
+    // probe to its own timeout. That timeout starts before the connection exists, so it must
+    // outlast connecting: at 0.5 s a loaded host's URLSession gave up before the server accepted
+    // (3 of 20 loaded runs). Nothing can start it at the accept instead; the late server still
+    // answers only after the watchdog.
     let endsAtTimeout = fault == .acceptThenSilence || fault == .firstByteTooLate
-    let timeout: TimeInterval = endsAtTimeout ? 0.5 : 4 * Self.watchdog
+    let timeout: TimeInterval = endsAtTimeout ? 3 : 4 * Self.watchdog
     let server: LoopbackTCPServer?
     let port: UInt16
     // Held until the probe has finished, so the port stays reserved while it is used.
@@ -372,8 +375,8 @@ struct FaultInjectionWireTests {
     }
     #expect(!result.isReachable, "\(fault): \(result.error ?? "no error")")
     #expect(result.statusCode == nil)
-    // The server counts the connection on its own thread, which a 0.5 s timeout can outrun on a
-    // loaded host, so wait for the count.
+    // The server counts the connection on its own thread, which the probe's return can outrun,
+    // so wait for the count.
     if fault != .refused {
       #expect(
         await eventually(within: 10) { (server?.accepted.value ?? 0) >= 1 },
