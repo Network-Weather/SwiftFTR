@@ -7,12 +7,12 @@ import Testing
 /// shared session answers the test's own upload requests itself, so nothing leaves the machine,
 /// and records what was asked for.
 ///
-/// The shared session is process-wide. The recorder claims only POST requests, and lets every
-/// other request (a download load's GETs included) through untouched. The upload load is the only
-/// code that POSTs on the shared session: no other code in the library or the tests uses
-/// `URLSession.shared` or registers a `URLProtocol`, and the HTTP probe builds its own sessions.
-/// Claiming every POST rather than only the expected URL keeps a regression that posts elsewhere
-/// offline too. The whole registration is held under ``NetworkTestGate``, which the live
+/// The shared session is process-wide. The recorder claims every request that carries a body or
+/// uses a method other than GET or HEAD, whatever its URL, so anything the upload loop could send
+/// stays on the machine even if it changes method or target; plain GET and HEAD requests (a
+/// download load's included) pass through untouched. No other code in the library or the tests
+/// uses `URLSession.shared` or registers a `URLProtocol`, and the HTTP probe builds its own
+/// sessions. The whole registration is held under ``NetworkTestGate``, which the live
 /// bufferbloat tests also hold, so a live load never runs while the recorder is installed.
 @Suite("Bufferbloat upload target", .serialized)
 struct BufferbloatUploadTargetTests {
@@ -34,9 +34,14 @@ struct BufferbloatUploadTargetTests {
 
     var recorded: [Request] { lock.withLock { requests } }
 
-    /// Whether the recorder answers `request`: a POST, while a test is recording.
+    /// Whether the recorder answers `request`, while a test is recording: anything but a bodiless
+    /// GET or HEAD. A missing method is GET.
     func claims(_ request: URLRequest) -> Bool {
-      lock.withLock { recording && request.httpMethod == "POST" }
+      let method = (request.httpMethod ?? "GET").uppercased()
+      let readOnly =
+        (method == "GET" || method == "HEAD") && request.httpBody == nil
+        && request.httpBodyStream == nil
+      return lock.withLock { recording } && !readOnly
     }
 
     func start() { lock.withLock { (recording, requests) = (true, []) } }
@@ -108,7 +113,8 @@ struct BufferbloatUploadTargetTests {
     try #require(!requests.isEmpty, "no upload request was made")
     let urls = Set(requests.map { $0.url?.absoluteString ?? "nil" })
     #expect(urls == ["https://speed.cloudflare.com/__up"], "\(requests.count) requests to \(urls)")
-    #expect(Set(requests.map { $0.method ?? "nil" }) == ["POST"])
+    let methods = Set(requests.map { $0.method ?? "nil" })
+    #expect(methods == ["POST"], "claimed \(requests.count) requests with methods \(methods)")
     #expect(Set(requests.map(\.bodyLength)) == [256 * 1024])
   }
 
