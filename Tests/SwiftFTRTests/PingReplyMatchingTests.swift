@@ -299,10 +299,17 @@ struct PingReplyMatchingTests {
     defer { ping.stop() }
     ping.afterSend = { seq, fd in
       if seq == 1 {
+        // Nothing of this test's is queued yet, so whatever is, another test's late datagram to a
+        // recycled port, goes first: a bare "two queued" could otherwise be met by it and the
+        // first reply while the duplicate is still in flight, and no reading would then be taken
+        // with exactly one queued. The wait counts exactly the two injected, so a stray landing
+        // meanwhile fails the premise rather than staging the wrong order.
+        var scratch = [UInt8](repeating: 0, count: 2048)
+        while recv(fd, &scratch, scratch.count, MSG_DONTWAIT) >= 0 {}
         ping.network.inject(Self.reply(family, id: DirectPing.identifier, seq: 1), to: fd)
         ping.network.inject(
           Self.reply(family, id: DirectPing.identifier, seq: 1, mark: Self.ignored), to: fd)
-        ping.premise(waitForQueued(fd, atLeast: 2))
+        ping.premise(ping.waitUntilEveryReplyQueuedOrRead(fd))
       } else {
         // Delivered from another thread once the first two are read: this closure runs on the
         // ping's queue, which must stay free to read them.
