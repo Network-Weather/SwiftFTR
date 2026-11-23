@@ -140,7 +140,7 @@ Key Features
 **Public IP Discovery**
 - `getPublicIPs()` is an uncached, STUN-only call that runs IPv4 and IPv6 in parallel and returns whichever families succeeded
 - `discoverPublicIPWithHostname()` performs fresh IPv4 discovery on each call: STUN first, then an unbound Akamai DNS-whoami fallback, plus optional system-routed rDNS
-- Classified trace honors `SwiftFTRConfig.publicIP` for traces of its family; otherwise it uses a seeded or cached address of the trace's family, or asks the `SwiftFTRConfig.publicIPResolver` strategy once and caches an accepted answer per family until invalidation. Supply your own `PublicIPResolver` with `.custom(_:)`, or send nothing with `.disabled`. Multipath also honors the override and reuses an actor-cached value when available
+- Classified trace honors `SwiftFTRConfig.publicIP` for traces of its family; otherwise it uses a seeded or cached address of the trace's family, or asks the `SwiftFTRConfig.publicIPResolver` strategy once and caches an accepted answer per family until invalidation. Supply your own `PublicIPResolver` with `.custom(_:)`, or send nothing with `.disabled`. Multipath follows the same order once per run, for IPv4, before its first batch, and gives every flow that one answer
 
 **Architecture**
 - Actor-based design for thread safety

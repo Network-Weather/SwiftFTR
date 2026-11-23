@@ -617,7 +617,8 @@ public struct NetworkTopology: Sendable, Codable {
     public let destinationIP: String
     public let sourceAdapter: String?
     public let sourceIP: String?
-    public let publicIP: String?
+    public let publicIP: String?                          // the run's one answer, shared by every path
+    public let publicIPSource: PublicIPObservationSource?
     public let paths: [DiscoveredPath]
     public let uniquePathCount: Int
     public let discoveryDuration: TimeInterval
@@ -1058,9 +1059,9 @@ struct TraceView: View {
   the instance's rDNS cache and ASN resolver, so they follow the same settings.
 - **Public IP** (classified trace and multipath only): one question per classified trace, bounded
   by `publicIPDiscoveryTimeout` (default 6 s), asked after the probes. An accepted answer is cached
-  per instance and family until invalidated; a miss is not. Multipath reuses an existing cached
-  value but does not write its own answers back; with no cached value, each flow asks on its own,
-  each question bounded by the instance's `publicIPDiscoveryTimeout`.
+  per instance and family until invalidated; a miss is not. A multipath run asks once for IPv4, in
+  the parent before its first batch, caches an accepted answer the same way, and hands the answer,
+  or its absence, to every flow; no flow asks.
 - **ASN**: the embedded database answers locally (microseconds per lookup once loaded; it reloads
   if every resolver holding it has been released). DNS-based results are cached process-wide with
   a soft cap of 2048 entries. ASN caches
