@@ -222,12 +222,16 @@ struct PublicIPValidationTests {
 
   @Test("Binding a socket to a source address with an embedded NUL fails")
   func sourceBindRejectsEmbeddedNUL() throws {
-    let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-    try #require(fd >= 0)
-    defer { close(fd) }
-    #expect(bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: "127.0.0.1\u{0}junk") != nil)
-    // Positive control: the address alone binds.
-    #expect(bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: "127.0.0.1") == nil)
+    for address in ["127.0.0.1\u{0}junk", "127.0.0.1"] {
+      let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+      try #require(fd >= 0)
+      defer { close(fd) }
+      let error = bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: address)
+      // Positive control: the address alone binds, on a socket of its own.
+      #expect(
+        (error == nil) == !address.contains("\u{0}"),
+        "\(address.debugDescription): \(error ?? "bound")")
+    }
   }
 
   @Test("A ping from a source address with an embedded NUL fails before it sends")
