@@ -68,7 +68,9 @@ import Testing
         config: UDPProbeConfig(
           host: route.address, port: server.port, timeout: 10, payload: payload,
           preferredFamily: .v4))
-      #expect(result.responseType == "udp_reply", "\(result.error ?? "no error")")
+      // A probe that got no reply leaves nothing to read, so the wait below would last until the
+      // time limit.
+      try #require(result.responseType == "udp_reply", "\(result.error ?? "no error")")
       #expect(await datagrams.next() == payload, "the first datagram yielded was not the probe's")
       #expect(server.ignored.value >= 2, "ignored: \(server.ignored.value)")
     }
