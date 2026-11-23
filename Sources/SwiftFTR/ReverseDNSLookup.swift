@@ -10,7 +10,8 @@ struct ReverseDNSQuestion: Sendable, Equatable {
   /// The reverse name, without a trailing dot: `4.3.2.1.in-addr.arpa` or 32 nibbles and
   /// `ip6.arpa`.
   let name: String
-  /// The zone of a link-local IPv6 address, as an interface index; 0 (every interface) otherwise.
+  /// The zone of a link-local address (fe80::/10, or 169.254.0.0/16 written as a mapped IPv6
+  /// address), as an interface index; 0 (every interface) otherwise.
   let interfaceIndex: UInt32
   /// Whether the daemon answers this question by multicast DNS on the local link (169.254.0.0/16
   /// and fe80::/10). Multicast never answers "no such name", so an unanswered question of this
@@ -25,8 +26,8 @@ struct ReverseDNSQuestion: Sendable, Equatable {
   /// which link to ask; on any other address it would scope a unicast question to an interface
   /// that may have no resolver, which the daemon answers with "no such record" at once.
   ///
-  /// A zone on a link-local address must name an interface that exists, by name (`%en0`) or by
-  /// index (`%4`); otherwise there is no question, because falling back to every link would let
+  /// A zone on a link-local address (a mapped 169.254.0.0/16 address included) must name an
+  /// interface that exists, by name (`%en0`) or by index (`%4`); otherwise there is no question, because falling back to every link would let
   /// a responder on another link name an address the caller scoped elsewhere. A link-local
   /// address with no zone asks on every link, as `getnameinfo` does for it (measured: unscoped
   /// `fe80::1` is answered with the name a lookup scoped to `lo0` received), so its answer may
@@ -48,7 +49,15 @@ struct ReverseDNSQuestion: Sendable, Equatable {
     let bytes = withUnsafeBytes(of: &v6) { Array($0) }
 
     if bytes[0..<10].allSatisfy({ $0 == 0 }) && bytes[10] == 0xFF && bytes[11] == 0xFF {
-      self.init(ipv4: Array(bytes[12..<16]))
+      // A mapped link-local address (169.254.0.0/16) is asked by multicast, so its zone picks
+      // the link exactly as it does for fe80::/10.
+      let octets = Array(bytes[12..<16])
+      var mappedIndex: UInt32 = 0
+      if octets[0] == 169 && octets[1] == 254 && parts.count == 2 {
+        guard let index = Self.interfaceIndex(zone: String(parts[1])) else { return nil }
+        mappedIndex = index
+      }
+      self.init(ipv4: octets, interfaceIndex: mappedIndex)
       return
     }
 
@@ -80,10 +89,10 @@ struct ReverseDNSQuestion: Sendable, Equatable {
     return if_indextoname(index, &name) != nil ? index : nil
   }
 
-  private init(ipv4 octets: [UInt8]) {
+  private init(ipv4 octets: [UInt8], interfaceIndex: UInt32 = 0) {
     self.init(
       name: octets.reversed().map(String.init).joined(separator: ".") + ".in-addr.arpa",
-      interfaceIndex: 0,
+      interfaceIndex: interfaceIndex,
       isMulticast: octets[0] == 169 && octets[1] == 254)
   }
 

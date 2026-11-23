@@ -73,12 +73,19 @@ struct ReverseDNSLookupTests {
     let unused = Self.unusedInterfaceIndex()
     let v4 = "4.3.2.1.in-addr.arpa"
     let v6 = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa"
+    let mappedLinkLocal = "1.1.254.169.in-addr.arpa"
     let linkLocal = "1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.e.f.ip6.arpa"
     let cases: [(String, (name: String, index: UInt32)?)] = [
       ("1.2.3.4", (v4, 0)),
       ("01.2.3.4", (v4, 0)),  // inet_pton reads the leading zero as decimal
       ("::ffff:1.2.3.4", (v4, 0)),
       ("::ffff:1.2.3.4%lo0", (v4, 0)),  // a zone on a non-link-local address is ignored
+      // A mapped link-local IPv4 address is asked by multicast, so its zone picks the link.
+      ("::ffff:169.254.1.1", (mappedLinkLocal, 0)),
+      ("::ffff:169.254.1.1%lo0", (mappedLinkLocal, loopbackIndex)),
+      ("::ffff:169.254.1.1%\(loopbackIndex)", (mappedLinkLocal, loopbackIndex)),
+      ("::ffff:169.254.1.1%gone0", nil),
+      ("::ffff:169.254.1.1%\(unused)", nil),
       ("2001:db8::1", (v6, 0)),
       ("2001:DB8::1", (v6, 0)),
       ("2001:0db8:0000:0000:0000:0000:0000:0001", (v6, 0)),
