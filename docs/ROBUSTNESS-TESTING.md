@@ -277,7 +277,7 @@ numbers are as of the commit that added this section.
     socket failed at once with `ECONNREFUSED` and the client called it `DNSError.timeout`, so
     `dnsProbe` said "Timeout - no response" about a host that had answered. Measured on `main`:
     `timeout` after 1 ms, for a fixture port and for port 53 on loopback. Now the query methods
-    throw `sendFailed`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
+    throw `connectionRefused`, and `dnsProbe` stays unreachable (no DNS server answered) with a message
     that names the refusal and `outcome == .refused`, with `elapsed` set to when it arrived.
     Tests: `EventBasedDNSTests.refusedPort` and `DNSProbeOutcomeTests.refused`, IPv4 and IPv6.
 18. **An empty DNS datagram was reported as silence.** Confirmed and fixed. A zero-byte `recv`
@@ -319,7 +319,7 @@ numbers are as of the commit that added this section.
     `DNSError.sendFailed` with the errno discarded, and a send-time errno was dropped, so "no route
     to this server", the usual no-network case, read "Failed to send query". `EHOSTUNREACH`,
     `EHOSTDOWN`, `ENETUNREACH` and `ENETDOWN` are now `outcome == .unreachable` with the errno, and
-    other errnos are named in the message. The query methods still throw `sendFailed`. Test:
+    other errnos are named in the message. The query methods throw `unreachable`. Test:
     `DNSProbeOutcomeTests.locallyUnreachable`, both stages and all four errnos.
 24. **An unclassified receive error was reported as a timeout.** Fixed: `dnsProbe` said "Timeout -
     no response" for a socket error that came at once. It now says a receive error occurred, with
@@ -377,13 +377,13 @@ numbers are as of the commit that added this section.
     reply is judged as before. A reply to an earlier probe
     that arrives after `timeout` but before the ping's last reply window ends still counts, as
     `PingConfig.timeout` documents. Tests: `PingReplyMatchingTests`, IPv4 and IPv6.
-- **A ping whose send failed waited out its whole window** (#138). Confirmed and fixed. Early
+29. **A ping whose send failed waited out its whole window** (#138). Confirmed and fixed. Early
   completion compared the replies with the configured `count`, which a ping with a failed send
   can never reach: two probes, the first send failing and the second answered at once, ended at
   the reply deadline. Once the send loop has finished, the ping now compares the replies with the
   sends that succeeded, both when the loop finishes and when a reply arrives. Tests:
   `PingReplyMatchingTests` (`failedSend…`), IPv4 and IPv6.
-- **`seedPublicIP` accepted a NAT64 address wrapping a private IPv4 address, and strings with an
+30. **`seedPublicIP` accepted a NAT64 address wrapping a private IPv4 address, and strings with an
   embedded NUL** (#139). Confirmed and fixed. `64:ff9b::192.168.1.1` was accepted because the
   well-known prefix was accepted whatever it embedded; RFC 6052 section 3.1 forbids it for
   non-global IPv4. `"8.8.8.8\u{0}junk"` was accepted as `8.8.8.8` because `inet_pton` reads a C
@@ -393,7 +393,7 @@ numbers are as of the commit that added this section.
   for ping, trace and the TCP and UDP probes (which resolved and probed the text before the NUL).
   The parsers and destination resolution now reject such a string. Interface names reach
   `if_nametoindex` the same way and are not checked. Tests: `PublicIPValidationTests`.
-- **A DNS reply's question was never compared with the query** (#128). Confirmed and fixed. A
+31. **A DNS reply's question was never compared with the query** (#128). Confirmed and fixed. A
   reply with the query's transaction ID was accepted whatever question it echoed, so its answers
   were reported for the name asked. A datagram whose first question is readable and names another
   name (compared without regard to ASCII case), type or class is now ignored like one with a

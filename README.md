@@ -72,9 +72,11 @@ Upgrades within 0.14 through 0.18 are additive at the source level, but read eac
 "Behavior changes" in [CHANGELOG.md](CHANGELOG.md).
 
 From 0.18, work through [Migrating to SwiftFTR 0.19](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo019.md):
-0.19 ignores DNS replies that echo another question, rejects address strings containing a NUL
-and NAT64 addresses wrapping a private IPv4 address in `seedPublicIP`, and ends a ping with a
-failed send once every sent probe is answered. Each entry has before-and-after code.
+0.19 adds two `DNSError` cases, `connectionRefused` and `unreachable`, which an exhaustive
+`switch` must handle (the guide has the edit), ignores DNS replies that echo another question, rejects address strings containing a NUL
+and NAT64 addresses wrapping a private IPv4 address in `seedPublicIP`, ends a ping with a
+failed send once every sent probe is answered, and sends bufferbloat's default upload load to
+the download's provider. Each entry has before-and-after code.
 
 From 0.17, work through [Migrating to SwiftFTR 0.18](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo018.md):
 0.18 changes which error a cancelled `ping` or `trace` throws, ends `discoverPaths` on a network
@@ -462,7 +464,7 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 - [Streaming traceroute](Sources/SwiftFTR/SwiftFTR.docc/StreamingTrace.md): `traceStream` usage, `StreamingTraceConfig` defaults, retry and early-completion behavior. (updated 2026-11-21; update when: `StreamingTraceConfig` or the emission rules for streaming hops change)
 - [Ping](Sources/SwiftFTR/SwiftFTR.docc/Ping.md): `ping(to:config:)` usage, statistics semantics and concurrent pinging. (updated 2026-11-21; update when: `PingConfig`, `PingStatistics` or ping concurrency behavior changes)
 - [Probing](Sources/SwiftFTR/SwiftFTR.docc/Probing.md): the TCP, UDP, HTTP and DNS probe functions, their results, errors and binding behavior. (updated 2026-11-22; update when: a probe function, config or result type changes, or HTTP probes gain route binding)
-- [Bufferbloat](Sources/SwiftFTR/SwiftFTR.docc/Bufferbloat.md): `testBufferbloat` usage, load generation, grading and RPM calculation, video-call severity and baseline-only bound mode. (updated 2026-11-21; update when: grading thresholds, the RPM method, default load endpoints or `BufferbloatConfig` change)
+- [Bufferbloat](Sources/SwiftFTR/SwiftFTR.docc/Bufferbloat.md): `testBufferbloat` usage, load generation, grading and RPM calculation, video-call severity and baseline-only bound mode. (updated 2026-11-22; update when: grading thresholds, the RPM method, default load endpoints or `BufferbloatConfig` change)
 - [Multipath](Sources/SwiftFTR/SwiftFTR.docc/Multipath.md): `discoverPaths` usage, topology analysis, ICMP-versus-UDP limitations and the IPv4-only restriction. (updated 2026-11-21; update when: multipath gains UDP or IPv6 support, or `MultipathConfig` or `NetworkTopology` change)
 - [Interface binding](Sources/SwiftFTR/SwiftFTR.docc/InterfaceBinding.md): which operations honor interface and source-address binding, resolution order and binding errors. (updated 2026-11-21; update when: an operation gains or loses binding support, or HTTP probes become bindable)
 - [Migrating to 0.19](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo019.md): upgrade guide from 0.18 to 0.19 for people and coding agents, one entry per change a caller can observe, with what changed, what a caller sees and before-and-after code. (updated 2026-11-22; update when: a change bound for 0.19 alters behavior or source a caller depends on, or 0.18 adopters no longer need it)
@@ -478,7 +480,7 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 - [Integration package](IntegrationPackage/README.md): the external-consumer package that imports SwiftFTR by path, what it checks and how CI builds and runs it. (updated 2026-11-21; update when: the package's checks change or a workflow stops building or running it)
 
 ### GitHub configuration
-- [Workflows](.github/WORKFLOWS.md): what each GitHub Actions workflow triggers on, runs and produces, and how they depend on each other. (updated 2026-11-21; update when: a file under `.github/workflows/` is added, removed or changes its triggers or jobs)
+- [Workflows](.github/WORKFLOWS.md): what each GitHub Actions workflow triggers on, runs and produces, and how they depend on each other. (updated 2026-11-22; update when: a file under `.github/workflows/` is added, removed or changes its triggers or jobs)
 - [Pull request template](.github/pull_request_template.md): the summary, change type, testing commands and checklist every PR body starts from. (updated 2026-07-21; update when: the required pre-merge checks change)
 - [Bug report template](.github/ISSUE_TEMPLATE/bug_report.md): the environment, reproduction and log fields requested for bug issues. (updated 2026-11-21; update when: the CLI's options or the information needed to triage a bug change)
 - [Feature request template](.github/ISSUE_TEMPLATE/feature_request.md): the motivation, proposal and alternatives fields requested for feature issues. (updated 2025-09-08; update when: the project changes how it takes feature proposals)

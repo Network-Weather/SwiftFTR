@@ -14,6 +14,9 @@ private func roundedMilliseconds(_ seconds: TimeInterval) -> Double {
 // MARK: - Public DNS Probe API
 
 /// Errors that can occur during DNS queries
+///
+/// A `switch` over this enum must handle every case; 0.19 added ``connectionRefused`` and
+/// ``unreachable``, which split out of ``sendFailed`` and ``timeout``.
 public enum DNSError: Error, Sendable {
   /// Invalid IP address format
   case invalidIP(String)
@@ -27,8 +30,18 @@ public enum DNSError: Error, Sendable {
   case setsockoptFailed(option: String, errno: Int32)
   /// Failed to bind to interface or source IP
   case bindFailed(String)
-  /// Failed to send DNS query
+  /// Failed to send the DNS query: a short send, a send or `connect` error other than no route
+  /// (such as `EPERM` or `EMSGSIZE`), or send buffer pressure that outlasted the timeout.
   case sendFailed
+  /// The server's host answered that nothing is listening on the DNS port (ICMP port
+  /// unreachable, reported as `ECONNREFUSED` after the query was sent). The host is up; no DNS
+  /// server took the query.
+  case connectionRefused
+  /// The server cannot be reached: the network reported its host or network unreachable after
+  /// the query was sent (ICMP host or network unreachable), or this machine has no route toward
+  /// it (`connect` or `send` failed with `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or
+  /// `ENETDOWN`).
+  case unreachable
   /// Query timed out waiting for response
   case timeout
   /// Received malformed DNS response
@@ -132,18 +145,28 @@ private func exchangeDNSQuery(
   return DNSReply(message: Data(reply.bytes), expectedID: id, rtt: reply.rtt)
 }
 
-/// The `DNSError` a query method throws for a transport failure.
-///
-/// A refusal is `sendFailed`: the query reached the host, but no DNS server was there to take it.
-/// Host and network unreachable, and other receive errors, stay `timeout`, as they were when the
-/// client waited in a blocking `recv`.
+/// The `DNSError` a query method throws for a transport failure. Each origin maps as
+/// ``dnsProbe(config:)`` classifies it (``probeResult(for:)``): a refusal after the send is
+/// `connectionRefused`; host or network unreachable, whether reported by the network after the
+/// send or by this machine's `send`, is `unreachable`; any other send failure is `sendFailed`.
+/// Other receive errors stay `timeout`, as they were when the client waited in a blocking `recv`.
 private func dnsError(for failure: UDPExchangeFailure) -> DNSError {
   switch failure {
   case .socketCreationFailed: .socketCreationFailed
   case .nonBlockingFailed(let code): .setsockoptFailed(option: "O_NONBLOCK", errno: code)
-  case .sendFailed, .refused: .sendFailed
-  case .unreachable, .receiveFailed, .timedOut: .timeout
+  case .refused: .connectionRefused
+  case .unreachable: .unreachable
+  case .sendFailed(let code?) where locallyUnreachableErrnos.contains(code): .unreachable
+  case .sendFailed: .sendFailed
+  case .receiveFailed, .timedOut: .timeout
   }
+}
+
+/// The `DNSError` a query method throws when `connect(2)` fails with `code`: `unreachable` for
+/// no route, as ``dnsProbe(config:)`` reports it, and `sendFailed` otherwise. A UDP `connect`
+/// sends nothing, so it has no refusal to report.
+private func dnsError(forConnectErrno code: Int32) -> DNSError {
+  locallyUnreachableErrnos.contains(code) ? .unreachable : .sendFailed
 }
 
 /// Runs one DNS query and returns its validated answers with the measured round-trip time.
@@ -165,8 +188,8 @@ private func runDNSQuery(
       interface: interface, sourceIP: sourceIP, serverPort: serverPort)
   } catch let failure as UDPExchangeFailure {
     throw dnsError(for: failure)
-  } catch is DNSConnectFailure {
-    throw DNSError.sendFailed
+  } catch let failure as DNSConnectFailure {
+    throw dnsError(forConnectErrno: failure.errno)
   }
   return (try reply.answers(), reply.rtt)
 }
@@ -1645,6 +1668,12 @@ private func probeResult(for failure: DNSProbeFailure) -> DNSProbeResultInternal
     return notReachable(.failed, "Invalid server IP: \(ip)")
   case .query(.sendFailed, _):
     return notReachable(.failed, DNSProbeMessage.sendFailed)
+  // The probe takes the transport's failure before it becomes a `DNSError`, so these two arise
+  // only from a query step; they map as their transport origins do, without timing.
+  case .query(.connectionRefused, _):
+    return notReachable(.refused, DNSProbeMessage.refused)
+  case .query(.unreachable, _):
+    return notReachable(.unreachable, DNSProbeMessage.hostUnreachablePrefix)
   case .query(.invalidHostname(let name), _):
     return notReachable(.failed, "Invalid hostname: \(name)")
   case .query(.invalidTimeout(let timeout), _):
@@ -1654,8 +1683,8 @@ private func probeResult(for failure: DNSProbeFailure) -> DNSProbeResultInternal
   }
 }
 
-/// `connect(2)` on a DNS socket failed. The query methods report it as `DNSError.sendFailed`;
-/// ``dnsProbe(config:)`` reports the errno.
+/// `connect(2)` on a DNS socket failed. The query methods report it as `DNSError.unreachable`
+/// for no route and `DNSError.sendFailed` otherwise; ``dnsProbe(config:)`` reports the errno.
 private struct DNSConnectFailure: Error {
   let errno: Int32
 }

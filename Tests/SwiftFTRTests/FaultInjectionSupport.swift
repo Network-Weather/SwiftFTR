@@ -640,6 +640,11 @@ final class LoopbackTCPServer: @unchecked Sendable {
 
   let port: UInt16
   let accepted = FaultCounter()
+  /// Requests a handler has read some bytes of. A test that sends a request and then stops the
+  /// server waits on this first: a request still in flight when `stop()` shuts the connection
+  /// down is never read, and closing a connection with unread data resets it instead of ending
+  /// it with end-of-file.
+  let requestsRead = FaultCounter()
 
   private let fd: Int32
   private let behavior: Behavior
@@ -780,7 +785,7 @@ final class LoopbackTCPServer: @unchecked Sendable {
   private func readRequest(_ client: Int32) {
     setReceiveTimeout(client, seconds: 1)
     var buffer = [UInt8](repeating: 0, count: 4096)
-    _ = recv(client, &buffer, buffer.count, 0)
+    if recv(client, &buffer, buffer.count, 0) > 0 { requestsRead.increment() }
   }
 
   private func write(_ bytes: [UInt8], to client: Int32) {

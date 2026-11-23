@@ -36,7 +36,8 @@ public struct BufferbloatConfig: Sendable {
   /// Calculate RPM (Round-trips Per Minute) metric
   public let calculateRPM: Bool
 
-  /// Custom upload URL (default: httpbin.org/post)
+  /// Custom upload URL (default: Cloudflare's speed-test upload endpoint,
+  /// `https://speed.cloudflare.com/__up`, the same provider as the download default)
   public let uploadURL: String?
 
   /// Custom download URL (default: Cloudflare speed test)
@@ -379,7 +380,7 @@ struct LoadGenerator: Sendable {
 
   /// Generate upload load (POST requests with random data)
   private func generateUploadLoad(until endTime: Date) async {
-    let url = URL(string: config.uploadURL ?? "https://httpbin.org/post")!
+    let url = URL(string: config.uploadURL ?? "https://speed.cloudflare.com/__up")!
 
     // Create chunk of random data (256 KB - smaller for faster requests)
     let chunkSize = 256 * 1024

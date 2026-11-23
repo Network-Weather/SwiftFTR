@@ -214,8 +214,17 @@ struct FaultInjectionFixtureTests {
       $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(client, $0, length) }
     }
     #expect(connected == 0)
-    _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
+    if case .respond = behavior {
+      // Sent at once, so it is waiting for the handler however late the handler or this task
+      // runs, and read by the handler before stop(): a request still unread when the connection
+      // closes turns the end-of-file checked below into a reset. The silent handler reads
+      // nothing, so it is sent no request.
+      _ = Darwin.send(client, "GET / HTTP/1.1\r\n\r\n", 18, 0)
+    }
     #expect(await eventually(within: 10) { server.accepted.value == 1 })
+    if case .respond = behavior {
+      #expect(await eventually(within: 10) { server.requestsRead.value == 1 })
+    }
 
     // The handler cannot finish while the exit gate is shut (its own limit is 30 s), so a stop()
     // that returns within the 10 s watchdog did so without waiting for it. Run on its own thread,

@@ -1,6 +1,6 @@
 # Migrating to SwiftFTR 0.19
 
-Handle the DNS, address-validation, ping and CLI changes introduced in SwiftFTR 0.19.
+Handle the two new DNSError cases and the DNS, address-validation, ping, bufferbloat and CLI changes introduced in SwiftFTR 0.19.
 
 ## Overview
 
@@ -11,9 +11,10 @@ person or a coding agent can work through a consumer one change at a time:
 - **What a caller sees**, at the call site.
 - **What to change**, with code before and after.
 
-To find the call sites to review, search the consumer for `dnsProbe(`, `DNSError.timeout`,
-`.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, and any script that reads the output of
-`swift-ftr probe dns`.
+To find the call sites to review, search the consumer for `switch` over `DNSError`,
+`DNSError.sendFailed`, `dnsProbe(`, `DNSError.timeout`,
+`.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, and any script that reads the
+output of `swift-ftr probe dns`.
 
 ## Update the package
 
@@ -25,6 +26,85 @@ dependencies: [
   )
 ]
 ```
+
+## DNSError adds connectionRefused and unreachable
+
+**What changed.** ``DNSError`` has two new cases, ``DNSError/connectionRefused`` and
+``DNSError/unreachable``. The query methods (``DNSQueries``, ``reverseDNS(ip:server:timeout:interface:sourceIP:)``,
+``reverseIPv6(ip:server:timeout:interface:sourceIP:)``, ``queryA(hostname:server:timeout:interface:sourceIP:)``,
+``queryAAAA(hostname:server:timeout:interface:sourceIP:)``) throw them where 0.18 threw
+``DNSError/sendFailed`` or ``DNSError/timeout``, so each failure is named as
+``dnsProbe(server:query:timeout:)`` already named it:
+
+| What happened | 0.18 threw | 0.19 throws | `dnsProbe` outcome (unchanged) |
+|---|---|---|---|
+| ICMP port unreachable after the send: the host is up, nothing listens on the port | `sendFailed` | `connectionRefused` | `refused` |
+| ICMP host or network unreachable after the send | `timeout` | `unreachable` | `unreachable` |
+| `connect` or `send` fails with `EHOSTUNREACH`, `EHOSTDOWN`, `ENETUNREACH` or `ENETDOWN` | `sendFailed` | `unreachable` | `unreachable` |
+| Any other send or connect failure (a short send, `EPERM`, `EMSGSIZE`, buffer pressure past the timeout) | `sendFailed` | `sendFailed` | `failed` |
+| Silence, or another receive error | `timeout` | `timeout` | `timedOut` or `failed` |
+
+`dnsProbe` itself does not change: its `outcome`, `isReachable`, `rtt`, `elapsed` and `error`
+are what 0.18 gave for every one of these.
+
+**What a caller sees.** A `switch` over `DNSError` without a `default` no longer compiles
+("switch must be exhaustive"). A `catch DNSError.sendFailed` no longer catches a refusal or a
+no-route failure, and a `catch DNSError.timeout` no longer catches a host or network unreachable
+report: code that retried on `timeout` no longer retries for that case, which arrives at once
+rather than after the timeout.
+
+**What to change.** Add the two cases to every exhaustive switch, and choose a retry policy for
+each. 0.18's handling cannot be kept exactly: `unreachable` joins a report that 0.18 threw as
+`timeout` with a local no-route failure it threw as `sendFailed`, and nothing in the error tells
+them apart afterwards (a later `dnsProbe` measures a new request, not the one that failed). The
+example below makes one explicit choice for each case; adapt it to the consumer's policy.
+
+Before:
+
+```swift
+do {
+  let result = try await tracer.dns.a(hostname: name, server: server)
+  use(result)
+} catch let error as DNSError {
+  switch error {
+  case .timeout: retryLater()
+  case .sendFailed: reportNoDNSServer()
+  case .invalidIP, .invalidHostname, .invalidTimeout: reportBadInput()
+  case .socketCreationFailed, .setsockoptFailed, .bindFailed: reportLocalFailure()
+  case .malformedResponse, .noRecords, .serverError: reportAnswer(error)
+  }
+}
+```
+
+After, retrying both kinds of unreachable failure and not retrying a refusal:
+
+```swift
+do {
+  let result = try await tracer.dns.a(hostname: name, server: server)
+  use(result)
+} catch let error as DNSError {
+  switch error {
+  case .timeout: retryLater()
+  case .unreachable:
+    // Retry, as for timeout: no route, or the network reported the server unreachable. It
+    // arrives at once rather than after the timeout, so retry after a backoff, not in a loop.
+    // (0.18 threw timeout for the network's report, and sendFailed for a local no-route.)
+    retryLater()
+  case .connectionRefused:
+    // Do not retry: the host answered that no DNS server listens on the port.
+    // (0.18 threw sendFailed for this.)
+    reportNoDNSServer()
+  case .sendFailed: reportNoDNSServer()
+  case .invalidIP, .invalidHostname, .invalidTimeout: reportBadInput()
+  case .socketCreationFailed, .setsockoptFailed, .bindFailed: reportLocalFailure()
+  case .malformedResponse, .noRecords, .serverError: reportAnswer(error)
+  }
+}
+```
+
+A consumer that would rather not retry a local no-route failure, as 0.18 effectively did, cannot
+tell it from the network's report by the error; treat every `unreachable` the same, whichever way
+it chooses.
 
 ## A DNS reply that echoes another question is ignored
 
@@ -147,4 +227,33 @@ After:
 
 ```sh
 swift-ftr probe dns 192.0.2.53 example.com --json | jq -e '.outcome == "failed"'
+```
+
+## The default bufferbloat upload target is Cloudflare's speed test
+
+**What changed.** With no ``BufferbloatConfig/uploadURL``, ``SwiftFTR/SwiftFTR/testBufferbloat(config:)``
+sent its upload load to `https://httpbin.org/post`, a free community service with no availability
+promise. It now sends it to `https://speed.cloudflare.com/__up`, the upload endpoint of the same
+service the default download load uses. The requests themselves are unchanged: 256 KiB POSTs, one
+after another on each of ``BufferbloatConfig/parallelStreams`` streams, until the load phase ends.
+
+**What a caller sees.** Upload traffic to `speed.cloudflare.com` instead of `httpbin.org`, and an
+upload load that no longer depends on httpbin.org's health. A caller that sets `uploadURL` sees no
+change.
+
+**What to change.** Nothing, unless a firewall rule, a proxy allowlist or a test fixture names
+`httpbin.org` for the bufferbloat test: allow `speed.cloudflare.com` instead, or keep the old
+target explicitly.
+
+Before (0.18, relying on the default):
+
+```swift
+let result = try await tracer.testBufferbloat(config: BufferbloatConfig(loadType: .upload))
+```
+
+After, to keep sending the upload load to httpbin.org:
+
+```swift
+let result = try await tracer.testBufferbloat(
+  config: BufferbloatConfig(loadType: .upload, uploadURL: "https://httpbin.org/post"))
 ```

@@ -1,0 +1,2 @@
+API breakage: enumelement DNSError.connectionRefused has been added as a new enum case
+API breakage: enumelement DNSError.unreachable has been added as a new enum case
