@@ -346,14 +346,19 @@ struct AsyncPublicIPDiscoveryTests {
     #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
     #expect(first.requests.value == 1)
 
+    // STUN's share of the budget ends at half of it, so the fallback was asked inside the
+    // budget, and the second server never got time.
+    #expect(second.requests.value == 0)
+    #expect(whoami.requests.value == 1)
+
     // The discovery itself ended, not only the wait for it: once the stalled attempt lets go of
-    // its slot, nothing goes on to the next server or the fallback.
+    // its slot, nothing goes on to the next server or asks the fallback again.
     first.release()
     _ = try await measure(within: Self.watchdog) {
       try await executor.run(priority: .userInitiated) {}
     }
     let carriedOn = await eventually(within: 1) {
-      second.requests.value > 0 || whoami.requests.value > 0
+      second.requests.value > 0 || whoami.requests.value > 1
     }
     #expect(!carriedOn, "the abandoned discovery went on after its budget")
   }
@@ -421,5 +426,95 @@ struct AsyncPublicIPDiscoveryTests {
     }.0
     #expect(throws: STUNError.self) { try outcome.get() }
     #expect(released.value == 0, "the lookup waited for the occupant to free its slot")
+  }
+
+  @Test("The whoami fallback still answers when STUN server names cannot get an executor slot")
+  func whoamiWhenSTUNNamesWaitForSlot() async throws {
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-names")
+    let occupant = StallGate()
+    defer { occupant.open() }
+    let occupied = FaultCounter()
+    let released = FaultCounter()
+    Task {
+      try? await executor.run(priority: .userInitiated) {
+        occupied.increment()
+        occupant.wait(limit: 3 * Self.watchdog)
+        released.increment()
+      }
+    }
+    #expect(await eventually(within: Self.watchdog) { occupied.value > 0 })
+
+    // Host names, as the built-in servers are, so each lookup queues for the held slot. Their
+    // 64-character labels are rejected by the resolver without a query, should a lookup run.
+    let names = ["a", "b"].map { String(repeating: $0, count: 64) + ".example" }
+    let whoami = try LoopbackUDPResponder { query in
+      (Self.whoamiAnswer(to: query, ip: "198.51.100.43"), 0)
+    }
+    defer { whoami.stop() }
+
+    // The budget and the DNS timeout outlive the watchdog; only STUN's own share of the time,
+    // two servers at 0.5 s, can let the fallback in.
+    let (found, _) = try await measure(within: Self.watchdog) {
+      try await Self.withFixtures(
+        servers: Self.servers(v4: names.map { ($0, 3478) }), whoamiPort: whoami.port,
+        executor: executor
+      ) {
+        try await publicIPv4Discovery(
+          stunTimeout: 0.5, dnsTimeout: 3 * Self.watchdog, interface: nil, sourceIP: nil,
+          enableLogging: false, budget: 3 * Self.watchdog)
+      }
+    }
+    #expect(found.ip == "198.51.100.43")
+    #expect(released.value == 0, "the lookups ran, so they were not waiting for the held slot")
+    #expect(whoami.requests.value == 1)
+  }
+
+  @Test("STUN's share of the discovery budget, and what it leaves the fallback")
+  func stunPhaseShare() {
+    // The defaults: 6 s budget, two servers.
+    #expect(
+      stunPhaseDeadline(servers: 2, stunTimeout: 2, dnsTimeout: 3, start: 10, deadline: 16) == 14)
+    #expect(
+      stunPhaseDeadline(servers: 2, stunTimeout: 0.8, dnsTimeout: 2, start: 10, deadline: 16)
+        == 11.6)
+    // A budget too small for both: half the DNS timeout is kept for the fallback.
+    #expect(
+      stunPhaseDeadline(servers: 2, stunTimeout: 2, dnsTimeout: 3, start: 10, deadline: 13) == 11.5)
+    // A budget smaller than the DNS timeout: half the budget.
+    #expect(
+      stunPhaseDeadline(servers: 2, stunTimeout: 2, dnsTimeout: 3, start: 10, deadline: 12) == 11)
+    // No overall deadline: STUN's share alone.
+    #expect(
+      stunPhaseDeadline(servers: 2, stunTimeout: 2, dnsTimeout: 3, start: 10, deadline: nil) == 14)
+  }
+
+  struct DefiniteFailure: Error {}
+
+  @Test("A failure at or after the deadline is a timeout, whichever timer noticed first")
+  func discoveryOutcomeIsDeterministic() throws {
+    let failed = Result<STUNPublicIP, Error>.failure(DefiniteFailure())
+    // Just before the deadline: the definite failure.
+    #expect(throws: DefiniteFailure.self) {
+      try publicIPDiscoveryOutcome(failed, now: 9.999, deadline: 10, cancelled: false)
+    }
+    // At and just after it: the budget ran out, also when the discovery child finished first.
+    for now in [10.0, 10.001] {
+      #expect(throws: PublicIPDiscoveryTimeout.self) {
+        try publicIPDiscoveryOutcome(failed, now: now, deadline: 10, cancelled: false)
+      }
+    }
+    // The timer child's own timeout, before the clock read reaches the deadline, stays a timeout.
+    #expect(throws: PublicIPDiscoveryTimeout.self) {
+      try publicIPDiscoveryOutcome(
+        .failure(PublicIPDiscoveryTimeout()), now: 9.999, deadline: 10, cancelled: false)
+    }
+    // The caller's cancellation comes first.
+    #expect(throws: CancellationError.self) {
+      try publicIPDiscoveryOutcome(failed, now: 10.001, deadline: 10, cancelled: true)
+    }
+    // An address that was found is kept.
+    let found = try publicIPDiscoveryOutcome(
+      .success(STUNPublicIP(ip: "198.51.100.1")), now: 10.001, deadline: 10, cancelled: false)
+    #expect(found.ip == "198.51.100.1")
   }
 }

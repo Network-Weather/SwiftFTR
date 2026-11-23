@@ -21,10 +21,15 @@ Unreleased
   and whoami DNS query, and is passed down to each. Each STUN attempt is its own executor request,
   abandoned after twice its per-server timeout or at the deadline, whichever is first, so a
   stalled attempt keeps one slot but the discovery moves on to the next server and the fallback.
-  A silent server ends its attempt at the socket timeout (2 s in the discovery before the trace,
-  0.8 s in the classifier's), so with the default 6 s budget two silent servers leave the whoami
-  fallback 2 s, or 4.4 s. The whoami fallback uses the event-based DNS transport and needs no
-  slot, so with every slot held it can still find the address where discovery used to find none.
+  The STUN tier, name lookups included, also ends at its own share of the time: the number of
+  servers times the per-server timeout, cut where needed to leave the whoami fallback at least
+  half its DNS timeout (or half the budget, if that is smaller). With the default 6 s budget the
+  cut never applies: STUN ends by 4 s in the discovery before the trace (2 s per server) and by
+  1.6 s in the classifier's (0.8 s), leaving the fallback 2 s and 4.4 s, so with free slots and
+  silent servers the fallback starts when it did in 0.18.1. The whoami fallback uses the
+  event-based DNS transport and needs no slot, so with every slot held, STUN's name lookups give
+  up at STUN's share and the fallback can still find the address where discovery used to find
+  none.
 
 ### Tooling
 

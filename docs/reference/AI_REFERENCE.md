@@ -274,7 +274,8 @@ public struct ClassifiedHop: Sendable, Codable {
 `traceClassified` gets the client's public IP from `config.publicIP`, then the actor cache (which
 `seedPublicIP` populates), then fresh IPv4 discovery (STUN, then a DNS TXT query to
 `whoami.ds.akahelp.net`). Each discovery attempt is bounded by `publicIPDiscoveryTimeout`, one
-deadline shared by every name lookup, STUN attempt and DNS query in it, and
+deadline shared by every name lookup, STUN attempt and DNS query in it (STUN stops at its own
+share, servers × per-server timeout, so the DNS fallback always gets time), and
 there can be two: one before the trace, and, if that one finds no address, a second during
 classification. With an empty cache and stalled discovery, a classified trace can therefore spend
 up to twice `publicIPDiscoveryTimeout` on public-IP discovery. If both fail or time out,

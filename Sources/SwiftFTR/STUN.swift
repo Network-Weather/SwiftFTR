@@ -711,7 +711,9 @@ public enum PublicIPError: Error, CustomStringConvertible, Sendable {
 ///   - sourceIP: Source IP address to bind to (optional)
 ///   - enableLogging: Enable debug logging
 ///   - deadline: An instant on `monotonicNow()`'s clock that bounds both tiers together: name
-///     lookups, every STUN attempt and the DNS fallback. `nil` bounds each step on its own.
+///     lookups, every STUN attempt and the DNS fallback. `nil` bounds each step on its own. The
+///     STUN tier also ends at its own share of the time (``stunPhaseDeadline(servers:stunTimeout:dnsTimeout:start:deadline:)``),
+///     so the fallback is always tried.
 /// - Returns: Public IP from first successful method
 /// - Throws: PublicIPError if all methods fail, or `CancellationError` when the calling task is
 ///   cancelled
@@ -723,7 +725,10 @@ func getPublicIPv4(
   enableLogging: Bool = false,
   deadline: TimeInterval? = nil
 ) async throws -> STUNPublicIP {
-  // Tier 1: Try STUN (fastest)
+  // Tier 1: Try STUN (fastest), within its share of the time.
+  let stunDeadline = stunPhaseDeadline(
+    servers: (TestSeams.stunServers?(AF_INET) ?? stunServers).count, stunTimeout: stunTimeout,
+    dnsTimeout: dnsTimeout, start: monotonicNow(), deadline: deadline)
   var stunErrorMsg = "Unknown error"
   do {
     return try await stunGetPublicIPWithFallback(
@@ -732,7 +737,7 @@ func getPublicIPv4(
       interface: interface,
       sourceIP: sourceIP,
       enableLogging: enableLogging,
-      deadline: deadline
+      deadline: stunDeadline
     )
   } catch is CancellationError {
     throw CancellationError()
@@ -770,6 +775,50 @@ func getPublicIPv4(
 
 /// Gives up on public-IP discovery that outlived its budget.
 struct PublicIPDiscoveryTimeout: Error {}
+
+/// When the STUN tier of ``getPublicIPv4(stunTimeout:dnsTimeout:interface:sourceIP:enableLogging:deadline:)``
+/// gives up, so that the DNS fallback after it always gets time to ask.
+///
+/// STUN's share is `servers × stunTimeout` from `start`: what its attempts take when every server
+/// is silent, so in that case the fallback starts no later than it would without this deadline.
+/// Name lookups that cannot get an executor slot are abandoned at it too, instead of using up the
+/// whole discovery. With an overall `deadline`, the share is also cut so that at least
+/// `min(dnsTimeout, budget) / 2` is left for the fallback, `budget` being the time from `start` to
+/// `deadline`. For the default 6 s budget that cut never applies: pre-trace discovery (2 s per
+/// server, two servers) ends STUN at 4 s, leaving 2 s; the classifier's (0.8 s) at 1.6 s, leaving
+/// 4.4 s.
+func stunPhaseDeadline(
+  servers: Int, stunTimeout: TimeInterval, dnsTimeout: TimeInterval, start: TimeInterval,
+  deadline: TimeInterval?
+) -> TimeInterval {
+  var share = Double(servers) * stunTimeout
+  if let deadline {
+    let budget = max(deadline - start, 0)
+    share = min(share, budget - min(dnsTimeout, budget) / 2)
+  }
+  return start + max(share, 0)
+}
+
+/// The outcome of a budgeted public-IP discovery whose first finished child gave `result`,
+/// decided at `now` against `deadline`.
+///
+/// Cancellation of the calling task comes first. Then a failure once `deadline` has passed is
+/// reported as ``PublicIPDiscoveryTimeout``, whichever timer noticed first, so a discovery that ran
+/// out of time is always told apart from one that got definite failures in time. An address
+/// that was found is returned.
+func publicIPDiscoveryOutcome(
+  _ result: Result<STUNPublicIP, Error>, now: TimeInterval, deadline: TimeInterval,
+  cancelled: Bool
+) throws -> STUNPublicIP {
+  if cancelled { throw CancellationError() }
+  switch result {
+  case .success(let address):
+    return address
+  case .failure(let error):
+    if now >= deadline { throw PublicIPDiscoveryTimeout() }
+    throw error
+  }
+}
 
 /// IPv4 public-address discovery for the trace family: the test substitute when one is bound,
 /// otherwise STUN with its DNS fallback, ended once `budget` seconds pass.
@@ -809,10 +858,17 @@ func publicIPv4Discovery(
       try await Task.sleep(nanoseconds: UInt64(left * 1_000_000_000))
       throw PublicIPDiscoveryTimeout()
     }
-    // Whichever child finishes first decides; the other is cancelled and awaited.
+    // The first child to finish is the outcome; the other is cancelled and awaited.
     defer { group.cancelAll() }
-    guard let first = try await group.next() else { throw PublicIPDiscoveryTimeout() }
-    return first
+    let first: Result<STUNPublicIP, Error>
+    do {
+      guard let value = try await group.next() else { throw PublicIPDiscoveryTimeout() }
+      first = .success(value)
+    } catch {
+      first = .failure(error)
+    }
+    return try publicIPDiscoveryOutcome(
+      first, now: monotonicNow(), deadline: deadline, cancelled: Task.isCancelled)
   }
 }
 
