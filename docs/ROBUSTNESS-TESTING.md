@@ -462,3 +462,16 @@ Observations that are not defects of the library:
   unread, met that while the injected one was in flight on loopback. Landing after the send, the
   injected reply was rightly kept. The test now waits until every datagram the fake network sent
   to the socket is queued or read.
+- A fake network's late reply could land in another test's fixture. Tests such as
+  `lateRepliesIgnored` schedule replies for after the operation has closed its probe socket. The
+  reply goes to that socket's port number, and a fixture bound in the meantime can have been
+  handed the same number: `DNSWireHardeningTests.productionQueryRejectsInvalidHeaders` read a
+  16-byte echo reply as its query, failed, and left the query to time out (once in 15 full debug
+  runs; 5 of 5 with the ordering forced). `FakeICMPNetwork` now holds a duplicate of every socket
+  it opens until it stops, so the port number stays taken while it can still send, and the DNS
+  fixture answers only the query for the name its test asked about. The same exposure remains in
+  responders that take the first datagram that arrives, or count every one:
+  `LoopbackUDPResponder` (which counts and answers any datagram; several tests assert its exact
+  request count), `ScriptedDNSPeer`, `RefusingThenAnsweringUDPPort`, and the UDP probe tests'
+  `LoopbackUDPServer`. A late sender that can still reach them is `ScriptedDNSPeer`'s feed, which
+  keeps sending to the client's port from the moment the query ends until its test stops it.
