@@ -517,4 +517,36 @@ struct AsyncPublicIPDiscoveryTests {
       .success(STUNPublicIP(ip: "198.51.100.1")), now: 10.001, deadline: 10, cancelled: false)
     #expect(found.ip == "198.51.100.1")
   }
+
+  @Test(
+    "A standalone STUN attempt that cannot get an executor slot is abandoned at its own deadline")
+  func standaloneAttemptBoundedWithoutSlot() async throws {
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-cap")
+    let occupant = StallGate()
+    defer { occupant.open() }
+    let occupied = FaultCounter()
+    let released = FaultCounter()
+    Task {
+      try? await executor.run(priority: .userInitiated) {
+        occupied.increment()
+        occupant.wait(limit: 3 * Self.watchdog)
+        released.increment()
+      }
+    }
+    #expect(await eventually(within: Self.watchdog) { occupied.value > 0 })
+    let silent = try HeldUDPServer(family: AF_INET)
+    defer { silent.stop() }
+
+    // getPublicIPs has no budget, so only each attempt's own deadline, twice the 0.2 s
+    // per-server timeout, can end a wait for a slot the occupant holds past the watchdog.
+    let (ips, _) = try await measure(within: Self.watchdog) {
+      await Self.withFixtures(
+        servers: Self.servers(v4: [(silent.host, silent.port), (silent.host, silent.port)]),
+        executor: executor
+      ) { await getPublicIPs(stunTimeout: 0.2) }
+    }
+    #expect(ips.v4 == nil)
+    #expect(released.value == 0, "an attempt waited for the occupant to free its slot")
+    #expect(silent.requests.value == 0, "an attempt ran although no slot was free")
+  }
 }
