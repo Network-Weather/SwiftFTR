@@ -67,13 +67,18 @@ struct BlockingIOStrandingTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.timer-release")
     let occupied = Counter()
     let released = Counter()
+    let free = DispatchSemaphore(value: 0)
 
+    // The only worker stays held until the deadline has fired, so the operation is still queued
+    // when it does, however slowly this task runs.
     let holder = Task {
       try? await executor.run(priority: .userInitiated) {
         occupied.increment()
-        Thread.sleep(forTimeInterval: 0.3)
+        free.wait()
       }
     }
+    // Also on an early exit, so the worker is not left blocked for the rest of the suite.
+    defer { free.signal() }
     try #require(
       await eventually(within: 10) { occupied.value > 0 }, "the worker was never occupied")
 
@@ -84,6 +89,7 @@ struct BlockingIOStrandingTests {
         try await executor.run(priority: .userInitiated, deadline: 0.05) { marker.touch() }
       }
     }
+    free.signal()
     await holder.value
 
     let giveUp = monotonicNow() + 2.0

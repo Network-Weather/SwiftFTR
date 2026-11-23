@@ -169,6 +169,12 @@ struct DNSServiceCalls: Sendable {
   var setDispatchQueue:
     @Sendable (_ ref: DNSServiceRef, _ queue: DispatchQueue) -> DNSServiceErrorType
   var deallocate: @Sendable (_ ref: DNSServiceRef) -> Void
+  /// When set, arms the lookup's deadline in place of its Dispatch timer: it receives the timeout
+  /// and the action that ends the lookup with ``ReverseDNSLookupOutcome/timedOut``, which a test
+  /// calls, from any thread, at the point it wants the deadline to pass. `nil`, as in
+  /// ``system``, uses the timer.
+  var armDeadline:
+    (@Sendable (_ timeout: TimeInterval, _ expire: @escaping @Sendable () -> Void) -> Void)? = nil
 
   /// The system daemon.
   static let system = DNSServiceCalls(
@@ -346,6 +352,10 @@ final class ReverseDNSLookup: @unchecked Sendable {
   }
 
   private func armDeadline(_ timeout: TimeInterval) {
+    if let substitute = calls.armDeadline {
+      substitute(timeout) { [weak self] in self?.resolve(.timedOut) }
+      return
+    }
     let timer = DispatchSource.makeTimerSource(queue: Self.timerQueue)
     // Capped so the conversion to nanoseconds cannot overflow.
     timer.schedule(deadline: .now() + min(timeout, 365 * 86400))

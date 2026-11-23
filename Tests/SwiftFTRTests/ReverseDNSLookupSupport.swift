@@ -66,13 +66,40 @@ final class FakeDNSService: @unchecked Sendable {
   private var unknownDeallocations = 0
   private var doubleDeallocations = 0
 
-  init(start: Start = .succeed, queueResult: DNSServiceErrorType = DNSServiceStatus.noError) {
+  /// - Parameter controlsDeadline: When true, a lookup's deadline passes only when the test calls
+  ///   ``expireDeadlines()``, never by the clock, so a test can order it against every other
+  ///   event. When false, the lookup's real timer runs.
+  init(
+    start: Start = .succeed, queueResult: DNSServiceErrorType = DNSServiceStatus.noError,
+    controlsDeadline: Bool = true
+  ) {
     self.start = start
     self.queueResult = queueResult
+    self.controlsDeadline = controlsDeadline
+  }
+
+  private let controlsDeadline: Bool
+  private var pendingDeadlines: [@Sendable () -> Void] = []
+  private var armedDeadlines = 0
+
+  /// Deadlines lookups have armed through this fake, fired or not.
+  var deadlinesArmed: Int { locked { armedDeadlines } }
+
+  /// Makes every armed deadline that has not yet been made to pass, pass now, on this thread.
+  /// Returns how many there were.
+  @discardableResult
+  func expireDeadlines() -> Int {
+    let due = locked {
+      let due = pendingDeadlines
+      pendingDeadlines.removeAll()
+      return due
+    }
+    for expire in due { expire() }
+    return due.count
   }
 
   var calls: DNSServiceCalls {
-    DNSServiceCalls(
+    return DNSServiceCalls(
       queryRecord: { [self] flags, interfaceIndex, name, context in
         let call = Self.currentCall()
         lock.lock()
@@ -121,8 +148,21 @@ final class FakeDNSService: @unchecked Sendable {
         contextAliveAtDeallocate.append(query.contextObject != nil)
         deallocatedOnStartQueue.append(call.queueID != nil && call.queueID == query.startQueue)
         live -= 1
-      }
+      },
+      armDeadline: controlsDeadline ? armDeadline : nil
     )
+  }
+
+  /// Records a lookup's deadline, to pass only when ``expireDeadlines()`` is called.
+  private var armDeadline:
+    @Sendable (_ timeout: TimeInterval, _ expire: @escaping @Sendable () -> Void) -> Void
+  {
+    { [self] _, expire in
+      lock.lock()
+      pendingDeadlines.append(expire)
+      armedDeadlines += 1
+      lock.unlock()
+    }
   }
 
   /// Runs `body` with this fake in place of the daemon.

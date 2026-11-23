@@ -188,9 +188,9 @@ struct ReverseDNSLookupTests {
     let tooLong = [label63, label63, label63, [UInt8](repeating: 0x62, count: 62)]
     #expect(decode(tooLong) == nil, "256 bytes in wire form")
     #expect(decode([[UInt8](repeating: 0x61, count: 64)]) == nil, "a 64-byte label")
-    #expect(
-      [UInt8]([1, 0x61, 0xC0, 0x00]).withUnsafeBytes { ReverseDNSLookup.hostname(fromPTR: $0) }
-        == nil, "a compression pointer after a label")
+    let pointerAfterLabel: [UInt8] = [1, 0x61, 0xC0, 0x00]
+    let followed = pointerAfterLabel.withUnsafeBytes { ReverseDNSLookup.hostname(fromPTR: $0) }
+    #expect(followed == nil, "a compression pointer after a label")
 
     // Whatever the bytes, the result is printable ASCII, and its unescaped dots separate
     // exactly the labels the data had.
@@ -359,7 +359,7 @@ struct ReverseDNSLookupTests {
 
   @Test("With no reply, the lookup times out at its deadline, not before")
   func deadline() async throws {
-    let fake = FakeDNSService()
+    let fake = FakeDNSService(controlsDeadline: false)
     let timeout: TimeInterval = 0.3
     let (outcome, elapsed) = try await measure(within: Self.watchdog) {
       await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: timeout) }
@@ -373,7 +373,7 @@ struct ReverseDNSLookupTests {
 
   @Test("Cancelled before it starts: cancelled, no query made, the permit returned")
   func cancelledBeforeStart() async throws {
-    let fake = FakeDNSService()
+    let fake = FakeDNSService(controlsDeadline: false)
     let limiter = _ConcurrencySemaphore(maxConcurrent: 1)
     let task = Task {
       withUnsafeCurrentTask { $0?.cancel() }
@@ -439,7 +439,7 @@ struct ReverseDNSLookupTests {
   func startStalledPastDeadline() async throws {
     let gate = StallGate()
     defer { gate.open() }
-    let fake = FakeDNSService(start: .gated(gate))
+    let fake = FakeDNSService(start: .gated(gate), controlsDeadline: false)
     let (outcome, _) = try await measure(within: Self.watchdog) {
       await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: 0.2) }
     }
@@ -525,17 +525,17 @@ struct ReverseDNSLookupTests {
   @Test("Order: the reply runs before the deadline, and the deadline then does nothing")
   func orderReplyThenDeadline() async throws {
     let fake = FakeDNSService()
-    let timeout: TimeInterval = 0.2
     let task = Task {
-      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: timeout) }
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout) }
     }
     try await Self.waitScheduled(fake, 1)
     fake.deliver(rdata: PTRData.name("host.example"))
     let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
     #expect(outcome == .answer("host.example"))
     try await Self.expectTornDown(fake, references: 1)
-    // Past the deadline, nothing more happened: the timer was cancelled with the outcome.
-    try? await Task.sleep(nanoseconds: UInt64(timeout * 3 * 1_000_000_000))
+    // The deadline passes after the outcome: nothing more happens.
+    #expect(fake.expireDeadlines() == 1)
+    await fake.drainQueue()
     #expect(fake.deallocs.count == 1)
   }
 
@@ -545,13 +545,14 @@ struct ReverseDNSLookupTests {
     let gate = StallGate()
     defer { gate.open() }
     let task = Task {
-      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: 0.2) }
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout) }
     }
     try await Self.waitScheduled(fake, 1)
     #expect(fake.blockQueue(until: gate))
     fake.deliver(rdata: PTRData.name("host.example"))
+    // The deadline passes off the lookup's queue, which is held with the reply in it.
+    #expect(fake.expireDeadlines() == 1)
     let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
-    // The deadline ran on its own queue while the lookup's queue was held with the reply in it.
     let releasedWhileQueueHeld = fake.deallocs.isEmpty
     #expect(releasedWhileQueueHeld)
     #expect(outcome == .timedOut)
@@ -565,9 +566,8 @@ struct ReverseDNSLookupTests {
     let fake = FakeDNSService()
     let gate = StallGate()
     defer { gate.open() }
-    let timeout: TimeInterval = 0.2
     let task = Task {
-      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: timeout) }
+      await fake.install { await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout) }
     }
     try await Self.waitScheduled(fake, 1)
     #expect(fake.blockQueue(until: gate))
@@ -575,8 +575,8 @@ struct ReverseDNSLookupTests {
     task.cancel()
     let (outcome, _) = try await measure(within: Self.watchdog) { await task.value }
     #expect(outcome == .cancelled)
-    // Let the deadline pass while the queue is still held; it must not resolve again.
-    try? await Task.sleep(nanoseconds: UInt64(timeout * 2 * 1_000_000_000))
+    // The deadline passes while the queue is still held; it must not resolve again.
+    #expect(fake.expireDeadlines() == 1)
     gate.open()
     try await Self.expectTornDown(fake, references: 1)
     #expect(fake.callbacksDelivered == 1)
@@ -604,7 +604,7 @@ struct ReverseDNSLookupTests {
   @Test("Cancellation racing the deadline: one outcome, and every reference deallocated once")
   func cancellationRacesDeadline() async throws {
     for iteration in 0..<200 {
-      let fake = FakeDNSService()
+      let fake = FakeDNSService(controlsDeadline: false)
       let limiter = _ConcurrencySemaphore(maxConcurrent: 1)
       let timeout = 0.0005 * Double(1 + iteration % 6)
       let task = Task {
@@ -632,12 +632,13 @@ struct ReverseDNSLookupTests {
   func limiterBoundsReferences() async throws {
     let fake = FakeDNSService()
     let limiter = _ConcurrencySemaphore(maxConcurrent: 3)
-    let (outcomes, _) = try await measure(within: Self.watchdog) {
+    let lookups = Task {
       await fake.install {
         await withTaskGroup(of: ReverseDNSLookupOutcome.self) { group in
           for _ in 0..<12 {
             group.addTask {
-              await ReverseDNSLookup.lookup("192.0.2.1", timeout: 0.1, limiter: limiter)
+              await ReverseDNSLookup.lookup(
+                "192.0.2.1", timeout: Self.longTimeout, limiter: limiter)
             }
           }
           var all: [ReverseDNSLookupOutcome] = []
@@ -646,6 +647,20 @@ struct ReverseDNSLookupTests {
         }
       }
     }
+    // Three references open at once, the cap, before any deadline passes.
+    try await waitBounded("three references open", within: Self.watchdog) {
+      _ = await eventually(within: 60) { fake.liveCount == 3 }
+    }
+    // Then each wave's deadlines pass, which hands the permits to the next three.
+    var expired = 0
+    while expired < 12 {
+      let armedBefore = expired
+      try await waitBounded("another deadline armed", within: Self.watchdog) {
+        _ = await eventually(within: 60) { fake.deadlinesArmed > armedBefore }
+      }
+      expired += fake.expireDeadlines()
+    }
+    let (outcomes, _) = try await measure(within: Self.watchdog) { await lookups.value }
     #expect(outcomes.count == 12)
     #expect(outcomes.allSatisfy { $0 == .timedOut })
     #expect(fake.maxConcurrent == 3)
@@ -668,8 +683,9 @@ struct ReverseDNSLookupTests {
         await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout, limiter: limiter)
       }
     }
-    // Let the waiter reach the limiter before cancelling it; either order must end the wait.
-    try? await Task.sleep(nanoseconds: 50_000_000)
+    try await waitBounded("the fourth lookup waiting for a permit", within: Self.watchdog) {
+      _ = await eventually(within: 60) { await limiter.waitingCount == 1 }
+    }
     waiter.cancel()
     let (waited, _) = try await measure(within: Self.watchdog) { await waiter.value }
     #expect(waited == .cancelled)
@@ -688,24 +704,36 @@ struct ReverseDNSLookupTests {
     defer { gate.open() }
     let fake = FakeDNSService(start: .gated(gate))
     let limiter = _ConcurrencySemaphore(maxConcurrent: 1)
-    let (first, _) = try await measure(within: Self.watchdog) {
+    let first = Task {
       await fake.install {
-        await ReverseDNSLookup.lookup("192.0.2.1", timeout: 0.1, limiter: limiter)
+        await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout, limiter: limiter)
       }
     }
-    #expect(first == .timedOut)
+    // The start call is stalled in the daemon when the deadline passes.
+    try await waitBounded("the first start call", within: Self.watchdog) {
+      _ = await eventually(within: 60) { fake.starts.count == 1 && fake.deadlinesArmed == 1 }
+    }
+    #expect(fake.expireDeadlines() == 1)
+    let (firstOutcome, _) = try await measure(within: Self.watchdog) { await first.value }
+    #expect(firstOutcome == .timedOut)
 
-    // The stalled start call will still make a reference, so the next lookup must wait.
+    // The stalled start call will still make a reference, so the next lookup waits for the
+    // permit, and does not start.
     let next = Task {
       await fake.install {
-        await ReverseDNSLookup.lookup("192.0.2.1", timeout: 0.1, limiter: limiter)
+        await ReverseDNSLookup.lookup("192.0.2.1", timeout: Self.longTimeout, limiter: limiter)
       }
     }
-    try? await Task.sleep(nanoseconds: 200_000_000)
-    let waitedForPermit = fake.starts.count == 1
-    #expect(waitedForPermit)
+    try await waitBounded("the next lookup waiting for the permit", within: Self.watchdog) {
+      _ = await eventually(within: 60) { await limiter.waitingCount == 1 }
+    }
+    let startedWhileWaiting = fake.starts.count
+    #expect(startedWhileWaiting == 1)
 
+    // The start returns, the first reference is deallocated, and the permit passes on.
     gate.open()
+    try await Self.waitScheduled(fake, 2)
+    #expect(fake.expireDeadlines() == 1)
     let (second, _) = try await measure(within: Self.watchdog) { await next.value }
     #expect(second == .timedOut)
     try await Self.expectTornDown(fake, references: 2)
