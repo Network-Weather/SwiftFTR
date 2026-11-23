@@ -3,8 +3,13 @@ Changelog
 
 All notable changes to this project are documented here. This project follows Semantic Versioning.
 
-Unreleased
-----------
+0.18.1 — 2026-11-22
+-------------------
+
+Bug fixes found by working through the open issues after 0.18.0. No public API is added, removed
+or changed: `swift package diagnose-api-breaking-changes v0.18.0` reports no breaking change.
+Three results differ for an unmodified caller, each because 0.18.0 reported the wrong thing; they
+are listed first.
 
 ### Behavior changes
 
