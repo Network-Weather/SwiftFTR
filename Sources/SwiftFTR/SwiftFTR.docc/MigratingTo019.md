@@ -105,7 +105,10 @@ and names another name (compared without regard to ASCII case), another type or 
 ignored, like one with another transaction ID, and the query keeps waiting to the same deadline.
 This applies to the query methods (``DNSQueries``), ``dnsProbe(server:query:timeout:)`` and the
 Team Cymru ASN lookups. A reply with no question section, such as a header-only REFUSED, still
-decides the query with its response code; one whose question cannot be read is still malformed.
+decides the query with its response code; one whose first question cannot be read (not plain
+labels, over 255 bytes, or cut short) is still malformed. A first question whose name is a
+compression pointer, which 0.18 read as the root name and whose response code it believed, is now
+malformed too: there is no earlier name for it to point at.
 
 **What a caller sees.** A server that answers only with replies to another question, which 0.18
 reported as answered with those replies' records, now times out: the query methods throw
