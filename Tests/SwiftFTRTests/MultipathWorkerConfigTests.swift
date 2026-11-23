@@ -144,9 +144,12 @@ struct MultipathWorkerConfigTests {
     #expect(flow.config.preferredFamily == .v4)
     let flowCache = await flow.rdnsCache
     let flowResolver = await flow.asnResolver
-    #expect(flowCache === rdns, "a flow must share the caller's reverse-DNS cache")
-    #expect(
-      (flowResolver as AnyObject) === resolver, "a flow must use the caller's ASN resolver")
+    // Compared outside `#expect`: Swift 6.1 crashes lowering the identity comparison of an
+    // existential with an actor when the macro captures its operands.
+    let sharesCache = flowCache === rdns
+    let sharesResolver = (flowResolver as AnyObject) === (resolver as AnyObject)
+    #expect(sharesCache, "a flow must share the caller's reverse-DNS cache")
+    #expect(sharesResolver, "a flow must use the caller's ASN resolver")
     #expect(await flow.cachedPublicIP == "198.51.100.10")
   }
 
