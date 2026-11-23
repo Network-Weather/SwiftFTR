@@ -288,8 +288,12 @@ final class ReverseDNSLookup: @unchecked Sendable {
   /// descriptor, its connection to the daemon, but the client library closes that descriptor in
   /// the cancel handler of its dispatch source, which runs on the lookup's queue after the
   /// deallocate returns (dnssd_clientstub.c, `DNSServiceSetDispatchQueue`), while the permit is
-  /// handed on as the deallocate returns. So open daemon descriptors can briefly exceed the cap
-  /// by the lookups whose cancel handler has not yet run.
+  /// handed on as the deallocate returns. So open daemon descriptors can exceed the cap by the
+  /// lookups whose cancel handler has not yet run, and nothing in this code bounds that overhang:
+  /// it depends on when each lookup's queue gets to run. What the code does guarantee is that
+  /// every descriptor is closed once its lookup is done (`ReverseDNSLookupDaemonTests` counts
+  /// them back to zero). Measured, not guaranteed: an overhang of at most one at caps of 1, 4 and
+  /// 16, on a development Mac and on CI.
   static let defaultMaxConcurrentLookups = 32
 
   /// Bounds the lookups in flight in this process, for callers that pass no limiter of their own.
