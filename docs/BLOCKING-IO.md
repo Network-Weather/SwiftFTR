@@ -272,8 +272,9 @@ overlap in time; the "After" column is what must have landed first.
 repeats the existing parameters and adds the new one, all defaulted. Swift resolves a call that
 names none of the new parameters to the initializer with the fewest defaulted parameters, so
 `SwiftFTRConfig()` and every existing call, including one that uses the initializer as a function
-value, compile unchanged and mean what they meant (checked with three such initializers on Swift
-6.4; CI compiles the same shape on 6.1). No initializer signature is changed or removed.
+value, compile unchanged and mean what they meant. That was checked with three such
+initializers on Swift 6.4 only; the pull request that adds the first one adds a test of the
+selection, so CI's Swift 6.1 checks it too. No initializer signature is changed or removed.
 
 **What must ship together.** Reverse-DNS Lookup with Reverse-DNS Cache. Enrichment Lifetimes
 before either Deadline row, or the default deadline budgets one discovery and the call spends
@@ -413,6 +414,10 @@ at expiry, and a blocking `getaddrinfo` already under way runs on in its slot.
 
 - One absolute deadline on one monotonic clock, the one Dispatch timers use, started on entry to
   the actor-isolated method.
+- The probe send burst honors it. The burst retries a send under socket pressure for up to its
+  own 250 ms budget, waiting synchronously on the tracer actor (`SendRetry.swift`); it uses the
+  earlier of that budget and the overall deadline, and stops sending when the overall deadline
+  has passed.
 - The default is the sum of the caps of the phases active for this call (skipping disabled
   reverse DNS, a configured or cached public IP, an embedded ASN database), plus a stated
   scheduling allowance. So by default it fires only when a phase overran its own cap. A
