@@ -936,8 +936,9 @@ public struct DNSProbeOutcome: RawRepresentable, Hashable, Sendable, Codable,
   /// sent (ICMP host or network unreachable), or this machine refused to send toward it at all
   /// (no route, or the interface is down). ``DNSProbeResult/error`` names the errno.
   public static let unreachable = DNSProbeOutcome(rawValue: "unreachable")
-  /// The probe could not run to an answer: invalid input, a socket, bind, connect or send error
-  /// other than no route, or a receive error the probe does not classify. ``DNSProbeResult/error`` says which.
+  /// The probe could not complete: invalid input, a socket, bind, connect or send error other than
+  /// no route before the query left, or, after it left, a receive error the probe does not
+  /// classify. ``DNSProbeResult/error`` says which.
   public static let failed = DNSProbeOutcome(rawValue: "failed")
 
   public var description: String { rawValue }

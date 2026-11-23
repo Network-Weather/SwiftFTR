@@ -115,7 +115,8 @@ Key Features
 - **Ping**: ICMP/ICMPv6 echo with statistics (min/avg/max RTT, jitter, packet loss)
 - **TCP Probe**: Port state detection (open/closed/filtered) over v4 or v6
 - **UDP Probe**: Connected-socket with ICMP/ICMPv6 unreachable detection
-- **DNS Probe**: Direct server queries with 11 record types (A, AAAA, TXT, MX, etc.)
+- **DNS Probe**: `dnsProbe` sends one query to a chosen server and reports whether it answered and how the probe ended (answered, refused, timed out, unreachable, malformed reply or failed)
+- **DNS Queries**: `tracer.dns` queries a chosen server directly for 11 record types (A, AAAA, TXT, MX, etc.) and returns the parsed records
 - **HTTP/HTTPS Probe**: Web server reachability testing
 
 **Multipath Discovery**
