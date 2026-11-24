@@ -680,6 +680,116 @@ final class SwiftFTRCacheTests: XCTestCase {
     XCTAssertEqual(calls, 1, "identical fallbacks did not share a flight")
   }
 
+  /// Through the cache, a Team Cymru lookup whose time runs out still returns the origins already
+  /// answered, and the AS names that came back, as a direct lookup does.
+  func testCachedCymruLookupReturnsAnsweredOriginsAtItsTimeout() async throws {
+    let cymru = CymruDNSResolver(servers: ["192.0.2.1"], query: CymruScript.originsAnswered)
+    let caching = CachingASNResolver(base: cymru)
+
+    let (result, _) = try await SwiftFTRTests.measure(within: 20) {
+      try await caching.resolve(ipv4Addrs: ["8.8.8.8", "1.1.1.1"], timeout: 0.3)
+    }
+
+    XCTAssertEqual(result["8.8.8.8"]?.asn, 15169, "the answered origin was dropped")
+    XCTAssertEqual(result["8.8.8.8"]?.name, "", "the name never came back")
+    XCTAssertEqual(result["1.1.1.1"]?.asn, 13335, "the answered origin was dropped")
+    XCTAssertEqual(result["1.1.1.1"]?.name, "CLOUDFLARENET, US", "the answered name was dropped")
+  }
+
+  /// The default hybrid resolver's DNS fallback does the same for addresses its database lacks.
+  func testHybridFallbackReturnsAnsweredOriginsAtItsTimeout() async throws {
+    let cymru = CymruDNSResolver(servers: ["192.0.2.1"], query: CymruScript.originsAnswered)
+    let store = LocalASNDatabaseStore(loader: { _ in EmptyLocalTable() })
+    let hybrid = HybridASNResolver(
+      local: LocalASNResolver(source: .embedded, store: store),
+      dns: CachingASNResolver(base: cymru), fallbackTimeout: 2)
+
+    let (result, _) = try await SwiftFTRTests.measure(within: 20) {
+      try await hybrid.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 0.3)
+    }
+
+    XCTAssertEqual(result["8.8.8.8"]?.asn, 15169, "the answered origin was dropped")
+  }
+
+  /// What a caller gets when one of its flights failed does not depend on the order it looks at
+  /// them: with no answer from the others it throws, with an answer it returns that answer.
+  func testFailedFlightOutcomeDoesNotDependOnOrder() async throws {
+    // Holds 198.51.100.x for good and 192.0.2.x until `release` opens, then answers it; fails
+    // everything else at once.
+    final class HoldOrFail: ASNResolver, @unchecked Sendable {
+      let gate = StallGate()
+      let release = StallGate()
+      func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+        if ipv4Addrs.contains(where: { $0.hasPrefix("198.51.100.") }) {
+          await gate.waitAsync(limit: 60)
+          return [:]
+        }
+        if ipv4Addrs.contains(where: { $0.hasPrefix("192.0.2.") }) {
+          await release.waitAsync(limit: 60)
+          return Dictionary(
+            uniqueKeysWithValues: ipv4Addrs.map { ($0, ASNInfo(asn: 64_550, name: "OK")) })
+        }
+        throw ControlledResolverError.requestedFailure
+      }
+    }
+
+    var threw = 0
+    var answered = 0
+    let rounds = 20
+    for round in 0..<rounds {
+      let base = HoldOrFail()
+      defer {
+        base.gate.open()
+        base.release.open()
+      }
+      let caching = CachingASNResolver(base: base)
+
+      // A held flight and one that fails at once: nothing to return, so the caller throws.
+      let held = "198.51.100.\(round)"
+      _ = try await caching.resolve(ipv4Addrs: [held], timeout: 0.05)  // leaves its flight held
+      do {
+        _ = try await caching.resolve(ipv4Addrs: [held, "203.0.113.\(round)"], timeout: 0.05)
+      } catch ControlledResolverError.requestedFailure {
+        threw += 1
+      }
+
+      // A flight that answers once released and one that fails at once: the answer is returned.
+      let answering = "192.0.2.\(round)"
+      let starter = Task { try await caching.resolve(ipv4Addrs: [answering], timeout: 30) }
+      let reserved = await eventually(within: 20) {
+        await _ASNMemoryCache.shared.inFlightReservationCount >= 2
+      }
+      XCTAssertTrue(reserved)
+      let joinsBefore = await _ASNMemoryCache.shared.inFlightJoinCount
+      let mixed = Task {
+        try await caching.resolve(ipv4Addrs: [answering, "203.0.114.\(round)"], timeout: 30)
+      }
+      let joined = await eventually(within: 20) {
+        await _ASNMemoryCache.shared.inFlightJoinCount > joinsBefore
+      }
+      XCTAssertTrue(joined)
+      base.release.open()
+      _ = try await starter.value
+      if let result = try? await mixed.value, result[answering] != nil { answered += 1 }
+    }
+    XCTAssertEqual(threw, rounds, "a caller with nothing but a failure did not always throw")
+    XCTAssertEqual(answered, rounds, "an answer beside a failure was not always returned")
+  }
+
+  /// A caller whose time runs out while it is still preparing its addresses starts no lookup: its
+  /// deadline is taken when the call begins.
+  func testDeadlineCoversPreparingTheAddresses() async throws {
+    let base = CountingResolver()
+    let caching = CachingASNResolver(base: base)
+    let addresses = (0..<65_536).map { "8.8.\($0 / 256).\($0 % 256)" }
+
+    let result = try await caching.resolve(ipv4Addrs: addresses, timeout: 1e-9)
+
+    XCTAssertTrue(result.isEmpty)
+    let calls = await base.calls()
+    XCTAssertEqual(calls, 0, "a lookup started after the deadline had passed")
+  }
+
   /// Verify concurrent cache access doesn't corrupt data.
   func testCacheConcurrentAccessCorrectness() async throws {
     actor SequenceResolver: ASNResolver {
@@ -816,4 +926,23 @@ final class SwiftFTRCacheTests: XCTestCase {
 /// A database stand-in that answers nothing.
 private struct EmptyLocalTable: LocalASNTable {
   func lookup(_ ipString: String) -> (asn: UInt32, name: String?)? { nil }
+}
+
+/// Team Cymru answers scripted for a resolver's query function: the origins of 8.8.8.8 and
+/// 1.1.1.1 at once, the AS name of AS13335 at once, and silence for AS15169's name until the
+/// query's deadline.
+enum CymruScript {
+  static let originsAnswered: CymruDNSResolver.TXTQuery = { name, _, deadline in
+    switch name.lowercased() {
+    case "8.8.8.8.origin.asn.cymru.com":
+      return ["15169 | 8.8.8.0/24 | US | arin | 2023-12-28"]
+    case "1.1.1.1.origin.asn.cymru.com":
+      return ["13335 | 1.1.1.0/24 | AU | apnic | 2011-08-11"]
+    case "as13335.asn.cymru.com":
+      return ["13335 | US | arin | 2010-07-14 | CLOUDFLARENET, US"]
+    default:
+      try? await Task.sleep(until: deadline, clock: .continuous)
+      return nil
+    }
+  }
 }
