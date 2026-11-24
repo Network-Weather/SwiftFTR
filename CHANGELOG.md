@@ -155,9 +155,13 @@ Unreleased
   back without ASN data; `preloadASNDatabase()` still waits for the load. Cancelling the caller of
   `LocalASNResolver.resolve` now throws `CancellationError` at once (it waited for the load and
   answered), and a cancelled `preload()` returns, leaving the load running.
-- **`HybridASNResolver`'s DNS fallback gets `fallbackTimeout` or the time the lookup has left,
-  whichever is shorter**, and is skipped when none is left. It got `fallbackTimeout` whatever
-  timeout the caller passed.
+- **`HybridASNResolver` waits for its DNS fallback only until the lookup's timeout**, and skips it
+  when no time is left. It waited out `fallbackTimeout` whatever timeout the caller passed. The
+  fallback itself still runs with `fallbackTimeout`, so concurrent lookups of one address share
+  one cached query.
+- **`LocalASNResolver` lookups no longer queue behind each other**: a batch runs off the resolver,
+  which only hands out the database, and stops at its timeout. A large batch used to hold every
+  other caller of the same resolver until it finished.
 - **A `CachingASNResolver` caller stops waiting at its own `timeout`** with what is cached or has
   arrived, even when the resolver behind it overruns. The shared lookup runs on and fills the
   cache, so the next caller is answered without another upstream call.

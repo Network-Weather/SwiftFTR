@@ -82,7 +82,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - Multiple strategies via `ASNResolverStrategy`: `.dns` (Team Cymru), `.embedded` (SwiftIP2ASN local DB), `.remote(bundledPath:url:)`, `.hybrid(source, fallbackTimeout:)`
 - `_ASNMemoryCache`: in-memory cache with 2048 entry capacity
 - `CymruDNSResolver`: Team Cymru TXT queries over `UDPExchange`, at most 8 in flight per resolve
-- A lookup's `timeout` bounds the whole call through every resolver (Cymru's queries and server fallback, the wait for a loading database, the hybrid fallback, a `CachingASNResolver` waiter); a caller that leaves stops no shared database load or cached flight
+- A lookup's `timeout` bounds the whole call through every resolver (Cymru's queries and server fallback, the wait for a loading database, the hybrid fallback, a `CachingASNResolver` waiter); a caller that leaves stops no shared database load or cached flight and leaves no registration on it (`SharedWork`); the hybrid fallback stays keyed by `fallbackTimeout` so concurrent lookups share it; a `LocalASNResolver` batch runs off the actor
 
 **Probe Modules** — each in its own file:
 - `Ping.swift`: ICMP echo with statistics (min/avg/max RTT, jitter, packet loss)

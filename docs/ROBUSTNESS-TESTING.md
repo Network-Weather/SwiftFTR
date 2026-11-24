@@ -441,11 +441,14 @@ numbers are as of the commit that added this section.
 - **`HybridASNResolver` ignored the lookup's timeout.** Confirmed and fixed. Its DNS fallback got
   `fallbackTimeout` whatever the caller passed (30 s for a 0.5 s lookup), and its wait for a
   database still loading had no bound: with the load held, a 0.3 s lookup was still waiting at a
-  20 s watchdog. One deadline now runs through the local wait and the fallback, which gets the
-  shorter of `fallbackTimeout` and the time left. Tests:
-  `LocalASNResolverTests.testHybridFallbackGetsNoMoreThanTheCallersTimeout`,
-  `testHybridFallbackKeepsItsShorterTimeout` (unchanged behavior: the exact value keeps cached
-  flights shared) and `testHybridReturnsAtItsTimeoutWhileTheDatabaseLoads`.
+  20 s watchdog. One deadline now runs through the local wait and the wait for the fallback,
+  which is skipped once no time is left. The fallback query keeps `fallbackTimeout` as its
+  timeout, because cached flights are keyed by it: review found that giving each caller's
+  query the time it had left made eight concurrent lookups of one address eight upstream calls.
+  Tests: `LocalASNResolverTests.testHybridFallbackWaitEndsAtTheCallersTimeout`,
+  `testHybridFallbackKeepsItsShorterTimeout`, `testHybridReturnsAtItsTimeoutWhileTheDatabaseLoads`
+  (which requires that no fallback is asked) and
+  `SwiftFTRCacheTests.testConcurrentHybridFallbacksShareOneFlight`.
 - **No caller could leave a shared ASN database load.** Confirmed. `LocalASNResolver` waited for
   a load still in flight until it ended, whatever its timeout and even when its task was
   cancelled. The plan's further defect, that a caller leaving cancels the load for the others or
@@ -468,6 +471,27 @@ numbers are as of the commit that added this section.
   with a resolver that overran, a 0.3 s caller was still waiting at a 20 s watchdog. Each caller now
   stops at its own timeout with what is cached or has arrived; the flight runs on and fills the
   cache. Test: `SwiftFTRCacheTests.testCallerReturnsAtItsTimeoutAndLeavesFlightRunning`.
+- **Leaving shared work, as first fixed, left something behind.** Found in review of the fix
+  above. Each caller that stopped waiting left a task suspended on the shared work until it
+  ended: 5,000 timeouts against one held flight grew resident memory by 8 MiB (no growth after).
+  At its deadline a caller also rebuilt its answer from the 2,048-entry cache, which had already
+  evicted part of a flight that finished (2,048 of 2,100 answers). Shared work now has one
+  observer, each caller's registration ends with its wait, and a caller keeps each flight's own
+  answer. Tests: `SwiftFTRCacheTests.testWaitersLeavingSharedWorkLeaveNothingBehind` and
+  `testCallerKeepsAnswersOfFinishedFlightsAtItsTimeout`.
+- **A local lookup's batch ran on the resolver and past its deadline.** Found in the same review.
+  Once the database was loaded, a batch never looked at the clock (400 one-millisecond lookups
+  with a 20 ms timeout all ran), and another caller's lookup waited for the whole batch. A
+  finite timeout too large for an instant on the clock crashed the wait for a loading database
+  ("Not enough bits to represent the passed value"); a timeout past
+  `ConfigurationLimits.maximumTimeout` now sets no bound. Tests:
+  `LocalASNResolverTests.testWarmLookupStopsAtItsDeadline`,
+  `testLookupIsNotQueuedBehindAnotherBatch` and `testHugeTimeoutWaitsForTheLoad`.
+- **A large Team Cymru lookup woke every queued address after its deadline.** Found in the same
+  review: a task per address waited for one of eight slots, and each went on to find the time
+  gone (4,096 addresses made over 8,000 attempts after a 50 ms deadline). At most eight now run,
+  and the next starts only while time is left. Test:
+  `CymruEventBasedTests.noAddressStartsAfterTheDeadline`.
 
 Observations that are not defects of the library:
 

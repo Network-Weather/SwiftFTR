@@ -440,7 +440,8 @@ A lookup's `timeout` bounds the whole call through every built-in resolver: Team
 and AS-name queries and its fallback to the second server share it; a lookup waits for a database
 still loading only until it passes (the load runs on and answers the next lookup, and a caller
 leaving, by timeout or cancellation, never stops it or marks the resolver failed); the hybrid
-resolver's DNS fallback gets `fallbackTimeout` or the time left, whichever is shorter; and a
+resolver waits for its DNS fallback only until the timeout (the query keeps `fallbackTimeout`,
+so concurrent lookups share it); a local lookup's batch runs off the resolver; and a
 `CachingASNResolver` caller stops waiting at its own timeout while the shared lookup fills the
 cache. A classified trace passes 1.5 s. A cancelled caller of `LocalASNResolver.resolve` gets
 `CancellationError`.
