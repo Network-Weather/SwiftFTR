@@ -163,15 +163,25 @@ struct FaultInjectionFixtureTests {
     defer { responder.stop() }
     let client = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
     defer { close(client) }
-    setReceiveTimeout(client, seconds: 1)
+    // Generous: the answer ends the wait, and loopback can be slow on a loaded host.
+    setReceiveTimeout(client, seconds: 10)
     var (address, length) = responder.address
     let sent = withUnsafePointer(to: &address) {
       $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(client, nil, 0, 0, $0, length) }
     }
     #expect(sent == 0)
-    var reply = [UInt8](repeating: 0, count: 8)
-    let received = recv(client, &reply, reply.count, 0)
-    #expect(received == 1)
+    // On a thread of its own, so the blocking read holds no cooperative thread. The client's
+    // ephemeral port can receive another test's stray, so read until the responder's one byte.
+    let answered = try await onOwnThread { () -> Bool in
+      var reply = [UInt8](repeating: 0, count: 64)
+      while true {
+        let received = recv(client, &reply, reply.count, 0)
+        if received < 0 { return false }
+        if received == 1 && reply[0] == 0x2A { return true }
+      }
+    }
+    #expect(answered, "the responder never answered the zero-byte request")
+    // Counted before the reply was sent.
     #expect(responder.requests.value == 1)
   }
 
@@ -464,12 +474,17 @@ struct FaultInjectionFixtureTests {
       // The refusal ends the wait as soon as it comes back. ICMP errors are rate-limited host
       // wide, so on a loaded host it may not come, and the wait then ends at its bound: a stray
       // still in flight after it would go unseen, which can only let this pass, never fail it.
+      // A refusal is read once and then gone, so each sender's is remembered across polls.
+      let refusals = DescriptorCopies()
       let strays = senders
       let refused = await eventually(within: 2) {
-        strays.allSatisfy { sender in
+        for sender in strays where !refusals.all.contains(sender) {
           var byte: UInt8 = 0
-          return recv(sender, &byte, 1, MSG_DONTWAIT) < 0 && errno == ECONNREFUSED
+          if recv(sender, &byte, 1, MSG_DONTWAIT) < 0 && errno == ECONNREFUSED {
+            refusals.add(sender)
+          }
         }
+        return refusals.all.count == strays.count
       }
       #expect(await eventually(within: 10) { queuedDatagrams(probe) >= 1 })
       #expect(
@@ -562,6 +577,40 @@ struct FaultInjectionFixtureTests {
         == network.port)
   }
 
+  @Test(
+    "Trace, stream and ping read their probe socket through the receive observer",
+    arguments: Operation.allCases)
+  func operationsReadThroughTheObserver(operation: Operation) async throws {
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 1))
+    defer { network.stop() }
+    let reads = FaultCounter()
+    let observe: TestSeams.ObserveProbeReceive = { _, receive in
+      let result = receive()
+      let code = errno
+      if result >= 0 { reads.increment() }
+      errno = code
+      return result
+    }
+    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 60_000, noReverseDNS: true))
+    _ = try await measure(within: 20) {
+      try await TestSeams.$observeProbeReceive.withValue(observe) {
+        try await network.install {
+          switch operation {
+          case .trace: _ = try await tracer.trace(to: "fake.test")
+          case .stream:
+            for try await _ in tracer.traceStream(
+              to: "fake.test", config: StreamingTraceConfig(probeTimeout: 60, maxHops: 1))
+            {}
+          case .ping:
+            _ = try await tracer.ping(to: "fake.test", config: PingConfig(count: 1, timeout: 60))
+          }
+        }
+      }
+    }
+    // The destination's reply ends each one, and it can only have been read through the observer.
+    #expect(reads.value >= 1, "the \(operation) read nothing through the observer")
+  }
+
   @Test("A stopped UDP fixture's own thread closes its socket")
   func udpFixtureThreadClosesItsSocket() async throws {
     let responder = try LoopbackUDPResponder(accepts: .payload([])) { _ in nil }
@@ -578,7 +627,8 @@ struct FaultInjectionFixtureTests {
   }
 }
 
-/// Descriptors a socket factory duplicated, for a test to inspect after the operation closed its own.
+/// Descriptors a test collects from another thread or across polls: probe-socket duplicates kept
+/// past the operation's close, or stray senders already seen refused.
 private final class DescriptorCopies: @unchecked Sendable {
   private let lock = NSLock()
   private var fds: [Int32] = []

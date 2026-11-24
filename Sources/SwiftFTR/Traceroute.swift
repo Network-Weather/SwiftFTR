@@ -787,6 +787,7 @@ public actor SwiftFTR {
       streamConfig: streamConfig,
       enableLogging: config.enableLogging,
       sendProbe: sendProbe,
+      observeReceive: TestSeams.observeProbeReceive,
       yield: yield
     )
     receiveOwnsSocket = true
@@ -932,7 +933,8 @@ public actor SwiftFTR {
       maxHops: maxHops,
       timeout: timeout,
       destinationIP: resolved.canonical,
-      enableLogging: config.enableLogging
+      enableLogging: config.enableLogging,
+      observeReceive: TestSeams.observeProbeReceive
     )
     receiveOwnsSocket = true
 
@@ -1771,7 +1773,8 @@ internal func sendTraceProbe(
 /// `nil` on EAGAIN/EWOULDBLOCK so callers can drain in a loop.
 internal func recvTraceMessage(
   sockfd: Int32, family: Int32,
-  recvBuffer: inout [UInt8], cmsgBuffer: inout [UInt8]
+  recvBuffer: inout [UInt8], cmsgBuffer: inout [UInt8],
+  observe: TestSeams.ObserveProbeReceive?
 ) -> (parsed: ParsedICMP, n: Int)? {
   var storage = sockaddr_storage()
   if family == AF_INET6 {
@@ -1790,6 +1793,7 @@ internal func recvTraceMessage(
             msg.msg_control = UnsafeMutableRawPointer(cb.baseAddress)
             msg.msg_controllen = socklen_t(cb.count)
             msg.msg_flags = 0
+            if let observe { return observe(sockfd) { recvmsg(sockfd, &msg, 0) } }
             return recvmsg(sockfd, &msg, 0)
           }
         }
@@ -1809,7 +1813,10 @@ internal func recvTraceMessage(
   let n = recvBuffer.withUnsafeMutableBytes { rb -> ssize_t in
     withUnsafeMutablePointer(to: &storage) { sp in
       sp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        recvfrom(sockfd, rb.baseAddress, rb.count, 0, sa, &addrlen)
+        if let observe {
+          return observe(sockfd) { recvfrom(sockfd, rb.baseAddress, rb.count, 0, sa, &addrlen) }
+        }
+        return recvfrom(sockfd, rb.baseAddress, rb.count, 0, sa, &addrlen)
       }
     }
   }
@@ -1929,6 +1936,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
   private let maxHops: Int
   private let destinationIP: String
   private let enableLogging: Bool
+  private let observeReceive: TestSeams.ObserveProbeReceive?
 
   private var outstanding: [UInt16: TraceSendInfo]
   private var hops: [TraceHop?]
@@ -1955,8 +1963,10 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     maxHops: Int,
     timeout: TimeInterval,
     destinationIP: String,
-    enableLogging: Bool
+    enableLogging: Bool,
+    observeReceive: TestSeams.ObserveProbeReceive?
   ) {
+    self.observeReceive = observeReceive
     self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
@@ -2029,7 +2039,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
       guard
         let received = recvTraceMessage(
           sockfd: socket.fd, family: family,
-          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer)
+          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer, observe: observeReceive)
       else { return }  // EAGAIN/EWOULDBLOCK or parse-fail
       let parsed = received.parsed
 
@@ -2142,6 +2152,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private let streamConfig: StreamingTraceConfig
   private let enableLogging: Bool
   private let sendProbe: TestSeams.SendProbe?
+  private let observeReceive: TestSeams.ObserveProbeReceive?
   private let yieldHop: @Sendable (StreamingHop) -> Bool
 
   private var outstanding: [UInt16: TraceSendInfo]
@@ -2174,9 +2185,11 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     streamConfig: StreamingTraceConfig,
     enableLogging: Bool,
     sendProbe: TestSeams.SendProbe?,
+    observeReceive: TestSeams.ObserveProbeReceive?,
     yield: @Sendable @escaping (StreamingHop) -> Bool
   ) {
     self.sendProbe = sendProbe
+    self.observeReceive = observeReceive
     self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
@@ -2261,7 +2274,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       guard
         let received = recvTraceMessage(
           sockfd: socket.fd, family: family,
-          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer)
+          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer, observe: observeReceive)
       else { return }
       let parsed = received.parsed
 

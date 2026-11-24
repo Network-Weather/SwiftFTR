@@ -25,6 +25,7 @@ final class HeldUDPServer: @unchecked Sendable {
   private var stopped = false
   private var released = false
   private var releasedAt: TimeInterval?
+  private var firstRequestAt: TimeInterval?
   private var clients: [(sockaddr_storage, socklen_t)] = []
 
   /// - Parameter gate: when given, the serve thread reads nothing until it opens.
@@ -48,6 +49,13 @@ final class HeldUDPServer: @unchecked Sendable {
   }
 
   var host: String { family == AF_INET6 ? "::1" : "127.0.0.1" }
+
+  /// When the first binding request was read, stamped on the serve thread; `nil` until then.
+  var firstRequestTime: TimeInterval? {
+    lock.lock()
+    defer { lock.unlock() }
+    return firstRequestAt
+  }
 
   /// When ``release()`` was first called, stamped on the releasing thread; `nil` while held.
   var releaseTime: TimeInterval? {
@@ -130,6 +138,7 @@ final class HeldUDPServer: @unchecked Sendable {
       } else {
         clients.append((source, length))
       }
+      firstRequestAt = firstRequestAt ?? monotonicNow()
       lock.unlock()
       requests.increment()
     }
@@ -378,8 +387,22 @@ struct AsyncPublicIPDiscoveryTests {
       first.stop()
       second.stop()
     }
-    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { _ in nil }
+    // When each step happened, attached to the failures below: this test failed once in about
+    // 500 strict repetitions with the fallback never asked, and 229 later ones did not repeat it.
+    let timeline = Timeline()
+    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { _ in
+      timeline.mark("whoami query arrived")
+      return nil
+    }
     defer { whoami.stop() }
+    // The fallback's query is the only UDP exchange in this test.
+    let send: TestSeams.SendDatagram = { fd, bytes in
+      let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+      let code = errno
+      timeline.mark("whoami query sent: \(sent) bytes, errno \(sent < 0 ? code : 0)")
+      Darwin.errno = code
+      return sent
+    }
     // One slot, so a call queued after the stalled attempt runs only once that attempt returns.
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-budget")
     let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
@@ -389,30 +412,37 @@ struct AsyncPublicIPDiscoveryTests {
     // what is checked below must happen inside it: the first attempt sent within STUN's share
     // (four seconds) and the fallback asked in the four after. On a three-core CI runner with the
     // rest of the suite running, a one-second budget ended before the first attempt was sent.
+    timeline.mark("discovery started; STUN's share ends at +4 s, the budget at +8 s")
     let outcome = try await measure(within: Self.watchdog) {
       await Self.withFixtures(servers: servers, whoamiPort: whoami.port, executor: executor) {
-        do {
-          return Result<PublicIPObservation, Error>.success(
-            try await publicIPDiscovery(
-              family: .v4,
-              stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
-              interface: nil, sourceIP: nil, enableLogging: false, budget: 8))
-        } catch {
-          return .failure(error)
+        await TestSeams.$sendDatagram.withValue(send) {
+          do {
+            return Result<PublicIPObservation, Error>.success(
+              try await publicIPDiscovery(
+                family: .v4,
+                stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
+                interface: nil, sourceIP: nil, enableLogging: false, budget: 8))
+          } catch {
+            return .failure(error)
+          }
         }
       }
     }.0
+    timeline.mark("discovery returned")
+    if let asked = first.firstRequestTime { timeline.mark("first STUN request arrived", at: asked) }
     #expect(throws: PublicIPDiscoveryTimeout.self) { try outcome.get() }
     #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
     // Each fixture counts a request on its own thread, so wait for the counts.
     let firstAsked = await eventually(within: 10) { first.requests.value == 1 }
-    #expect(firstAsked, "the first server was asked \(first.requests.value) times")
+    #expect(
+      firstAsked, "the first server was asked \(first.requests.value) times; \(timeline.summary)")
 
     // STUN's share of the budget ends at half of it, so the fallback was asked inside the
     // budget, and the second server never got time.
     #expect(second.requests.value == 0)
     let fallbackAsked = await eventually(within: 10) { whoami.requests.value == 1 }
-    #expect(fallbackAsked, "the fallback was asked \(whoami.requests.value) times")
+    #expect(
+      fallbackAsked, "the fallback was asked \(whoami.requests.value) times; \(timeline.summary)")
 
     // The discovery itself ended, not only the wait for it: once the stalled attempt lets go of
     // its slot, nothing goes on to the next server or asks the fallback again.
@@ -722,5 +752,22 @@ struct AsyncPublicIPDiscoveryTests {
       return
     }
     #expect(dnsError.contains("No response from DNS servers"), "\(dnsError)")
+  }
+}
+
+/// Named moments of a test, on `monotonicNow()`'s clock, for a failure message.
+final class Timeline: @unchecked Sendable {
+  private let lock = NSLock()
+  private var events: [(String, TimeInterval)] = []
+
+  func mark(_ event: String, at time: TimeInterval = monotonicNow()) {
+    lock.withLock { events.append((event, time)) }
+  }
+
+  /// Every event, in time order, as seconds after the first.
+  var summary: String {
+    let sorted = lock.withLock { events }.sorted { $0.1 < $1.1 }
+    guard let start = sorted.first?.1 else { return "no events" }
+    return sorted.map { String(format: "+%.3f s %@", $0.1 - start, $0.0) }.joined(separator: "; ")
   }
 }
