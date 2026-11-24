@@ -711,7 +711,7 @@ struct DNSForeignReplyTests {
   static let txtRecord: [UInt8] =
     [0xC0, 0x0C, 0, 16, 0, 1, 0, 0, 0, 60, 0, 3, 2] + Array("ok".utf8)
 
-  @Test("A TXT lookup, as the whoami fallback makes it, ignores a reply for another query")
+  @Test("A Team Cymru TXT lookup ignores a reply for another query")
   func txtForeignThenValid() async throws {
     let peer = try ScriptedDNSPeer { query in
       let reply = FaultInjectionWireTests.dnsResponse(to: query, answers: Self.txtRecord)
