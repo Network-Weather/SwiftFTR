@@ -475,10 +475,14 @@ struct PublicIPResolverTests {
     let probesAtAsk = TimeStamp()
     let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9"))) {
       probesAtAsk.set(TimeInterval(network.probes.value))
+      // The question takes a known time, which the run's reported duration must include.
+      usleep(400_000)
     }
     let tracer = Self.tracer(.custom(resolver))
 
     let topology = try await Self.discoverPaths(tracer, on: network)
+
+    #expect(topology.discoveryDuration >= 0.4, "the duration leaves out the question")
 
     #expect(resolver.asked.value == 1)
     #expect(resolver.requests.map(\.family) == [.v4])

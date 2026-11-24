@@ -354,10 +354,18 @@ struct MultipathDiscovery<Worker: MultipathFlowRunning>: Sendable {
   private let publicIP: PublicIPObservation?
   private let debugTracing: Bool
 
-  init(worker: Worker, config: SwiftFTRConfig, publicIP: PublicIPObservation? = nil) {
+  /// Seconds the run spent before this value was made: the public-address question is asked
+  /// first, and ``NetworkTopology/discoveryDuration`` counts it.
+  private let elapsedBefore: TimeInterval
+
+  init(
+    worker: Worker, config: SwiftFTRConfig, publicIP: PublicIPObservation? = nil,
+    elapsedBefore: TimeInterval = 0
+  ) {
     self.worker = worker
     self.config = config
     self.publicIP = publicIP
+    self.elapsedBefore = elapsedBefore
     self.debugTracing =
       ProcessInfo.processInfo.environment["SWIFTFTR_DEBUG_MULTIPATH"] != nil
   }
@@ -488,7 +496,7 @@ struct MultipathDiscovery<Worker: MultipathFlowRunning>: Sendable {
 
     try Task.checkCancellation()
 
-    let duration = monotonicTime() - startTime
+    let duration = elapsedBefore + (monotonicTime() - startTime)
 
     return NetworkTopology(
       destination: target,
@@ -637,6 +645,7 @@ extension SwiftFTR {
       // its absence, is handed to every flow, so no flow asks again. It is asked on its own,
       // before the race below, because both wait on the handle's one cancellation slot.
       try validateBeforeQuestion(target: target)
+      let asked = monotonicNow()
       let publicIP = try await publicIPObservation(for: .v4, handle: handle)
       let worker = MultipathWorkerSpawner(
         baseConfig: swiftConfig,
@@ -644,7 +653,9 @@ extension SwiftFTR {
         asnResolver: self.asnResolver,
         publicIP: publicIP
       )
-      let discovery = MultipathDiscovery(worker: worker, config: swiftConfig, publicIP: publicIP)
+      let discovery = MultipathDiscovery(
+        worker: worker, config: swiftConfig, publicIP: publicIP,
+        elapsedBefore: monotonicNow() - asked)
       outcome = .success(
         try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
           group.addTask {
