@@ -292,22 +292,23 @@ internal func stunExchange(
     throw STUNError.invalidTimeout(timeout)
   }
   let (request, transactionID) = makeSTUNBindingRequest()
+  // Connected, so the kernel delivers only the server's datagrams to this socket.
+  let connectToServer: (Int32) throws -> Void = { fd in
+    var server = server
+    let connected = withUnsafePointer(to: &server) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, serverLen) }
+    }
+    guard connected == 0 else {
+      throw STUNError.connectFailed(errno: errno, details: "Failed to connect to \(serverLabel)")
+    }
+  }
   let reply: UDPExchangeReply
   do {
     reply = try await UDPExchange.perform(
       adopting: fd, request: request, timeout: timeout, receiveCapacity: 512,
       accepts: { isSTUNReply($0, to: transactionID) },
-      send: send ?? { fd, bytes in Darwin.send(fd, bytes.baseAddress, bytes.count, 0) }
-    ) { fd in
-      // Connected, so the kernel delivers only the server's datagrams to this socket.
-      var server = server
-      let connected = withUnsafePointer(to: &server) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, serverLen) }
-      }
-      guard connected == 0 else {
-        throw STUNError.connectFailed(errno: errno, details: "Failed to connect to \(serverLabel)")
-      }
-    }
+      send: send ?? { fd, bytes in Darwin.send(fd, bytes.baseAddress, bytes.count, 0) },
+      configure: connectToServer)
   } catch let failure as UDPExchangeFailure {
     throw STUNError(failure, serverLabel: serverLabel)
   }
