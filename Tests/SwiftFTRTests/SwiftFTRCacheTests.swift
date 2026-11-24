@@ -571,6 +571,85 @@ final class SwiftFTRCacheTests: XCTestCase {
     XCTAssertEqual(base.cancelled.value, 0, "the flight was cancelled when its caller left")
   }
 
+  /// A caller whose timeout passes while one of its flights is held still gets every answer the
+  /// other flights gave, however many there are, whichever flight it waited on first.
+  func testCallerKeepsAnswersOfFinishedFlightsAtItsTimeout() async throws {
+    final class HoldingResolver: ASNResolver, @unchecked Sendable {
+      let gate = StallGate()
+      let held: Set<String>
+      init(held: Set<String>) { self.held = held }
+      func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+        if ipv4Addrs.contains(where: held.contains) { await gate.waitAsync(limit: 60) }
+        var out: [String: ASNInfo] = [:]
+        for ip in ipv4Addrs { out[ip] = ASNInfo(asn: 64_530, name: "Held") }
+        return out
+      }
+    }
+
+    // More answers than the cache keeps, so they cannot be read back from it. Each round starts
+    // its two flights afresh, so the order the caller waits on them varies between rounds.
+    let rounds = 6
+    let heldAddresses = Set((0..<rounds).map { "198.51.100.\($0)" })
+    let base = HoldingResolver(held: heldAddresses)
+    defer { base.gate.open() }
+    let caching = CachingASNResolver(base: base)
+    for round in 0..<rounds {
+      let held = "198.51.100.\(round)"
+      // The same timeout as the caller below, so the caller joins this flight for `held`.
+      let holding = Task { try await caching.resolve(ipv4Addrs: [held], timeout: 1) }
+      let reserved = await eventually(within: 20) {
+        await _ASNMemoryCache.shared.inFlightReservationCount >= round + 1
+      }
+      XCTAssertTrue(reserved)
+      let quick = (0..<2_100).map { "203.\(round).\($0 / 256).\($0 % 256)" }
+      let (result, _) = try await SwiftFTRTests.measure(within: 20) {
+        try await caching.resolve(ipv4Addrs: [held] + quick, timeout: 1)
+      }
+      let answered = quick.filter { result[$0] != nil }.count
+      XCTAssertEqual(answered, quick.count, "round \(round): answers lost at the timeout")
+      holding.cancel()
+    }
+  }
+
+  /// Concurrent hybrid lookups of one address the database lacks share one DNS flight, whatever
+  /// time each has left.
+  func testConcurrentHybridFallbacksShareOneFlight() async throws {
+    final class HeldCountingResolver: ASNResolver, @unchecked Sendable {
+      let gate = StallGate()
+      let calls = FaultCounter()
+      func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+        calls.increment()
+        await gate.waitAsync(limit: 60)
+        var out: [String: ASNInfo] = [:]
+        for ip in ipv4Addrs { out[ip] = ASNInfo(asn: 64_540, name: "DNS") }
+        return out
+      }
+    }
+
+    let base = HeldCountingResolver()
+    defer { base.gate.open() }
+    let store = LocalASNDatabaseStore(loader: { _ in EmptyLocalTable() })
+    let hybrid = HybridASNResolver(
+      local: LocalASNResolver(source: .embedded, store: store),
+      dns: CachingASNResolver(base: base), fallbackTimeout: 30)
+
+    let lookups = (0..<8).map { _ in
+      Task { try await hybrid.resolve(ipv4Addrs: ["203.0.113.90"], timeout: 30) }
+    }
+    let allArrived = await eventually(within: 20) {
+      await base.calls.value + _ASNMemoryCache.shared.inFlightJoinCount >= 8
+    }
+    XCTAssertTrue(allArrived, "the lookups never all reached the fallback")
+    let calls = base.calls.value
+
+    base.gate.open()
+    for lookup in lookups {
+      let (result, _) = try await SwiftFTRTests.measure(within: 20) { try await lookup.value }
+      XCTAssertEqual(result["203.0.113.90"]?.asn, 64_540)
+    }
+    XCTAssertEqual(calls, 1, "identical fallbacks did not share a flight")
+  }
+
   /// Verify concurrent cache access doesn't corrupt data.
   func testCacheConcurrentAccessCorrectness() async throws {
     actor SequenceResolver: ASNResolver {
@@ -702,4 +781,9 @@ final class SwiftFTRCacheTests: XCTestCase {
     // address, so overlapping misses can never produce more calls than unique keys.
     XCTAssertLessThanOrEqual(calls, 34, "Cache should coalesce overlapping misses (got \(calls))")
   }
+}
+
+/// A database stand-in that answers nothing.
+private struct EmptyLocalTable: LocalASNTable {
+  func lookup(_ ipString: String) -> (asn: UInt32, name: String?)? { nil }
 }

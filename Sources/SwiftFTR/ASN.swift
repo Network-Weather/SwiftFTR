@@ -623,10 +623,13 @@ public struct CymruDNSResolver: ASNResolver {
   private func queryTXT(name: String, until deadline: ContinuousClock.Instant) async -> [String]? {
     for (index, server) in servers.enumerated() {
       if Task.isCancelled { return nil }
+      // Past the deadline the attempt gets a deadline already passed, and the real query sends
+      // nothing for it.
       let now = ContinuousClock.now
-      guard now < deadline else { return nil }
-      let share = now.duration(to: deadline) / (servers.count - index)
-      if let answer = await query(name, server, now + share) { return answer }
+      let left = max(now.duration(to: deadline), .zero)
+      if let answer = await query(name, server, now + left / (servers.count - index)) {
+        return answer
+      }
     }
     return nil
   }

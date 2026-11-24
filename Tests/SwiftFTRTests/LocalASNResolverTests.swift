@@ -341,8 +341,69 @@ final class LocalASNResolverTests: XCTestCase {
 
     XCTAssertEqual(loader.started.value, 1)
     XCTAssertTrue(result.isEmpty, "nothing could answer before the timeout")
-    let longest = await dns.timeouts.max() ?? 0
-    XCTAssertLessThanOrEqual(longest, 0.3)
+    let timeouts = await dns.timeouts
+    XCTAssertTrue(timeouts.isEmpty, "the fallback was asked with no time left: \(timeouts)")
+  }
+
+  /// A lookup of many addresses in a loaded database stops at its deadline instead of finishing the
+  /// batch.
+  func testWarmLookupStopsAtItsDeadline() async throws {
+    let table = SlowASNTable()
+    let resolver = LocalASNResolver(
+      source: .embedded, store: LocalASNDatabaseStore(loader: { _ in table }))
+    await resolver.preload()
+    let addresses = (0..<400).map { "203.0.\($0 / 256).\($0 % 256)" }
+
+    _ = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await resolver.resolve(ipv4Addrs: addresses, timeout: 0.02)
+    }
+
+    // Each lookup takes at least a millisecond, so finishing the batch took 0.4 s or more.
+    XCTAssertLessThan(table.lookups.value, addresses.count, "the batch ran past its deadline")
+  }
+
+  /// One caller's batch does not hold the resolver: a lookup started while it runs is answered
+  /// before it ends.
+  func testLookupIsNotQueuedBehindAnotherBatch() async throws {
+    let table = SlowASNTable()
+    let resolver = LocalASNResolver(
+      source: .embedded, store: LocalASNDatabaseStore(loader: { _ in table }))
+    await resolver.preload()
+    let batch = (0..<2_000).map { "203.0.\($0 / 256).\($0 % 256)" }
+
+    let long = Task { try await resolver.resolve(ipv4Addrs: batch, timeout: 60) }
+    let started = await eventually(within: Self.watchdog) { table.lookups.value > 0 }
+    XCTAssertTrue(started, "the batch never reached the table")
+
+    let (single, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await resolver.resolve(ipv4Addrs: ["198.51.100.200"], timeout: 60)
+    }
+    let doneByThen = table.lookups.value
+    _ = try await long.value
+
+    XCTAssertNotNil(single["198.51.100.200"])
+    XCTAssertLessThan(doneByThen, batch.count, "the lookup waited for the whole batch")
+  }
+
+  /// A timeout too large to be an instant on the clock waits for a loading database without
+  /// crashing, as an unbounded one does.
+  func testHugeTimeoutWaitsForTheLoad() async throws {
+    let address = "203.0.113.75"
+    let loader = GatedASNLoader(FakeASNTable([address: 64_503]))
+    defer { loader.gate.open() }
+    let resolver = LocalASNResolver(
+      source: .embedded, store: LocalASNDatabaseStore(loader: loader.load))
+
+    let lookup = Task {
+      try await resolver.resolve(ipv4Addrs: [address], timeout: Double(Int.max).nextDown)
+    }
+    let started = await eventually(within: Self.watchdog) { loader.started.value > 0 }
+    XCTAssertTrue(started, "the lookup never reached the load")
+    loader.gate.open()
+    let (result, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await lookup.value
+    }
+    XCTAssertEqual(result[address]?.asn, 64_503)
   }
 
   /// A caller that runs out of time waiting for a shared database load leaves it running for the
@@ -448,6 +509,17 @@ private final class GatedASNLoader: Sendable {
       }
       return table
     }
+  }
+}
+
+/// A database stand-in whose every lookup takes a millisecond of CPU-bound work, as a large batch
+/// does, and is counted.
+private final class SlowASNTable: LocalASNTable {
+  let lookups = FaultCounter()
+  func lookup(_ ipString: String) -> (asn: UInt32, name: String?)? {
+    usleep(1_000)
+    lookups.increment()
+    return (64_520, "SLOW")
   }
 }
 

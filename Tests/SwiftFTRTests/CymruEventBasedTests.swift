@@ -37,6 +37,25 @@ struct CymruEventBasedTests {
     #expect(server.requests.value == 2)
   }
 
+  @Test("A lookup of many addresses starts none once its deadline has passed")
+  func noAddressStartsAfterTheDeadline() async throws {
+    let recorder = TXTQueryRecorder()
+    let resolver = CymruDNSResolver(servers: ["192.0.2.1", "192.0.2.2"]) { name, server, deadline in
+      await recorder.silent(name: name, server: server, until: deadline)
+    }
+    let addresses = (0..<4_096).map { "203.0.\($0 / 256).\($0 % 256)" }
+    let deadline = ContinuousClock.now + .milliseconds(50)
+
+    _ = try await measure(within: Self.watchdog) {
+      await resolver.resolve(ipv4Addrs: addresses, until: deadline)
+    }
+
+    // Queries in flight at the deadline may each still try their servers; nothing else may start.
+    let attempts = await recorder.attempts
+    let late = attempts.filter { $0.askedAt >= deadline }.count
+    #expect(late <= 16, "\(late) attempts were made after the deadline")
+  }
+
   @Test("A query waiting for a free slot gives up when its task is cancelled")
   func semaphoreWaitIsCancellable() async throws {
     let semaphore = _ConcurrencySemaphore(maxConcurrent: 1)
@@ -142,6 +161,7 @@ actor TXTQueryRecorder {
     let name: String
     let server: String
     let deadline: ContinuousClock.Instant
+    let askedAt: ContinuousClock.Instant
   }
 
   private(set) var attempts: [Attempt] = []
@@ -149,7 +169,8 @@ actor TXTQueryRecorder {
   func silent(name: String, server: String, until deadline: ContinuousClock.Instant) async
     -> [String]?
   {
-    attempts.append(Attempt(name: name, server: server, deadline: deadline))
+    attempts.append(
+      Attempt(name: name, server: server, deadline: deadline, askedAt: ContinuousClock.now))
     try? await Task.sleep(until: deadline, clock: .continuous)
     return nil
   }
