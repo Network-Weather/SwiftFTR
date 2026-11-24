@@ -10,8 +10,8 @@ import Foundation
 /// It never asks a recursive resolver for a whoami name, whose answer can be another host's
 /// (#153). Every STUN socket is bound before its server name is resolved, and a failed bind sends
 /// nothing, the lookup included (#151); the lookup itself uses the system resolver, unbound. A
-/// source address not of the family asked sends nothing. It holds the request's deadline itself,
-/// so the tracer runs no second timer against it.
+/// source address not of the family asked, or whose zone names no interface, sends nothing. It
+/// holds the request's deadline itself, so the tracer runs no second timer against it.
 struct LibraryPublicIPResolver: PublicIPResolver {
   /// The per-server STUN timeout for a classified trace, a multipath run and
   /// ``SwiftFTR/discoverPublicIPWithHostname()``.
@@ -52,7 +52,11 @@ func publicIPDiscovery(
   budget: TimeInterval
 ) async throws -> PublicIPObservation? {
   try Task.checkCancellation()
-  if let sourceIP, IPAddressFamily(address: sourceIP) != family {
+  // A zone that names no interface (`::1%`, `fe80::1%nope`) would bind with no scope at all.
+  if let sourceIP,
+    IPAddressFamily(address: sourceIP) != family
+      || (sourceIP.contains("%") && parseIPv6Scoped(sourceIP).scopeID == 0)
+  {
     if enableLogging {
       print("[PublicIP] Source address '\(sourceIP)' cannot be bound for \(family); not asking")
     }

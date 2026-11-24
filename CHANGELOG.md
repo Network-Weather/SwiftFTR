@@ -136,7 +136,9 @@ Unreleased
   an internal timeout error is `noAddress` too.
 - **`getPublicIPs` asks the library's resolver**, so it also binds every socket before its
   lookups. A STUN sweep opens its sockets only once admitted, one sweep per executor worker, so
-  sweeps waiting their turn hold none. A call cancelled before it starts asks nothing.
+  sweeps waiting their turn hold none. A call cancelled before it starts asks nothing. An IPv6
+  source address whose `%zone` is empty or names no interface (`::1%`) now sends nothing for its
+  family, where it was bound with no scope.
 
 - **A classified trace asks for its public address once, after its probes, for the family they
   used** (decision 12). It asked for IPv4 before the probes, whatever the destination, and when

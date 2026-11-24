@@ -357,6 +357,7 @@ struct LibraryPublicIPResolverTests {
       }
       #expect(ips.v6 == (source == "fe80::1%lo0" ? "2001:db8::5" : nil), "\(source)")
     }
-    #expect(requests.all.dropFirst(2).map(\.sourceIP) == ["fe80::1%lo0"])
+    let asked6 = requests.all.filter { $0.family == .v6 }.dropFirst()
+    #expect(asked6.map(\.sourceIP) == ["fe80::1%lo0"])
   }
 }
