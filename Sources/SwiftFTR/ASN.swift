@@ -393,9 +393,14 @@ actor _ASNMemoryCache {
     var resolved: [String: ASNInfo] = [:]
     var addressesByFlight: [UInt64: [String]] = [:]
     var unreserved: [String] = []
+    var outOfTime = false
     for address in addresses {
-      // Out of time before any lookup was asked: what the cache had is the answer.
-      if clock.expired() { return resolved }
+      // Out of time while sorting the addresses: no lookup is started, and what the cache and the
+      // flights joined so far have is the answer.
+      if clock.expired() {
+        outOfTime = true
+        break
+      }
       if let info = map[address] {
         resolved[address] = info
         continue
@@ -412,7 +417,7 @@ actor _ASNMemoryCache {
       flightsByID[flightID]?.joinCount += 1
       if let flight = flightsByID[flightID] { flights.append(flight) }
     }
-    if !unreserved.isEmpty {
+    if !unreserved.isEmpty, !outOfTime {
       let flight = startFlight(
         addresses: unreserved, timeout: timeout, using: resolver, scope: scope)
       addressesByFlight[flight.id] = unreserved
@@ -596,8 +601,17 @@ public struct CachingASNResolver: ASNResolver {
     guard let prepared = prepareASNBatch(ipv4Addrs, until: deadline, key: { $0 }),
       !prepared.isEmpty
     else { return [:] }
-    return try await _ASNMemoryCache.shared.resolve(
-      Array(prepared.keys),
+    return try await resolve(prepared: Array(prepared.keys), timeout: timeout, until: deadline)
+  }
+
+  /// Resolves distinct, non-empty `addresses`, already prepared, until `deadline`.
+  func resolve(
+    prepared addresses: [String], timeout: TimeInterval, until deadline: ContinuousClock.Instant?
+  )
+    async throws -> [String: ASNInfo]
+  {
+    try await _ASNMemoryCache.shared.resolve(
+      addresses,
       timeout: timeout,
       until: deadline,
       using: base,

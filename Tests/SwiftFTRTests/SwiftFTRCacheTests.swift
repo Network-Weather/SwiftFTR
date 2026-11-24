@@ -790,6 +790,44 @@ final class SwiftFTRCacheTests: XCTestCase {
     XCTAssertEqual(calls, 0, "a lookup started after the deadline had passed")
   }
 
+  /// A caller whose time runs out while it sorts its addresses still gets what the flights it had
+  /// already joined have answered.
+  func testCallerOutOfTimeWhileSortingKeepsJoinedAnswers() async throws {
+    // Publishes an answer for every address at once, then holds its flight until `gate` opens.
+    final class PublishThenHold: ASNProgressReporting, @unchecked Sendable {
+      let gate = StallGate()
+      let published = FaultCounter()
+      func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+        await gate.waitAsync(limit: 60)
+        return [:]
+      }
+      func resolve(
+        ipv4Addrs: [String], timeout: TimeInterval, publishing log: ASNAnswerLog
+      ) async throws -> [String: ASNInfo] {
+        log.publish(
+          Dictionary(uniqueKeysWithValues: ipv4Addrs.map { ($0, ASNInfo(asn: 64_560, name: "P")) }))
+        published.increment()
+        return try await resolve(ipv4Addrs: ipv4Addrs, timeout: timeout)
+      }
+    }
+    let base = PublishThenHold()
+    defer { base.gate.open() }
+    let caching = CachingASNResolver(base: base)
+    let joined = "198.51.100.77"
+    let holder = Task { try await caching.resolve(ipv4Addrs: [joined], timeout: 30) }
+    defer { holder.cancel() }
+    let published = await eventually(within: 20) { base.published.value > 0 }
+    XCTAssertTrue(published, "the held flight never published its answer")
+
+    // Prepared in this order, so the joined address is sorted before the first look at the clock,
+    // which has passed by then.
+    let others = (0..<65_536).map { "8.9.\($0 / 256).\($0 % 256)" }
+    let result = try await caching.resolve(
+      prepared: [joined] + others, timeout: 30, until: .now + .nanoseconds(1))
+
+    XCTAssertEqual(result[joined]?.asn, 64_560, "the joined flight's answer was dropped")
+  }
+
   /// Verify concurrent cache access doesn't corrupt data.
   func testCacheConcurrentAccessCorrectness() async throws {
     actor SequenceResolver: ASNResolver {
