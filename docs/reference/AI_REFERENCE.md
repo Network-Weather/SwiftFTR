@@ -1056,7 +1056,8 @@ struct TraceView: View {
 - **rDNS phase**: lookups run concurrently, each a PTR query to the system's DNS daemon bounded
   by `rdnsLookupTimeout` (default 5 s; a link-local address gets at most 1 s). Hostnames found
   are cached per instance (TTL 86400 s, 1000 entries by default); an address with no name is
-  asked again next time. After two lookups in a row that were asked and got no answer, the
+  asked again next time. An address whose lookup timed out is not asked again for 10 minutes
+  (proposed by an agent, not yet confirmed by David, 2026-11-24). After unanswered lookups of two different addresses in a row, the
   instance stops asking until `networkChanged()`, `clearCaches()` or
   `invalidateNetworkScopedRDNS()`. Multipath flows use
   the instance's rDNS cache and ASN resolver, so they follow the same settings.

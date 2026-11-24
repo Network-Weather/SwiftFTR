@@ -148,9 +148,13 @@ Unreleased
   `255.255.255.255`, is named `broadcasthost` in `/etc/hosts`, which `getnameinfo` reads and this
   query does not. The public `reverseDNS(_:)` still calls `getnameinfo`. A label holding a byte outside printable ASCII is escaped (`\DDD`) where
   `getnameinfo` returned it raw.
-- **Only hostnames are cached by reverse DNS.** An address with no name, or whose lookup timed
-  out or failed, is asked again by the next trace, where 0.18 cached "no hostname" for the whole
-  TTL (a day by default), a timeout included. Within one trace each hop address is asked once:
+- **Only hostnames are cached by reverse DNS.** An address with no name, or whose lookup
+  failed, is asked again by the next trace, where 0.18 cached "no hostname" for the whole TTL (a
+  day by default), a timeout included. An address whose question was asked and got no answer by
+  its deadline is not asked again for ten minutes (proposed by an agent, not yet confirmed by David, 2026-11-24); during that holdoff it reports no
+  hostname at once. `networkChanged()`, `clearCaches()` and `invalidateNetworkScopedRDNS()` end
+  every holdoff. So a hop whose PTR query always times out costs one lookup budget per ten
+  minutes, not one per trace. Within one trace each hop address is asked once:
   a classified trace and a multipath flow no longer ask again, after the probes, about a hop
   that found no name, and an address seen at several TTLs is asked once.
 - **A link-local hop's reverse lookup gets at most one second.** The daemon asks fe80::/10 and
@@ -159,7 +163,9 @@ Unreleased
 - **The reverse-DNS stall breaker counts unanswered questions, not slow lookups.** It stops
   lookups after two in a row that were asked and got no answer by their deadline. A lookup that
   waited for its turn past the deadline without asking, a link-local lookup, and an error do not
-  count; an answer or "no such record" resets it.
+  count; an answer or "no such record" resets it. One address counts once in a run of stalls
+  (proposed by an agent, not yet confirmed by David, 2026-11-24), so several lookups of one hop timing out together, as a multipath batch's flows
+  make, do not open the breaker by themselves.
 
 ### Bug fixes
 

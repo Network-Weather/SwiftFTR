@@ -516,9 +516,14 @@ got no answer, not every lookup that took nearly its deadline.
   `255.255.255.255` named `broadcasthost` by `getnameinfo` and unnamed by the daemon.
 - A hostname whose labels hold bytes outside printable ASCII is escaped as `\DDD` (and a `\` in
   a label as `\\`); `getnameinfo` returned those bytes raw.
-- An address with no name, and one whose lookup timed out, is asked again by every trace, where
-  0.18 remembered "no hostname" for the cache TTL (a day by default). On a link whose resolver
-  times out, a hostname now appears once the resolver recovers, without a network change.
+- An address with no name is asked again by every trace, where 0.18 remembered "no hostname"
+  for the cache TTL (a day by default). An address whose lookup timed out is held off for ten
+  minutes (proposed by an agent, not yet confirmed by David, 2026-11-24): it reports no hostname without asking, then is asked again. On a link
+  whose resolver times out, a hostname now appears within ten minutes of the resolver
+  recovering, or at once after ``SwiftFTR/SwiftFTR/networkChanged()``,
+  ``SwiftFTR/SwiftFTR/clearCaches()`` or ``SwiftFTR/SwiftFTR/invalidateNetworkScopedRDNS()``.
+  ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` called again within the holdoff returns
+  no hostname for that address.
 - A trace whose first hop is an unnamed link-local address spends at most one second on it in
   the reverse-DNS phase, rather than the whole lookup timeout.
 - Reverse DNS no longer waits for a blocking-I/O worker, so other work holding the workers does
