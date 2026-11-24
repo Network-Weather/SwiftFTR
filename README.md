@@ -451,7 +451,7 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 
 ### Project
 - [Changelog](CHANGELOG.md): release-by-release notes of new API, behavior changes, fixes and dependency changes, newest first. (updated 2026-11-22; update when: a PR merges to `main` or a release is cut)
-- [Roadmap](ROADMAP.md): forward-looking work, stack-ranked by priority, with the goal and constraints of each item. (updated 2026-11-22; update when: a PR completes or reprioritizes a roadmap item)
+- [Roadmap](ROADMAP.md): forward-looking work, stack-ranked by priority, with the goal and constraints of each item. (updated 2026-11-24; update when: a PR completes or reprioritizes a roadmap item)
 - [Benchmarks](BENCHMARKS.md): measured ping throughput, embedded ASN database load cost and memory, and ASN resolver strategy timings, each with its release, date and command. (updated 2026-11-21; update when: a release changes the ASN database, resolver defaults or the ping I/O path, or a benchmark is re-run)
 - [Contributing](CONTRIBUTING.md): development setup, formatting, testing, documentation, commit style and the maintainer release checklist. (updated 2026-11-21; update when: the build, test, CI or release procedure changes)
 - [Security policy](SECURITY.md): supported versions, how to report a vulnerability, response timeline and the library's security-relevant design choices. (updated 2026-11-21; update when: a release line is added or dropped from support, or the reporting channel changes)
