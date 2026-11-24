@@ -107,8 +107,9 @@ struct CymruEventBasedTests {
     let late = attempts.filter { $0.deadline > deadline }
     #expect(late.isEmpty, "\(late.count) of \(attempts.count) queries outlived the lookup")
     // A silent first server does not use up the time: the second is asked too.
-    let fallbacks = Set(attempts.filter { $0.server == "192.0.2.2" }.map(\.name))
-    #expect(!fallbacks.isEmpty, "no query fell back to the second server")
+    let fallbacks = Set(
+      attempts.filter { $0.server == "192.0.2.2" && $0.askedAt < deadline }.map(\.name))
+    #expect(!fallbacks.isEmpty, "no query fell back to the second server in time")
   }
 }
 
