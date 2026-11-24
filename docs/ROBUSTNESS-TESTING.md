@@ -620,9 +620,10 @@ Observations that are not defects of the library:
   network. A held test's "not early" bound is measured on ping's clock from probe 3's own send to
   ping's close, both stamped on ping's queue, never from the start of a run that contains the
   hold. In the late-reply test probe 3 is no longer answered, so the ping reads
-  probe 1's late reply after its own probe's timeout and before its own end. The second answers
-  every probe with a window past the watchdog and tells the early reply for sequence 2 apart by
-  its mark. `failedSendEndsWhenSendLoopFinishes` cannot be held that way: the
+  probe 1's late reply after its own probe's timeout and before its own end. The second leaves
+  probe 2 unanswered, holds its send until probe 1's reply and the early one are queued, and
+  checks that the reply queued before probe 2's send does not give it an RTT, so no genuine reply
+  can mask a false match. `failedSendEndsWhenSendLoopFinishes` cannot be held that way: the
   send loop enqueues each send and sleeps on its own, so a hook cannot keep probe 2 back until a
   reply is read. Its reply is now injected (one loopback crossing, not two) and its interval is
   2 s, which still has to outlast delivery; a seam on the send loop's sleep would remove that.
