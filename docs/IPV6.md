@@ -70,7 +70,7 @@ Dual-stack `tcpProbe(...)` and `udpProbe(...)`: same entry points work for both 
 
 ### Stage 7 — Hardening
 
-- Add a CI matrix entry for a v6-capable runner (self-hosted, or GitHub's `larger-resource` runners when they offer v6).
+- Add a CI matrix entry for a v6-capable GitHub-hosted runner when one exists (this repository does not use self-hosted runners).
 - Enable `testIPv6PingReachable` and the v6 trace integration tests on that runner.
 - ~~Extend `icmpfuzz` to fuzz the v6 parsers.~~ Shipped as the separate `icmpv6fuzz` target (`swift run -c release icmpv6fuzz`, `ITER` overrides the iteration count).
 - v6 variant of `ResourceBenchmark` (memory and per-call cost). `ResourceBenchmark` today measures ASN resolver strategies over IPv4 addresses only.
@@ -105,6 +105,8 @@ To exercise the v6 paths in CI:
 ## Known limitations & open questions
 
 - ~~**NAT64 transparency**: `ping(to: "1.1.1.1")` on a pure-v6 network with DNS64/NAT64~~ *(shipped)*. In `.auto` mode (the default), v4 literals go through `getaddrinfo` with `AI_V4MAPPED | AI_ADDRCONFIG` flags so macOS synthesizes a v4-mapped v6 address when on a v6-only NAT64 network. Force modes (`.v4` / `.v6`) keep the `inet_pton` fast path. Dual-stack hosts see unchanged behavior.
+- **IPv6-only networks are untested, and some paths are IPv4-only by construction** (read from the code, 2026-11-24). The NAT64 mapping above covers ping, trace and probe targets. It does not cover the library's own DNS sockets: Team Cymru ASN lookups (`1.1.1.1`, `8.8.8.8`) and the DNS query APIs' default server (`8.8.8.8`) connect over IPv4. The embedded ASN database is unaffected. A forced `.v4` family skips the mapping by design.
+- **Multipath discovery is IPv4-only**: it rejects an IPv6 family or source address, because flows vary IPv4 ICMP identifiers.
 - **Happy-eyeballs**: `.auto` for hostnames currently takes the first `getaddrinfo` answer without racing v4 and v6 connects. RFC 8305 happy-eyeballs is deferred — most callers either pin a family (`.v4` / `.v6`) or accept the OS's resolver preference.
 - **Should the `ttl` field on `PingResponse` become `hopCount` (or split into a separate `hopLimit`)?** Currently overloaded: v4 TTL or v6 hop limit. Documented dual meaning. Splitting would be source-breaking; revisit only if it causes real consumer confusion.
 
