@@ -264,6 +264,18 @@ func bindLoopback(family: Int32, type: Int32) throws -> (fd: Int32, port: UInt16
   return (fd, port)
 }
 
+/// The kernel's identity of the socket open on `fd` (`soi_so`, from `proc_pidfdinfo`), or `nil`
+/// when `fd` names no socket. Every descriptor of one socket shares it, and no other socket can
+/// have it while one of them stays open, so a test that holds a duplicate can tell whether a
+/// descriptor number still names that socket. A local address cannot: a socket of another type
+/// can share it, and `fstat` reports inode 0 for every socket on Darwin.
+func socketIdentity(_ fd: Int32) -> UInt64? {
+  var info = socket_fdinfo()
+  let size = Int32(MemoryLayout<socket_fdinfo>.size)
+  guard proc_pidfdinfo(getpid(), fd, PROC_PIDFDSOCKETINFO, &info, size) == size else { return nil }
+  return info.psi.soi_so
+}
+
 func setReceiveTimeout(_ fd: Int32, seconds: TimeInterval) {
   var tv = timeval(
     tv_sec: Int(seconds), tv_usec: __darwin_suseconds_t((seconds - floor(seconds)) * 1_000_000))
@@ -316,6 +328,9 @@ final class FakeICMPNetwork: @unchecked Sendable {
   /// Datagrams this peer has sent, scripted replies and injected ones alike, counted once
   /// `sendto` has returned.
   let repliesSent = FaultCounter()
+  /// Echo requests from a socket this network did not make (another test's late probe to a
+  /// recycled port), neither counted as probes nor scripted.
+  let foreignProbes = FaultCounter()
 
   /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
@@ -324,6 +339,12 @@ final class FakeICMPNetwork: @unchecked Sendable {
   private var stopped = false
   private let socketsLock = NSLock()
   private var openedSockets: [Int32] = []
+  /// A duplicate of every socket ``makeSocket(_:)`` opened, held until the serve thread exits, so
+  /// each socket's port stays reserved while this peer can still answer it. Without them, a reply
+  /// scheduled after the operation closed its socket (a late reply a test stages on purpose, say)
+  /// could reach whatever socket was handed that port number next, in another test. Guarded by
+  /// `lock`; datagrams that land on a held socket are never read.
+  private var heldSockets: [Int32] = []
   /// What the peer received and sent, for a test to print when an operation outlives its
   /// watchdog. Guarded by `lock`; capped so a long trace cannot grow it without bound.
   private var events: [String] = []
@@ -363,6 +384,11 @@ final class FakeICMPNetwork: @unchecked Sendable {
     socketsLock.lock()
     openedSockets.append(s)
     socketsLock.unlock()
+    let held = dup(s)
+    lock.lock()
+    // Once stopped, the serve thread may already have released the others: hold nothing more.
+    if held >= 0 { if stopped { close(held) } else { heldSockets.append(held) } }
+    lock.unlock()
     return s
   }
 
@@ -379,8 +405,14 @@ final class FakeICMPNetwork: @unchecked Sendable {
   /// Public-IP discovery is substituted too: by the test's own substitute when one is bound, and
   /// otherwise by one that fails at once, so a classified trace inside `body` can never fall
   /// through to real STUN traffic.
+  ///
+  /// When `isolated` (the default), probes go out through ``connectingSend``, which connects each
+  /// probe socket to this network before its first send: the kernel then delivers to the socket
+  /// only what this network sends, so no other test's late datagram can reach it. A test whose
+  /// factory connects the socket itself, to make the library's `sendto` fail, passes `false`.
   func install<T>(
-    socketFactory: TestSeams.MakeICMPSocket? = nil, _ body: () async throws -> T
+    socketFactory: TestSeams.MakeICMPSocket? = nil, isolated: Bool = true,
+    _ body: () async throws -> T
   ) async rethrows -> T {
     let resolved = self.resolved
     let resolve: TestSeams.ResolveHost = { _, _ in resolved }
@@ -392,10 +424,66 @@ final class FakeICMPNetwork: @unchecked Sendable {
     return try await TestSeams.$resolveHost.withValue(resolve) {
       try await TestSeams.$makeICMPSocket.withValue(makeSocket) {
         try await TestSeams.$discoverPublicIP.withValue(discover) {
-          try await body()
+          try await TestSeams.$sendProbe.withValue(isolated ? Self.connectingSend : nil) {
+            try await body()
+          }
         }
       }
     }
+  }
+
+  /// The library's probe send on a socket connected to the destination: `connect(2)` on the
+  /// first send, then `send(2)`, since Darwin refuses a `sendto` that names an address on a
+  /// connected datagram socket (EISCONN). Every probe in a test goes to the fake network's own
+  /// address, so connecting to it changes nothing the library sees except that only the network
+  /// can reach the socket. Production ICMP sockets are never connected; a connected one whose peer
+  /// is gone reports ECONNREFUSED once on `recv`, which trace and ping both read as "nothing more
+  /// to read now", and no test stops its network before the operation has closed its socket.
+  static let connectingSend: TestSeams.SendProbe = { fd, bytes, destination, length in
+    var peer = sockaddr_storage()
+    var peerLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let connected = withUnsafeMutablePointer(to: &peer) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fd, $0, &peerLength) }
+    }
+    if connected != 0, connect(fd, destination, length) != 0 { return -1 }
+    return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+  }
+
+  /// Connects `fd`, an unbound socket from ``makeSocket(_:)``, to this network. The connect
+  /// assigns its local port, so there is no moment at which the socket has a port and no peer: a
+  /// socket bound first could queue a late datagram in between, and connecting keeps it.
+  func connectProbe(_ fd: Int32) throws {
+    var (address, length) = loopbackAddress(family: family, port: port)
+    let connected = withUnsafePointer(to: &address) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, length) }
+    }
+    guard connected == 0 else { throw FixtureError.socket("connect probe socket", errno) }
+  }
+
+  /// Sends `bytes` now, from this network's address, to loopback port `port`: the only source a
+  /// connected probe socket accepts. Returns whether the whole datagram was sent.
+  @discardableResult
+  func send(_ bytes: [UInt8], toPort port: UInt16) -> Bool {
+    let (destination, _) = loopbackAddress(family: family, port: port)
+    return send(bytes, to: destination, hopLimit: nil)
+  }
+
+  /// The local ports of the sockets ``makeSocket(_:)`` opened and this network still holds, read
+  /// now, so a socket the library bound after it was made is included.
+  private func ownPorts() -> Set<UInt16> {
+    lock.lock()
+    let held = heldSockets
+    lock.unlock()
+    var ports = Set<UInt16>()
+    for fd in held {
+      var local = sockaddr_storage()
+      var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      let named = withUnsafeMutablePointer(to: &local) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+      }
+      if named == 0 { ports.insert(Self.port(of: local)) }
+    }
+    return ports
   }
 
   /// Stops answering, without waiting: no reply is sent once this returns, and the serve thread
@@ -420,6 +508,8 @@ final class FakeICMPNetwork: @unchecked Sendable {
     defer {
       lock.lock()
       close(fd)
+      for held in heldSockets { close(held) }
+      heldSockets = []
       lock.unlock()
     }
     var buffer = [UInt8](repeating: 0, count: 4096)
@@ -457,6 +547,13 @@ final class FakeICMPNetwork: @unchecked Sendable {
       let bytes = Array(buffer.prefix(received))
       let requestType: UInt8 = family == AF_INET6 ? 128 : 8
       guard bytes[0] == requestType else { continue }
+      // Only this network's own sockets are answered: a request from any other port is another
+      // test's late probe to this recycled port number.
+      guard ownPorts().contains(Self.port(of: source)) else {
+        foreignProbes.increment()
+        record("foreign probe from port \(Self.port(of: source)) ignored")
+        continue
+      }
       let probe = Probe(
         identifier: UInt16(bytes[4]) << 8 | UInt16(bytes[5]),
         sequence: UInt16(bytes[6]) << 8 | UInt16(bytes[7]),
@@ -930,30 +1027,141 @@ private func connectToDiscard(_ fd: Int32, family: Int32) throws {
   guard connected == 0 else { throw FixtureError.socket("connect", errno) }
 }
 
+// MARK: - Stray datagrams
+
+/// Which datagrams a loopback fixture takes as its test's request.
+///
+/// A freshly bound loopback port can receive what was sent to a socket that held its number
+/// before, in another test: a fake network's late echo reply, a silent STUN server's garbage, an
+/// empty UDP probe, another test's late query. A fixture that answered, counted or parsed the
+/// first datagram to arrive would let any late sender in the suite decide its test, and a script
+/// that indexed a datagram shorter than it expects ends the whole test process. So every loopback
+/// responder takes only the datagram its test asked for and ignores the rest, empty ones
+/// included, and a script sees only datagrams its filter accepted.
+struct DatagramFilter: Sendable {
+  let accepts: @Sendable (_ datagram: [UInt8]) -> Bool
+
+  /// Exactly `payload`, which may be empty when the test sends an empty datagram on purpose.
+  static func payload(_ payload: [UInt8]) -> DatagramFilter { DatagramFilter { $0 == payload } }
+
+  /// A STUN Binding Request as the library sends it (RFC 5389 §6): a 20-byte header of type
+  /// 0x0001 with no attributes and the magic cookie.
+  static let stunBindingRequest = DatagramFilter { datagram in
+    datagram.count == 20 && datagram[0..<4] == [0x00, 0x01, 0x00, 0x00]
+      && datagram[4..<8] == [0x21, 0x12, 0xA4, 0x42]
+  }
+
+  /// A standard DNS query (QR clear, opcode 0) with one question, for a name other than the root,
+  /// that reads to its end, asking for `name` (ASCII case ignored) when one is given.
+  static func dnsQuery(named name: String? = nil) -> DatagramFilter {
+    let wanted = name.map {
+      $0.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+    return DatagramFilter { datagram in
+      guard datagram.count >= 12, datagram[2] & 0xF8 == 0, datagram[4] == 0, datagram[5] == 1,
+        let asked = dnsQuestionName(datagram), !asked.isEmpty
+      else { return false }
+      return wanted.map { $0 == asked.lowercased() } ?? true
+    }
+  }
+}
+
+/// The offset of the first question's QTYPE in `message`, or `nil` unless the question's name is
+/// a run of uncompressed labels ending in the root label and its type and class fit after it.
+func dnsQuestionTypeOffset(_ message: [UInt8]) -> Int? {
+  var offset = 12
+  while offset < message.count, message[offset] != 0 {
+    let length = Int(message[offset])
+    guard length & 0xC0 == 0, offset + 1 + length <= 12 + 255 else { return nil }
+    offset += 1 + length
+  }
+  guard offset < message.count, offset + 1 + 4 <= message.count else { return nil }
+  return offset + 1
+}
+
+/// The first question's name in `message`, labels joined by dots, or `nil` if the question does
+/// not read to its end (``dnsQuestionTypeOffset(_:)``).
+func dnsQuestionName(_ message: [UInt8]) -> String? {
+  guard let end = dnsQuestionTypeOffset(message) else { return nil }
+  var labels: [String] = []
+  var offset = 12
+  while offset < end - 1 {
+    let length = Int(message[offset])
+    labels.append(String(decoding: message[offset + 1..<offset + 1 + length], as: UTF8.self))
+    offset += 1 + length
+  }
+  return labels.joined(separator: ".")
+}
+
+/// What a late sender elsewhere in the suite can put on a freshly bound port: a datagram shorter
+/// than any header a script reads (a silent STUN server's garbage reply), and an empty one.
+enum Strays {
+  static let short: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF]
+  static let empty: [UInt8] = []
+
+  /// Sends ``short`` then ``empty`` to `port` on loopback. Returns whether both left whole.
+  static func send(to port: UInt16, family: Int32 = AF_INET) -> Bool {
+    let sender = socket(family, SOCK_DGRAM, IPPROTO_UDP)
+    guard sender >= 0 else { return false }
+    defer { close(sender) }
+    var (address, length) = loopbackAddress(family: family, port: port)
+    return [short, empty].allSatisfy { datagram in
+      datagram.withUnsafeBytes { raw in
+        withUnsafePointer(to: &address) {
+          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            sendto(sender, raw.baseAddress, raw.count, 0, $0, length)
+          }
+        }
+      } == datagram.count
+    }
+  }
+}
+
 // MARK: - Loopback UDP responder
 
-/// A loopback UDP server that answers each datagram as a test scripts: not at all, late, or with
-/// arbitrary bytes.
+/// A loopback UDP server that answers each request its filter accepts as a test scripts: not at
+/// all, late, or with arbitrary bytes. Every other datagram is counted in ``ignored`` and left
+/// unanswered (see ``DatagramFilter``).
 final class LoopbackUDPResponder: @unchecked Sendable {
   typealias Script = @Sendable (_ request: [UInt8]) -> (reply: [UInt8], delay: TimeInterval)?
 
   let port: UInt16
   let family: Int32
+  /// Requests the filter accepted, each handed to the script.
   let requests = FaultCounter()
+  /// Datagrams the filter turned away.
+  let ignored = FaultCounter()
 
   /// Owned by the serve thread, which closes it as it exits.
   private let fd: Int32
+  private let filter: DatagramFilter
   private let script: Script
   private let lock = NSLock()
   private var stopped = false
 
-  init(family: Int32 = AF_INET, script: @escaping Script) throws {
+  /// - Parameter gate: when given, the serve thread reads nothing until it opens, so a test can
+  ///   queue datagrams ahead of its request.
+  init(
+    family: Int32 = AF_INET, accepts filter: DatagramFilter, readsAfter gate: StallGate? = nil,
+    script: @escaping Script
+  ) throws {
     self.family = family
+    self.filter = filter
     self.script = script
     (fd, port) = try bindLoopback(family: family, type: SOCK_DGRAM)
     setReceiveTimeout(fd, seconds: 0.02)
-    let thread = Thread { [self] in self.serve() }
+    let thread = Thread { [self] in
+      gate?.wait(limit: 60)
+      self.serve()
+    }
     thread.start()
+  }
+
+  /// Datagrams waiting on the socket (`SO_NUMRCVPKT`), or -1 once stopped.
+  var queued: Int32 {
+    lock.lock()
+    defer { lock.unlock() }
+    return stopped ? -1 : queuedDatagrams(fd)
   }
 
   deinit { stop() }
@@ -1001,10 +1209,15 @@ final class LoopbackUDPResponder: @unchecked Sendable {
       }
       // A request that arrives after `stop()` is neither counted nor scripted.
       if isStopped { return }
-      // A zero-byte datagram is a valid request; only a failed or timed-out receive is not.
+      // A zero-byte datagram is read like any other; only a failed or timed-out receive is not.
       guard n >= 0 else { continue }
+      let request = Array(buffer.prefix(n))
+      guard filter.accepts(request) else {
+        ignored.increment()
+        continue
+      }
       requests.increment()
-      guard let (reply, delay) = script(Array(buffer.prefix(n))) else { continue }
+      guard let (reply, delay) = script(request) else { continue }
       let deliver: @Sendable () -> Void = { [self, source, length] in
         self.lock.lock()
         defer { self.lock.unlock() }

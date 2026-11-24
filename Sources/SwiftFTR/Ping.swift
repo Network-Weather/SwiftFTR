@@ -248,7 +248,9 @@ struct PingExecutor: Sendable {
     // 4c. Unique identifier per ping session to avoid cross-socket collisions.
     let identifier = generateIdentifier()
 
-    // 5. Delegate to PingOperation (which knows the family for parse-time dispatch).
+    // 5. Delegate to PingOperation (which knows the family for parse-time dispatch). Its sends
+    // run on a dispatch queue, so the send seam is read here.
+    let sendProbe = TestSeams.sendProbe
     let operation = PingOperation(
       sockfd: sockfd,
       target: target,
@@ -256,10 +258,11 @@ struct PingExecutor: Sendable {
       config: config,
       identifier: identifier,
       sendPacket: { sockfd, packet, resolved in
-        try self.sendPacket(sockfd: sockfd, packet: packet, to: resolved)
+        try self.sendPacket(sockfd: sockfd, packet: packet, to: resolved, sendProbe: sendProbe)
       },
       monotonicTime: { self.monotonicTime() },
-      closeSocket: closeSocket
+      closeSocket: closeSocket,
+      observeReceive: TestSeams.observeProbeReceive
     )
     operationOwnsSocket = true
 
@@ -397,7 +400,8 @@ struct PingExecutor: Sendable {
   // monotonic timestamp of the attempt that reached the wire, so the caller
   // records a send time that excludes any waiting.
   internal func sendPacket(
-    sockfd: Int32, packet: [UInt8], to resolved: ResolvedHost
+    sockfd: Int32, packet: [UInt8], to resolved: ResolvedHost,
+    sendProbe: TestSeams.SendProbe? = nil
   ) throws -> TimeInterval {
     var addr = resolved.address
     var sendTime: TimeInterval = 0
@@ -408,7 +412,8 @@ struct PingExecutor: Sendable {
       return withUnsafePointer(to: &addr) { destPtr in
         destPtr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
           packet.withUnsafeBytes { bufPtr in
-            sendto(
+            if let sendProbe { return sendProbe(sockfd, bufPtr, sa, resolved.addressLen) }
+            return sendto(
               sockfd, bufPtr.baseAddress, packet.count, 0, sa, resolved.addressLen)
           }
         }
@@ -472,6 +477,7 @@ final class PingOperation: @unchecked Sendable {
   private let sendPacket: @Sendable (Int32, [UInt8], ResolvedHost) throws -> TimeInterval
   private let monotonicTime: @Sendable () -> TimeInterval
   private let closeSocket: @Sendable (Int32) -> Void
+  private let observeReceive: TestSeams.ObserveProbeReceive?
   private var family: Int32 { resolved.family }
 
   private var continuation: CheckedContinuation<PingResult, Error>?
@@ -523,8 +529,10 @@ final class PingOperation: @unchecked Sendable {
     identifier: UInt16,
     sendPacket: @escaping @Sendable (Int32, [UInt8], ResolvedHost) throws -> TimeInterval,
     monotonicTime: @escaping @Sendable () -> TimeInterval,
-    closeSocket: @escaping @Sendable (Int32) -> Void
+    closeSocket: @escaping @Sendable (Int32) -> Void,
+    observeReceive: TestSeams.ObserveProbeReceive? = nil
   ) {
+    self.observeReceive = observeReceive
     self.sockfd = sockfd
     self.target = target
     self.resolved = resolved
@@ -745,7 +753,12 @@ final class PingOperation: @unchecked Sendable {
               msg.msg_control = UnsafeMutableRawPointer(cb.baseAddress)
               msg.msg_controllen = socklen_t(cb.count)
               msg.msg_flags = 0
-              let n = recvmsg(sockfd, &msg, 0)
+              let n: Int
+              if let observeReceive {
+                n = observeReceive(sockfd) { recvmsg(sockfd, &msg, 0) }
+              } else {
+                n = recvmsg(sockfd, &msg, 0)
+              }
               if n >= 0 {
                 // If the kernel had to truncate the ancillary buffer (extra cmsgs
                 // we didn't account for), our readings would be unreliable.

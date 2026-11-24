@@ -141,7 +141,7 @@ struct PublicIPValidationTests {
   func seedRejectsSiteLocal() async {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
     #expect(await tracer.seedPublicIP("fec0::1", source: .gatewayReported) == false)
-    #expect(await tracer.publicIP(for: .v4)?.address == nil)
+    for family in [IPAddressFamily.v4, .v6] { #expect(await tracer.publicIP(for: family) == nil) }
   }
 
   @Test(
@@ -165,7 +165,7 @@ struct PublicIPValidationTests {
   func seedRejectsEmbeddedNUL(_ address: String) async {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
     #expect(await tracer.seedPublicIP(address, source: .gatewayReported) == false)
-    #expect(await tracer.publicIP(for: .v4)?.address == nil)
+    for family in [IPAddressFamily.v4, .v6] { #expect(await tracer.publicIP(for: family) == nil) }
   }
 
   @Test("The explicit-server reverse queries reject an address with an embedded NUL")

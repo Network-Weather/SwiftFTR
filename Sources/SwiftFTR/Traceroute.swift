@@ -749,9 +749,11 @@ public actor SwiftFTR {
       print("[SwiftFTR] Streaming trace: sending \(maxHops) probes...")
     }
     let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
+    let sendProbe = TestSeams.sendProbe
     let unsentTTLs = try sendTraceBurst(
       sockfd: fd, resolved: resolved, identifier: identifier, maxHops: maxHops,
-      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, outstanding: &outstanding)
+      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, sendProbe: sendProbe,
+      outstanding: &outstanding)
 
     // Collect responses via DispatchSourceRead with retry support.
     if config.enableLogging {
@@ -784,6 +786,8 @@ public actor SwiftFTR {
       resolved: resolved,
       streamConfig: streamConfig,
       enableLogging: config.enableLogging,
+      sendProbe: sendProbe,
+      observeReceive: TestSeams.observeProbeReceive,
       yield: yield
     )
     receiveOwnsSocket = true
@@ -909,7 +913,8 @@ public actor SwiftFTR {
     let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
     let unsentTTLs = try sendTraceBurst(
       sockfd: fd, resolved: resolved, identifier: identifier, maxHops: maxHops,
-      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, outstanding: &outstanding)
+      payloadSize: payloadSize, retryDeadline: sendRetryDeadline,
+      sendProbe: TestSeams.sendProbe, outstanding: &outstanding)
 
     // Collect responses via DispatchSourceRead (kqueue-backed on macOS).
     // All probes are already in-flight; we wait for responses until the deadline
@@ -928,7 +933,8 @@ public actor SwiftFTR {
       maxHops: maxHops,
       timeout: timeout,
       destinationIP: resolved.canonical,
-      enableLogging: config.enableLogging
+      enableLogging: config.enableLogging,
+      observeReceive: TestSeams.observeProbeReceive
     )
     receiveOwnsSocket = true
 
@@ -1698,7 +1704,8 @@ internal func bindTraceSourceIP(
 /// - Returns: TTLs that never left the host, mapped to the errno that stopped them.
 internal func sendTraceBurst(
   sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, maxHops: Int, payloadSize: Int,
-  retryDeadline: TimeInterval, outstanding: inout [UInt16: TraceSendInfo]
+  retryDeadline: TimeInterval, sendProbe: TestSeams.SendProbe?,
+  outstanding: inout [UInt16: TraceSendInfo]
 ) throws -> [Int: Int32] {
   var unsent: [Int: Int32] = [:]
   var lastTransientError: Error?
@@ -1710,7 +1717,8 @@ internal func sendTraceBurst(
     do {
       try sendTraceProbe(
         sockfd: sockfd, resolved: resolved, identifier: identifier,
-        sequence: seq, payloadSize: payloadSize, retryDeadline: retryDeadline)
+        sequence: seq, payloadSize: payloadSize, retryDeadline: retryDeadline,
+        sendProbe: sendProbe)
       outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
     } catch let error as TracerouteError {
       guard case .sendFailed(let code) = error, isTransientSendErrno(code) else { throw error }
@@ -1735,7 +1743,7 @@ internal func sendTraceBurst(
 /// bounded budget. Non-transient errnos propagate on the first attempt.
 internal func sendTraceProbe(
   sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, sequence: UInt16,
-  payloadSize: Int, retryDeadline: TimeInterval
+  payloadSize: Int, retryDeadline: TimeInterval, sendProbe: TestSeams.SendProbe?
 ) throws {
   let packet: [UInt8]
   if resolved.family == AF_INET6 {
@@ -1750,7 +1758,8 @@ internal func sendTraceProbe(
     packet.withUnsafeBytes { raw in
       withUnsafePointer(to: &addr) { ap -> ssize_t in
         ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-          sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
+          if let sendProbe { return sendProbe(sockfd, raw, sa, resolved.addressLen) }
+          return sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
         }
       }
     }
@@ -1764,7 +1773,8 @@ internal func sendTraceProbe(
 /// `nil` on EAGAIN/EWOULDBLOCK so callers can drain in a loop.
 internal func recvTraceMessage(
   sockfd: Int32, family: Int32,
-  recvBuffer: inout [UInt8], cmsgBuffer: inout [UInt8]
+  recvBuffer: inout [UInt8], cmsgBuffer: inout [UInt8],
+  observe: TestSeams.ObserveProbeReceive?
 ) -> (parsed: ParsedICMP, n: Int)? {
   var storage = sockaddr_storage()
   if family == AF_INET6 {
@@ -1783,6 +1793,7 @@ internal func recvTraceMessage(
             msg.msg_control = UnsafeMutableRawPointer(cb.baseAddress)
             msg.msg_controllen = socklen_t(cb.count)
             msg.msg_flags = 0
+            if let observe { return observe(sockfd) { recvmsg(sockfd, &msg, 0) } }
             return recvmsg(sockfd, &msg, 0)
           }
         }
@@ -1802,7 +1813,10 @@ internal func recvTraceMessage(
   let n = recvBuffer.withUnsafeMutableBytes { rb -> ssize_t in
     withUnsafeMutablePointer(to: &storage) { sp in
       sp.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-        recvfrom(sockfd, rb.baseAddress, rb.count, 0, sa, &addrlen)
+        if let observe {
+          return observe(sockfd) { recvfrom(sockfd, rb.baseAddress, rb.count, 0, sa, &addrlen) }
+        }
+        return recvfrom(sockfd, rb.baseAddress, rb.count, 0, sa, &addrlen)
       }
     }
   }
@@ -1922,6 +1936,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
   private let maxHops: Int
   private let destinationIP: String
   private let enableLogging: Bool
+  private let observeReceive: TestSeams.ObserveProbeReceive?
 
   private var outstanding: [UInt16: TraceSendInfo]
   private var hops: [TraceHop?]
@@ -1948,8 +1963,10 @@ private final class TraceReceiveOperation: @unchecked Sendable {
     maxHops: Int,
     timeout: TimeInterval,
     destinationIP: String,
-    enableLogging: Bool
+    enableLogging: Bool,
+    observeReceive: TestSeams.ObserveProbeReceive?
   ) {
+    self.observeReceive = observeReceive
     self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
@@ -2022,7 +2039,7 @@ private final class TraceReceiveOperation: @unchecked Sendable {
       guard
         let received = recvTraceMessage(
           sockfd: socket.fd, family: family,
-          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer)
+          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer, observe: observeReceive)
       else { return }  // EAGAIN/EWOULDBLOCK or parse-fail
       let parsed = received.parsed
 
@@ -2134,6 +2151,8 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private let resolved: ResolvedHost
   private let streamConfig: StreamingTraceConfig
   private let enableLogging: Bool
+  private let sendProbe: TestSeams.SendProbe?
+  private let observeReceive: TestSeams.ObserveProbeReceive?
   private let yieldHop: @Sendable (StreamingHop) -> Bool
 
   private var outstanding: [UInt16: TraceSendInfo]
@@ -2165,8 +2184,12 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     resolved: ResolvedHost,
     streamConfig: StreamingTraceConfig,
     enableLogging: Bool,
+    sendProbe: TestSeams.SendProbe?,
+    observeReceive: TestSeams.ObserveProbeReceive?,
     yield: @Sendable @escaping (StreamingHop) -> Bool
   ) {
+    self.sendProbe = sendProbe
+    self.observeReceive = observeReceive
     self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
@@ -2251,7 +2274,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       guard
         let received = recvTraceMessage(
           sockfd: socket.fd, family: family,
-          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer)
+          recvBuffer: &recvBuffer, cmsgBuffer: &cmsgBuffer, observe: observeReceive)
       else { return }
       let parsed = received.parsed
 
@@ -2369,7 +2392,8 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       do {
         try sendTraceProbe(
           sockfd: socket.fd, resolved: resolved, identifier: identifier,
-          sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
+          sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline,
+          sendProbe: sendProbe)
         outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
       } catch {
         // Best-effort retry — silently skip if send fails (will time out instead).

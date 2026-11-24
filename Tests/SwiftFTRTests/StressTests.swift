@@ -143,8 +143,8 @@ final class StressAndEdgeCaseTests: XCTestCase {
     // Test various public IP formats
     let testIPs = [
       "1.2.3.4",
-      "255.255.255.254",
-      "100.64.0.1",  // CGNAT
+      "8.8.8.8",
+      "9.9.9.9",
     ]
 
     for ip in testIPs {

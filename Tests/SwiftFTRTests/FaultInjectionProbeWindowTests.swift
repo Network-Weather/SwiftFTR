@@ -73,7 +73,10 @@ struct FaultInjectionProbeWindowTests {
     #expect(result.hops.count == 6)
     #expect(result.hops.allSatisfy { $0.ipAddress == nil && $0.outcome == .timedOut })
     #expect(elapsed >= 0.35, "silent trace returned after \(elapsed)s, before its 0.4s window")
-    #expect(network.probes.value == 6, "every TTL should have been sent")
+    // The network counts each probe as it reads it, which can be after the trace has returned.
+    #expect(
+      await eventually(within: 10) { network.probes.value == 6 },
+      "every TTL should have been sent: \(network.probes.value) probes")
   }
 
   @Test("Replies that arrive after the deadline are ignored, not fatal", arguments: families)
@@ -224,20 +227,28 @@ struct FaultInjectionProbeWindowTests {
 
   @Test("Unreachable replies are reported per hop and do not end the trace early")
   func unreachableReported() async throws {
+    // Hops 1 and 2 answer host-unreachable and hop 3 is the destination. The window outlasts the
+    // watchdog, so only the destination's reply can end the trace in time: a trace that stopped
+    // at an unreachable reply would miss hop 3, and none waits on how fast loopback delivers.
     let network = try FakeICMPNetwork { probe in
-      [
-        .init(
-          ICMPWire.unreachable(family: AF_INET, code: 1, id: probe.identifier, seq: probe.sequence))
-      ]
+      let ttl = probe.hopLimit ?? Int(probe.sequence)
+      let bytes =
+        ttl < 3
+        ? ICMPWire.unreachable(family: AF_INET, code: 1, id: probe.identifier, seq: probe.sequence)
+        : ICMPWire.echoReply(family: AF_INET, id: probe.identifier, seq: probe.sequence)
+      return [.init(bytes)]
     }
     defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 3, maxWaitMs: 300, noReverseDNS: true))
+    let tracer = offlineTracer(
+      SwiftFTRConfig(maxHops: 3, maxWaitMs: Int(3 * Self.watchdog * 1000), noReverseDNS: true))
 
     let result = try await measure(within: Self.watchdog) {
       try await network.install { try await tracer.trace(to: "fake.test") }
     }.0
-    #expect(!result.reached)
-    #expect(result.hops.allSatisfy { $0.outcome == .unreachable(code: 1) })
+    #expect(result.reached)
+    #expect(result.hops.count == 3)
+    #expect(result.hops.prefix(2).allSatisfy { $0.outcome == .unreachable(code: 1) })
+    #expect(result.hops.last?.reachedDestination == true)
   }
 
   // MARK: The socket
@@ -268,7 +279,7 @@ struct FaultInjectionProbeWindowTests {
       }
     }
 
-    try await network.install(socketFactory: connectedFactory) {
+    try await network.install(socketFactory: connectedFactory, isolated: false) {
       await expectSendFailure("trace") { _ = try await tracer.trace(to: "fake.test") }
       await expectSendFailure("traceClassified") {
         _ = try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
@@ -304,7 +315,9 @@ struct FaultInjectionProbeWindowTests {
     // A ping that counted its failed sends would wait out their reply window, which outlasts the
     // watchdog.
     let (result, _) = try await measure(within: Self.watchdog) {
-      try await network.install(socketFactory: Self.connectedSocketFactory(network)) {
+      try await network.install(
+        socketFactory: Self.connectedSocketFactory(network), isolated: false
+      ) {
         try await tracer.ping(
           to: "fake.test", config: PingConfig(count: 3, interval: 0.05, timeout: timeout))
       }
@@ -513,7 +526,10 @@ struct FaultInjectionProbeWindowTests {
     #expect(result.statistics.sent == 3)
     #expect(result.statistics.received == 0)
     #expect(result.statistics.packetLoss == 1)
-    #expect(network.probes.value == 3, "the network saw \(network.probes.value) probes")
+    // The network counts each probe as it reads it, which can be after the ping has returned.
+    #expect(
+      await eventually(within: 10) { network.probes.value == 3 },
+      "the network saw \(network.probes.value) probes")
     // The last probe leaves at about 0.1 s and is owed its 0.3 s reply window, so a ping that
     // gives up after its last send returns too early.
     #expect(elapsed >= 0.35, "silent ping took \(elapsed)s")

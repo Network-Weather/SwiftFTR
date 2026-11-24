@@ -23,7 +23,8 @@ that fail when any phase can wait without a bound or strand its caller.
   overrides, all `nil` in production: the blocking-I/O executor, forward resolution, the ICMP
   socket factory used by trace and ping, IPv4 public-address discovery, a hook that holds
   `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping,
-  UDP exchange, TCP probe or UDP probe socket non-blocking, and for the event-based UDP transport (`UDPExchange`) its
+  UDP exchange, TCP probe or UDP probe socket non-blocking, the `sendto` a trace, stream or ping
+  sends its probes with, an observer of each read it makes from its probe socket, and for the event-based UDP transport (`UDPExchange`) its
   `send` and `close` calls and the DNS server port. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
@@ -34,6 +35,9 @@ that fail when any phase can wait without a bound or strand its caller.
   The trace sends its real echo requests to that peer, which replies with whatever a test scripts:
   silence, late replies, time-exceeded and echo replies, truncated or garbage datagrams, replies
   carrying another identifier. The trace's own receive loop and parser handle them unchanged.
+  Each probe socket is connected to its peer before its first send, through the send seam (Darwin
+  refuses a `sendto` that names an address on a connected datagram socket), so the kernel
+  delivers to it only what that peer sends, and the peer answers only sockets it made.
 - **Local fixtures for every other protocol.** TCP listeners that refuse, accept and stay silent,
   reset mid-response or answer slowly; an HTTP responder on the same listener; UDP responders for
   STUN and DNS that stay silent, answer late or answer garbage. All bind `127.0.0.1` or `::1` on an
@@ -92,7 +96,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails; for the probes, the result, nothing sent or connected, and the socket closed, against a pass-through control | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ReceiveLoop`, `ProbeNonBlockingSetupTests` |
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
-| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP `stop()` returns without waiting for its handlers and `stopAndWait()` joins them; a stopped UDP fixture's thread closes its own socket | fixtures | `Fixture` |
+| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; a probe socket connected to its fake network receiving only the network's datagrams, against an unconnected control; trace, stream and ping probe sockets connected through the send seam; a fake network answering only the sockets it made, bound by their first send or later; every UDP responder and counter (the shared responder, the scripted DNS peer, the held STUN server, the refusing-then-answering port, the UDP probe server and sink) answering or counting its request after a short and an empty stray queued ahead of it; the DNS query filter; refusing TCP port reserved; TCP `stop()` returns without waiting for its handlers and `stopAndWait()` joins them; a stopped UDP fixture's thread closes its own socket | fixtures | `Fixture` |
 
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`,
 `DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport,
@@ -454,7 +458,11 @@ Observations that are not defects of the library:
   cannot fail to end are left unbounded: a stall the test itself releases, a call with its own
   timeout that is not the one under test.
 - `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
-  identifies a socket by its bound local address when checking that the library closed it.
+  identifies a socket by the kernel's identity of it (`soi_so`, from `proc_pidfdinfo`), against a
+  duplicate it holds, when checking that the library closed it. It used the bound local address
+  until a socket of the other type, bound to the same address and port and handed the same
+  descriptor number, made a closed TCP probe socket read as open (once in a full debug run;
+  forced by placing such a UDP socket on the old number).
 - A loopback fixture could take the port of an IPv6 probe socket and receive its replies. The
   fake network hands trace and ping an unbound UDP socket, which takes an ephemeral port on `[::]`
   at its first send. Fixtures bound `::1` on port 0 with `SO_REUSEADDR`, and with that option
@@ -507,3 +515,153 @@ Observations that are not defects of the library:
   21 s steps, and the TCP stop test, starved past both of its 30 s budgets, saw its handler answer
   and exit before `stop()` (2 of 500 strict repetitions, twice). Both loops now run on a thread of
   their own (`onOwnThread`).
+- A fake network's late reply could land in another test's fixture. Tests such as
+  `lateRepliesIgnored` schedule replies for after the operation has closed its probe socket. The
+  reply goes to that socket's port number, and a fixture bound in the meantime can have been
+  handed the same number: `DNSWireHardeningTests.productionQueryRejectsInvalidHeaders` read a
+  16-byte echo reply as its query, failed, and left the query to time out (once in 15 full debug
+  runs; 5 of 5 with the ordering forced). `FakeICMPNetwork` now holds a duplicate of every socket
+  it opens until it stops, so the port number stays taken while it can still send, and every
+  loopback responder takes only the datagram its test asked for (see the stray crash below).
+- **`--repeat-until fail` over several suites at once is not a valid gate: it slows loopback for
+  the whole host.** It repeats every test on its own and in parallel, so the quick ones run flat
+  out together. Run with the filter `DNSWireHardeningTests|FaultInjection|PingReplyMatching`, it
+  raised the worst loopback round trip of an unrelated process (one datagram every 10 ms) from
+  1 to 5 ms to 200 to 750 ms in every second it ran. With
+  `loopbackFixtureKeepsOffWildcardPorts` and `refusingUDPPortKeepsOffDualStack` skipped (about
+  8,000 socket, bind and close calls a repetition), the worst round trip was 60 to 290 ms; with
+  only those two repeating, 10 to 64 ms; with any one suite repeating alone, 8 to 124 ms. A
+  capture on `lo0` showed requests reaching a fixture's port 0.35 s and up to 0.7 s after they
+  were sent, after their 0.3 s fixture had closed. The fixtures' own threads ran on time
+  throughout: they started within 3 ms, read every 20 ms, and found nothing queued. So the
+  climb in "dropped due to no socket" is these late requests, not a separate fault, and every
+  test that needs a loopback answer, or a probe seen, within a sub-second budget failed at its
+  first repetition: about 25 tests in six files, 40 to 50 issues in the first 2 to 3 seconds. A
+  test that fails stops repeating, so the failures look like a short burst although the
+  slowdown lasts the whole run. Main and the branch that holds `FakeICMPNetwork`'s duplicate
+  sockets each failed 10 of 10 such runs; every suite repeated alone passed. The same load from
+  another process is enough without repetition: plain runs of the filter failed 10 of 10 while
+  a second process ran the repeated filter, and 1 of 10 while it ran plain full suites. A valid
+  repetition gate loops whole runs, each a normal load, with nothing else running:
+  `for i in $(seq 30); do SKIP_NETWORK_TESTS=1 PTR_SKIP_STUN=1 swift test -c debug --skip-build
+  --filter '<suites>' || break; done` passed 30 of 30 on main and on the branch, and 15 of 15
+  each under `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`. The tests themselves still assume a
+  loopback answer within 0.3 to 0.5 s, a wall-clock bound in disguise that a loaded host breaks.
+  The rule they now follow, file by file (#103): a call the fixture must answer gets a generous
+  timeout that the answer ends; a count of what a fixture saw is awaited, not read when the call
+  returns; a ping or trace whose result depends on which replies land inside a short window is
+  restaged so that it does not. A call whose own timeout is the thing tested keeps it short.
+  Measured by running `DNSWireHardeningTests|FaultInjection|PingReplyMatching|TCPProbeTests|
+  AsyncPublicIP|UDPProbeBinding` as whole runs while a second process runs the repeated filter
+  from a main worktree, and counting the issues in the files a change touched.
+- **A `DNSWireHardeningTests` query timed out because its responder started late.** The fixture's
+  responder starts from a `Task`, so it first needs a cooperative-pool thread. Repeated under
+  `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, 187 of 1,507 responders entered more than 0.1 s late
+  (at most 0.59 s), each with its query already queued, and the two that entered after 0.5 s
+  were the run's two `.timeout` failures of `productionQueryPreservesOwnerName` and
+  `productionQueryRejectsInvalidHeaders`, whose queries had 0.5 s. Delaying the responder by
+  0.6 s failed all four of their cases with that signature. The three queries the fixture must answer now
+  take `answeredQueryTimeout` (10 s); the answer ends them, so a passing run waits no longer.
+- **A short stray datagram crashed the test process through a fixture's script** (#169).
+  `FaultInjectionWireTests.dnsFaults` built its replies with `dnsResponse(to:)`, which wrote
+  bytes 2, 3, 6 and 7 of whatever datagram reached the responder, so a stray under 8 bytes (a
+  silent STUN server's 4-byte garbage, an empty probe) trapped with "Index out of range" and
+  ended every test in the process: 4 of about 70 repeated runs, while loopback was slow enough
+  that late datagrams reached recycled ports. `DNSQuestionMatchTests.questionTypeOffset`, reached
+  through `ScriptedDNSPeer` from `DNSQuestionVerdictTests`, trapped the same way. A 4-byte
+  datagram sent to either fixture reproduced both traps on demand. Fixed by one rule for every
+  loopback responder: a `DatagramFilter` names the one request it takes (a DNS query for the
+  test's name, a STUN binding request, the test's own payload), and everything else, empty
+  datagrams included, is counted as ignored and never answered, counted as a request or handed
+  to a script. `LoopbackUDPResponder`, `ScriptedDNSPeer`, `HeldUDPServer`,
+  `RefusingThenAnsweringUDPPort`, the UDP probe tests' `LoopbackUDPServer` and `DatagramSink`
+  follow it, and the shared DNS readers check lengths rather than index past a short datagram.
+  Each has a test that queues a short and an empty stray ahead of its request (confirmed with
+  `SO_NUMRCVPKT`, the fixture's first read held behind a gate) and fails when the filter is
+  bypassed. `ScriptedDNSPeer`'s feed, which kept sending to the client's port after the query
+  ended, now stops, under its send lock, before the query's socket closes (through the
+  transport's close seam), and the peer holds a duplicate of that socket until it stops.
+- **Strays that remain possible.** None can reach a probe socket: each is connected to its fake
+  network, and a connected datagram socket receives only from its peer (a short and an empty
+  stray from another socket: `SO_NUMRCVPKT` 1, the network's reply alone, against 3 unconnected),
+  and the fake network answers only sockets it made, so another test's late request is neither
+  counted nor scripted. Tests that count what is queued on a probe socket can therefore count
+  exactly. Strays can still reach the unconnected sides: a fixture's port, and a test-side
+  client socket. A fixture that holds a port releases it once it stops sending, but a datagram
+  it sent just before can still be in flight on a loaded host (round trips of 200 to 750 ms were
+  measured) and land on the next socket handed that number; `FakeICMPNetwork`'s replies and
+  `EndlessReplies`' feed, at 500 a second, are the largest sources. `HeldUDPServer` answers its held clients with a 4-byte datagram when released, which
+  reaches a client only while its STUN attempt is still blocked in `recv`: every test that
+  releases one with attempts outstanding gives them a 60 s receive timeout, and the one whose
+  attempts have 0.2 s asserts that none reached the server. Receivers no longer act on such
+  datagrams, and a DNS filter given no name still takes another test's late query: the tests
+  that assert an exact request count name their query.
+- **The wire tests waited on loopback inside sub-second budgets** (#103). Under that load
+  `FaultInjectionWireTests` recorded issues in 9 of 10 runs on main (93 issues), 3 of 10 with
+  `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`: DNS error replies, the open TCP port and the refusing
+  UDP port arrived after their 0.3 to 1 s timeouts and were reported as timeouts, and request
+  and connection counts were read before the fixture's thread had counted. Every call the
+  fixture answers now has a 10 s timeout its answer ends; an HTTP fault the server itself ends
+  (refusal, reset, close) has a timeout past the watchdog, so a probe that missed it trips the
+  watchdog; counts are awaited. A silent DNS or STUN server keeps 0.3 s. An HTTP server that
+  accepts and stays silent, or answers after the watchdog, keeps a timeout the test is about, and
+  that timeout starts before URLSession has connected: at 0.5 s the server had not accepted when
+  the probe gave up in 3 of 20 loaded runs (6 cases), so it is 3 s, which still depends on connecting
+  within it; a hook at the accept would remove that. The compression-loop reply is now required
+  to be `malformedResponse`, not any `DNSError`.
+- **Ping reply-matching tests needed replies inside a 0.5 s window** (#103). Under that load
+  ping's tests recorded issues in 9 of 10 runs on main (116 issues), 3 of 10 strict:
+  `unsentSequencesCannotEndPingEarly`, `futureSequenceIsNotCounted`,
+  `failedSendStillWaitsForUnansweredProbe` and `lateReplyWithinPingIsCounted` counted fewer
+  replies than were sent, because the
+  replies crossed loopback after the last probe's window had closed, and
+  `failedSendEndsWhenSendLoopFinishes` found probe 1's reply still unread at probe 2's send. Ping
+  arms its last window at the last send's time and drops what it has not read when the window
+  closes, so a reply's crossing has to finish before then. The first, third and fourth now hold probe 3's
+  send, on the ping's queue, until the network has sent the earlier replies and they are queued
+  (`DirectPing.waitUntilReplied`); the send time is taken after the hold, so the queued replies
+  are read inside the window; the count is exact, since the probe socket hears only its
+  network. A held test's "not early" bound is measured on ping's clock from probe 3's own send to
+  ping's close, both stamped on ping's queue, never from the start of a run that contains the
+  hold. In the late-reply test probe 3 is no longer answered, so the ping reads
+  probe 1's late reply after its own probe's timeout and before its own end. The second leaves
+  probe 2 unanswered, holds its send until probe 1's reply and the early one are queued, and
+  checks that the reply queued before probe 2's send does not give it an RTT, so no genuine reply
+  can mask a false match. `failedSendEndsWhenSendLoopFinishes` cannot be held that way: the
+  send loop enqueues each send and sleeps on its own, so a hook cannot keep probe 2 back until a
+  reply is read. Its reply is now injected (one loopback crossing, not two) and its interval is
+  2 s, which still has to outlast delivery; a seam on the send loop's sleep would remove that.
+- **The receive-loop tests waited on loopback and inferred what the operation did** (#103). Under
+  that load `traceDeadline` and `streamDeadline` failed with "sent 0 -> 0": `EndlessReplies` started
+  its feed only when the fake network saw the first probe, which crossed loopback after the 0.3 s
+  window had closed (the strict "294 sent, 4 read" failures were the same start, just before it
+  closed). The feed now starts as the probe socket is made, with an exact batch of echo replies for
+  sequence 0, which no operation sends, and the socket is handed over only once the batch is queued
+  whole. Nothing is inferred from the fixture's side: the operation's first read is the batch
+  shrinking, and its every read passes through `TestSeams.observeProbeReceive` (the three
+  probe-socket reads in the library), so `heldReading` asks for a read past the batch and no empty
+  read, counted on the operation's own queue. Sent minus queued had taken replies in flight for
+  reads, and the sender's pace had hidden a read that came back empty. Bounds are measured from the
+  handover: "not early" from it, and each upper bound from it too, with the factory's priming under
+  its own allowance, so pingDeadline still tells its reply window from its 5.8 s safety timer.
+  `unreachableReported` ends on a destination reply instead of needing three replies within 0.3 s,
+  and two probe counts are awaited. Under that load these files recorded issues in 9 of 10 runs on
+  main (20 issues), 2 of 10 strict.
+- **Two fixture and probe tests assumed a quiet host** (#103). `ProbeTests.testClosedPort` probed
+  port 9999 on the assumption that nothing listens there and required the reset within 100 ms, a
+  wall-clock upper bound that failed even unloaded (rtt 0.155 s in a release run; 5 of 60
+  unloaded runs of the broad filter, and 6 of 10 loaded). It now probes a `RefusingTCPPort`
+  reserved for the test, with a timeout past its watchdog, so only the reset can end it, and
+  checks the round trip against the elapsed time instead of a constant.
+  `FaultInjectionFixtureTests.udpZeroByteRequest` read the responder's answer with a blocking
+  `recv` and a 1 s timeout in the async test body; the read now runs on a thread of its own with
+  a 10 s timeout the answer ends, and reads past any other datagram on its client's port.
+- **`AsyncPublicIPDiscoveryTests.stalledAttemptsBoundedByBudget` once found the fallback never
+  asked.** It failed once in about 500 strict repetitions of its suite with the whoami responder
+  asked 0 times, so not a stray (which would count one or more). 229 instrumented strict
+  repetitions did not repeat it: the fallback always started 4.000 to 4.012 s into discovery and
+  discovery ended at 8.001 to 8.014 s. Not reproduced; the mechanism is not known. On failure
+  the test now reports a timeline: discovery's start and return, the first STUN request's
+  arrival, when the fallback's query was sent and what `send` returned (through the UDP
+  exchange's send seam), and its arrival.
+

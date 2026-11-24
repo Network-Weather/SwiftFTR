@@ -685,13 +685,11 @@ extension SwiftFTR {
     if let name = config.interface { _ = try validateInterface(name) }
     if let source = config.sourceIP {
       try validateSourceIPFamily(source, destinationFamily: AF_INET)
-      let fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-      if fd >= 0 {
-        defer { close(fd) }
-        if let message = bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: source) {
-          throw TracerouteError.sourceIPBindFailed(
-            sourceIP: source, errno: errno, details: message)
-        }
+      let fd = TestSeams.validationSocket?() ?? socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+      guard fd >= 0 else { throw TracerouteError.socketCreateFailed(errno: errno, details: "bind") }
+      defer { close(fd) }
+      if let message = bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: source) {
+        throw TracerouteError.sourceIPBindFailed(sourceIP: source, errno: errno, details: message)
       }
     }
     // Literals resolve without `getaddrinfo` under a forced family.

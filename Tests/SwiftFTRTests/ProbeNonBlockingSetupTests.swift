@@ -50,7 +50,7 @@ struct ProbeNonBlockingSetupTests {
     #expect(message.contains(step.rawValue), "\(message)")
     #expect(message.contains("errno=\(EINVAL)"), "\(message)")
     #expect(!sockets.anyConnected, "the probe connected its blocking socket")
-    #expect(sink.queued == 0, "a datagram was sent from a blocking socket")
+    #expect(sink.received(Self.udpPayload) == 0, "a datagram was sent from a blocking socket")
     #expect(sockets.opened == 1, "fcntl was called on \(sockets.opened) sockets")
     #expect(sockets.allClosed, "the probe left its socket open")
   }
@@ -68,19 +68,38 @@ struct ProbeNonBlockingSetupTests {
     #expect(result.responseType == "timeout", "\(result.error ?? "nil")")
     #expect(sockets.anyConnected, "the probe never connected its socket")
     // Loopback delivery is asynchronous to `send`, so wait for the datagram to land.
-    #expect(await eventually(within: 10) { sink.queued == 1 }, "\(sink.queued) datagrams queued")
+    #expect(
+      await eventually(within: 10) { sink.received(Self.udpPayload) == 1 },
+      "\(sink.received(Self.udpPayload)) probe datagrams received")
     #expect(sockets.opened == 1, "fcntl was called on \(sockets.opened) sockets")
     #expect(sockets.leftNonBlocking, "the probe's socket was not non-blocking")
     #expect(sockets.allClosed, "the probe left its socket open")
+  }
+
+  @Test("The datagram sink counts only the probe's datagram, after strays queued ahead of it")
+  func sinkIgnoresStrays() async throws {
+    let sink = try DatagramSink()
+    #expect(Strays.send(to: sink.port))
+    try #require(await eventually(within: 10) { sink.queued >= 2 }, "queued: \(sink.queued)")
+    let (result, _) = try await measure(within: Self.watchdog) {
+      try await udpProbe(config: Self.udpConfig(port: sink.port))
+    }
+    #expect(result.responseType == "timeout", "\(result.error ?? "nil")")
+    #expect(
+      await eventually(within: 10) { sink.received(Self.udpPayload) == 1 },
+      "\(sink.received(Self.udpPayload)) probe datagrams received")
   }
 
   /// Bound to a loopback source address so the probe's socket has a local address unique to it
   /// before `fcntl`, which is how ``ProbeSocketLog`` tells whether it was closed.
   static func udpConfig(port: UInt16) -> UDPProbeConfig {
     UDPProbeConfig(
-      host: "127.0.0.1", port: Int(port), timeout: 0.3, payload: Data("probe".utf8),
+      host: "127.0.0.1", port: Int(port), timeout: 0.3, payload: Data(udpPayload),
       sourceIP: "127.0.0.1")
   }
+
+  /// The probe's payload, the only datagram ``DatagramSink`` counts.
+  static let udpPayload = Array("probe".utf8)
 
   // MARK: TCP
 
@@ -139,13 +158,13 @@ struct ProbeNonBlockingSetupTests {
 
 /// Records each socket a probe passes to `fcntl`, to tell afterwards whether it was closed.
 ///
-/// It keeps a duplicate of each descriptor, so the socket's local address stays allocated to it
-/// and no other socket can be given that address. The probe's descriptor number is closed when it
-/// no longer names a socket with that address: either nothing, or a different socket another test
-/// was handed.
+/// It keeps a duplicate of each descriptor, which keeps the socket open, and so its kernel
+/// identity (``socketIdentity(_:)``) unique to it. The probe's descriptor number is closed when it
+/// no longer names that socket: either nothing, or a different socket another test was handed,
+/// whatever its type or address.
 private final class ProbeSocketLog: @unchecked Sendable {
   private let lock = NSLock()
-  private var sockets: [(fd: Int32, copy: Int32, address: [UInt8])] = []
+  private var sockets: [(fd: Int32, copy: Int32)] = []
   private var nonBlocking = false
 
   deinit { for socket in sockets { close(socket.copy) } }
@@ -190,7 +209,7 @@ private final class ProbeSocketLog: @unchecked Sendable {
   var allClosed: Bool {
     lock.lock()
     defer { lock.unlock() }
-    return sockets.allSatisfy { Self.localAddress($0.fd) != $0.address }
+    return sockets.allSatisfy { socketIdentity($0.fd) != socketIdentity($0.copy) }
   }
 
   /// Whether any recorded socket has a peer: it got as far as `connect`. Read through the
@@ -213,35 +232,37 @@ private final class ProbeSocketLog: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     guard !sockets.contains(where: { $0.fd == fd }) else { return }
-    sockets.append((fd, dup(fd), Self.localAddress(fd) ?? []))
-  }
-
-  private static func localAddress(_ fd: Int32) -> [UInt8]? {
-    var storage = sockaddr_storage()
-    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
-    let result = withUnsafeMutablePointer(to: &storage) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
-    }
-    guard result == 0 else { return nil }
-    return withUnsafeBytes(of: storage) { Array($0.prefix(Int(length))) }
+    sockets.append((fd, dup(fd)))
   }
 }
 
-/// A loopback UDP port that nobody reads, so every datagram sent to it stays queued and countable.
-private final class DatagramSink: @unchecked Sendable {
+/// A loopback UDP port that nothing reads until a test asks how many of its datagrams arrived, so
+/// what was sent to it stays queued and countable.
+final class DatagramSink: @unchecked Sendable {
   let port: UInt16
   private let fd: Int32
+  private let lock = NSLock()
+  private var arrived: [[UInt8]] = []
 
   init() throws { (fd, port) = try bindLoopback(family: AF_INET, type: SOCK_DGRAM) }
 
   deinit { close(fd) }
 
   /// Datagrams waiting on the port, from `SO_NUMRCVPKT`, or -1 if it cannot be read.
-  var queued: Int32 {
-    var count: Int32 = 0
-    var length = socklen_t(MemoryLayout<Int32>.size)
-    guard getsockopt(fd, SOL_SOCKET, SO_NUMRCVPKT, &count, &length) == 0 else { return -1 }
-    return count
+  var queued: Int32 { queuedDatagrams(fd) }
+
+  /// How many datagrams equal to `payload` have arrived. Reads whatever is queued first; any
+  /// other datagram is a stray (``DatagramFilter``) and is not counted.
+  func received(_ payload: [UInt8]) -> Int {
+    lock.lock()
+    defer { lock.unlock() }
+    var buffer = [UInt8](repeating: 0, count: 2048)
+    while true {
+      let n = recv(fd, &buffer, buffer.count, MSG_DONTWAIT)
+      guard n >= 0 else { break }
+      arrived.append(Array(buffer.prefix(n)))
+    }
+    return arrived.filter { $0 == payload }.count
   }
 }
 
