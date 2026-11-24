@@ -612,6 +612,12 @@ internal func stunGetPublicIPWithFallback(
   var lastError: Error = STUNError.recvTimeout
   let famName = family == AF_INET6 ? "v6" : "v4"
 
+  // Admitted first, one sweep per executor worker, so a sweep waiting its turn holds no socket;
+  // the wait ends with the caller's cancellation (a discovery's deadline cancels it too).
+  try Task.checkCancellation()
+  let admission = (TestSeams.blockingIOExecutor ?? blockingIOExecutor).stunSweepAdmission
+  try await admission.wait()
+  defer { Task { await admission.signal() } }
   // Bound first: nothing is resolved or sent unless every socket could be bound.
   let sockets = try servers.map { _ in
     try BoundSTUNSocket(

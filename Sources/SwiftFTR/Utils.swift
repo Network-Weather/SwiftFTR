@@ -610,6 +610,9 @@ private final class ContinuationBox<T: Sendable>: @unchecked Sendable {
 /// caller stops waiting for it, but the executor slot is not reclaimed until it returns.
 final class BlockingIOExecutor: Sendable {
   private let operationQueue: OperationQueue
+  /// One permit per worker for STUN sweeps, taken before a sweep opens its sockets, so sweeps
+  /// queued behind this executor hold none.
+  let stunSweepAdmission: _ConcurrencySemaphore
 
   init(maximumConcurrentOperations: Int, name: String) {
     precondition(maximumConcurrentOperations > 0)
@@ -619,6 +622,7 @@ final class BlockingIOExecutor: Sendable {
     operationQueue.maxConcurrentOperationCount = maximumConcurrentOperations
     operationQueue.qualityOfService = .utility
     self.operationQueue = operationQueue
+    stunSweepAdmission = _ConcurrencySemaphore(maxConcurrent: maximumConcurrentOperations)
   }
 
   /// - Parameter deadline: Seconds the caller will wait before abandoning the operation with

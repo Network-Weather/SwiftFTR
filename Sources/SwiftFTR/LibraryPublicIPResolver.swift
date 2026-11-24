@@ -59,7 +59,12 @@ func publicIPDiscovery(
   enableLogging: Bool,
   budget: TimeInterval
 ) async throws -> PublicIPObservation? {
-  if let sourceIP, IPAddressFamily(address: sourceIP) != family {
+  try Task.checkCancellation()
+  // A zone that names no interface (`::1%`, `fe80::1%nope`) would bind with no scope at all.
+  if let sourceIP,
+    IPAddressFamily(address: sourceIP) != family
+      || (sourceIP.contains("%") && parseIPv6Scoped(sourceIP).scopeID == 0)
+  {
     if enableLogging {
       print("[PublicIP] Source address '\(sourceIP)' cannot be bound for \(family); not asking")
     }

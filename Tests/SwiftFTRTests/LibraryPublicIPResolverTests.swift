@@ -355,5 +355,12 @@ struct LibraryPublicIPResolverTests {
     let asked = requests.all
     #expect(Set(asked.map(\.family)) == [.v4, .v6])
     #expect(asked.allSatisfy { $0.interface == "lo0" && $0.sourceIP == nil })
+
+    // A link-local source keeps its zone, and only its family is asked.
+    let zoned = await TestSeams.$discoverPublicIP.withValue(discovery) {
+      await getPublicIPs(sourceIP: "fe80::1%lo0")
+    }
+    #expect(zoned.v6 == "2001:db8::5" && zoned.v4 == nil)
+    #expect(requests.all.last?.sourceIP == "fe80::1%lo0")
   }
 }

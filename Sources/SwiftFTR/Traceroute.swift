@@ -1297,6 +1297,7 @@ public actor SwiftFTR {
   ///   ``PublicIPError/noAddress(reason:)`` when it gives no globally routable IPv4 address in time,
   ///   or the cancellation of `handle` or of the calling task.
   internal func discoverPublicIP(handle: TraceHandle? = nil) async throws -> String {
+    try Task.checkCancellation()
     let strategy = config.publicIPResolver
     if case .disabled = strategy { throw PublicIPError.discoveryDisabled }
     guard let request = publicIPRequest(for: .v4) else {
@@ -1351,6 +1352,9 @@ public actor SwiftFTR {
   private nonisolated func ask(
     _ strategy: PublicIPResolverStrategy, _ request: PublicIPRequest, handle: TraceHandle?
   ) async throws -> Result<PublicIPObservation?, any Error> {
+    // Cancelled already: no resolver is started, not even one whose outcome would be discarded.
+    if let reason = handle?.cancellationError() { throw reason }
+    try Task.checkCancellation()
     let ask: @Sendable () async throws -> PublicIPObservation?
     switch strategy {
     case .disabled:
