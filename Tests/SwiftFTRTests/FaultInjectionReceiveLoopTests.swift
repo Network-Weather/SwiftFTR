@@ -193,7 +193,9 @@ final class EndlessReplies: @unchecked Sendable {
 
   /// Whether the operation's receive loop never found its socket empty: it read at least
   /// `minimumReads` datagrams and none of its reads came back empty, and the feed is still
-  /// running. Both counts come from the operation's own reads, through the receive observer, so
+  /// running. One more than ``primed`` shows a fed reply arrived and was read: after the batch,
+  /// each read blocks until the next reply arrives or the receive timeout reports it empty, so a
+  /// slow loopback lowers the count only to that, never below it without an empty read. Both counts come from the operation's own reads, through the receive observer, so
   /// nothing but the operation can satisfy them; the sender's pace proves nothing about what the
   /// receiver found.
   func heldReading(minimumReads: Int) -> (ok: Bool, detail: String) {
@@ -381,7 +383,7 @@ struct FaultInjectionReceiveLoopTests {
       }
     }
     let ended = monotonicNow()
-    let flow = replies.heldReading(minimumReads: 20)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "the socket was not kept fed and read while the trace ran: \(flow.detail)")
     // From the handover, not the run's start, which includes priming the socket.
@@ -439,7 +441,7 @@ struct FaultInjectionReceiveLoopTests {
     let (result, _) = try await measure(within: Self.watchdog) {
       try await replies.install(network) { try await tracer.trace(to: "fake.test") }
     }
-    let flow = replies.heldReading(minimumReads: 20)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     // Foreign replies were read before the trace completed, so the valid ones came among them.
     #expect(flow.ok, "\(flow.detail)")
@@ -542,7 +544,7 @@ struct FaultInjectionReceiveLoopTests {
       }
     }
     let ended = monotonicNow()
-    let flow = replies.heldReading(minimumReads: 20)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "the socket was not kept fed and read while the stream ran: \(flow.detail)")
     // From the handover, not the run's start, which includes priming the socket.
@@ -605,7 +607,7 @@ struct FaultInjectionReceiveLoopTests {
     defer { consumer.cancel() }
     // Four initial probes, then the retry re-sends TTLs 1...3.
     let retried = await eventually(within: Self.watchdog) { network.probes.value == 7 }
-    let flow = replies.heldReading(minimumReads: 20)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
     await tracer.cancelActiveTraces()
     _ = try await measure(within: Self.watchdog) { await consumer.result }
 
@@ -632,7 +634,7 @@ struct FaultInjectionReceiveLoopTests {
         return hops
       }
     }
-    let flow = replies.heldReading(minimumReads: 20)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "\(flow.detail)")
     let answered = Set(hops.filter { $0.ipAddress != nil }.map(\.ttl))
@@ -666,7 +668,7 @@ struct FaultInjectionReceiveLoopTests {
       }
     }
     let ended = monotonicNow()
-    let flow = replies.heldReading(minimumReads: 20)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "the socket was not kept fed and read while the ping ran: \(flow.detail)")
     // Ping's sends run on the queue its receive loop drains on, so all three going out shows the
@@ -733,7 +735,7 @@ struct FaultInjectionReceiveLoopTests {
     let (result, _) = try await measure(within: Self.watchdog) {
       try await replies.install(network) { try await tracer.ping(to: "fake.test", config: config) }
     }
-    let flow = replies.heldReading(minimumReads: 20)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "\(flow.detail)")
     #expect(result.statistics.sent == 3)

@@ -652,11 +652,12 @@ Observations that are not defects of the library:
 - **Whether a receive loop's socket ran dry is observed at the receiver** (#103). The deadline
   tests' premise that the socket never ran dry was counted at the fixture's sends: a sender
   descheduled past the one-second receive timeout let a read come back empty, and the overdue
-  deadline then ended the operation, while the fixture's own bookkeeping still looked fed. The
-  three reads of a probe socket in the library (`recvmsg` and `recvfrom` in `recvTraceMessage`,
-  `recvmsg` in ping) now go through `TestSeams.observeProbeReceive` when one is bound, so
-  `EndlessReplies` counts, on the operation's own queue, the reads that returned a datagram and
-  those that found the socket empty. `heldReading` requires at least 20 reads and none empty.
-  With the feed paused for 1.5 s after the first read, the tests now fail on "reads 10, empty
-  reads 1"; under the unbounded drain fixed in 29716fc they still outlive their watchdog.
-
+  deadline then ended the operation, while the fixture's own bookkeeping still looked fed. The three
+  reads of a probe socket in the library (`recvmsg` and `recvfrom` in `recvTraceMessage`, `recvmsg`
+  in ping) now go through `TestSeams.observeProbeReceive` when one is bound, so `EndlessReplies`
+  counts, on the operation's own queue, the reads that returned a datagram and those that found the
+  socket empty. `heldReading` requires a read past the primed batch (one fed reply read) and no
+  empty read; a count of reads in the window would be a loopback-throughput budget again (11 to 17
+  reads in 0.3 s under load). With the feed paused for 1.5 s after the first read, the tests now
+  fail on "reads 10, empty reads 1"; under the unbounded drain fixed in 29716fc they still outlive
+  their watchdog.
