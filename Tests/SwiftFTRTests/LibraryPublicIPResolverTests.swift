@@ -231,35 +231,6 @@ struct LibraryPublicIPResolverTests {
 
   // MARK: getPublicIPs
 
-  @Test("getPublicIPs with a source address runs only its family's sweep; a malformed one, none")
-  func standaloneSourceSelectsFamily() async throws {
-    let answer4 = try Self.answering(AF_INET, ip: Self.mapped4)
-    let answer6 = try Self.answering(AF_INET6, ip: Self.mapped6)
-    defer {
-      answer4.stop()
-      answer6.stop()
-    }
-    let servers = AsyncPublicIPDiscoveryTests.servers(
-      v4: [("127.0.0.1", answer4.port)], v6: [("::1", answer6.port)])
-
-    let cases: [(source: String, v4: String?, v6: String?)] = [
-      ("127.0.0.1", "198.51.100.9", nil), ("::1", nil, "2001:db8::9"), ("not-an-ip", nil, nil),
-      ("::1%", nil, nil), ("::1%swiftftr-none0", nil, nil),
-    ]
-    for (source, v4, v6) in cases {
-      let (ips, _) = try await measure(within: Self.watchdog) {
-        await TestSeams.$stunServers.withValue(servers) {
-          await getPublicIPs(stunTimeout: Self.longSTUNTimeout, sourceIP: source)
-        }
-      }
-      #expect(ips.v4 == v4, "source \(source)")
-      #expect(ips.v6 == v6, "source \(source)")
-    }
-    // One request per family, each from the source of its own family; none unbound.
-    #expect(await eventually(within: 10) { answer4.requests.value == 1 })
-    #expect(await eventually(within: 10) { answer6.requests.value == 1 })
-  }
-
   /// UDP sockets of this process bound to lo0's interface index, from its descriptor table.
   static func lo0UDPSockets() -> Int {
     let lo0 = if_nametoindex("lo0")
@@ -355,12 +326,5 @@ struct LibraryPublicIPResolverTests {
     let asked = requests.all
     #expect(Set(asked.map(\.family)) == [.v4, .v6])
     #expect(asked.allSatisfy { $0.interface == "lo0" && $0.sourceIP == nil })
-
-    // A link-local source keeps its zone, and only its family is asked.
-    let zoned = await TestSeams.$discoverPublicIP.withValue(discovery) {
-      await getPublicIPs(sourceIP: "fe80::1%lo0")
-    }
-    #expect(zoned.v6 == "2001:db8::5" && zoned.v4 == nil)
-    #expect(requests.all.last?.sourceIP == "fe80::1%lo0")
   }
 }

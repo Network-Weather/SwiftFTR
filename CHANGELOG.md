@@ -134,10 +134,9 @@ Unreleased
   `PublicIPError.discoveryDisabled` for `.disabled`, and returns only a globally routable IPv4
   address, throwing `PublicIPError.noAddress(reason:)` otherwise. A failure that used to escape as
   an internal timeout error is `noAddress` too.
-- **`getPublicIPs` with a `sourceIP` runs only that family's sweep**, bound to it, and returns
-  `nil` for the other family, which it used to sweep unbound. A `sourceIP` that is not an IP
-  address sends nothing and returns both fields `nil`; it used to run both sweeps unbound. It asks
-  the library's resolver, so it also binds every socket before its lookups.
+- **`getPublicIPs` asks the library's resolver**, so it also binds every socket before its
+  lookups. A STUN sweep opens its sockets only once admitted, one sweep per executor worker, so
+  sweeps waiting their turn hold none. A call cancelled before it starts asks nothing.
 
 - **A classified trace asks for its public address once, after its probes, for the family they
   used** (decision 12). It asked for IPv4 before the probes, whatever the destination, and when

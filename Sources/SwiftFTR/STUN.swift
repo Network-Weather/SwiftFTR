@@ -748,9 +748,8 @@ func publicIPDiscoveryOutcome<Found>(
 /// - Parameters:
 ///   - stunTimeout: Per-server timeout (default 0.8s).
 ///   - interface: Optional interface to bind to (applied to both families).
-///   - sourceIP: Optional source IP. Only the sweep of its own family runs, bound to it; the
-///               other family sends nothing and is `nil`. A value that is not an IP address
-///               sends nothing for either family.
+///   - sourceIP: Optional source IP. If v4, only the v4 STUN sweep gets it;
+///               if v6, only the v6 sweep. (Cross-family bind would fail.)
 ///   - enableLogging: Verbose logging.
 public func getPublicIPs(
   stunTimeout: TimeInterval = 0.8,
@@ -758,11 +757,16 @@ public func getPublicIPs(
   sourceIP: String? = nil,
   enableLogging: Bool = false
 ) async -> PublicIPs {
+  // Detect family of sourceIP (if provided) so we only pass it to the matching sweep.
+  let sourceFamily = sourceIP.map { detectAddressFamily($0) } ?? -1
+  let v4Source = (sourceFamily == AF_INET) ? sourceIP : nil
+  let v6Source = (sourceFamily == AF_INET6) ? sourceIP : nil
+
   async let v4 = stunSweepAddress(
-    family: AF_INET, timeout: stunTimeout, interface: interface, sourceIP: sourceIP,
+    family: AF_INET, timeout: stunTimeout, interface: interface, sourceIP: v4Source,
     enableLogging: enableLogging)
   async let v6 = stunSweepAddress(
-    family: AF_INET6, timeout: stunTimeout, interface: interface, sourceIP: sourceIP,
+    family: AF_INET6, timeout: stunTimeout, interface: interface, sourceIP: v6Source,
     enableLogging: enableLogging)
   return await PublicIPs(v4: v4, v6: v6)
 }

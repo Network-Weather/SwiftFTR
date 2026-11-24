@@ -17,7 +17,7 @@ To find the call sites to review, search the consumer for `switch` over `DNSErro
 `.classify(`, `.publicIP` read from a `SwiftFTR` tracer, `SwiftFTRConfig(` calls that pass `publicIP:`,
 `traceClassified(` results whose `publicIP` or `clientASN` is read for an IPv6 destination,
 `discoverPaths(` followed by a read of the public-IP cache, `PublicIPError`,
-`discoverPublicIPWithHostname(`, `STUNPublicIP`, `getPublicIPs(` calls that pass `sourceIP:`, and any
+`discoverPublicIPWithHostname(`, `STUNPublicIP`, and any
 script that reads the output of `swift-ftr probe dns`.
 
 ## Update the package
@@ -395,34 +395,6 @@ do {
 } catch PublicIPError.discoveryDisabled {
   // the tracer's publicIPResolver is .disabled
 }
-```
-
-## getPublicIPs binds each family, or sends nothing for it
-
-**What changed.** ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` asks the
-library's resolver for each family. Given a `sourceIP`, it runs only the sweep of that address's
-family, bound to it; 0.18 ran the other family's sweep unbound. A `sourceIP` that is not an IP
-address now sends nothing; 0.18 ran both sweeps unbound. `stunTimeout` is still per server, and
-the call still has no overall deadline and reports the address as the STUN server gave it.
-
-**What a caller sees.** With `sourceIP: "192.0.2.10"`, `v6` is always `nil`; with an IPv6
-`sourceIP`, `v4` is always `nil`; with a malformed one, both are `nil`.
-
-**What to change.** To discover both families with a source address for one of them, make two
-calls:
-
-Before:
-
-```swift
-let ips = await getPublicIPs(sourceIP: v4Source)  // 0.18: v6 swept unbound
-```
-
-After:
-
-```swift
-async let v4 = getPublicIPs(sourceIP: v4Source)
-async let v6 = getPublicIPs(sourceIP: v6Source)  // or no sourceIP for system routing
-let ips = await PublicIPs(v4: v4.v4, v6: v6.v6)
 ```
 
 ## STUNPublicIP is no longer public

@@ -7,19 +7,11 @@ import Foundation
 /// The library's own public-IP resolver: STUN only, for the family asked, from sockets bound to
 /// the request's interface and source address.
 ///
-/// It has no other method. Where STUN is blocked it has no answer, and a classified trace
-/// classifies without an address unless the host app supplies one through its own
-/// ``PublicIPResolver``. In particular it never asks a recursive resolver for a whoami name: the
-/// address such a record carries is built from what the resolver forwards about its client, which
-/// can be another host than this one (#153).
-///
-/// Every STUN socket is created and bound to the interface and source address before its server
-/// name is resolved, and when a bind fails nothing is sent, the name lookup included (#151). The
-/// lookup itself goes through the system resolver, which is not bound to the interface. A source
-/// address that is not of the family asked for, or not an address at all, sends nothing.
-///
-/// The resolver holds the request's deadline itself (``publicIPDiscovery(family:stunTimeout:interface:sourceIP:enableLogging:budget:)``),
-/// so the tracer does not race it against a second timer.
+/// It never asks a recursive resolver for a whoami name, whose answer can be another host's
+/// (#153). Every STUN socket is bound before its server name is resolved, and a failed bind sends
+/// nothing, the lookup included (#151); the lookup itself uses the system resolver, unbound. A
+/// source address not of the family asked sends nothing. It holds the request's deadline itself,
+/// so the tracer runs no second timer against it.
 struct LibraryPublicIPResolver: PublicIPResolver {
   /// The per-server STUN timeout for a classified trace, a multipath run and
   /// ``SwiftFTR/discoverPublicIPWithHostname()``.
@@ -60,11 +52,7 @@ func publicIPDiscovery(
   budget: TimeInterval
 ) async throws -> PublicIPObservation? {
   try Task.checkCancellation()
-  // A zone that names no interface (`::1%`, `fe80::1%nope`) would bind with no scope at all.
-  if let sourceIP,
-    IPAddressFamily(address: sourceIP) != family
-      || (sourceIP.contains("%") && parseIPv6Scoped(sourceIP).scopeID == 0)
-  {
+  if let sourceIP, IPAddressFamily(address: sourceIP) != family {
     if enableLogging {
       print("[PublicIP] Source address '\(sourceIP)' cannot be bound for \(family); not asking")
     }
