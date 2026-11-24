@@ -21,8 +21,7 @@ struct HopMonitor {
       // Initial traceroute
       let config = SwiftFTRConfig(
         maxHops: 30,
-        maxWaitMs: 1000,
-        publicIP: "0.0.0.0"  // Skip STUN for faster startup
+        maxWaitMs: 1000
       )
       let tracer = SwiftFTR(config: config)
 

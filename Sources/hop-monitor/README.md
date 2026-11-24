@@ -70,7 +70,7 @@ Updated: 17:02:48
 - Actor-based statistics collection for thread-safe concurrent updates
 - Maintains rolling window of RTT samples (last 100) for percentile calculations
 - Jitter calculated as average of absolute differences between consecutive RTTs
-- No public-IP discovery: it uses plain `trace()`, which does none. (It also sets `publicIP: "0.0.0.0"`, which only matters for classified traces and multipath.)
+- No public-IP discovery: it uses plain `trace()`, which does none.
 
 ## Technical Notes
 
