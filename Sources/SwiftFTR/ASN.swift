@@ -60,10 +60,63 @@ public protocol ASNResolver: Sendable {
   /// Resolve metadata for the given IPv4 addresses.
   /// - Parameters:
   ///   - ipv4Addrs: IPv4 addresses as dotted-quad strings.
-  ///   - timeout: The per-lookup timeout in seconds. DNS-backed resolvers require a finite value
-  ///     greater than zero.
+  ///   - timeout: How long the whole call may take, in seconds. The built-in resolvers return
+  ///     what they have when it runs out, through every stage they pass a lookup to. DNS-backed
+  ///     resolvers require a finite value greater than zero; for the others, a value that is not
+  ///     finite and positive sets no bound.
   /// - Returns: Map of input IP -> ASNInfo for addresses with public routing data.
   func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
+}
+
+/// The instant `timeout` seconds from now, by which an ASN lookup returns what it has, or `nil`
+/// for no bound when `timeout` is not finite and positive.
+func asnDeadline(after timeout: TimeInterval) -> ContinuousClock.Instant? {
+  guard timeout.isFinite, timeout > 0, timeout < TimeInterval(Int.max) else { return nil }
+  return .now + .seconds(timeout)
+}
+
+/// Waits for `task`, work shared with other callers, until `deadline` passes or the calling task
+/// is cancelled, whichever comes first.
+///
+/// Neither the deadline nor the caller's cancellation cancels `task`: it runs on for the callers
+/// still waiting and for whoever asks next.
+///
+/// - Returns: The task's value, or `nil` once `deadline` has passed without it.
+/// - Throws: `CancellationError` when the calling task is cancelled, or the task's own error.
+func awaitShared<T: Sendable>(
+  _ task: Task<T, Error>, until deadline: ContinuousClock.Instant?
+) async throws -> T? {
+  let pair = AsyncThrowingStream<T?, Error>.makeStream()
+  _ = Task.detached {
+    do {
+      pair.continuation.yield(try await task.value)
+      pair.continuation.finish()
+    } catch {
+      pair.continuation.finish(throwing: error)
+    }
+  }
+  let timer = deadline.map { deadline in
+    Task.detached {
+      do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+      pair.continuation.yield(nil)
+      pair.continuation.finish()
+    }
+  }
+  defer { timer?.cancel() }
+
+  return try await withTaskCancellationHandler {
+    do {
+      var iterator = pair.stream.makeAsyncIterator()
+      guard let result = try await iterator.next() else { throw CancellationError() }
+      try Task.checkCancellation()
+      return result
+    } catch {
+      try Task.checkCancellation()
+      throw error
+    }
+  } onCancel: {
+    pair.continuation.finish(throwing: CancellationError())
+  }
 }
 
 /// Identity shared by copies of one caching resolver.
@@ -138,7 +191,8 @@ actor _ASNMemoryCache {
   /// A flight reserves each `(address, timeout)` key before its resolver task starts. Calls with
   /// overlapping keys await that shared task, while calls for disjoint keys start independent
   /// tasks. The task, rather than its first caller, owns the reservation, so caller cancellation
-  /// cannot cancel or poison work shared with another caller.
+  /// cannot cancel or poison work shared with another caller. Each caller stops waiting
+  /// `timeout` seconds after it arrived, with what it has by then, and the flights run on.
   fileprivate func resolve(
     _ addresses: [String],
     timeout: TimeInterval,
@@ -146,6 +200,7 @@ actor _ASNMemoryCache {
     scope: _ASNResolverScope
   ) async throws -> [String: ASNInfo] {
     try Task.checkCancellation()
+    let deadline = asnDeadline(after: timeout)
 
     var resolved = getMany(addresses)
     let missing = addresses.filter { resolved[$0] == nil }
@@ -180,12 +235,16 @@ actor _ASNMemoryCache {
     }
 
     for task in tasksByFlightID.values {
-      let loaded = try await Self.waitForLoad(task)
+      guard let loaded = try await awaitShared(task, until: deadline) else { break }
       for address in addresses {
         if let info = loaded[address] { resolved[address] = info }
       }
     }
 
+    // A flight not waited for because the deadline passed may still have finished in time.
+    for (address, info) in getMany(addresses) where resolved[address] == nil {
+      resolved[address] = info
+    }
     return resolved
   }
 
@@ -247,33 +306,6 @@ actor _ASNMemoryCache {
     }
   }
 
-  /// Waits for shared work while allowing this caller to stop waiting independently.
-  nonisolated private static func waitForLoad(_ task: LoadTask) async throws -> [String: ASNInfo] {
-    let pair = AsyncThrowingStream<[String: ASNInfo], Error>.makeStream()
-    _ = Task.detached {
-      do {
-        pair.continuation.yield(try await task.value)
-        pair.continuation.finish()
-      } catch {
-        pair.continuation.finish(throwing: error)
-      }
-    }
-
-    return try await withTaskCancellationHandler {
-      do {
-        var iterator = pair.stream.makeAsyncIterator()
-        guard let result = try await iterator.next() else { throw CancellationError() }
-        try Task.checkCancellation()
-        return result
-      } catch {
-        try Task.checkCancellation()
-        throw error
-      }
-    } onCancel: {
-      pair.continuation.finish(throwing: CancellationError())
-    }
-  }
-
   private func completeFlight(
     id: UInt64,
     generation flightGeneration: UInt64,
@@ -323,7 +355,9 @@ actor _ASNMemoryCache {
 ///
 /// Concurrent misses made through the same resolver instance are coalesced by address and timeout.
 /// Canceling one caller stops that caller's wait without canceling a shared lookup needed by other
-/// callers. The underlying resolver remains responsible for honoring its per-lookup timeout.
+/// callers. Each caller also stops waiting once its own `timeout` has passed, returning what is
+/// cached or has arrived by then, even when the underlying resolver overruns; the shared lookup
+/// runs on and fills the cache when it ends.
 public struct CachingASNResolver: ASNResolver {
   private let base: ASNResolver
   private let scope: _ASNResolverScope
@@ -416,6 +450,11 @@ private struct _OriginASNResult: Sendable {
 // Team Cymru DNS-based resolver using TXT queries.
 /// Team Cymru DNS-based resolver using TXT queries for origin ASN and AS names.
 public struct CymruDNSResolver: ASNResolver {
+  /// One TXT query for `name` to one server, answered by `deadline` or not at all.
+  typealias TXTQuery =
+    @Sendable (_ name: String, _ server: String, _ deadline: ContinuousClock.Instant) async ->
+    [String]?
+
   /// Queries in flight at once for one ``resolve(ipv4Addrs:timeout:)`` call. Each holds one UDP
   /// socket and no thread.
   private static let maxConcurrentQueries = 8
@@ -423,17 +462,35 @@ public struct CymruDNSResolver: ASNResolver {
   /// DNS servers each query tries, in order.
   private let servers: [String]
 
-  public init() { self.servers = DNSClient.defaultTXTServers }
+  /// Sends one query; the event-based DNS transport outside tests.
+  private let query: TXTQuery
 
-  /// A resolver that sends its queries to `servers`. Tests point it at a loopback responder.
-  init(servers: [String]) { self.servers = servers }
+  public init() { self.init(servers: DNSClient.defaultTXTServers) }
+
+  /// A resolver that sends its queries to `servers` through `query`. Tests point it at a
+  /// loopback responder, or record what each query is given.
+  init(servers: [String], query: @escaping TXTQuery = CymruDNSResolver.sendTXTQuery) {
+    self.servers = servers
+    self.query = query
+  }
+
+  /// One query on the event-based DNS transport, given the time left until `deadline`.
+  private static func sendTXTQuery(
+    name: String, server: String, deadline: ContinuousClock.Instant
+  ) async -> [String]? {
+    let timeout = secondsUntil(deadline)
+    guard timeout > 0 else { return nil }
+    return await DNSClient.queryTXT(name: name, timeout: timeout, servers: [server])
+  }
 
   /// Resolves origin ASN metadata through Team Cymru's DNS service.
   ///
   /// - Parameters:
   ///   - ipv4Addrs: IP addresses to resolve. IPv4 and IPv6 literals are supported; empty entries
   ///     are ignored.
-  ///   - timeout: The per-query timeout in seconds. It must be finite and greater than zero.
+  ///   - timeout: How long the whole call may take, in seconds: every origin and AS-name query
+  ///     and the fallback to the next server share it, and the call returns what has answered
+  ///     when it runs out. It must be finite and greater than zero.
   /// - Returns: A map from each resolved input address to its ASN metadata.
   /// - Throws: ``DNSError/invalidTimeout(_:)`` if `timeout` is not finite and greater than zero.
   #if compiler(>=6.2)
@@ -443,7 +500,13 @@ public struct CymruDNSResolver: ASNResolver {
     ASNInfo]
   {
     try _validateDNSTimeout(timeout)
+    return await resolve(ipv4Addrs: ipv4Addrs, until: .now + .seconds(timeout))
+  }
 
+  /// Resolves `ipv4Addrs`, returning by `deadline` with whatever has answered.
+  func resolve(ipv4Addrs: [String], until deadline: ContinuousClock.Instant) async -> [String:
+    ASNInfo]
+  {
     let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
     if ips.isEmpty { return [:] }
 
@@ -462,7 +525,7 @@ public struct CymruDNSResolver: ASNResolver {
         group.addTask {
           guard (try? await semaphore.wait()) != nil else { return (ip, nil) }
           defer { Task { await semaphore.signal() } }
-          return (ip, await self.lookupOriginASN(ip: ip, timeout: timeout))
+          return (ip, await self.lookupOriginASN(ip: ip, until: deadline))
         }
       }
 
@@ -482,7 +545,7 @@ public struct CymruDNSResolver: ASNResolver {
         group.addTask {
           guard (try? await semaphore.wait()) != nil else { return (asn, nil) }
           defer { Task { await semaphore.signal() } }
-          return (asn, await self.lookupASName(asn: asn, timeout: timeout))
+          return (asn, await self.lookupASName(asn: asn, until: deadline))
         }
       }
 
@@ -519,7 +582,9 @@ public struct CymruDNSResolver: ASNResolver {
   /// Look up origin ASN for a single IP address. Dispatches v4 to
   /// `origin.asn.cymru.com` (dotted-quad reverse) and v6 to
   /// `origin6.asn.cymru.com` (full nibble reverse, RFC 1886 §2.5 style).
-  private func lookupOriginASN(ip: String, timeout: TimeInterval) async -> _OriginASNResult? {
+  private func lookupOriginASN(
+    ip: String, until deadline: ContinuousClock.Instant
+  ) async -> _OriginASNResult? {
     let fam = detectAddressFamily(ip)
     let q: String
     if fam == AF_INET6 {
@@ -531,7 +596,7 @@ public struct CymruDNSResolver: ASNResolver {
       q = "\(rev).origin.asn.cymru.com"
     }
 
-    let txts = await DNSClient.queryTXT(name: q, timeout: timeout, servers: servers)
+    let txts = await queryTXT(name: q, until: deadline)
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Format: "AS | BGP Prefix | CC | Registry | Allocated"
@@ -551,11 +616,26 @@ public struct CymruDNSResolver: ASNResolver {
     return _OriginASNResult(asn: asn, prefix: prefix, cc: cc, registry: reg)
   }
 
+  /// TXT strings for `name` from the first of `servers` that answers by `deadline`, or `nil`.
+  ///
+  /// Each server still to try gets an equal share of the time left, so a silent server cannot use
+  /// up the time the next one needs, and a server that fails at once leaves its share to the rest.
+  private func queryTXT(name: String, until deadline: ContinuousClock.Instant) async -> [String]? {
+    for (index, server) in servers.enumerated() {
+      if Task.isCancelled { return nil }
+      let now = ContinuousClock.now
+      guard now < deadline else { return nil }
+      let share = now.duration(to: deadline) / (servers.count - index)
+      if let answer = await query(name, server, now + share) { return answer }
+    }
+    return nil
+  }
+
   /// Look up AS name for a single ASN.
-  private func lookupASName(asn: Int, timeout: TimeInterval) async -> String? {
+  private func lookupASName(asn: Int, until deadline: ContinuousClock.Instant) async -> String? {
     let qn = "AS\(asn).asn.cymru.com"
 
-    let txts = await DNSClient.queryTXT(name: qn, timeout: timeout, servers: servers)
+    let txts = await queryTXT(name: qn, until: deadline)
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Typical format: "AS | AS Name | CC | Registry | Allocated"

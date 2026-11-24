@@ -67,6 +67,30 @@ struct CymruEventBasedTests {
     await semaphore.signal()
     _ = try await measure(within: Self.watchdog) { try await next.value }
   }
+
+  @Test("Every query of a lookup ends by its deadline; a silent server leaves time for the next")
+  func queriesShareTheLookupsDeadline() async throws {
+    let recorder = TXTQueryRecorder()
+    let resolver = CymruDNSResolver(servers: ["192.0.2.1", "192.0.2.2"]) { name, server, deadline in
+      await recorder.silent(name: name, server: server, until: deadline)
+    }
+    // More addresses than queries run at once, so a second wave starts when the first times out.
+    let addresses = (1...12).map { "198.51.100.\($0)" }
+    let deadline = ContinuousClock.now + .milliseconds(600)
+
+    let (result, _) = try await measure(within: Self.watchdog) {
+      await resolver.resolve(ipv4Addrs: addresses, until: deadline)
+    }
+
+    #expect(result.isEmpty)
+    let attempts = await recorder.attempts
+    #expect(!attempts.isEmpty)
+    let late = attempts.filter { $0.deadline > deadline }
+    #expect(late.isEmpty, "\(late.count) of \(attempts.count) queries outlived the lookup")
+    // A silent first server does not use up the time: the second is asked too.
+    let fallbacks = Set(attempts.filter { $0.server == "192.0.2.2" }.map(\.name))
+    #expect(!fallbacks.isEmpty, "no query fell back to the second server")
+  }
 }
 
 /// Team Cymru's two TXT answers for 8.8.8.8, served from a loopback responder.
@@ -107,6 +131,26 @@ enum CymruFixture {
       labels.append(String(decoding: query[offset..<(offset + length)], as: UTF8.self))
       offset += length
     }
+    return nil
+  }
+}
+
+/// Records each Team Cymru query a resolver makes and answers none of them, waiting out each
+/// query's own deadline as a silent server would.
+actor TXTQueryRecorder {
+  struct Attempt {
+    let name: String
+    let server: String
+    let deadline: ContinuousClock.Instant
+  }
+
+  private(set) var attempts: [Attempt] = []
+
+  func silent(name: String, server: String, until deadline: ContinuousClock.Instant) async
+    -> [String]?
+  {
+    attempts.append(Attempt(name: name, server: server, deadline: deadline))
+    try? await Task.sleep(until: deadline, clock: .continuous)
     return nil
   }
 }

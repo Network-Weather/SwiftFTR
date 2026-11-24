@@ -13,7 +13,7 @@ final class LocalASNResolverTests: XCTestCase {
 
     // Well-known public IPs
     let results = try await resolver.resolve(
-      ipv4Addrs: ["8.8.8.8", "1.1.1.1"], timeout: 1.0)
+      ipv4Addrs: ["8.8.8.8", "1.1.1.1"], timeout: 60)
 
     // Should resolve both
     XCTAssertEqual(results.count, 2, "Should resolve both public IPs")
@@ -39,7 +39,7 @@ final class LocalASNResolverTests: XCTestCase {
   func testEmbeddedDatabaseIPv6Lookup() async throws {
     let resolver = LocalASNResolver(source: .embedded)
     let results = try await resolver.resolve(
-      ipv4Addrs: ["2606:4700:4700::1111", "2001:4860:4860::8888"], timeout: 1.0)
+      ipv4Addrs: ["2606:4700:4700::1111", "2001:4860:4860::8888"], timeout: 60)
 
     XCTAssertEqual(
       results["2606:4700:4700::1111"]?.asn, 13335, "Cloudflare v6 → AS13335")
@@ -58,7 +58,7 @@ final class LocalASNResolverTests: XCTestCase {
     let ips = (1...100).map { "8.8.\($0 % 256).\($0 % 256)" }
     let start = Date()
     for _ in 0..<10 {
-      _ = try await resolver.resolve(ipv4Addrs: ips, timeout: 1.0)
+      _ = try await resolver.resolve(ipv4Addrs: ips, timeout: 60)
     }
     let elapsed = Date().timeIntervalSince(start)
 
@@ -82,7 +82,7 @@ final class LocalASNResolverTests: XCTestCase {
     XCTAssertTrue(residentAfterPreload, "the preloaded database should stay resident")
 
     // The first lookup is served by the preloaded database rather than loading its own.
-    let results = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
+    let results = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 60)
     let loadsAfterLookup = await store.loadCount
     XCTAssertEqual(results["8.8.8.8"]?.asn, 15169)
     XCTAssertEqual(loadsAfterLookup, 1, "the first lookup after preload loaded the database again")
@@ -101,7 +101,7 @@ final class LocalASNResolverTests: XCTestCase {
         "192.168.1.1",  // Private (Class C)
         "8.8.8.8",  // Public
       ],
-      timeout: 1.0
+      timeout: 60
     )
 
     // Only the public IP should be resolved
@@ -122,7 +122,7 @@ final class LocalASNResolverTests: XCTestCase {
         "100.127.255.254",  // CGNAT (end of range)
         "8.8.8.8",  // Public
       ],
-      timeout: 1.0
+      timeout: 60
     )
 
     XCTAssertEqual(results.count, 1, "Only public IPs should be resolved")
@@ -135,11 +135,11 @@ final class LocalASNResolverTests: XCTestCase {
     let resolver = LocalASNResolver(source: .embedded)
 
     // Empty input
-    let emptyResult = try await resolver.resolve(ipv4Addrs: [], timeout: 1.0)
+    let emptyResult = try await resolver.resolve(ipv4Addrs: [], timeout: 60)
     XCTAssertTrue(emptyResult.isEmpty, "Empty input should return empty result")
 
     // Empty strings
-    let emptyStrings = try await resolver.resolve(ipv4Addrs: ["", "", "8.8.8.8"], timeout: 1.0)
+    let emptyStrings = try await resolver.resolve(ipv4Addrs: ["", "", "8.8.8.8"], timeout: 60)
     XCTAssertEqual(emptyStrings.count, 1, "Should filter empty strings")
   }
 
@@ -149,7 +149,7 @@ final class LocalASNResolverTests: XCTestCase {
   func testHybridLocalHit() async throws {
     let resolver = HybridASNResolver(source: .embedded, fallbackTimeout: 0.5)
 
-    let results = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
+    let results = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 60)
 
     XCTAssertEqual(results.count, 1)
     XCTAssertEqual(results["8.8.8.8"]?.asn, 15169, "Should resolve from local DB")
@@ -198,8 +198,8 @@ final class LocalASNResolverTests: XCTestCase {
     let loads = await store.loadCount
     XCTAssertEqual(loads, 1, "Second resolver should reuse the first resolver's database")
 
-    let firstResult = try await first.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
-    let secondResult = try await second.resolve(ipv4Addrs: ["1.1.1.1"], timeout: 1.0)
+    let firstResult = try await first.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 60)
+    let secondResult = try await second.resolve(ipv4Addrs: ["1.1.1.1"], timeout: 60)
     XCTAssertEqual(firstResult["8.8.8.8"]?.asn, 15169)
     XCTAssertEqual(secondResult["1.1.1.1"]?.asn, 13335)
   }
@@ -218,7 +218,7 @@ final class LocalASNResolverTests: XCTestCase {
     let loads = await store.loadCount
     XCTAssertEqual(loads, 1, "Eight concurrent preloads should share one load")
     for resolver in resolvers {
-      let result = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
+      let result = try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 60)
       XCTAssertEqual(result["8.8.8.8"]?.asn, 15169)
     }
   }
@@ -250,7 +250,7 @@ final class LocalASNResolverTests: XCTestCase {
     let missing = LocalASNSource.bundled("/nonexistent/swiftftr-asn-test.ultra")
 
     let first = LocalASNResolver(source: missing, store: store)
-    let firstResult = try await first.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 1.0)
+    let firstResult = try await first.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 60)
     XCTAssertTrue(firstResult.isEmpty, "A resolver whose database failed to load answers nothing")
 
     let second = LocalASNResolver(source: missing, store: store)
@@ -308,7 +308,7 @@ final class LocalASNResolverTests: XCTestCase {
     let timeouts = await dns.timeouts
     XCTAssertEqual(timeouts.count, 1, "the address the table lacks should reach the fallback once")
     let longest = timeouts.max() ?? 0
-    XCTAssertLessThanOrEqual(longest, 0.5, "the fallback was given \(timeouts), past the caller's 0.5 s")
+    XCTAssertLessThanOrEqual(longest, 0.5, "the fallback was given \(timeouts), past the 0.5 s")
   }
 
   /// With time to spare, the fallback keeps its own, shorter `fallbackTimeout` exactly, so concurrent

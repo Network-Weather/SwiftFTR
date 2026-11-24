@@ -25,6 +25,9 @@ import SwiftIP2ASN
 public actor LocalASNResolver: ASNResolver {
   private enum LoadState: Sendable {
     case notLoaded
+    /// The shared load this resolver is waiting on. Holding it keeps its database alive for this
+    /// resolver once it finishes, even when every caller stopped waiting before then.
+    case loading(Task<LocalASNDatabaseHandle, any Error>)
     case loaded(LocalASNDatabaseHandle)
     case failed
   }
@@ -49,41 +52,70 @@ public actor LocalASNResolver: ASNResolver {
   ///
   /// Loading the embedded database takes tens of milliseconds. Because the database is shared per
   /// source, preloading through any one resolver also serves every other resolver for that source
-  /// that exists while this one is alive.
+  /// that exists while this one is alive. Waits for the load to finish, or returns when the calling
+  /// task is cancelled, leaving the load running.
   public func preload() async {
-    _ = await getDatabase()
+    _ = try? await database(until: nil)
   }
 
-  private func getDatabase() async -> (any LocalASNTable)? {
+  /// The loaded database, or `nil` when it failed to load or `deadline` passed first.
+  ///
+  /// Only a failed load is remembered. A caller that stops waiting, at its deadline or because it
+  /// was cancelled, leaves the shared load running for every other caller and for this resolver's
+  /// next lookup.
+  ///
+  /// - Throws: `CancellationError` when the calling task is cancelled before the database is ready.
+  private func database(until deadline: ContinuousClock.Instant?) async throws -> (
+    any LocalASNTable
+  )? {
+    let load: Task<LocalASNDatabaseHandle, any Error>
     switch loadState {
     case .loaded(let handle):
       return handle.database
     case .failed:
       return nil
+    case .loading(let task):
+      load = task
     case .notLoaded:
       // Concurrent callers on this actor all reach the store, which coalesces them into one load.
-      do {
-        let handle = try await store.handle(for: source)
-        loadState = .loaded(handle)
-        return handle.database
-      } catch {
-        loadState = .failed
-        return nil
-      }
+      let task = await store.loadTask(for: source)
+      if case .notLoaded = loadState { loadState = .loading(task) }
+      return try await database(until: deadline)
+    }
+
+    do {
+      guard let handle = try await awaitShared(load, until: deadline) else { return nil }
+      if case .loading = loadState { loadState = .loaded(handle) }
+      return handle.database
+    } catch {
+      if Task.isCancelled { throw CancellationError() }
+      if case .loading = loadState { loadState = .failed }
+      return nil
     }
   }
 
+  /// Resolves `ipv4Addrs` from the database. `timeout` bounds the wait for a database that is still
+  /// loading; once it is loaded, lookups take microseconds.
+  ///
+  /// - Throws: `CancellationError` when the calling task is cancelled while the database loads.
   #if compiler(>=6.2)
     @concurrent
   #endif
   public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
   {
+    try await resolve(ipv4Addrs: ipv4Addrs, until: asnDeadline(after: timeout))
+  }
+
+  /// Resolves `ipv4Addrs`, waiting for a database that is still loading until `deadline`.
+  func resolve(ipv4Addrs: [String], until deadline: ContinuousClock.Instant?) async throws
+    -> [String: ASNInfo]
+  {
     let inputIPs = Set(ipv4Addrs)
     let lookupIPs = Set(inputIPs.compactMap(asnLookupAddress))
     guard !lookupIPs.isEmpty else { return [:] }
 
-    guard let db = await getDatabase() else {
-      return [:]  // Database failed to load
+    guard let db = try await database(until: deadline) else {
+      return [:]  // Failed to load, or still loading at the deadline
     }
 
     var lookupResults: [String: ASNInfo] = [:]
@@ -158,7 +190,7 @@ extension UltraCompactDatabase: LocalASNTable {}
 /// Requests for a source whose load is still in flight join that load instead of starting another,
 /// so N tracers constructed at once cost one decompression, not N. A failed load is not remembered
 /// here: the next request retries, while the resolver that observed the failure keeps its own
-/// failed state.
+/// failed state. A caller that stops waiting does not stop the load.
 actor LocalASNDatabaseStore {
   static let shared = LocalASNDatabaseStore()
 
@@ -182,27 +214,41 @@ actor LocalASNDatabaseStore {
     self.loader = loader
   }
 
-  /// Returns the shared handle for `source`, loading it if no live resolver already holds one.
-  func handle(for source: LocalASNSource) async throws -> LocalASNDatabaseHandle {
+  /// The load of `source`'s database: one already finished when a live resolver holds it, the one
+  /// in flight when there is one, or a new one.
+  ///
+  /// The load belongs to the store, not to any caller: it is never cancelled, and it records its
+  /// own result here when it ends, however many callers are still waiting for it.
+  func loadTask(for source: LocalASNSource) -> Task<LocalASNDatabaseHandle, any Error> {
     let key = LocalASNSourceKey(source)
     if let handle = resident[key]?.handle {
-      return handle
+      return Task { handle }
     }
     if let task = inFlight[key] {
-      return try await task.value
+      return task
     }
 
     loadCount += 1
     let loader = self.loader
-    let task = Task<LocalASNDatabaseHandle, any Error> {
-      LocalASNDatabaseHandle(try await loader(source))
+    let task = Task<LocalASNDatabaseHandle, any Error>.detached {
+      do {
+        let handle = LocalASNDatabaseHandle(try await loader(source))
+        await self.finishLoad(key, handle: handle)
+        return handle
+      } catch {
+        await self.finishLoad(key, handle: nil)
+        throw error
+      }
     }
     inFlight[key] = task
-    defer { inFlight[key] = nil }
+    return task
+  }
 
-    let handle = try await task.value
-    resident[key] = WeakHandle(handle: handle)
-    return handle
+  private func finishLoad(_ key: LocalASNSourceKey, handle: LocalASNDatabaseHandle?) {
+    inFlight[key] = nil
+    if let handle {
+      resident[key] = WeakHandle(handle: handle)
+    }
   }
 
   /// Whether at least one live resolver currently holds the database for `source`.

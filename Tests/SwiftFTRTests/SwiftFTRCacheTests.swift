@@ -274,13 +274,13 @@ final class SwiftFTRCacheTests: XCTestCase {
     let addresses = ["203.0.113.10", "203.0.113.11"]
 
     let first = Task {
-      try await caching.resolve(ipv4Addrs: addresses, timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: addresses, timeout: 60)
     }
     let firstStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(firstStarted)
 
     let second = Task {
-      try await caching.resolve(ipv4Addrs: addresses, timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: addresses, timeout: 60)
     }
     let secondJoined = await waitForJoinCount(1)
     let callsWhileSuspended = await base.callCount()
@@ -302,7 +302,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let first = Task {
       try await caching.resolve(
         ipv4Addrs: ["203.0.113.1", "203.0.113.2"],
-        timeout: 1.0
+        timeout: 60
       )
     }
     let firstStarted = await waitForCallCount(1, from: base)
@@ -311,7 +311,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let second = Task {
       try await caching.resolve(
         ipv4Addrs: ["203.0.113.2", "203.0.113.3"],
-        timeout: 1.0
+        timeout: 60
       )
     }
     let secondStarted = await waitForCallCount(2, from: base)
@@ -334,7 +334,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.4"
 
     let lookup = Task {
-      try await outer.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await outer.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let baseStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(baseStarted, "Nested caching decorators must not await their own outer flight")
@@ -354,12 +354,12 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.5"
 
     let first = Task {
-      try await firstCache.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await firstCache.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let firstStarted = await waitForCallCount(1, from: firstBase)
     XCTAssertTrue(firstStarted)
     let second = Task {
-      try await secondCache.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await secondCache.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let secondStarted = await waitForCallCount(1, from: secondBase)
     XCTAssertTrue(
@@ -377,12 +377,12 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.6"
 
     let short = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 0.1)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 30)
     }
     let firstStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(firstStarted)
     let long = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let secondStarted = await waitForCallCount(2, from: base)
     XCTAssertTrue(secondStarted, "A short-timeout caller must not join a longer flight")
@@ -416,12 +416,12 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.20"
 
     let first = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let firstStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(firstStarted)
     let joined = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let secondJoined = await waitForJoinCount(1)
     let callsWhileSuspended = await base.callCount()
@@ -439,7 +439,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     }
 
     let retry = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let retryStarted = await waitForCallCount(2, from: base)
     XCTAssertTrue(retryStarted)
@@ -459,12 +459,12 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.40"
 
     let owner = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let ownerStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(ownerStarted)
     let joined = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let secondJoined = await waitForJoinCount(1)
 
@@ -499,7 +499,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.50"
 
     let first = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let firstStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(firstStarted)
@@ -519,7 +519,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     XCTAssertEqual(cacheCount, 0)
 
     let retry = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let retryStarted = await waitForCallCount(2, from: base)
     XCTAssertTrue(retryStarted)
@@ -606,7 +606,7 @@ final class SwiftFTRCacheTests: XCTestCase {
         group.addTask {
           // All tasks request the same cached IPs
           let ips = ["203.0.113.1", "203.0.113.2"]
-          return (try? await caching.resolve(ipv4Addrs: ips, timeout: 1.0)) ?? [:]
+          return (try? await caching.resolve(ipv4Addrs: ips, timeout: 60)) ?? [:]
         }
       }
 
@@ -651,14 +651,14 @@ final class SwiftFTRCacheTests: XCTestCase {
     let caching = CachingASNResolver(base: base)
 
     // The first call is held in the resolver until the second has returned.
-    let slowCall = Task { try await caching.resolve(ipv4Addrs: ["203.0.113.1"], timeout: 2.0) }
+    let slowCall = Task { try await caching.resolve(ipv4Addrs: ["203.0.113.1"], timeout: 60) }
     let started = await eventually(within: 20) { base.slowStarted.value > 0 }
     XCTAssertTrue(started, "the first lookup never reached the resolver")
 
     // A different address must not wait for the held one: it returns while the gate is still
     // closed, or trips the watchdog. (Qualified: XCTestCase's own `measure` hides the helper.)
     let (fast, _) = try await SwiftFTRTests.measure(within: 20) {
-      try await caching.resolve(ipv4Addrs: ["203.0.113.2"], timeout: 2.0)
+      try await caching.resolve(ipv4Addrs: ["203.0.113.2"], timeout: 60)
     }
     XCTAssertEqual(fast["203.0.113.2"]?.asn, 65000)
 
@@ -690,7 +690,7 @@ final class SwiftFTRCacheTests: XCTestCase {
         for i in 0..<100 {
           group.addTask {
             let ips = (0..<10).map { "203.0.113.\($0 + (i % 25))" }
-            _ = try? await caching.resolve(ipv4Addrs: ips, timeout: 1.0)
+            _ = try? await caching.resolve(ipv4Addrs: ips, timeout: 60)
           }
         }
       }

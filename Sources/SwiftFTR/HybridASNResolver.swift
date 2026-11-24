@@ -34,11 +34,19 @@ public struct HybridASNResolver: ASNResolver, Sendable {
     await localResolver.preload()
   }
 
+  /// Resolves `ipv4Addrs` from the local database, then asks DNS for the addresses it lacks.
+  ///
+  /// `timeout` bounds the whole call: a database still loading is waited for only until it runs
+  /// out, and the DNS fallback gets `fallbackTimeout` or the time left, whichever is shorter (none
+  /// once it has run out). A value that is not finite and positive sets no bound, and the fallback
+  /// gets `fallbackTimeout`.
   #if compiler(>=6.2)
     @concurrent
   #endif
   public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
   {
+    let deadline = asnDeadline(after: timeout)
+
     // Filter and deduplicate input
     let publicIPs = Set(ipv4Addrs)
       .filter(isGloballyRoutableIPAddress)
@@ -46,7 +54,7 @@ public struct HybridASNResolver: ASNResolver, Sendable {
 
     // Try local first
     let localResults = try? await localResolver.resolve(
-      ipv4Addrs: Array(publicIPs), timeout: timeout)
+      ipv4Addrs: Array(publicIPs), until: deadline)
 
     // Find missing IPs
     let resolvedIPs: Set<String>
@@ -57,13 +65,13 @@ public struct HybridASNResolver: ASNResolver, Sendable {
     }
     let missingIPs = publicIPs.filter { !resolvedIPs.contains($0) }
 
-    guard !missingIPs.isEmpty else {
+    guard !missingIPs.isEmpty, let dnsTimeout = fallbackTimeout(before: deadline) else {
       return localResults ?? [:]
     }
 
     // Fall back to DNS for missing IPs
     let dnsResults = try? await dnsResolver.resolve(
-      ipv4Addrs: Array(missingIPs), timeout: fallbackTimeout)
+      ipv4Addrs: Array(missingIPs), timeout: dnsTimeout)
 
     // Merge results (local takes precedence)
     var merged = localResults ?? [:]
@@ -73,5 +81,15 @@ public struct HybridASNResolver: ASNResolver, Sendable {
       }
     }
     return merged
+  }
+
+  /// The DNS fallback's timeout: `fallbackTimeout`, cut to the time left before `deadline`, or
+  /// `nil` when none is left. Kept exact when there is time to spare, so concurrent lookups of one
+  /// address share a cached flight, which is keyed by timeout.
+  private func fallbackTimeout(before deadline: ContinuousClock.Instant?) -> TimeInterval? {
+    guard let deadline else { return fallbackTimeout }
+    let left = secondsUntil(deadline)
+    guard left > 0 else { return nil }
+    return left < fallbackTimeout ? left : fallbackTimeout
   }
 }
