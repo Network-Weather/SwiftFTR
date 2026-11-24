@@ -26,8 +26,6 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   `stunTimeout`, but resolving the server names has no deadline, so a stalled resolver holds the
   call for as long as `getaddrinfo` takes unless the caller cancels. Needs a budget the public
   signature does not have, for example a new overload.
-- **A failed public-IP discovery is paid twice** (finding 6): the classifier rediscovers when
-  `traceClassified` hands it no address. Needs an internal way to say "already tried".
 - **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code
   reading). Decide between failing classification fast and loading in the background, and make
   the SwiftIP2ASN cache directory injectable so a test can stage it without touching the user's.

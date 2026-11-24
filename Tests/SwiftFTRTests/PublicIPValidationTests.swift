@@ -141,7 +141,7 @@ struct PublicIPValidationTests {
   func seedRejectsSiteLocal() async {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
     #expect(await tracer.seedPublicIP("fec0::1", source: .gatewayReported) == false)
-    #expect(await tracer.publicIP == nil)
+    for family in [IPAddressFamily.v4, .v6] { #expect(await tracer.publicIP(for: family) == nil) }
   }
 
   @Test(
@@ -149,9 +149,9 @@ struct PublicIPValidationTests {
   func seedNAT64() async {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
     #expect(await tracer.seedPublicIP("64:ff9b::192.168.1.1", source: .gatewayReported) == false)
-    #expect(await tracer.publicIP == nil)
+    #expect(await tracer.publicIP(for: .v6)?.address == nil)
     #expect(await tracer.seedPublicIP("64:ff9b::8.8.8.8", source: .gatewayReported))
-    #expect(await tracer.publicIP == "64:ff9b::808:808")
+    #expect(await tracer.publicIP(for: .v6)?.address == "64:ff9b::808:808")
   }
 
   /// Strings that hold a valid address up to an embedded NUL. A C-string conversion stops at the
@@ -165,7 +165,7 @@ struct PublicIPValidationTests {
   func seedRejectsEmbeddedNUL(_ address: String) async {
     let tracer = SwiftFTR(config: SwiftFTRConfig(noReverseDNS: true))
     #expect(await tracer.seedPublicIP(address, source: .gatewayReported) == false)
-    #expect(await tracer.publicIP == nil)
+    for family in [IPAddressFamily.v4, .v6] { #expect(await tracer.publicIP(for: family) == nil) }
   }
 
   @Test("The explicit-server reverse queries reject an address with an embedded NUL")

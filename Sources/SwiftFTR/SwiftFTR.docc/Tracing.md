@@ -52,9 +52,11 @@ for hop in classified.hops {
   such as the documentation blocks, are not filtered. Lookups are best-effort, so ASN fields may be `nil`.
 - Enrichment steps have their own budgets, but a classified trace has no overall deadline.
   ``SwiftFTR/SwiftFTRConfig/rdnsLookupTimeout`` bounds each reverse-DNS lookup and
-  ``SwiftFTR/SwiftFTRConfig/publicIPDiscoveryTimeout`` bounds each public-IP discovery attempt,
-  of which there can be two. Hops whose lookups run out of time report numerically, and
+  ``SwiftFTR/SwiftFTRConfig/publicIPDiscoveryTimeout`` bounds the one public-IP question a
+  classified trace asks, after its probes. Hops whose lookups run out of time report numerically, and
   classification proceeds without a public address. Resolving a hostname destination is not
   bounded by either setting.
 - Set ``SwiftFTR/SwiftFTRConfig/publicIP`` to use a known public address and bypass discovery for
-  classified-trace enrichment.
+  classified-trace enrichment of its address family, or
+  ``SwiftFTR/SwiftFTRConfig/publicIPResolver`` to answer the question with your own
+  ``SwiftFTR/PublicIPResolver``.

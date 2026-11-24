@@ -1,2 +1,6 @@
 API breakage: enumelement DNSError.connectionRefused has been added as a new enum case
 API breakage: enumelement DNSError.unreachable has been added as a new enum case
+API breakage: func TraceClassifier.classify(trace:destinationIP:resolver:timeout:publicIP:interface:sourceIP:vpnContext:enableLogging:publicIPDiscoveryTimeout:) has removed default argument from parameter 4
+API breakage: func TraceClassifier.classify(trace:destinationIP:resolver:timeout:publicIP:interface:sourceIP:vpnContext:enableLogging:publicIPDiscoveryTimeout:) has parameter 5 type change from Swift.String? to SwiftFTR.VPNContext?
+API breakage: func TraceClassifier.classify(trace:destinationIP:resolver:timeout:publicIP:interface:sourceIP:vpnContext:enableLogging:publicIPDiscoveryTimeout:) has been renamed to func classify(trace:destinationIP:resolver:timeout:publicIP:vpnContext:)
+API breakage: var SwiftFTR.publicIP has been removed

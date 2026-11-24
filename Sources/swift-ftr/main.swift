@@ -138,7 +138,11 @@ extension SwiftFTRCommand {
     @Flag(name: .customLong("no-rdns"), help: "Disable reverse DNS lookups")
     var noRDNS: Bool = false
 
-    @Option(name: .customLong("public-ip"), help: "Override public IP (bypasses STUN)")
+    @Option(
+      name: .customLong("public-ip"),
+      help:
+        "Public IP to classify with; nothing is sent to discover one. Ignored unless it is a globally routable address of the trace's family"
+    )
     var publicIP: String?
 
     @Option(
@@ -166,8 +170,11 @@ extension SwiftFTRCommand {
     @Argument(help: "Destination hostname or IPv4/IPv6 address")
     var host: String
 
-    mutating func run() async throws {
-      let config = SwiftFTRConfig(
+    /// The tracer's configuration. `--public-ip` means "do not discover": it disables the
+    /// public-IP strategy, so an address the library refuses, or one of the other family, sends
+    /// nothing either.
+    var config: SwiftFTRConfig {
+      SwiftFTRConfig(
         maxHops: maxHops,
         maxWaitMs: Int(timeout * 1000),
         payloadSize: payloadSize,
@@ -175,8 +182,12 @@ extension SwiftFTRCommand {
         enableLogging: verbose,
         noReverseDNS: noRDNS,
         interface: interface,
-        sourceIP: sourceIP
+        sourceIP: sourceIP,
+        publicIPResolver: publicIP == nil ? .library : .disabled
       )
+    }
+
+    mutating func run() async throws {
       let tracer = SwiftFTR(config: config)
 
       do {
@@ -1103,7 +1114,11 @@ extension SwiftFTRCommand {
     @Option(name: [.short, .customLong("source")], help: "IPv4 source address to bind to")
     var sourceIP: String?
 
-    @Option(name: .customLong("public-ip"), help: "Override public IP (bypasses STUN)")
+    @Option(
+      name: .customLong("public-ip"),
+      help:
+        "Public IP to classify with; nothing is sent to discover one. Ignored unless it is a globally routable address of the trace's family"
+    )
     var publicIP: String?
 
     @Flag(name: .customLong("no-rdns"), help: "Disable reverse DNS lookups")
@@ -1118,8 +1133,9 @@ extension SwiftFTRCommand {
     @Argument(help: "Destination hostname or IPv4 address (IPv4 only)")
     var target: String
 
-    func run() async throws {
-      let ftrConfig = SwiftFTRConfig(
+    /// The tracer's configuration; `--public-ip` disables discovery, as for `trace`.
+    var config: SwiftFTRConfig {
+      SwiftFTRConfig(
         maxHops: maxHops,
         maxWaitMs: Int(timeout * 1000),
         payloadSize: payloadSize,
@@ -1127,9 +1143,13 @@ extension SwiftFTRCommand {
         enableLogging: verbose,
         noReverseDNS: noRDNS,
         interface: interface,
-        sourceIP: sourceIP
+        sourceIP: sourceIP,
+        publicIPResolver: publicIP == nil ? .library : .disabled
       )
-      let tracer = SwiftFTR(config: ftrConfig)
+    }
+
+    func run() async throws {
+      let tracer = SwiftFTR(config: config)
 
       let multipathConfig = MultipathConfig(
         flowVariations: flows,

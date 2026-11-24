@@ -714,7 +714,7 @@ public enum PublicIPError: Error, CustomStringConvertible, Sendable {
 ///     lookups, every STUN attempt and the DNS fallback. `nil` bounds each step on its own. The
 ///     STUN tier also ends at its own share of the time (``stunPhaseDeadline(servers:stunTimeout:dnsTimeout:start:deadline:)``),
 ///     so the fallback is always tried.
-/// - Returns: Public IP from first successful method
+/// - Returns: Public IP from first successful method, with the tier that found it as its source
 /// - Throws: PublicIPError if all methods fail, or `CancellationError` when the calling task is
 ///   cancelled
 func getPublicIPv4(
@@ -724,14 +724,14 @@ func getPublicIPv4(
   sourceIP: String? = nil,
   enableLogging: Bool = false,
   deadline: TimeInterval? = nil
-) async throws -> STUNPublicIP {
+) async throws -> PublicIPObservation {
   // Tier 1: Try STUN (fastest), within its share of the time.
   let stunDeadline = stunPhaseDeadline(
     servers: (TestSeams.stunServers?(AF_INET) ?? stunServers).count, stunTimeout: stunTimeout,
     dnsTimeout: dnsTimeout, start: monotonicNow(), deadline: deadline)
   var stunErrorMsg = "Unknown error"
   do {
-    return try await stunGetPublicIPWithFallback(
+    let found = try await stunGetPublicIPWithFallback(
       family: AF_INET,
       timeout: stunTimeout,
       interface: interface,
@@ -739,6 +739,7 @@ func getPublicIPv4(
       enableLogging: enableLogging,
       deadline: stunDeadline
     )
+    return PublicIPObservation(address: found.ip, family: .v4, source: .stun)
   } catch is CancellationError {
     throw CancellationError()
   } catch {
@@ -757,11 +758,12 @@ func getPublicIPv4(
   // enterprise networks). Callers should prefer HTTP-based IP discovery when available.
   var dnsErrorMsg = "Unknown error"
   do {
-    return try await getPublicIPv4ViaDNS(
+    let found = try await getPublicIPv4ViaDNS(
       timeout: dnsTimeout,
       enableLogging: enableLogging,
       deadline: deadline
     )
+    return PublicIPObservation(address: found.ip, family: .v4, source: .dnsWhoami)
   } catch {
     dnsErrorMsg = String(describing: error)
     if enableLogging {
@@ -784,9 +786,8 @@ struct PublicIPDiscoveryTimeout: Error {}
 /// Name lookups that cannot get an executor slot are abandoned at it too, instead of using up the
 /// whole discovery. With an overall `deadline`, the share is also cut so that at least
 /// `min(dnsTimeout, budget) / 2` is left for the fallback, `budget` being the time from `start` to
-/// `deadline`. For the default 6 s budget that cut never applies: pre-trace discovery (2 s per
-/// server, two servers) ends STUN at 4 s, leaving 2 s; the classifier's (0.8 s) at 1.6 s, leaving
-/// 4.4 s.
+/// `deadline`. For the default 6 s budget that cut never applies: the library's resolver (2 s per
+/// server, two servers) ends STUN at 4 s, leaving 2 s.
 func stunPhaseDeadline(
   servers: Int, stunTimeout: TimeInterval, dnsTimeout: TimeInterval, start: TimeInterval,
   deadline: TimeInterval?
@@ -806,10 +807,10 @@ func stunPhaseDeadline(
 /// reported as ``PublicIPDiscoveryTimeout``, whichever timer noticed first, so a discovery that ran
 /// out of time is always told apart from one that got definite failures in time. An address
 /// that was found is returned.
-func publicIPDiscoveryOutcome(
-  _ result: Result<STUNPublicIP, Error>, now: TimeInterval, deadline: TimeInterval,
+func publicIPDiscoveryOutcome<Found>(
+  _ result: Result<Found, Error>, now: TimeInterval, deadline: TimeInterval,
   cancelled: Bool
-) throws -> STUNPublicIP {
+) throws -> Found {
   if cancelled { throw CancellationError() }
   switch result {
   case .success(let address):
@@ -820,8 +821,8 @@ func publicIPDiscoveryOutcome(
   }
 }
 
-/// IPv4 public-address discovery for the trace family: the test substitute when one is bound,
-/// otherwise STUN with its DNS fallback, ended once `budget` seconds pass.
+/// Public-address discovery of one family for the library's resolver: the test substitute when one
+/// is bound, otherwise STUN, with its DNS fallback for IPv4, ended once `budget` seconds pass.
 ///
 /// The budget bounds the whole discovery, however many steps it takes: one absolute deadline,
 /// `budget` seconds from entry, is passed down to every name lookup, STUN attempt and DNS query,
@@ -831,27 +832,46 @@ func publicIPDiscoveryOutcome(
 /// keeps only its executor slot. A `budget` that is not finite is no bound; one that is not
 /// positive ends discovery before it starts.
 ///
+/// The answer's source names the tier that found it: ``PublicIPObservationSource/stun`` or, for
+/// the IPv4 fallback, ``PublicIPObservationSource/dnsWhoami``. A test substitute's answer is
+/// reported as STUN's.
+///
 /// - Throws: ``PublicIPDiscoveryTimeout`` when the budget passes, `CancellationError` when the
 ///   calling task is cancelled, or the discovery's own error.
-func publicIPv4Discovery(
+func publicIPDiscovery(
+  family: IPAddressFamily,
   stunTimeout: TimeInterval,
   dnsTimeout: TimeInterval,
   interface: String?,
   sourceIP: String?,
   enableLogging: Bool,
   budget: TimeInterval
-) async throws -> STUNPublicIP {
+) async throws -> PublicIPObservation {
   let bounded = budget.isFinite && budget < 1e9
   let deadline = bounded ? monotonicNow() + budget : nil
-  let discover: TestSeams.DiscoverPublicIPv4 =
-    TestSeams.discoverPublicIPv4 ?? {
+  let discover: @Sendable () async throws -> PublicIPObservation
+  if let substitute = TestSeams.discoverPublicIP {
+    discover = {
+      let found = try await substitute(family)
+      return PublicIPObservation(address: found.ip, family: family, source: .stun)
+    }
+  } else if family == .v6 {
+    discover = {
+      let found = try await stunGetPublicIPWithFallback(
+        family: AF_INET6, timeout: stunTimeout, interface: interface, sourceIP: sourceIP,
+        enableLogging: enableLogging, deadline: deadline)
+      return PublicIPObservation(address: found.ip, family: .v6, source: .stun)
+    }
+  } else {
+    discover = {
       try await getPublicIPv4(
         stunTimeout: stunTimeout, dnsTimeout: dnsTimeout, interface: interface,
         sourceIP: sourceIP, enableLogging: enableLogging, deadline: deadline)
     }
+  }
   guard let deadline else { return try await discover() }
   guard budget > 0 else { throw PublicIPDiscoveryTimeout() }
-  return try await withThrowingTaskGroup(of: STUNPublicIP.self) { group in
+  return try await withThrowingTaskGroup(of: PublicIPObservation.self) { group in
     group.addTask { try await discover() }
     group.addTask {
       let left = secondsLeft(until: deadline) ?? 0
@@ -860,7 +880,7 @@ func publicIPv4Discovery(
     }
     // The first child to finish is the outcome; the other is cancelled and awaited.
     defer { group.cancelAll() }
-    let first: Result<STUNPublicIP, Error>
+    let first: Result<PublicIPObservation, Error>
     do {
       guard let value = try await group.next() else { throw PublicIPDiscoveryTimeout() }
       first = .success(value)

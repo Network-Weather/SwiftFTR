@@ -278,8 +278,9 @@ struct VPNClassificationTests {
 
 // MARK: - Offline classification
 
-/// Classifies `trace` with no public address, as these tests intend. Discovery is substituted by
-/// one that finds nothing, so the classifier never reaches live STUN.
+/// Classifies `trace` with no public address, as these tests intend, and checks that the
+/// classifier did not set out to find one: discovery is substituted by a counting one, which also
+/// keeps a classifier that did ask off the network.
 private func classifyWithoutPublicIP(
   _ classifier: TraceClassifier, trace: TraceResult, destinationIP: String,
   resolver: ASNResolver, vpnContext: VPNContext?
@@ -287,9 +288,10 @@ private func classifyWithoutPublicIP(
   let discovery = OfflinePublicIPDiscovery()
   let classified = try await discovery.install {
     try await classifier.classify(
-      trace: trace, destinationIP: destinationIP, resolver: resolver, vpnContext: vpnContext)
+      trace: trace, destinationIP: destinationIP, resolver: resolver, publicIP: nil,
+      vpnContext: vpnContext)
   }
-  #expect(discovery.calls.value == 1, "classification did not ask for a public address")
+  #expect(discovery.calls.value == 0, "the classifier set out to discover a public address")
   return classified
 }
 

@@ -226,12 +226,12 @@ numbers are as of the commit that added this section.
    5 s injected stall, `cancelActiveTraces()` took 5.0 s to return. Not fixed: bounding it needs a
    resolution budget, which is a configuration field. Test, disabled because it blocks for its
    stall: `FaultInjectionEnrichmentTests.forwardResolutionStall`.
-6. **A failed public-IP discovery is paid twice.** Confirmed, not fixed. When discovery fails or
-   times out, `traceClassified` passes `publicIP: nil` to the classifier (`Traceroute.swift:1059`),
-   which runs discovery again with the same budget (`Segmentation.swift:240`), so the bound is two
-   budgets. Measured in `multipathHonoursPublicIPBudget` (0.6 s for a 0.3 s budget). Not fixed
-   here because the public `classify(publicIP: nil)` means "discover", so the fix is an internal
-   way to say "already tried", a small design choice. Test, disabled: `publicIPDiscoveredOnce`.
+6. **A failed public-IP discovery was paid twice.** Confirmed and fixed. When discovery failed or
+   timed out, `traceClassified` passed `publicIP: nil` to the classifier, which ran discovery again
+   with the same budget, so the bound was two budgets. The classifier no longer discovers
+   (`classify` takes a required `publicIP`), and `traceClassified` asks once, after its probes.
+   Test: `publicIPDiscoveredOnce`, two attempts before, one after; the classification helpers in
+   `SwiftFTRClassificationTests` and `VPNClassificationTests` assert the classifier starts none.
 7. **A `.remote` ASN database download is bounded only by URLSession's request timeout.**
    Unverified, from reading the code. With no bundled or cached database, the first resolve waits
    on `RemoteDatabase.load()` (`LocalASNResolver.swift:212`), which uses `URLSession.shared` with

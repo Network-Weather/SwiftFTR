@@ -8,10 +8,36 @@ Unreleased
 
 ### Breaking changes
 
-- **`DNSError` adds `connectionRefused` and `unreachable`**, the one source break 0.19 takes
+- **`DNSError` adds `connectionRefused` and `unreachable`**, a source break 0.19 takes
   (decision 10 in docs/BLOCKING-IO.md). An exhaustive `switch` over `DNSError` must handle both;
   `MigratingTo019.md` has the edit. `swift package diagnose-api-breaking-changes v0.18.1` reports
-  exactly these two, and `api-breakage-allowlist.txt` lists them for the CI gate.
+  these and the public-IP breaks below, and `api-breakage-allowlist.txt` lists each for the CI
+  gate.
+- **`TraceClassifier.classify` no longer discovers the public address** (decision 12). Its
+  `interface`, `sourceIP`, `enableLogging` and `publicIPDiscoveryTimeout` parameters, which existed
+  only for discovery, are gone, and `publicIP` is required: pass the address, or `nil` to classify
+  without one. A call that left `publicIP` out no longer compiles.
+- **`SwiftFTR.publicIP` is replaced by `publicIP(for:)`**, which takes an `IPAddressFamily` and
+  returns a `PublicIPObservation` (address, family, source). The cache holds one address per
+  family, so a single property could no longer say which one it meant.
+
+### New public API
+
+- **`PublicIPResolver`**, and `SwiftFTRConfig.publicIPResolver` with a
+  `PublicIPResolverStrategy`: `.library` (the default, the discovery 0.18 ran), `.disabled` (send
+  nothing) or `.custom(_:)` (the caller's resolver). A resolver answers a `PublicIPRequest` (one
+  `IPAddressFamily`, the tracer's interface and source address, and a `ContinuousClock` deadline)
+  with a `PublicIPObservation` or `nil`. The tracer holds a caller's resolver to the deadline: one
+  that never returns or ignores cancellation is abandoned there and its task cancelled, and an
+  answer handled once the clock has reached the deadline is a miss, never used or cached, whatever
+  else happened first. A tracer whose `sourceIP` cannot be bound for the family asked asks
+  nothing. The option comes as a further `SwiftFTRConfig` initializer, so existing calls resolve
+  as before.
+- **`ClassifiedTrace.publicIPSource`** (`PublicIPObservationSource?`) says where `publicIP` came
+  from: `.configured`, `.validatedCallerCache` or `.gatewayReported` (a seed), `.stun` or
+  `.dnsWhoami` (the library's resolver), or whatever a caller's resolver names. It is encoded
+  beside `publicIP`; JSON without it decodes as `nil`. A further `ClassifiedTrace` initializer
+  takes it.
 
 ### Behavior changes
 
@@ -82,12 +108,29 @@ Unreleased
   The STUN tier, name lookups included, also ends at its own share of the time: the number of
   servers times the per-server timeout, cut where needed to leave the whoami fallback at least
   half its DNS timeout (or half the budget, if that is smaller). With the default 6 s budget the
-  cut never applies: STUN ends by 4 s in the discovery before the trace (2 s per server) and by
-  1.6 s in the classifier's (0.8 s), leaving the fallback 2 s and 4.4 s, so with free slots and
-  silent servers the fallback starts when it did in 0.18.1. The whoami fallback uses the
+  cut never applies: STUN ends by 4 s (2 s per server), leaving the fallback 2 s, so with free
+  slots and silent servers the fallback starts when it did in 0.18.1. The whoami fallback uses the
   event-based DNS transport and needs no slot, so with every slot held, STUN's name lookups give
   up at STUN's share and the fallback can still find the address where discovery used to find
   none. See `MigratingTo019.md`.
+
+- **A classified trace asks for its public address once, after its probes, for the family they
+  used** (decision 12). It asked for IPv4 before the probes, whatever the destination, and when
+  that failed the classifier asked again with the same budget, so a failed discovery cost two
+  budgets (finding 6 in `docs/ROBUSTNESS-TESTING.md`); it now costs one, and a deadline that
+  passes during the question finds the hops already measured. An IPv6 trace now asks for an IPv6
+  address (the library's resolver uses IPv6 STUN, with no DNS fallback) where it was labelled with
+  the IPv4 one, so `publicIP` and `clientASN` describe the IPv6 path, or are `nil` where IPv6 STUN
+  gets no answer.
+- **Public addresses are kept per family and must be public.** A seed fills only its own family's
+  slot, so an IPv6 seed no longer labels an IPv4 trace; `SwiftFTRConfig.publicIP` answers only
+  traces of its own family (a trace of the other family asks the strategy, which by default sends
+  STUN). An address that is not globally routable, whether configured, returned by a resolver or
+  found by the library's discovery, is not used: a configured private or documentation address is
+  ignored where 0.18 used it, and the trace asks the strategy instead. An IPv4-mapped address
+  (`::ffff:a.b.c.d`) from any of them is IPv4, kept as `a.b.c.d`.
+- **`swift-ftr trace` and `multipath` with `--public-ip` send no discovery traffic** whatever the
+  address; one the library refuses, or of the other family, means no public address.
 
 ### Bug fixes
 

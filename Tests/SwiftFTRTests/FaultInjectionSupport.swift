@@ -417,13 +417,13 @@ final class FakeICMPNetwork: @unchecked Sendable {
     let resolved = self.resolved
     let resolve: TestSeams.ResolveHost = { _, _ in resolved }
     let makeSocket: TestSeams.MakeICMPSocket = socketFactory ?? { try self.makeSocket($0) }
-    let discover: TestSeams.DiscoverPublicIPv4 =
-      TestSeams.discoverPublicIPv4 ?? {
+    let discover: TestSeams.DiscoverPublicIP =
+      TestSeams.discoverPublicIP ?? { _ in
         throw PublicIPError.allMethodsFailed(stunError: "offline test", dnsError: "offline test")
       }
     return try await TestSeams.$resolveHost.withValue(resolve) {
       try await TestSeams.$makeICMPSocket.withValue(makeSocket) {
-        try await TestSeams.$discoverPublicIPv4.withValue(discover) {
+        try await TestSeams.$discoverPublicIP.withValue(discover) {
           try await TestSeams.$sendProbe.withValue(isolated ? Self.connectingSend : nil) {
             try await body()
           }
@@ -1272,7 +1272,14 @@ func offlineTracer(
   publicIP: String? = nil
 ) -> SwiftFTR {
   SwiftFTR(
-    config: config, rdnsCache: rdns, asnResolver: EmptyASNResolver(), cachedPublicIP: publicIP)
+    config: config, rdnsCache: rdns, asnResolver: EmptyASNResolver(),
+    publicIPCache: testPublicIPCache(publicIP))
+}
+
+/// A public-address cache holding `address`, if any, in its own family's slot, as a test seed.
+func testPublicIPCache(_ address: String?) -> [IPAddressFamily: PublicIPObservation] {
+  guard let address, let family = IPAddressFamily(address: address) else { return [:] }
+  return [family: PublicIPObservation(address: address, family: family, source: .stun)]
 }
 
 // MARK: - Offline substitutes for live dependencies
@@ -1296,23 +1303,34 @@ final class SilentTCPPort: @unchecked Sendable {
 
 /// Public-IP discovery that finds nothing, at once, and counts how often it was asked.
 ///
-/// A classification that is given no public address starts discovery, which is live STUN with a
-/// DNS fallback unless a substitute is bound. Run such a call inside ``install(_:)`` so it never
-/// reaches the network, and read ``calls`` to check that discovery reached this substitute.
+/// The library's resolver is live STUN with a DNS fallback unless a substitute is bound. Run a call
+/// that could ask it inside ``install(_:)`` so it never reaches the network, and read ``calls`` to
+/// check how often discovery reached this substitute.
 final class OfflinePublicIPDiscovery: Sendable {
   let calls = FaultCounter()
 
   func install<T>(_ body: () async throws -> T) async rethrows -> T {
     let calls = self.calls
-    let discover: TestSeams.DiscoverPublicIPv4 = {
+    let discover: TestSeams.DiscoverPublicIP = { _ in
       calls.increment()
       throw PublicIPError.allMethodsFailed(stunError: "offline test", dnsError: "offline test")
     }
-    return try await TestSeams.$discoverPublicIPv4.withValue(discover) { try await body() }
+    return try await TestSeams.$discoverPublicIP.withValue(discover) { try await body() }
   }
 }
 
 /// A complete HTTP/1.1 response with `status` and an empty body, for ``LoopbackTCPServer``.
 func httpResponse(status: Int, reason: String) -> [UInt8] {
   Array("HTTP/1.1 \(status) \(reason)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8)
+}
+
+extension SwiftFTR {
+  /// The IPv4 public address a classified trace would use, with `answer` standing in for the
+  /// strategy's answer to the question when one is asked.
+  func effectivePublicIPv4(answer: @Sendable () async -> String?) async -> String? {
+    let observation = try? await effectivePublicIP(for: .v4) { _ in
+      await answer().map { PublicIPObservation(address: $0, family: .v4, source: .stun) }
+    }
+    return observation?.address
+  }
 }

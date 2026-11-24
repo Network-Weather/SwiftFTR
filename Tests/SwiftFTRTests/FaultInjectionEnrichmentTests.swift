@@ -27,12 +27,13 @@ struct FaultInjectionEnrichmentTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-stall")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    let budget: TimeInterval = 0.3
+    // Short against the watchdog; long enough that load cannot spend it before the question.
+    let budget: TimeInterval = 2
     let tracer = offlineTracer(
       SwiftFTRConfig(
         maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, publicIPDiscoveryTimeout: budget))
     // A blocking attempt that stalls in its executor slot, as a STUN `recv` does.
-    let discovery: TestSeams.DiscoverPublicIPv4 = {
+    let discovery: TestSeams.DiscoverPublicIP = { _ in
       attempts.increment()
       return try await runDetachedBlockingIO {
         gate.wait(limit: 20)
@@ -42,7 +43,7 @@ struct FaultInjectionEnrichmentTests {
     }
 
     let trace = try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+      try await TestSeams.$discoverPublicIP.withValue(discovery) {
         try await network.install {
           // A trace that ignored its budget would wait at least the default one.
           try await measure(within: Self.watchdog) {
@@ -56,33 +57,33 @@ struct FaultInjectionEnrichmentTests {
     #expect(finished.value == 0, "the trace waited for a stalled discovery to end")
     #expect(trace.publicIP == nil)
     #expect(trace.hops.count == 2)
-    #expect(await tracer.publicIP == nil, "a failed discovery must not be cached")
+    #expect(
+      await tracer.publicIP(for: .v4)?.address == nil, "a failed discovery must not be cached")
   }
 
-  @Test(
-    "A failed public-IP discovery is attempted once per classified trace",
-    .disabled("finding 6 in docs/ROBUSTNESS-TESTING.md: the classifier rediscovers"))
+  @Test("A failed public-IP discovery is attempted once per classified trace")
   func publicIPDiscoveredOnce() async throws {
     let attempts = FaultCounter()
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-once")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
+    // The substitute fails at once; the budget is long so load cannot spend it before the question.
     let tracer = offlineTracer(
-      SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, publicIPDiscoveryTimeout: 0.3)
+      SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, noReverseDNS: true, publicIPDiscoveryTimeout: 60)
     )
-    let discovery: TestSeams.DiscoverPublicIPv4 = {
+    let discovery: TestSeams.DiscoverPublicIP = { _ in
       attempts.increment()
       throw PublicIPError.allMethodsFailed(stunError: "down", dnsError: "down")
     }
 
     _ = try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+      try await TestSeams.$discoverPublicIP.withValue(discovery) {
         try await network.install {
           try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
         }
       }
     }
-    #expect(attempts.value == 1)
+    #expect(attempts.value == 1, "discovery ran \(attempts.value) times")
   }
 
   @Test("Public-IP discovery that finishes after a network change is neither returned nor cached")
@@ -92,16 +93,16 @@ struct FaultInjectionEnrichmentTests {
     let entered = FaultCounter()
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-stale")
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true, publicIPDiscoveryTimeout: 5))
-    let discovery: TestSeams.DiscoverPublicIPv4 = {
+    let discovery: TestSeams.DiscoverPublicIP = { _ in
       entered.increment()
       await gate.waitAsync(limit: 5)
-      return STUNPublicIP(ip: "198.51.100.99")
+      return STUNPublicIP(ip: "8.8.4.99")
     }
 
     await TestSeams.$blockingIOExecutor.withValue(executor) {
-      await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+      await TestSeams.$discoverPublicIP.withValue(discovery) {
         let lookup = Task {
-          await tracer.effectivePublicIPForClassification {
+          await tracer.effectivePublicIPv4 {
             try? await tracer.discoverPublicIP()
           }
         }
@@ -111,7 +112,7 @@ struct FaultInjectionEnrichmentTests {
         gate.open()
         let observed = await lookup.value
         #expect(observed == nil, "stale address \(observed ?? "") escaped")
-        #expect(await tracer.publicIP == nil)
+        #expect(await tracer.publicIP(for: .v4)?.address == nil)
       }
     }
   }
@@ -164,11 +165,12 @@ struct FaultInjectionEnrichmentTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 4, name: "test.mp-pip")
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    let budget: TimeInterval = 0.3
+    // Short against the watchdog; long enough that load cannot spend it before the question.
+    let budget: TimeInterval = 2
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, noReverseDNS: true, publicIPDiscoveryTimeout: budget))
     let attempts = FaultCounter()
-    let discovery: TestSeams.DiscoverPublicIPv4 = {
+    let discovery: TestSeams.DiscoverPublicIP = { _ in
       attempts.increment()
       return try await runDetachedBlockingIO {
         gate.wait(limit: 20)
@@ -179,7 +181,7 @@ struct FaultInjectionEnrichmentTests {
       flowVariations: 1, maxPaths: 4, earlyStopThreshold: 1, timeoutMs: 2000, maxHops: 4)
 
     let topology = try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+      try await TestSeams.$discoverPublicIP.withValue(discovery) {
         try await network.install {
           // Ignoring the configured budget means waiting the default one at least.
           try await measure(within: Self.watchdog) {
@@ -279,12 +281,12 @@ struct FaultInjectionEnrichmentTests {
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, publicIPDiscoveryTimeout: 0.3), rdns: rdns)
     // Discovery whose answer needs an executor slot, as a STUN attempt does.
-    let discovery: TestSeams.DiscoverPublicIPv4 = {
-      try await runDetachedBlockingIO { STUNPublicIP(ip: "198.51.100.7") }
+    let discovery: TestSeams.DiscoverPublicIP = { _ in
+      try await runDetachedBlockingIO { STUNPublicIP(ip: "8.8.4.7") }
     }
 
     let trace = try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+      try await TestSeams.$discoverPublicIP.withValue(discovery) {
         try await network.install {
           try await measure(within: Self.watchdog) {
             try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())

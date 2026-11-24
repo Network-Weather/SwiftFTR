@@ -110,7 +110,8 @@ extension SwiftFTRConfig {
       interface: interface,
       sourceIP: sourceIP,
       asnResolverStrategy: asnResolverStrategy,
-      preferredFamily: .v4
+      preferredFamily: .v4,
+      publicIPResolver: publicIPResolver
     )
   }
 }
@@ -528,6 +529,7 @@ struct MultipathDiscovery<Worker: MultipathFlowRunning>: Sendable {
       destinationIP: canonical.destinationIP,
       destinationHostname: canonical.destinationHostname,
       publicIP: canonical.publicIP,
+      publicIPSource: canonical.publicIPSource,
       publicHostname: canonical.publicHostname,
       clientASN: canonical.clientASN,
       clientASName: canonical.clientASName,
@@ -598,7 +600,7 @@ extension SwiftFTR {
       baseConfig: swiftConfig,
       rdnsCache: self.rdnsCache,
       asnResolver: self.asnResolver,
-      cachedPublicIP: self.cachedPublicIP
+      publicIPCache: self.publicIPCache
     )
     let discovery = MultipathDiscovery(worker: worker, config: swiftConfig)
 
@@ -643,12 +645,33 @@ extension SwiftFTR {
     return try outcome.get()
   }
 
+  /// Rejects, before a public-IP question, every input a flow would reject only after it:
+  /// the interface, the source address (its form, its family, and whether this host can bind it),
+  /// and a numeric destination of the wrong family. So an unusable binding never sends discovery
+  /// traffic. A destination name that does not resolve is found only by the flows.
+  private func validateBeforeQuestion(target: String) throws {
+    if let name = config.interface { _ = try validateInterface(name) }
+    if let source = config.sourceIP {
+      try validateSourceIPFamily(source, destinationFamily: AF_INET)
+      let fd = TestSeams.validationSocket?() ?? socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+      guard fd >= 0 else { throw TracerouteError.socketCreateFailed(errno: errno, details: "bind") }
+      defer { close(fd) }
+      if let message = bindSourceIP(sockfd: fd, family: AF_INET, sourceIP: source) {
+        throw TracerouteError.sourceIPBindFailed(sourceIP: source, errno: errno, details: message)
+      }
+    }
+    // Literals resolve without `getaddrinfo` under a forced family.
+    if containsNUL(target) || detectAddressFamily(target) != -1 {
+      _ = try resolveHost(host: target, prefer: .v4)
+    }
+  }
+
   /// Runs flow workers that reuse caches without escaping the caller's task group.
   struct MultipathWorkerSpawner: MultipathFlowRunning {
     let baseConfig: SwiftFTRConfig
     let rdnsCache: RDNSCache
     let asnResolver: ASNResolver
-    let cachedPublicIP: String?
+    let publicIPCache: [IPAddressFamily: PublicIPObservation]
 
     func runMultipathFlow(
       target: String,
@@ -675,7 +698,7 @@ extension SwiftFTR {
         config: baseConfig.multipathFlowConfig(maxHops: maxHops, timeoutMs: timeoutMs),
         rdnsCache: rdnsCache,
         asnResolver: asnResolver,
-        cachedPublicIP: baseConfig.publicIP ?? cachedPublicIP
+        publicIPCache: publicIPCache
       )
     }
   }
@@ -694,7 +717,7 @@ extension SwiftFTR {
       baseConfig: self.config,
       rdnsCache: self.rdnsCache,
       asnResolver: self.asnResolver,
-      cachedPublicIP: self.cachedPublicIP
+      publicIPCache: self.publicIPCache
     ).makeFlowTracer(maxHops: maxHops, timeoutMs: timeoutMs)
 
     return try await tempTracer.performClassifiedTraceWithFlowID(
@@ -720,11 +743,10 @@ extension SwiftFTR {
       _ = try validateInterface(interfaceName)
     }
 
-    let effectivePublicIP = await effectivePublicIPForClassification {
-      try? await self.discoverPublicIP()
-    }
-    // Discovery swallows its own cancellation; do not start resolving a destination for a flow
-    // whose discovery has already been cancelled.
+    try validateBeforeQuestion(target: host)
+    let observation = try await publicIPObservation(for: .v4, handle: handle)
+    let effectivePublicIP = observation?.address
+    // Do not start resolving a destination for a flow whose question was cancelled.
     try Task.checkCancellation()
 
     // Perform base trace with flow ID
@@ -778,11 +800,7 @@ extension SwiftFTR {
         destinationIP: destIP,
         resolver: effectiveResolver,
         timeout: 1.5,
-        publicIP: effectivePublicIP,
-        interface: self.config.interface,
-        sourceIP: self.config.sourceIP,
-        enableLogging: self.config.enableLogging,
-        publicIPDiscoveryTimeout: self.config.publicIPDiscoveryTimeoutForOperation
+        publicIP: effectivePublicIP
       )
     }
 
@@ -816,6 +834,7 @@ extension SwiftFTR {
       destinationIP: baseClassified.destinationIP,
       destinationHostname: hostnameMap[destIP],
       publicIP: baseClassified.publicIP,
+      publicIPSource: observation?.source,
       publicHostname: effectivePublicIP.flatMap { hostnameMap[$0] },
       clientASN: baseClassified.clientASN,
       clientASName: baseClassified.clientASName,

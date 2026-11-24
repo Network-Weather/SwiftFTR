@@ -18,9 +18,9 @@ enum TestSeams {
   /// socket for `family`.
   typealias MakeICMPSocket = @Sendable (_ family: Int32) throws -> Int32
 
-  /// IPv4 public-address discovery for the trace family, in place of STUN with its DNS fallback.
-  /// It runs under the discovery budget, which cancels it when it passes.
-  typealias DiscoverPublicIPv4 = @Sendable () async throws -> STUNPublicIP
+  /// The library resolver's public-address discovery of one family, in place of STUN (with its
+  /// DNS fallback for IPv4). It runs under the discovery budget, which cancels it when it passes.
+  typealias DiscoverPublicIP = @Sendable (_ family: IPAddressFamily) async throws -> STUNPublicIP
 
   /// The STUN servers to try, in order, for one address family.
   typealias STUNServers = @Sendable (_ family: Int32) -> [(host: String, port: UInt16)]
@@ -92,7 +92,7 @@ enum TestSeams {
 
   @TaskLocal static var observeProbeReceive: ObserveProbeReceive?
 
-  @TaskLocal static var discoverPublicIPv4: DiscoverPublicIPv4?
+  @TaskLocal static var discoverPublicIP: DiscoverPublicIP?
 
   /// The STUN servers a sweep of address family `family` tries, in place of the built-in list, so
   /// a test can point each family at loopback fixtures by numeric address.
@@ -101,6 +101,16 @@ enum TestSeams {
   /// The DNS servers the IPv4 whoami fallback asks, in place of its built-in ones. Pair with
   /// ``dnsServerPort`` to reach a loopback fixture.
   @TaskLocal static var whoamiServers: [String]?
+
+  /// Arms the wake-up at a caller's public-IP resolver's deadline in place of a sleeping task, and
+  /// returns the call that stops it. A test can leave the race unwoken, or wake it early.
+  typealias ArmPublicIPDeadline =
+    @Sendable (_ deadline: ContinuousClock.Instant, _ wake: @escaping @Sendable () -> Void) ->
+    @Sendable () -> Void
+
+  @TaskLocal static var armPublicIPDeadline: ArmPublicIPDeadline?
+  /// Opens the socket a multipath run test-binds its source address on; -1 with `errno` set fails it.
+  @TaskLocal static var validationSocket: (@Sendable () -> Int32)?
 
   /// Awaited by `discoverPaths` once it holds a topology, just before it checks for an
   /// invalidation and returns, so a test can order a network change before or after that step.

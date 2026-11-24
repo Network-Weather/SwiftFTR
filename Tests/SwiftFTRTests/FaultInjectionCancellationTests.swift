@@ -261,7 +261,7 @@ struct FaultInjectionCancellationTests {
     }
     defer { network.stop() }
     // A stall in a blocking attempt's executor slot, as a STUN `recv` stalls.
-    let discovery: TestSeams.DiscoverPublicIPv4 = {
+    let discovery: TestSeams.DiscoverPublicIP = { _ in
       if phase == .publicIPDiscovery {
         entered.increment()
         try await runDetachedBlockingIO { gate.wait(limit: 20) }
@@ -284,7 +284,7 @@ struct FaultInjectionCancellationTests {
       rdns: rdns)
 
     await TestSeams.$blockingIOExecutor.withValue(executor) {
-      await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+      await TestSeams.$discoverPublicIP.withValue(discovery) {
         await network.install {
           let task = Task { try await tracer.traceClassified(to: "fake.test", resolver: resolver) }
           let reached = await eventually(within: Self.watchdog) {
@@ -358,7 +358,7 @@ struct FaultInjectionCancellationTests {
     }
     defer { network.stop() }
     // A stall in a blocking attempt's executor slot, as a STUN `recv` stalls.
-    let discovery: TestSeams.DiscoverPublicIPv4 = {
+    let discovery: TestSeams.DiscoverPublicIP = { _ in
       if phase == .publicIPDiscovery {
         entered.increment()
         try await runDetachedBlockingIO { gate.wait(limit: 20) }
@@ -379,12 +379,12 @@ struct FaultInjectionCancellationTests {
       rdnsCache: rdns,
       asnResolver: UncancellableASNResolver(
         stall: phase == .asnLookup, gate: gate, entered: entered),
-      cachedPublicIP: nil)
+      publicIPCache: [:])
     let config = MultipathConfig(
       flowVariations: 2, maxPaths: 8, earlyStopThreshold: 2, timeoutMs: 20_000, maxHops: 4)
 
     await TestSeams.$blockingIOExecutor.withValue(executor) {
-      await TestSeams.$discoverPublicIPv4.withValue(discovery) {
+      await TestSeams.$discoverPublicIP.withValue(discovery) {
         await network.install {
           let resolve: TestSeams.ResolveHost = { [network] _, _ in
             resolutions.increment()

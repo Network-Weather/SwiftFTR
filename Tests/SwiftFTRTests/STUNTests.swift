@@ -239,7 +239,7 @@ struct STUNTests {
   func testSTUNCaching() async throws {
     // Test that we can override public IP without STUN call. The trace runs against a loopback
     // peer with local reverse DNS and ASN stubs, and discovery is a counting substitute.
-    let config = SwiftFTRConfig(maxHops: 4, publicIP: "203.0.113.1")
+    let config = SwiftFTRConfig(maxHops: 4, publicIP: "9.9.9.9")
     let tracer = offlineTracer(config)
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
@@ -250,7 +250,7 @@ struct STUNTests {
       try await network.install { try await tracer.traceClassified(to: "fake.test") }
     }
 
-    #expect(result.publicIP == "203.0.113.1")
+    #expect(result.publicIP == "9.9.9.9")
     #expect(discovery.calls.value == 0, "a configured public IP must not start discovery")
   }
 
@@ -472,8 +472,8 @@ struct STUNTests {
     // Should succeed via STUN (fast path) or DNS (fallback)
     let result = try await getPublicIPv4(stunTimeout: 2.0, dnsTimeout: 5.0)
 
-    #expect(result.ip.contains("."))
-    let parts = result.ip.split(separator: ".").compactMap { Int($0) }
+    #expect(result.address.contains("."))
+    let parts = result.address.split(separator: ".").compactMap { Int($0) }
     #expect(parts.count == 4)
     #expect(parts.allSatisfy { $0 >= 0 && $0 <= 255 })
   }
@@ -488,7 +488,7 @@ struct STUNTests {
       dnsTimeout: 5.0,
       enableLogging: true
     )
-    #expect(result.ip.contains("."))
+    #expect(result.address.contains("."))
   }
 
   @Test(
