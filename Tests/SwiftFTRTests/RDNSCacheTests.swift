@@ -160,6 +160,9 @@ struct RDNSCacheTests {
       }
       #expect(settled, "the batch never reached the limiter")
       #expect(daemon.startedCount == cap, "\(daemon.startedCount) queries asked, cap \(cap)")
+      // Every deadline passes before any lookup is woken, so a permit freed by one woken lookup
+      // cannot reach a waiter whose deadline has not passed yet.
+      for number in 0..<ips.count { daemon.passDeadline(number: number) }
       daemon.expireDeadlines()
       let (results, _) = try await measure(within: Self.watchdog) { await batch.value }
       #expect(results.isEmpty)
