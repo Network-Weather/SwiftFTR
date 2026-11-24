@@ -15,7 +15,8 @@ To find the call sites to review, search the consumer for `switch` over `DNSErro
 `DNSError.sendFailed`, `dnsProbe(`, `DNSError.timeout`,
 `.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, `getPublicIPs(`, `publicIPDiscoveryTimeout`,
 `.classify(`, `.publicIP` read from a `SwiftFTR` tracer, `SwiftFTRConfig(` calls that pass `publicIP:`,
-`traceClassified(` results whose `publicIP` or `clientASN` is read for an IPv6 destination, and any
+`traceClassified(` results whose `publicIP` or `clientASN` is read for an IPv6 destination,
+`discoverPaths(` followed by a read of the public-IP cache, and any
 script that reads the output of `swift-ftr probe dns`.
 
 ## Update the package
@@ -459,4 +460,39 @@ After:
 ```swift
 let config = SwiftFTRConfig(publicIP: knownWAN, publicIPResolver: .disabled)
 // knownWAN must be globally routable, and answers only traces of its own family.
+```
+
+## A multipath run asks for its public address once, before its flows
+
+**What changed.** ``SwiftFTR/SwiftFTR/discoverPaths(to:config:)`` asks for the IPv4 public address
+once, in the parent, before its first batch of flows, in the same order a classified trace uses
+(configured, seeded or cached, then the ``SwiftFTRConfig/publicIPResolver`` strategy), and gives
+every flow that answer or its absence. With nothing cached, each flow used to discover on its own,
+and nothing it found was cached. ``NetworkTopology/publicIPSource`` says where the address came
+from.
+
+**What a caller sees.**
+
+- With discovery failing, a run spends one ``SwiftFTRConfig/publicIPDiscoveryTimeout`` on it
+  before probing, rather than one per flow.
+- An address the run finds is cached, so a later classified trace or run on the same tracer does
+  not ask again until ``SwiftFTR/SwiftFTR/invalidatePublicIP()`` or a network change.
+- ``NetworkTopology/publicIP`` is the run's answer; it was the first path's.
+- A network change while the question is outstanding ends the run with
+  ``TracerouteError/cancelled`` before any flow has probed.
+
+**What to change.** Nothing, unless code relied on a multipath run leaving the public-IP cache
+empty; invalidate it after the run in that case:
+
+Before:
+
+```swift
+let topology = try await tracer.discoverPaths(to: host)
+```
+
+After, to keep the cache as it was:
+
+```swift
+let topology = try await tracer.discoverPaths(to: host)
+await tracer.invalidatePublicIP()  // 0.19 caches the run's answer
 ```

@@ -450,10 +450,105 @@ struct PublicIPResolverTests {
     #expect(await tracer.publicIP(for: .v4) == nil, "the abandoned answer was cached")
   }
 
-  // MARK: Validation
+  // MARK: Multipath
 
   static let multipathConfig = MultipathConfig(
     flowVariations: 7, maxPaths: 16, earlyStopThreshold: 7, timeoutMs: 2000, maxHops: 4)
+
+  /// One multipath run through `network`, or a fresh two-hop one, under the watchdog.
+  static func discoverPaths(_ tracer: SwiftFTR, on given: FakeICMPNetwork? = nil) async throws
+    -> NetworkTopology
+  {
+    let network = try given ?? FakeICMPNetwork(script: pathScript(destinationTTL: 2))
+    defer { if given == nil { network.stop() } }
+    return try await network.install {
+      try await measure(within: Self.watchdog) {
+        try await tracer.discoverPaths(to: "fake.test", config: Self.multipathConfig)
+      }.0
+    }
+  }
+
+  @Test("A multipath run asks once, before its first batch, and every flow uses the answer")
+  func multipathAsksOnce() async throws {
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
+    defer { network.stop() }
+    let probesAtAsk = TimeStamp()
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9"))) {
+      probesAtAsk.set(TimeInterval(network.probes.value))
+      // The question takes a known time, which the run's reported duration must include.
+      usleep(400_000)
+    }
+    let tracer = Self.tracer(.custom(resolver))
+
+    let topology = try await Self.discoverPaths(tracer, on: network)
+
+    #expect(topology.discoveryDuration >= 0.4, "the duration leaves out the question")
+
+    #expect(resolver.asked.value == 1)
+    #expect(resolver.requests.map(\.family) == [.v4])
+    #expect(probesAtAsk.value == 0, "asked after a flow had started probing")
+    #expect(topology.paths.count == 7, "two batches of flows")
+    #expect(topology.paths.allSatisfy { $0.trace.publicIP == "9.9.9.9" })
+    #expect(topology.paths.allSatisfy { $0.trace.publicIPSource == Self.hostApp })
+    #expect(topology.publicIP == "9.9.9.9")
+    #expect(topology.publicIPSource == Self.hostApp)
+  }
+
+  @Test("A multipath run with no answer shares its one miss with every flow")
+  func multipathSharesMiss() async throws {
+    let discovery = OfflinePublicIPDiscovery()
+    let tracer = Self.tracer(.library)
+
+    let topology = try await discovery.install { try await Self.discoverPaths(tracer) }
+
+    #expect(
+      discovery.calls.value == 1, "the library's discovery ran \(discovery.calls.value) times")
+    #expect(topology.paths.count == 7)
+    #expect(topology.paths.allSatisfy { $0.trace.publicIP == nil })
+    #expect(topology.publicIP == nil)
+    #expect(topology.publicIPSource == nil)
+  }
+
+  @Test("An IPv6 seed does not label a multipath run, which asks for IPv4")
+  func ipv6SeedThenMultipath() async throws {
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("9.9.9.9")))
+    let tracer = Self.tracer(.custom(resolver))
+    #expect(await tracer.seedPublicIP("2606:4700::1111", source: .gatewayReported))
+
+    let topology = try await Self.discoverPaths(tracer)
+
+    #expect(resolver.requests.map(\.family) == [.v4])
+    #expect(topology.publicIP == "9.9.9.9")
+    #expect(topology.paths.allSatisfy { $0.trace.publicIP == "9.9.9.9" })
+  }
+
+  @Test("A network change during a multipath run's question ends the run before any probe")
+  func multipathQuestionCancelled() async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
+    defer { network.stop() }
+    let resolver = ScriptedPublicIPResolver(
+      .ignoringCancellation(gate, Self.observation("9.9.9.9")))
+    let tracer = Self.tracer(.custom(resolver))
+
+    let outcome = try await network.install {
+      let task = Task {
+        try await tracer.discoverPaths(to: "fake.test", config: Self.multipathConfig)
+      }
+      let asked = await eventually(within: Self.watchdog) { resolver.asked.value > 0 }
+      #expect(asked, "the run never asked its question")
+      await tracer.networkChanged()
+      return try await measure(within: Self.watchdog) { await task.result }.0
+    }
+    let stillWaiting = resolver.returned.value == 0
+    #expect(stillWaiting, "the run ended only once the resolver had answered")
+    guard case .failure(TracerouteError.cancelled) = outcome else {
+      Issue.record("expected TracerouteError.cancelled, got \(outcome)")
+      return
+    }
+    #expect(network.probes.value == 0, "a flow probed after the run was cancelled")
+  }
 
   @Test("An IPv4-mapped address is an IPv4 observation, from every origin; NAT64 stays IPv6")
   func ipv4MappedIsIPv4() async throws {
@@ -544,5 +639,21 @@ struct PublicIPResolverTests {
       ClassifiedTrace.self, from: try JSONEncoder().encode(trace))
     #expect(roundTripped.publicIPSource == .stun)
 
+    let topology = NetworkTopology(
+      destination: "example.com", destinationIP: "93.184.216.34", sourceAdapter: nil,
+      sourceIP: nil, publicIP: "8.8.8.8", publicIPSource: .gatewayReported, paths: [],
+      uniquePathCount: 0, discoveryDuration: 0)
+    let topologyJSON = try JSONEncoder().encode(topology)
+    #expect(
+      String(decoding: topologyJSON, as: UTF8.self).contains(#""publicIPSource":"gatewayReported""#)
+    )
+    let topologyBack = try JSONDecoder().decode(NetworkTopology.self, from: topologyJSON)
+    #expect(topologyBack.publicIPSource == .gatewayReported)
+    let legacyTopology =
+      #"{"destination":"example.com","destinationIP":"93.184.216.34","publicIP":"8.8.8.8","paths":[],"uniquePathCount":0,"discoveryDuration":0}"#
+    let oldTopology = try JSONDecoder().decode(
+      NetworkTopology.self, from: Data(legacyTopology.utf8))
+    #expect(oldTopology.publicIP == "8.8.8.8")
+    #expect(oldTopology.publicIPSource == nil)
   }
 }
