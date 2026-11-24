@@ -94,8 +94,8 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - `Multipath.swift`: Dublin Traceroute-style ECMP path enumeration
 
 **Caching Infrastructure**
-- `RDNSCache` (`RDNSCache.swift`): Reverse DNS with 86400s TTL
-- `ReverseDNSLookup` (`ReverseDNSLookup.swift`): one PTR query through `DNSServiceQueryRecord`, holding no thread, with typed outcomes and a cap on lookups in flight; not yet used by `RDNSCache`, which still calls `getnameinfo` on the executor
+- `RDNSCache` (`RDNSCache.swift`): Reverse DNS with 86400s TTL, through `ReverseDNSLookup`; caches answers only; a stall breaker counts unicast questions asked and unanswered; link-local lookups capped at one second
+- `ReverseDNSLookup` (`ReverseDNSLookup.swift`): one PTR query through `DNSServiceQueryRecord`, holding no thread, with typed outcomes and a process-wide cap on lookups in flight
 - `SwiftFTR.publicIPCache`: One `PublicIPObservation` per address family, with its source, for classified trace/multipath; invalidated on network change
 - `_ASNMemoryCache` (in `ASN.swift`): LRU-style IP-to-ASN cache
 
@@ -106,7 +106,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 3. **Dependency Injection**: Resolvers (ASN, DNS) are injectable via `SwiftFTRConfig` for testing
 4. **Per-Operation Interface Binding**: Override global interface on individual operations (ping, trace, etc.)
 5. **Resource Management**: Single socket per trace, buffer reuse, minimal allocations
-6. **Blocking I/O**: `BlockingIOExecutor` (`Utils.swift`, eight workers) carries reverse DNS (`getnameinfo`), STUN server-name resolution (`getaddrinfo`, one request per name) and each STUN exchange (one request per attempt, for classified traces and standalone `getPublicIPs` alike). Public-IP discovery itself is async and holds no slot between those requests; the whoami fallback, DNS queries, DNS probes and Team Cymru lookups do not use it
+6. **Blocking I/O**: `BlockingIOExecutor` (`Utils.swift`, eight workers) carries STUN server-name resolution (`getaddrinfo`, one request per name) and each STUN exchange (one request per attempt, for classified traces and standalone `getPublicIPs` alike). Public-IP discovery itself is async and holds no slot between those requests; the whoami fallback, DNS queries, DNS probes, Team Cymru lookups and reverse DNS do not use it
 
 ## Environment Variables
 

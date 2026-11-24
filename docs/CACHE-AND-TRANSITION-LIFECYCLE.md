@@ -52,11 +52,13 @@ As of 0.18.0, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
   its family, or after the request deadline, is neither returned nor cached
   (`effectivePublicIP(for:ask:)`, `askWithinDeadline`).
 - `RDNSCache` holds entries for 86400 s, evicting the oldest-inserted entry at 1000 entries
-  (both configurable through `SwiftFTRConfig`), caches negative results, and
-  has a stall breaker: after two consecutive lookups that take at least 90% of their
-  deadline, further lookups are suppressed while that count stays at two or
-  more. `clear()` and `invalidateNetworkScoped()` reset it, and so does a
-  lookup that was already in flight finishing quickly. `clear()` also generation-guards against
+  (both configurable through `SwiftFTRConfig`). It caches answers only: no such record, a
+  timeout, an error and a cancellation are asked again next time. It has a stall breaker: after
+  two consecutive unicast lookups that were asked and got no answer by their deadline, further
+  lookups are suppressed while that count stays at two or more. A lookup that never got to ask
+  in time and a link-local lookup (asked by multicast) do not count. `clear()` and
+  `invalidateNetworkScoped()` reset it, and so does a lookup that was already in flight being
+  answered, or told there is no such record. `clear()` also generation-guards against
   in-flight lookups repopulating the cache.
 - The ASN cache is capacity-bounded (2048 entries) with **no TTL**; entries
   live until evicted or the cache is reset.
@@ -138,7 +140,7 @@ It does not touch the rDNS, public-IP, or ASN caches.
 public func invalidateNetworkScopedRDNS() async
 ```
 
-Evicts cached rDNS entries — positive and negative — whose address is not
+Evicts cached rDNS entries (answers; nothing else is cached) whose address is not
 globally routable, using the library's existing scope classifier so there is
 exactly one definition of "network-scoped". Global entries and their TTLs are
 untouched: one network's `192.168.1.1` hostname must not appear on another

@@ -1,6 +1,6 @@
 # Migrating to SwiftFTR 0.19
 
-Handle the two new DNSError cases, the public-IP resolver, and the DNS, address-validation, ping, bufferbloat, public-IP discovery and CLI changes introduced in SwiftFTR 0.19.
+Handle the two new DNSError cases, the public-IP resolver, and the DNS, address-validation, ping, bufferbloat, public-IP discovery, reverse-DNS and CLI changes introduced in SwiftFTR 0.19.
 
 ## Overview
 
@@ -16,7 +16,8 @@ To find the call sites to review, search the consumer for `switch` over `DNSErro
 `.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, `getPublicIPs(`, `publicIPDiscoveryTimeout`,
 `.classify(`, `.publicIP` read from a `SwiftFTR` tracer, `SwiftFTRConfig(` calls that pass `publicIP:`,
 `traceClassified(` results whose `publicIP` or `clientASN` is read for an IPv6 destination,
-`discoverPaths(` followed by a read of the public-IP cache, and any
+`discoverPaths(` followed by a read of the public-IP cache, `reverseDNS(` compared with a hop's
+`hostname`, and any
 script that reads the output of `swift-ftr probe dns`.
 
 ## Update the package
@@ -495,4 +496,46 @@ After, to keep the cache as it was:
 ```swift
 let topology = try await tracer.discoverPaths(to: host)
 await tracer.invalidatePublicIP()  // 0.19 caches the run's answer
+```
+
+## Reverse DNS asks the system's DNS daemon
+
+**What changed.** The hostnames on trace, classified-trace and multipath hops, and from
+``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()``, come from a PTR query to the system's DNS
+daemon (`DNSServiceQueryRecord`) instead of `getnameinfo` on the blocking-I/O executor. The query
+holds no thread and is stopped at ``SwiftFTRConfig/rdnsLookupTimeout`` or when the trace is
+cancelled. Only hostnames are cached. A link-local address (fe80::/10, 169.254.0.0/16), which the
+daemon asks by multicast on the link, gets at most one second. The stall breaker, which stops
+reverse DNS until a network change after two stalls, now counts only lookups that were asked and
+got no answer, not every lookup that took nearly its deadline.
+
+**What a caller sees.** No signature changes. Results differ in these cases:
+
+- An address named only in `/etc/hosts` can have a hostname from one of ``reverseDNS(_:)``
+  (still `getnameinfo`) and a hop lookup and not the other: one comparison found
+  `255.255.255.255` named `broadcasthost` by `getnameinfo` and unnamed by the daemon.
+- A hostname whose labels hold bytes outside printable ASCII is escaped as `\DDD` (and a `\` in
+  a label as `\\`); `getnameinfo` returned those bytes raw.
+- An address with no name, and one whose lookup timed out, is asked again by every trace, where
+  0.18 remembered "no hostname" for the cache TTL (a day by default). On a link whose resolver
+  times out, a hostname now appears once the resolver recovers, without a network change.
+- A trace whose first hop is an unnamed link-local address spends at most one second on it in
+  the reverse-DNS phase, rather than the whole lookup timeout.
+- Reverse DNS no longer waits for a blocking-I/O worker, so other work holding the workers does
+  not delay hostnames, and reverse DNS no longer delays public-IP discovery.
+
+**What to change.** Nothing, unless code compares hop hostnames with ``reverseDNS(_:)`` for the
+same address, or expects one unanswered lookup to stop the next trace from asking. To keep the
+hostnames the hops report, use the hop's own field rather than asking again:
+
+Before:
+
+```swift
+let name = reverseDNS(hop.ipAddress ?? "")
+```
+
+After:
+
+```swift
+let name = hop.hostname  // the daemon's answer, as the trace saw it
 ```

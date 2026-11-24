@@ -140,8 +140,31 @@ Unreleased
   classified trace does, where flows never wrote theirs back, and `NetworkTopology.publicIP` is
   that answer rather than the first path's. A network change during the question ends the run
   with `TracerouteError.cancelled` before any flow probes.
+- **Reverse DNS for traces asks the system's DNS daemon directly** (`DNSServiceQueryRecord`)
+  instead of calling `getnameinfo` on the blocking-I/O executor. A lookup holds no thread, is
+  stopped (not abandoned) at its deadline or when its trace is cancelled, and no longer waits
+  for, or holds, an executor slot. At most 32 are in flight in the process at once. In one
+  comparison on one Mac the two gave the same name for 12 of 13 addresses; the exception,
+  `255.255.255.255`, is named `broadcasthost` in `/etc/hosts`, which `getnameinfo` reads and this
+  query does not. The public `reverseDNS(_:)` still calls `getnameinfo`. A label holding a byte outside printable ASCII is escaped (`\DDD`) where
+  `getnameinfo` returned it raw.
+- **Only hostnames are cached by reverse DNS.** An address with no name, or whose lookup timed
+  out or failed, is asked again by the next trace, where 0.18 cached "no hostname" for the whole
+  TTL (a day by default), a timeout included.
+- **A link-local hop's reverse lookup gets at most one second.** The daemon asks fe80::/10 and
+  169.254.0.0/16 addresses by multicast on the link, which never answers "no such name", so an
+  unanswered one used to wait out the whole `rdnsLookupTimeout`.
+- **The reverse-DNS stall breaker counts unanswered questions, not slow lookups.** It stops
+  lookups after two in a row that were asked and got no answer by their deadline. A lookup that
+  waited for its turn past the deadline without asking, a link-local lookup, and an error do not
+  count; an answer or "no such record" resets it.
 
 ### Bug fixes
+
+- **A multipath flow cancelled during its own reverse-DNS wave returns at once.** The flow looked
+  up the destination and the public address after its trace without racing the wait against
+  its cancellation, as `trace` and `traceClassified` already did, so a lookup that ignored
+  cancellation held the whole `discoverPaths` call.
 
 - **A ping whose send failed ends once every probe that was sent is answered** (#138). Early
   completion compared the replies with the configured `count`, which a ping with a failed send
