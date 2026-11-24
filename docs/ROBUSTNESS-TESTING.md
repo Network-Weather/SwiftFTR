@@ -458,7 +458,11 @@ Observations that are not defects of the library:
   cannot fail to end are left unbounded: a stall the test itself releases, a call with its own
   timeout that is not the one under test.
 - `fstat` cannot tell sockets apart on Darwin: it reports inode 0 for every socket. The battery
-  identifies a socket by its bound local address when checking that the library closed it.
+  identifies a socket by the kernel's identity of it (`soi_so`, from `proc_pidfdinfo`), against a
+  duplicate it holds, when checking that the library closed it. It used the bound local address
+  until a socket of the other type, bound to the same address and port and handed the same
+  descriptor number, made a closed TCP probe socket read as open (once in a full debug run;
+  forced by placing such a UDP socket on the old number).
 - A loopback fixture could take the port of an IPv6 probe socket and receive its replies. The
   fake network hands trace and ping an unbound UDP socket, which takes an ephemeral port on `[::]`
   at its first send. Fixtures bound `::1` on port 0 with `SO_REUSEADDR`, and with that option

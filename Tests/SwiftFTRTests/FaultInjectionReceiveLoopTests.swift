@@ -242,33 +242,22 @@ final class EndlessReplies: @unchecked Sendable {
 
 /// Records the sockets a socket factory hands out, so a test can check the library closed them.
 ///
-/// Each socket is identified by its local address. The log binds a socket the factory left
-/// unbound to an ephemeral loopback port, and keeps a duplicate, which holds that port reserved.
-/// A descriptor the library has closed then no longer has that address, even if its number has
-/// since been handed to another socket, so the check holds while parallel tests open and close
-/// descriptors. (`fstat` cannot tell sockets apart on Darwin: it reports inode 0 for all of them.)
+/// The log keeps a duplicate of each socket, which keeps it open and its kernel identity
+/// (``socketIdentity(_:)``) unique to it. A descriptor the library has closed then no longer names
+/// that socket, even if its number has since been handed to another socket of any type or address,
+/// so the check holds while parallel tests open and close descriptors.
 final class DescriptorLog: @unchecked Sendable {
   private let lock = NSLock()
-  private var sockets: [(fd: Int32, copy: Int32, address: [UInt8])] = []
+  private var sockets: [(fd: Int32, copy: Int32)] = []
 
   deinit { for socket in sockets { close(socket.copy) } }
 
   func wrap(_ factory: @escaping TestSeams.MakeICMPSocket) -> TestSeams.MakeICMPSocket {
     { [self] family in
       let fd = try factory(family)
-      var handedOver = false
-      defer { if !handedOver { close(fd) } }
-      if Self.localAddress(fd).map(Self.port) == 0 {
-        var (address, length) = loopbackAddress(family: family, port: 0)
-        let bound = withUnsafePointer(to: &address) {
-          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, length) }
-        }
-        guard bound == 0 else { throw FixtureError.socket("bind logged socket", errno) }
-      }
       lock.lock()
-      sockets.append((fd, dup(fd), Self.localAddress(fd) ?? []))
+      sockets.append((fd, dup(fd)))
       lock.unlock()
-      handedOver = true
       return fd
     }
   }
@@ -283,22 +272,7 @@ final class DescriptorLog: @unchecked Sendable {
   var allClosed: Bool {
     lock.lock()
     defer { lock.unlock() }
-    return sockets.allSatisfy { Self.localAddress($0.fd) != $0.address }
-  }
-
-  private static func localAddress(_ fd: Int32) -> [UInt8]? {
-    var storage = sockaddr_storage()
-    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
-    let result = withUnsafeMutablePointer(to: &storage) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
-    }
-    guard result == 0 else { return nil }
-    return withUnsafeBytes(of: storage) { Array($0.prefix(Int(length))) }
-  }
-
-  /// The port in a `sockaddr_in` or `sockaddr_in6`, which share its offset.
-  private static func port(_ address: [UInt8]) -> UInt16 {
-    address.count >= 4 ? UInt16(address[2]) << 8 | UInt16(address[3]) : 0
+    return sockets.allSatisfy { socketIdentity($0.fd) != socketIdentity($0.copy) }
   }
 }
 
