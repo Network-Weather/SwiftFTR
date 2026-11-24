@@ -174,9 +174,8 @@ func askWithinDeadline(_ resolver: any PublicIPResolver, _ request: PublicIPRequ
   -> PublicIPObservation?
 {
   let deadline = request.deadline
-  // Nothing is started for a caller already cancelled or a deadline already passed.
+  // Nothing is started for a caller already cancelled.
   try Task.checkCancellation()
-  guard ContinuousClock.now < deadline else { return nil }
   let race = DeadlineRace(deadline: deadline)
   let arm = TestSeams.armPublicIPDeadline ?? sleepUntilDeadline
   return try await withTaskCancellationHandler {
