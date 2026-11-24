@@ -264,6 +264,18 @@ func bindLoopback(family: Int32, type: Int32) throws -> (fd: Int32, port: UInt16
   return (fd, port)
 }
 
+/// The kernel's identity of the socket open on `fd` (`soi_so`, from `proc_pidfdinfo`), or `nil`
+/// when `fd` names no socket. Every descriptor of one socket shares it, and no other socket can
+/// have it while one of them stays open, so a test that holds a duplicate can tell whether a
+/// descriptor number still names that socket. A local address cannot: a socket of another type
+/// can share it, and `fstat` reports inode 0 for every socket on Darwin.
+func socketIdentity(_ fd: Int32) -> UInt64? {
+  var info = socket_fdinfo()
+  let size = Int32(MemoryLayout<socket_fdinfo>.size)
+  guard proc_pidfdinfo(getpid(), fd, PROC_PIDFDSOCKETINFO, &info, size) == size else { return nil }
+  return info.psi.soi_so
+}
+
 func setReceiveTimeout(_ fd: Int32, seconds: TimeInterval) {
   var tv = timeval(
     tv_sec: Int(seconds), tv_usec: __darwin_suseconds_t((seconds - floor(seconds)) * 1_000_000))
