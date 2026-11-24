@@ -10,7 +10,7 @@ struct CacheGenerationTests {
   func rdnsClearWinsAgainstInFlightLookup() async throws {
     let lookup = SuspendedLookup()
     let cache = RDNSCache(
-      resolver: { ip in await lookup.resolve(ip) }
+      resolver: { ip, _ in .named(await lookup.resolve(ip)) }
     )
 
     let task = Task { await cache.lookup("192.0.2.1") }
@@ -26,7 +26,7 @@ struct CacheGenerationTests {
   func rdnsLookupCachesNormally() async {
     let resolver = CountingResolver(result: "router.example")
     let cache = RDNSCache(
-      resolver: { ip in await resolver.resolve(ip) }
+      resolver: { ip, _ in .named(await resolver.resolve(ip)) }
     )
 
     #expect(await cache.lookup("192.0.2.2") == "router.example")
@@ -62,7 +62,7 @@ struct CacheGenerationTests {
   @Test("invalidateNetworkScoped evicts only non-global entries and preserves global ones")
   func scopedEvictionPreservesGlobal() async {
     let resolver = CountingResolver(result: "resolved.example")
-    let cache = RDNSCache(resolver: { ip in await resolver.resolve(ip) })
+    let cache = RDNSCache(resolver: { ip, _ in .named(await resolver.resolve(ip)) })
 
     let scopedIPs = [
       "192.168.1.1",
@@ -107,13 +107,7 @@ struct CacheGenerationTests {
 
   @Test("invalidateNetworkScoped resets the stall breaker")
   func scopedEvictionResetsStallBreaker() async {
-    let cache = RDNSCache(
-      lookupDeadline: 0.05,
-      resolver: { _ in
-        try? await Task.sleep(for: .milliseconds(60))
-        return nil
-      }
-    )
+    let cache = RDNSCache(resolver: { _, _ in .timedOut })
 
     _ = await cache.lookup("192.0.2.1")
     _ = await cache.lookup("192.0.2.2")
@@ -127,11 +121,9 @@ struct CacheGenerationTests {
   func staleScopedLookupsDoNotRetripBreaker() async throws {
     let lookup = MultiSuspendedLookup()
     let cache = RDNSCache(
-      lookupDeadline: 0.05,
-      resolver: { ip in
+      resolver: { ip, _ in
         _ = await lookup.resolve(ip)
-        try? await Task.sleep(for: .milliseconds(60))
-        return nil
+        return .timedOut
       }
     )
 
@@ -146,7 +138,7 @@ struct CacheGenerationTests {
     await cache.invalidateNetworkScoped()
     #expect(await cache.isSuppressingLookups == false)
 
-    // Resume the stale lookups so they complete with stall durations
+    // Resume the stale lookups so they complete as stalls
     await lookup.resume("192.168.1.1", returning: nil)
     await lookup.resume("192.168.1.2", returning: nil)
 
@@ -160,7 +152,7 @@ struct CacheGenerationTests {
   @Test("In-flight scoped lookup is rejected while concurrent global lookup succeeds")
   func inFlightScopedVsGlobal() async throws {
     let lookup = MultiSuspendedLookup()
-    let cache = RDNSCache(resolver: { ip in await lookup.resolve(ip) })
+    let cache = RDNSCache(resolver: { ip, _ in .named(await lookup.resolve(ip)) })
 
     let scopedTask = Task { await cache.lookup("192.168.1.1") }
     let globalTask = Task { await cache.lookup("1.1.1.1") }
@@ -188,7 +180,7 @@ struct CacheGenerationTests {
   func tracerScopedEviction() async {
     // Lookups answer from a local stub, so populating the cache sends no reverse-DNS query.
     let tracer = SwiftFTR(
-      config: SwiftFTRConfig(noReverseDNS: false), rdnsCache: RDNSCache { _ in "name.example" },
+      config: SwiftFTRConfig(noReverseDNS: false), rdnsCache: RDNSCache { _, _ in .answer("name.example") },
       asnResolver: EmptyASNResolver(), publicIPCache: [:])
     _ = await tracer.rdnsCache.lookup("192.168.1.1")
     _ = await tracer.rdnsCache.lookup("1.1.1.1")

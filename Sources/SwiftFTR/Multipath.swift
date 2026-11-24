@@ -796,7 +796,11 @@ extension SwiftFTR {
         !tr.hops.contains { $0.ipAddress == ip && $0.hostname != nil }
       }
       if !ipsNeedingRDNS.isEmpty {
-        let additionalHostnames = await rdnsCache.batchLookup(Array(ipsNeedingRDNS))
+        // Raced against cancellation like the classification below, so a cancelled flow returns
+        // without waiting for its slowest lookup.
+        let additionalHostnames = try await withTraceCancellation(handle: handle) {
+          await self.rdnsCache.batchLookup(Array(ipsNeedingRDNS))
+        }
         hostnameMap = additionalHostnames
       }
 

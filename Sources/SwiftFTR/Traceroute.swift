@@ -253,10 +253,11 @@ public struct SwiftFTRConfig: Sendable {
   public let rdnsCacheSize: Int?
   /// How long a single reverse-DNS lookup may take before the trace gives up on it.
   ///
-  /// Reverse DNS runs through `getnameinfo`, which consults the system resolver and has no timeout
-  /// parameter of its own; an unanswered query holds it for 30 seconds. Hops whose lookup exceeds
-  /// this budget report numerically instead. Lookups run concurrently, so this bounds the whole
-  /// reverse-DNS phase rather than costing this much per hop.
+  /// Reverse DNS asks the system's DNS daemon for each hop's PTR record, and the query is stopped
+  /// when this budget passes. Hops whose lookup exceeds it report numerically instead. Lookups run
+  /// concurrently, so this bounds the whole reverse-DNS phase rather than costing this much per
+  /// hop. A link-local address, which the daemon asks by multicast on the link, gets at most one
+  /// second.
   ///
   /// Raise it on links whose legitimate resolver latency is high. `nil` uses the default of 5s.
   public let rdnsLookupTimeout: TimeInterval?

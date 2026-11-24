@@ -1250,17 +1250,26 @@ struct EmptyASNResolver: ASNResolver {
 }
 
 /// A reverse-DNS cache whose lookups stall until `gate` opens or `limit` passes, ignoring
-/// cancellation the way a blocked `getnameinfo` does.
-func stallingRDNSCache(gate: StallGate, limit: TimeInterval, deadline: TimeInterval = 30)
+/// cancellation, so only the caller's own race can release it. Each lookup counts in `entered`
+/// once it has begun to stall.
+func stallingRDNSCache(gate: StallGate, limit: TimeInterval, entered: FaultCounter? = nil)
   -> RDNSCache
 {
-  RDNSCache(lookupDeadline: deadline) { _ in
+  RDNSCache(lookupDeadline: 30) { _, _ in
     await withCheckedContinuation { continuation in
       DispatchQueue.global().async {
+        entered?.increment()
         gate.wait(limit: limit)
-        continuation.resume(returning: nil)
+        continuation.resume(returning: .timedOut)
       }
     }
+  }
+}
+
+extension ReverseDNSLookupOutcome {
+  /// The outcome a test resolver reports for `hostname`: the answer, or no such record.
+  static func named(_ hostname: String?) -> ReverseDNSLookupOutcome {
+    hostname.map { .answer($0) } ?? .noSuchRecord
   }
 }
 
@@ -1268,7 +1277,7 @@ func stallingRDNSCache(gate: StallGate, limit: TimeInterval, deadline: TimeInter
 /// reaches the system resolver.
 func offlineTracer(
   _ config: SwiftFTRConfig,
-  rdns: RDNSCache = RDNSCache { _ in nil },
+  rdns: RDNSCache = RDNSCache { _, _ in .noSuchRecord },
   publicIP: String? = nil
 ) -> SwiftFTR {
   SwiftFTR(

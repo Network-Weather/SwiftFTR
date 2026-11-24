@@ -15,23 +15,17 @@ struct MultipathWorkerConfigTests {
   /// Longer than any default budget a flow could fall back to (5 s reverse DNS, 6 s public IP).
   static let watchdog: TimeInterval = 20
 
-  @Test("A flow's reverse DNS goes through the caller's cache and stops at its deadline")
+  @Test("A flow's reverse DNS goes through the caller's cache, under its deadline")
   func flowHonoursRDNSLookupTimeout() async throws {
-    let gate = StallGate()
-    defer { gate.open() }
     let lookups = FaultCounter()
-    let finished = FaultCounter()
-    let executor = BlockingIOExecutor(maximumConcurrentOperations: 4, name: "test.mp-rdns")
     let deadline: TimeInterval = 0.3
+    let wrongTimeouts = FaultCounter()
     // The deadline the caller's cache was built with, as `SwiftFTR(config:)` builds it from
     // `rdnsLookupTimeout`. A flow that built its own cache would never reach this resolver.
-    let rdns = RDNSCache(lookupDeadline: deadline) { _ in
+    let rdns = RDNSCache(lookupDeadline: deadline) { _, timeout in
       lookups.increment()
-      return try? await runDetachedBlockingIO(priority: .background, deadline: deadline) {
-        gate.wait(limit: 60)
-        finished.increment()
-        return String?.none
-      }
+      if timeout != deadline { wrongTimeouts.increment() }
+      return .timedOut
     }
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 3))
     defer { network.stop() }
@@ -41,15 +35,13 @@ struct MultipathWorkerConfigTests {
     let config = MultipathConfig(
       flowVariations: 1, maxPaths: 4, earlyStopThreshold: 1, timeoutMs: 2000, maxHops: 4)
 
-    let topology = try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await network.install {
-        try await measure(within: Self.watchdog) {
-          try await tracer.discoverPaths(to: "fake.test", config: config)
-        }.0
-      }
+    let topology = try await network.install {
+      try await measure(within: Self.watchdog) {
+        try await tracer.discoverPaths(to: "fake.test", config: config)
+      }.0
     }
     #expect(lookups.value > 0, "the flow never consulted the caller's reverse-DNS cache")
-    #expect(finished.value == 0, "the flow waited for a stalled lookup to end")
+    #expect(wrongTimeouts.value == 0, "a lookup was not given the caller's deadline")
     #expect(topology.paths.count == 1)
     #expect(topology.paths.first?.trace.hops.allSatisfy { $0.hostname == nil } == true)
   }
@@ -63,7 +55,7 @@ struct MultipathWorkerConfigTests {
     defer { network.stop() }
     let tracer = SwiftFTR(
       config: SwiftFTRConfig(maxHops: 4, noReverseDNS: true, asnResolverStrategy: .embedded),
-      rdnsCache: RDNSCache { _ in nil },
+      rdnsCache: RDNSCache { _, _ in .noSuchRecord },
       asnResolver: resolver,
       publicIPCache: testPublicIPCache(publicIP))
     let config = MultipathConfig(
@@ -128,7 +120,7 @@ struct MultipathWorkerConfigTests {
       #expect(caller[label] != defaults[label], "callerConfig leaves \(label) at its default")
     }
 
-    let rdns = RDNSCache { _ in nil }
+    let rdns = RDNSCache { _, _ in .noSuchRecord }
     let resolver = MultipathRecordingASNResolver(mapping: [:])
     let spawner = SwiftFTR.MultipathWorkerSpawner(
       baseConfig: Self.callerConfig, rdnsCache: rdns, asnResolver: resolver, publicIP: nil)

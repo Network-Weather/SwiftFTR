@@ -5,21 +5,20 @@ import Testing
 
 /// Reverse DNS degradation when the system resolver stops answering.
 ///
-/// A stalled `getnameinfo` holds its worker for 30 seconds. These tests use an injected resolver
-/// and a short deadline so the behavior is exercised in milliseconds and without live DNS.
+/// A stall is a lookup whose question was asked and got no answer by its deadline
+/// (`ReverseDNSLookupOutcome.timedOut`). These tests use an injected resolver that reports
+/// outcomes directly, so the behavior is exercised without waiting and without live DNS.
 @Suite(.serialized)
 struct RDNSSuppressionTests {
 
-  /// Counts calls and stalls for a configurable duration, standing in for a dead resolver.
+  /// Counts calls and reports a fixed outcome, standing in for the daemon.
   private final class CountingResolver: @unchecked Sendable {
     private let lock = NSLock()
     private var _calls = 0
-    let stall: TimeInterval
-    let answer: String?
+    let outcome: ReverseDNSLookupOutcome
 
-    init(stall: TimeInterval, answer: String? = nil) {
-      self.stall = stall
-      self.answer = answer
+    init(_ outcome: ReverseDNSLookupOutcome) {
+      self.outcome = outcome
     }
 
     var calls: Int {
@@ -28,30 +27,23 @@ struct RDNSSuppressionTests {
       return _calls
     }
 
-    private func bump() {
+    func resolve() -> ReverseDNSLookupOutcome {
       lock.lock()
       _calls += 1
       lock.unlock()
-    }
-
-    func resolve() async -> String? {
-      bump()
-      if stall > 0 { try? await Task.sleep(nanoseconds: UInt64(stall * 1_000_000_000)) }
-      return answer
+      return outcome
     }
   }
 
   @Test("Repeated stalls suppress further lookups instead of re-paying the deadline")
   func stallsSuppressFurtherLookups() async {
-    let probe = CountingResolver(stall: 0.12)
-    let cache = RDNSCache(lookupDeadline: 0.1, resolver: { _ in await probe.resolve() })
+    let probe = CountingResolver(.timedOut)
+    let cache = RDNSCache(resolver: { _, _ in probe.resolve() })
 
     _ = await cache.lookup("192.0.2.1")
     _ = await cache.lookup("192.0.2.2")
     #expect(await cache.isSuppressingLookups, "two stalled lookups should open the breaker")
 
-    // The cache bounds a lookup only by its resolver, so a lookup that does not reach the
-    // resolver cannot pay the deadline.
     let callsBefore = probe.calls
     let hostname = await cache.lookup("192.0.2.3")
 
@@ -61,8 +53,8 @@ struct RDNSSuppressionTests {
 
   @Test("A fast resolver never trips the breaker")
   func fastLookupsDoNotSuppress() async {
-    let probe = CountingResolver(stall: 0, answer: "host.example")
-    let cache = RDNSCache(lookupDeadline: 0.1, resolver: { _ in await probe.resolve() })
+    let probe = CountingResolver(.answer("host.example"))
+    let cache = RDNSCache(resolver: { _, _ in probe.resolve() })
 
     for octet in 1...5 {
       #expect(await cache.lookup("192.0.2.\(octet)") == "host.example")
@@ -71,14 +63,14 @@ struct RDNSSuppressionTests {
     #expect(probe.calls == 5)
   }
 
-  @Test("One stall followed by a fast answer resets the count")
-  func recoveryResetsTheStallCount() async {
-    let slow = CountingResolver(stall: 0.12)
-    let fast = CountingResolver(stall: 0, answer: "host.example")
+  @Test("One stall followed by an answer resets the count", arguments: [true, false])
+  func recoveryResetsTheStallCount(answered: Bool) async {
+    let slow = CountingResolver(.timedOut)
+    let fast = CountingResolver(answered ? .answer("host.example") : .noSuchRecord)
     let useFast = Mutex(false)
 
-    let cache = RDNSCache(lookupDeadline: 0.1) { _ in
-      useFast.value ? await fast.resolve() : await slow.resolve()
+    let cache = RDNSCache { _, _ in
+      useFast.value ? fast.resolve() : slow.resolve()
     }
 
     _ = await cache.lookup("192.0.2.1")
@@ -95,8 +87,8 @@ struct RDNSSuppressionTests {
 
   @Test("clear() reopens the breaker so a fixed network is retried")
   func clearResetsSuppression() async {
-    let probe = CountingResolver(stall: 0.12)
-    let cache = RDNSCache(lookupDeadline: 0.1, resolver: { _ in await probe.resolve() })
+    let probe = CountingResolver(.timedOut)
+    let cache = RDNSCache(resolver: { _, _ in probe.resolve() })
 
     _ = await cache.lookup("192.0.2.1")
     _ = await cache.lookup("192.0.2.2")
@@ -110,21 +102,19 @@ struct RDNSSuppressionTests {
     #expect(probe.calls == callsBefore + 1, "clear() should let lookups reach the resolver again")
   }
 
-  @Test("A batch runs its stalled lookups concurrently, not one after another")
+  @Test("A batch runs its lookups concurrently, not one after another")
   func batchLookupStaysBounded() async throws {
-    // Every lookup stalls until all forty are in flight at once, so a batch that ran them one
-    // after another never releases the first, and trips the watchdog. Each then stalls past the
-    // deadline as well.
+    // Every lookup waits until all forty are in flight at once, so a batch that ran them one
+    // after another never releases the first, and trips the watchdog.
     let ips = (1...40).map { "192.0.2.\($0)" }
     let allInFlight = StallGate()
     defer { allInFlight.open() }
     let inFlight = FaultCounter()
-    let cache = RDNSCache(lookupDeadline: 0.1) { _ in
+    let cache = RDNSCache { _, _ in
       inFlight.increment()
       if inFlight.value >= ips.count { allInFlight.open() }
       await allInFlight.waitAsync(limit: 60)
-      try? await Task.sleep(nanoseconds: 120_000_000)
-      return nil
+      return .timedOut
     }
 
     let (results, _) = try await measure(within: 20) { await cache.batchLookup(ips) }
