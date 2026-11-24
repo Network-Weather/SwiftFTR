@@ -705,6 +705,7 @@ public struct PublicIPs: Sendable {
 }
 // STUN-only, both families in parallel; failed families are nil. Ignores SwiftFTRConfig.publicIP.
 // stunTimeout is per server. Cancelling the caller ends it at once with what it had found.
+// A sourceIP runs only its own family's sweep, bound to it; one that is not an IP sends nothing.
 public func getPublicIPs(stunTimeout: TimeInterval = 0.8, interface: String? = nil,
                          sourceIP: String? = nil, enableLogging: Bool = false) async -> PublicIPs
 
