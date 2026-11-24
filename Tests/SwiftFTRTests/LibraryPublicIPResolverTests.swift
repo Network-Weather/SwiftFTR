@@ -176,7 +176,8 @@ struct LibraryPublicIPResolverTests {
     let lookups = NameLookups([:])
     let sends = STUNSends()
     for (family, source) in [
-      (IPAddressFamily.v6, "127.0.0.1"), (.v4, "::1"), (.v4, "not-an-ip"),
+      (IPAddressFamily.v6, "127.0.0.1"), (.v4, "::1"), (.v4, "not-an-ip"), (.v6, "::1%"),
+      (.v6, "::1%swiftftr-none0"),
     ] {
       let found = try await TestSeams.$stunServers.withValue(Self.named(["stun-a.test"])) {
         try await TestSeams.$resolveSTUNServer.withValue(lookups.seam) {
@@ -348,5 +349,14 @@ struct LibraryPublicIPResolverTests {
     let asked = requests.all
     #expect(Set(asked.map(\.family)) == [.v4, .v6])
     #expect(asked.allSatisfy { $0.interface == "lo0" && $0.sourceIP == nil })
+
+    // A link-local source keeps its zone; a zone that names no interface asks nothing.
+    for source in ["fe80::1%lo0", "::1%", "::1%swiftftr-none0"] {
+      let ips = await TestSeams.$discoverPublicIP.withValue(discovery) {
+        await getPublicIPs(sourceIP: source)
+      }
+      #expect(ips.v6 == (source == "fe80::1%lo0" ? "2001:db8::5" : nil), "\(source)")
+    }
+    #expect(requests.all.dropFirst(2).map(\.sourceIP) == ["fe80::1%lo0"])
   }
 }
