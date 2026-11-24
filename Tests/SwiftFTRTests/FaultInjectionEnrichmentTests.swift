@@ -117,11 +117,13 @@ struct FaultInjectionEnrichmentTests {
     }
   }
 
-  @Test("Each stalled reverse-DNS wave costs its deadline once, and two open the breaker")
+  @Test(
+    "A stalled hop costs its deadline once, is held off on the next trace, and two open the breaker"
+  )
   func reverseDNSStallBounded() async throws {
     // A daemon that takes every question and never answers, behind the real lookup and its real
     // deadline timer, as a resolver that stopped answering looks. Every hop of the fake path
-    // answers from one address, so each trace asks one question.
+    // answers from one address, so each trace asks at most one question.
     let daemon = FakeDNSService(deadline: .timer)
     let rdns = RDNSCache(
       lookupDeadline: 0.3, limiter: _ConcurrencySemaphore(maxConcurrent: 32))
@@ -139,14 +141,17 @@ struct FaultInjectionEnrichmentTests {
         #expect(first.hops.allSatisfy { $0.hostname == nil })
         #expect(await rdns.isSuppressingLookups == false, "one stall opened the breaker")
 
-        // Nothing was cached, so the second trace asks again, and its stall is the second.
+        // The hop is held off, so the second trace asks nothing and pays no budget.
         _ = try await measure(within: Self.watchdog) { try await tracer.trace(to: "fake.test") }
+        #expect(daemon.startedCount == 1, "the held-off hop was asked again")
+        #expect(await rdns.isSuppressingLookups == false)
+
+        // A second address that stalls is the second stall, and opens the breaker.
+        _ = try await measure(within: Self.watchdog) { await rdns.lookup("198.51.100.77") }
         #expect(daemon.startedCount == 2)
-        let before = daemon.startedCount
-        _ = try await measure(within: Self.watchdog) { try await tracer.trace(to: "fake.test") }
-        let unseen = try await measure(within: Self.watchdog) { await rdns.lookup("198.51.100.77") }
+        let unseen = try await measure(within: Self.watchdog) { await rdns.lookup("198.51.100.78") }
         #expect(unseen.0 == nil)
-        #expect(daemon.startedCount == before, "the breaker should suppress further lookups")
+        #expect(daemon.startedCount == 2, "the breaker should suppress further lookups")
       }
     }
     #expect(await rdns.isSuppressingLookups)

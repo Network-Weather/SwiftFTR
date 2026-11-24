@@ -35,11 +35,12 @@ struct RDNSCacheTests {
   }
 
   static let uncachedOutcomes: [ReverseDNSLookupOutcome] = [
-    .noSuchRecord, .timedOut, .timedOutBeforeQuery, .cancelled,
+    .noSuchRecord, .timedOutBeforeQuery, .cancelled,
     .error(.invalidAddress), .error(.daemon(DNSServiceStatus.serviceNotRunning)),
     .error(.malformedRecord),
   ]
 
+  // A timeout is not cached either, but holds the address off for a while: see the holdoff tests.
   @Test("Only an answer is cached; every other outcome is asked again", arguments: uncachedOutcomes)
   func onlyAnswersAreCached(outcome: ReverseDNSLookupOutcome) async {
     let resolver = RecordingResolver { _ in outcome }
@@ -62,28 +63,31 @@ struct RDNSCacheTests {
     #expect(resolver.calls.count == 1)
   }
 
-  /// Two of an outcome in a row, and whether they open the breaker.
-  static let breakerTable: [(String, ReverseDNSLookupOutcome, Bool)] = [
+  /// An outcome for two different addresses in a row, and whether they open the breaker.
+  static let breakerTable: [([String], ReverseDNSLookupOutcome, Bool)] = [
     // Asked and unanswered: the resolver is stalled.
-    ("192.0.2.1", .timedOut, true),
+    (["192.0.2.1", "192.0.2.2"], .timedOut, true),
     // Never asked (no permit in time, or no time left to start): no evidence (David, 2026-11-24).
-    ("192.0.2.1", .timedOutBeforeQuery, false),
+    (["192.0.2.1", "192.0.2.2"], .timedOutBeforeQuery, false),
     // Asked by multicast on the link, where silence means no responder, not a stalled resolver.
-    ("fe80::1%lo0", .timedOut, false),
-    ("169.254.1.1", .timedOut, false),
-    ("::ffff:169.254.1.1", .timedOut, false),
+    (["fe80::1%lo0", "fe80::2%lo0"], .timedOut, false),
+    (["169.254.1.1", "169.254.1.2"], .timedOut, false),
+    (["::ffff:169.254.1.1", "::ffff:169.254.1.2"], .timedOut, false),
     // Failed without waiting on the resolver.
-    ("192.0.2.1", .error(.daemon(DNSServiceStatus.serviceNotRunning)), false),
-    ("192.0.2.1", .noSuchRecord, false),
-    ("192.0.2.1", .answer("router.example"), false),
+    (["192.0.2.1", "192.0.2.2"], .error(.daemon(DNSServiceStatus.serviceNotRunning)), false),
+    (["192.0.2.1", "192.0.2.2"], .noSuchRecord, false),
+    (["192.0.2.1", "192.0.2.2"], .answer("router.example"), false),
   ]
 
   @Test("Only an asked, unanswered unicast question counts as a stall", arguments: breakerTable)
-  func whatCountsAsAStall(address: String, outcome: ReverseDNSLookupOutcome, opens: Bool) async {
+  func whatCountsAsAStall(addresses: [String], outcome: ReverseDNSLookupOutcome, opens: Bool)
+    async
+  {
     let cache = RDNSCache { _, _ in outcome }
-    for _ in 0..<RDNSCache.stallsBeforeSuppressing {
+    for address in addresses {
       _ = await cache.lookup(address)
     }
+    let address = addresses.joined(separator: ", ")
     let suppressing = await cache.isSuppressingLookups
     #expect(suppressing == opens, "\(address): \(outcome)")
   }

@@ -6,7 +6,8 @@ import Foundation
 /// no thread while it waits and is stopped when its caller stops waiting. Only answers are
 /// cached: "no such record" cannot be told apart from a question the daemon suppressed, and a
 /// timeout, an error or a cancellation says nothing about the name, so an address without one is
-/// asked again by the next lookup.
+/// asked again by the next lookup, with one exception: an address whose question was asked and
+/// timed out is held off for ``stalledAddressHoldoff`` (see there).
 ///
 /// When an insertion takes the cache past `maxSize`, the entry stored longest ago is evicted; a
 /// cache hit does not refresh an entry, so this is insertion-order eviction, not
@@ -51,10 +52,21 @@ actor RDNSCache {
   /// likely to have fixed the resolver.
   static let stallsBeforeSuppressing = 2
 
+  /// How long an address whose question was asked and got no answer by its deadline
+  /// (``ReverseDNSLookupOutcome/timedOut``, unicast or link-local) is not asked again.
+  ///
+  /// Proposed by an agent, not yet confirmed by David (2026-11-24). Only answers are cached, so
+  /// without it a hop whose PTR query always times out costs the whole lookup budget on every
+  /// trace: a hop that answers "no such record" in the same wave resets the stall count each
+  /// time, so the breaker never opens. During the holdoff a lookup of the address returns `nil`
+  /// at once, asks nothing, and neither counts toward nor resets the breaker. A holdoff is not a
+  /// cached answer, and ``clear()`` and ``invalidateNetworkScoped()`` drop every one, since a
+  /// network change may have fixed the resolver.
+  static let stalledAddressHoldoff: Duration = .seconds(600)
+
   private var cache: [String: CacheEntry] = [:]
   private let ttl: Duration
   private let maxSize: Int
-  private let clock = ContinuousClock()
   private let resolver: Resolver
   private let lookupDeadline: TimeInterval
   private let linkLocalLookupDeadline: TimeInterval
@@ -62,6 +74,12 @@ actor RDNSCache {
   private var globalGeneration: UInt64 = 0
   private var breakerGeneration: UInt64 = 0
   private var consecutiveStalls = 0
+  /// The addresses counted in the current run of stalls: each counts once, so many lookups of one
+  /// address in flight together (multipath flows sharing a hop) cannot open the breaker alone.
+  private var stalledInStreak: Set<String> = []
+  /// When each held-off address timed out. Bounded by `maxSize`, oldest inserted evicted first.
+  private var holdoffs: [String: ContinuousClock.Instant] = [:]
+  private let now: @Sendable () -> ContinuousClock.Instant
 
   /// Initialize a new rDNS cache.
   /// - Parameters:
@@ -72,14 +90,17 @@ actor RDNSCache {
   ///     than `lookupDeadline`.
   ///   - limiter: Bounds the lookups in flight; by default one limiter shared by the process.
   ///   - resolver: Replaces the lookup through the system daemon, for tests.
+  ///   - now: The monotonic clock entries and holdoffs expire by; tests substitute their own.
   init(
     ttl: TimeInterval = 86400,
     maxSize: Int = 1000,
     lookupDeadline: TimeInterval = RDNSCache.lookupDeadline,
     linkLocalLookupDeadline: TimeInterval = RDNSCache.linkLocalLookupDeadline,
     limiter: _ConcurrencySemaphore = ReverseDNSLookup.sharedLimiter,
-    resolver: Resolver? = nil
+    resolver: Resolver? = nil,
+    now: @escaping @Sendable () -> ContinuousClock.Instant = { ContinuousClock.now }
   ) {
+    self.now = now
     self.ttl = .seconds(ttl)
     self.maxSize = maxSize
     self.lookupDeadline = lookupDeadline
@@ -103,11 +124,17 @@ actor RDNSCache {
   /// - Parameter ip: The IP address to resolve, with a zone if it has one.
   /// - Returns: The hostname if one was found, nil otherwise
   func lookup(_ ip: String) async -> String? {
-    let now = clock.now
+    let now = self.now()
 
     // Check cache first
     if let entry = cache[ip], now < entry.timestamp + ttl {
       return entry.hostname
+    }
+
+    // Asked recently and unanswered: not asked again until the holdoff passes.
+    if let since = holdoffs[ip] {
+      if now < since + Self.stalledAddressHoldoff { return nil }
+      holdoffs.removeValue(forKey: ip)
     }
 
     // Lookups keep stalling, so skip the wait and report numerically until the breaker resets.
@@ -124,20 +151,26 @@ actor RDNSCache {
     // outcome it reports: recording it could trip the breaker on lookups nobody waited for.
     guard !Task.isCancelled else { return nil }
 
-    // Only lookups initiated under the current breaker generation may update breaker state.
-    // Stale lookups from a prior network generation must not re-trip or reset the breaker on the
-    // new network. A multicast question is no evidence about the resolver either way.
-    if lookupBreakerGeneration == breakerGeneration && !isMulticast {
-      switch outcome {
-      case .timedOut:
-        // Asked and unanswered: the resolver is stalled.
-        consecutiveStalls += 1
-      case .answer, .noSuchRecord:
-        // The resolver answered.
-        consecutiveStalls = 0
-      case .timedOutBeforeQuery, .error, .cancelled:
-        // Never asked, or failed without waiting on the resolver.
-        break
+    // Only lookups initiated under the current breaker generation may update breaker state or
+    // hold an address off. Stale lookups from a prior network generation must not re-trip or
+    // reset the breaker on the new network. A multicast question is no evidence about the
+    // resolver either way, but an unanswered one is held off like any other.
+    if lookupBreakerGeneration == breakerGeneration {
+      if outcome == .timedOut {
+        holdOff(ip, since: self.now())
+      }
+      if !isMulticast {
+        switch outcome {
+        case .timedOut:
+          // Asked and unanswered: the resolver is stalled. Once per address per run of stalls.
+          if stalledInStreak.insert(ip).inserted { consecutiveStalls += 1 }
+        case .answer, .noSuchRecord:
+          // The resolver answered.
+          resetStalls()
+        case .timedOutBeforeQuery, .error, .cancelled:
+          // Never asked, or failed without waiting on the resolver.
+          break
+        }
       }
     }
 
@@ -148,7 +181,7 @@ actor RDNSCache {
     guard lookupGeneration == currentGeneration else { return nil }
 
     guard case .answer(let hostname) = outcome else { return nil }
-    cache[ip] = CacheEntry(hostname: hostname, timestamp: clock.now)
+    cache[ip] = CacheEntry(hostname: hostname, timestamp: self.now())
 
     // Evict oldest entry if cache is too large
     if cache.count > maxSize {
@@ -186,7 +219,8 @@ actor RDNSCache {
     globalGeneration &+= 1
     breakerGeneration &+= 1
     cache.removeAll()
-    consecutiveStalls = 0
+    holdoffs.removeAll()
+    resetStalls()
   }
 
   /// Invalidate network-scoped (non-global) rDNS cache entries and reset the stall breaker.
@@ -194,12 +228,29 @@ actor RDNSCache {
   /// Evicts cached rDNS entries whose address is not globally routable (RFC 1918 private, CGNAT,
   /// link-local, loopback, ULA). Preserves globally routable entries and their TTLs. In-flight
   /// lookups for scoped addresses are discarded, while in-flight global lookups continue to
-  /// complete and cache normally.
+  /// complete and cache normally. Every holdoff is dropped, global ones included: a timeout says
+  /// something about the path to a resolver, which the network change may have fixed.
   func invalidateNetworkScoped() {
     scopedGeneration &+= 1
     breakerGeneration &+= 1
     cache = cache.filter { ip, _ in ipAddressScope(of: ip) == .global }
+    holdoffs.removeAll()
+    resetStalls()
+  }
+
+  /// Addresses currently held off, expired or not, for tests.
+  var holdoffCount: Int { holdoffs.count }
+
+  private func resetStalls() {
     consecutiveStalls = 0
+    stalledInStreak.removeAll()
+  }
+
+  private func holdOff(_ ip: String, since: ContinuousClock.Instant) {
+    holdoffs[ip] = since
+    if holdoffs.count > maxSize, let oldest = holdoffs.min(by: { $0.value < $1.value }) {
+      holdoffs.removeValue(forKey: oldest.key)
+    }
   }
 
   /// Get the current number of cached entries.
@@ -209,10 +260,11 @@ actor RDNSCache {
 
   /// Remove expired entries from the cache.
   func pruneExpired() {
-    let now = clock.now
+    let now = self.now()
     cache = cache.filter { _, entry in
       now < entry.timestamp + ttl
     }
+    holdoffs = holdoffs.filter { _, since in now < since + Self.stalledAddressHoldoff }
   }
 
   private func evictOldest() {
