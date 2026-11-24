@@ -408,8 +408,10 @@ the call still has no overall deadline and reports the address as the STUN serve
 **What a caller sees.** With `sourceIP: "192.0.2.10"`, `v6` is always `nil`; with an IPv6
 `sourceIP`, `v4` is always `nil`; with a malformed one, both are `nil`.
 
-**What to change.** To discover both families with a source address for one of them, make two
-calls:
+**What to change.** To discover both families, make two calls, each with a source address of its
+own family. A call without `sourceIP` sweeps both families unbound, so it cannot ask for
+system-routed IPv6 alone: the IPv4 request would also leave, over the default route. A caller
+with a source address for one family only gets that family.
 
 Before:
 
@@ -421,7 +423,7 @@ After:
 
 ```swift
 async let v4 = getPublicIPs(sourceIP: v4Source)
-async let v6 = getPublicIPs(sourceIP: v6Source)  // or no sourceIP for system routing
+async let v6 = getPublicIPs(sourceIP: v6Source)
 let ips = await PublicIPs(v4: v4.v4, v6: v6.v6)
 ```
 
