@@ -24,7 +24,7 @@ that fail when any phase can wait without a bound or strand its caller.
   socket factory used by trace and ping, IPv4 public-address discovery, a hook that holds
   `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping,
   UDP exchange, TCP probe or UDP probe socket non-blocking, the `sendto` a trace, stream or ping
-  sends its probes with, and for the event-based UDP transport (`UDPExchange`) its
+  sends its probes with, an observer of each read it makes from its probe socket, and for the event-based UDP transport (`UDPExchange`) its
   `send` and `close` calls and the DNS server port. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
@@ -624,12 +624,29 @@ Observations that are not defects of the library:
   network. A held test's "not early" bound is measured on ping's clock from probe 3's own send to
   ping's close, both stamped on ping's queue, never from the start of a run that contains the
   hold. In the late-reply test probe 3 is no longer answered, so the ping reads
-  probe 1's late reply after its own probe's timeout and before its own end. The second answers
-  every probe with a window past the watchdog and tells the early reply for sequence 2 apart by
-  its mark. `failedSendEndsWhenSendLoopFinishes` cannot be held that way: the
+  probe 1's late reply after its own probe's timeout and before its own end. The second leaves
+  probe 2 unanswered, holds its send until probe 1's reply and the early one are queued, and
+  checks that the reply queued before probe 2's send does not give it an RTT, so no genuine reply
+  can mask a false match. `failedSendEndsWhenSendLoopFinishes` cannot be held that way: the
   send loop enqueues each send and sleeps on its own, so a hook cannot keep probe 2 back until a
   reply is read. Its reply is now injected (one loopback crossing, not two) and its interval is
   2 s, which still has to outlast delivery; a seam on the send loop's sleep would remove that.
+- **The receive-loop tests waited on loopback and inferred what the operation did** (#103). Under
+  that load `traceDeadline` and `streamDeadline` failed with "sent 0 -> 0": `EndlessReplies` started
+  its feed only when the fake network saw the first probe, which crossed loopback after the 0.3 s
+  window had closed (the strict "294 sent, 4 read" failures were the same start, just before it
+  closed). The feed now starts as the probe socket is made, with an exact batch of echo replies for
+  sequence 0, which no operation sends, and the socket is handed over only once the batch is queued
+  whole. Nothing is inferred from the fixture's side: the operation's first read is the batch
+  shrinking, and its every read passes through `TestSeams.observeProbeReceive` (the three
+  probe-socket reads in the library), so `heldReading` asks for a read past the batch and no empty
+  read, counted on the operation's own queue. Sent minus queued had taken replies in flight for
+  reads, and the sender's pace had hidden a read that came back empty. Bounds are measured from the
+  handover: "not early" from it, and each upper bound from it too, with the factory's priming under
+  its own allowance, so pingDeadline still tells its reply window from its 5.8 s safety timer.
+  `unreachableReported` ends on a destination reply instead of needing three replies within 0.3 s,
+  and two probe counts are awaited. Under that load these files recorded issues in 9 of 10 runs on
+  main (20 issues), 2 of 10 strict.
 - **Two fixture and probe tests assumed a quiet host** (#103). `ProbeTests.testClosedPort` probed
   port 9999 on the assumption that nothing listens there and required the reset within 100 ms, a
   wall-clock upper bound that failed even unloaded (rtt 0.155 s in a release run; 5 of 60

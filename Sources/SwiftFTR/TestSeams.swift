@@ -54,6 +54,12 @@ enum TestSeams {
       _ length: socklen_t
     ) -> Int
 
+  /// Observes each read a trace, stream or ping makes from its probe socket: called with the
+  /// descriptor and the read itself (`recvmsg` or `recvfrom`, unchanged), it must call `receive`
+  /// exactly once and return its result with `errno` as `receive` left it. Captured when the
+  /// operation is built, since the reads run on dispatch queues.
+  typealias ObserveProbeReceive = @Sendable (_ fd: Int32, _ receive: () -> Int) -> Int
+
   /// `close(2)`, in place of the system call a ``UDPExchange`` closes its socket with. A substitute
   /// must close `fd` (or the test leaks it) and return what `close` would.
   typealias CloseDescriptor = @Sendable (_ fd: Int32) -> Int32
@@ -83,6 +89,8 @@ enum TestSeams {
   @TaskLocal static var makeICMPSocket: MakeICMPSocket?
 
   @TaskLocal static var sendProbe: SendProbe?
+
+  @TaskLocal static var observeProbeReceive: ObserveProbeReceive?
 
   @TaskLocal static var discoverPublicIPv4: DiscoverPublicIPv4?
 

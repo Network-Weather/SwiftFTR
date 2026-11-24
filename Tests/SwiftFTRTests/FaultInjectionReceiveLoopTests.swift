@@ -26,16 +26,26 @@ import Testing
 /// a held loop ends after the test.
 ///
 /// ``install(_:descriptors:_:)`` routes the operation's sockets through ``socketFactory(_:)``,
-/// which binds each to loopback so replies can be addressed to it, sets the timeout, and keeps a
-/// duplicate so the port cannot be handed to another socket while replies still go to it. It also
+/// which connects each to the network, so only the network's replies can reach it, sets the
+/// timeout, and keeps a duplicate so the port cannot be handed to another socket while replies
+/// still go to it. It also
 /// substitutes `fcntl` so the operation's switch to non-blocking reports success and changes
-/// nothing. Replies start when the network sees the first probe, because their identifier must
-/// differ from the operation's, and run until ``stop()``.
+/// nothing. Replies start as the socket is made, before the operation sends anything, and the
+/// socket is handed over only once ``primed`` of them are queued on it, so the socket is already
+/// fed when the operation's window opens however slowly loopback delivers. They are echo replies
+/// for sequence 0, which no trace, stream or ping sends, so every operation reads and drops them
+/// whatever its identifier. They run until ``stop()``.
 final class EndlessReplies: @unchecked Sendable {
   let family: Int32
   /// The gap between replies, and so the longest a read waits for one.
   let interval: TimeInterval = 0.002
   private let receiveTimeout: TimeInterval = 1
+  /// Replies queued on the probe socket before it is handed to the operation.
+  static let primed: Int32 = 10
+  /// The longest the factory waits for that batch to arrive: setup, timed apart from the
+  /// operation, so a watchdog around a call that includes it adds this and checks its own bound
+  /// from the handover.
+  static let primingAllowance: TimeInterval = 10
   private let lock = NSLock()
   private var started = false
   private var stopped = false
@@ -43,10 +53,16 @@ final class EndlessReplies: @unchecked Sendable {
   private var port: UInt16 = 0
   private var sentCount = 0
   private var senderGone = false
-  private var lastSend: TimeInterval?
-  private var longestGap: TimeInterval = 0
+  /// The operation's own reads of its probe socket, seen through the receive observer: those that
+  /// returned a datagram, and those that found the socket empty (EAGAIN, which is also what a
+  /// blocking read's timeout returns).
+  private var reads = 0
+  private var emptyReads = 0
   /// The network whose socket the replies leave from, set by ``socketFactory(_:)``.
   private var network: FakeICMPNetwork?
+  private var handedOverAt: TimeInterval?
+  /// When the fixture first saw the primed batch shrink, the proof that the operation read.
+  private var readSeenAt: TimeInterval?
 
   init(family: Int32 = AF_INET) {
     self.family = family
@@ -64,12 +80,27 @@ final class EndlessReplies: @unchecked Sendable {
     let leaveBlocking: TestSeams.FileControl = { fd, command, argument in
       command == F_SETFL ? 0 : fcntl(fd, command, argument)
     }
+    let observe: TestSeams.ObserveProbeReceive = { [self] _, receive in
+      let result = receive()
+      let code = errno
+      lock.lock()
+      if result >= 0 {
+        reads += 1
+      } else if code == EAGAIN || code == EWOULDBLOCK {
+        emptyReads += 1
+      }
+      lock.unlock()
+      errno = code
+      return result
+    }
     return try await TestSeams.$fileControl.withValue(leaveBlocking) {
-      try await network.install(socketFactory: descriptors?.wrap(factory) ?? factory, body)
+      try await TestSeams.$observeProbeReceive.withValue(observe) {
+        try await network.install(socketFactory: descriptors?.wrap(factory) ?? factory, body)
+      }
     }
   }
 
-  /// Opens a probe socket through `network`, bound to loopback and with the receive timeout set.
+  /// Opens a probe socket through `network`, connected to it and with the receive timeout set.
   func socketFactory(_ network: FakeICMPNetwork) -> TestSeams.MakeICMPSocket {
     { [self] requestedFamily in
       let fd = try network.makeSocket(requestedFamily)
@@ -93,27 +124,36 @@ final class EndlessReplies: @unchecked Sendable {
       port = boundPort
       self.network = network
       lock.unlock()
+      startFeed()
+      // Waiting for replies that have to cross loopback, not for the operation, which has not
+      // sent anything yet. Bounded, and a short wait on a thread the call already holds.
+      let giveUp = monotonicNow() + Self.primingAllowance
+      while queuedDatagrams(fd) < Self.primed, monotonicNow() < giveUp { usleep(1000) }
+      // Exactly the batch: the socket hears only the network, and the feed sends nothing more
+      // until the operation has read.
+      guard queuedDatagrams(fd) == Self.primed else {
+        throw FixtureError.socket("\(queuedDatagrams(fd)) replies queued before handover", 0)
+      }
       handedOver = true
+      lock.lock()
+      handedOverAt = handedOverAt ?? monotonicNow()
+      lock.unlock()
       return fd
     }
   }
 
-  /// A network script that answers nothing itself and starts the replies at the first probe.
+  /// A network script that answers nothing itself.
   func silentScript() -> FakeICMPNetwork.Script {
     script { _ in [] }
   }
 
-  /// Wraps `script`, starting the replies at the first probe.
+  /// `script`, unchanged: the replies start with the socket, not at a probe.
   func script(_ script: @escaping FakeICMPNetwork.Script) -> FakeICMPNetwork.Script {
-    { [self] probe in
-      start(foreignTo: probe.identifier)
-      return script(probe)
-    }
+    script
   }
 
-  /// Starts sending echo replies for an identifier other than `identifier`. Later calls do
-  /// nothing.
-  func start(foreignTo identifier: UInt16) {
+  /// Starts sending echo replies for sequence 0 to the probe socket. Later calls do nothing.
+  private func startFeed() {
     lock.lock()
     guard !started, !stopped, socketCopy >= 0 else {
       lock.unlock()
@@ -122,7 +162,7 @@ final class EndlessReplies: @unchecked Sendable {
     started = true
     let port = self.port
     lock.unlock()
-    let datagram = ICMPWire.echoReply(family: family, id: identifier &+ 1, seq: 1)
+    let datagram = ICMPWire.echoReply(family: family, id: 0, seq: 0)
     let thread = Thread { [self] in
       // The sender releases the duplicate itself, after its last reply, so the port stays
       // reserved for as long as replies are sent to it.
@@ -133,51 +173,52 @@ final class EndlessReplies: @unchecked Sendable {
         socketCopy = -1
         lock.unlock()
       }
-      send(datagram, to: port)
+      feed(datagram, to: port)
     }
     thread.start()
   }
 
-  /// How much traffic there had been at one moment: replies sent, and how many of them some
-  /// reader had taken off the probe socket.
+  /// How much traffic there had been at one moment: replies sent, and whether the operation had
+  /// been seen reading.
   struct Traffic: Sendable {
     let sent: Int
-    let read: Int
+    let readSeen: Bool
   }
 
-  /// Replies sent so far, and how many have been read from the probe socket. Read counts the
-  /// datagrams no longer queued on it (`SO_NUMRCVPKT` on the fixture's duplicate). It is 0 before
-  /// the socket exists, and -1 if the queue cannot be counted, which no check accepts.
+  /// Replies sent so far, and whether the operation has read from the probe socket: the fixture
+  /// saw the primed batch shrink. Only the operation reads the socket (the fixture's duplicate is
+  /// never read), and nothing is sent between the batch being queued whole and that read, so it
+  /// is an observation of a read, not arithmetic over datagrams that may still be in flight.
   func traffic() -> Traffic {
     lock.lock()
     defer { lock.unlock() }
-    return Traffic(sent: sentCount, read: readCount())
+    return Traffic(sent: sentCount, readSeen: readSeenAt != nil)
   }
 
-  /// Whether the socket stayed fed since `mark` and the operation read it: the sender is still
-  /// running, no gap between sends reached the receive timeout (after which a read reports no
-  /// data), neither has the time since the last send, and at least `minimumSent` more replies
-  /// were sent and `minimumRead` more were read. The default of ten reads is far more than
-  /// loopback ever has in flight at this spacing, so those replies were read, not merely still on
-  /// their way. A test that checks reading before it cancels passes zero for both, since a prompt
-  /// return can come before the next reply; the read count is an estimate, so with zero its
-  /// change is not checked at all.
-  func fedAndRead(
-    since mark: Traffic, minimumSent: Int = 1, minimumRead: Int = 10
-  ) -> (ok: Bool, detail: String) {
+  /// Whether the operation's receive loop never found its socket empty: it read at least
+  /// `minimumReads` datagrams and none of its reads came back empty, and the feed is still
+  /// running. One more than ``primed`` shows a fed reply arrived and was read: after the batch,
+  /// each read blocks until the next reply arrives or the receive timeout reports it empty, so a
+  /// slow loopback lowers the count only to that, never below it without an empty read. Both counts come from the operation's own reads, through the receive observer, so
+  /// nothing but the operation can satisfy them; the sender's pace proves nothing about what the
+  /// receiver found.
+  func heldReading(minimumReads: Int) -> (ok: Bool, detail: String) {
     lock.lock()
     defer { lock.unlock() }
-    let read = readCount()
-    let sinceLastSend = lastSend.map { monotonicNow() - $0 }
-    let ok =
-      !senderGone && !stopped && sentCount > 0 && sentCount - mark.sent >= minimumSent
-      && longestGap < receiveTimeout && sinceLastSend.map { $0 < receiveTimeout } == true
-      && mark.read >= 0 && read >= 0 && (minimumRead == 0 || read - mark.read >= minimumRead)
+    let ok = !senderGone && !stopped && reads >= minimumReads && emptyReads == 0
     let detail =
-      "sender running: \(!senderGone && !stopped), sent \(mark.sent) -> \(sentCount), "
-      + "read \(mark.read) -> \(read), longest gap \(longestGap)s, "
-      + "since last send \(sinceLastSend.map { "\($0)s" } ?? "never")"
+      "sender running: \(!senderGone && !stopped), sent \(sentCount), reads \(reads), "
+      + "empty reads \(emptyReads)"
     return (ok, detail)
+  }
+
+  /// Seconds from the moment the socket was handed to the operation, after the replies were
+  /// primed, until `end`; `nil` if it never was. Stamped in the socket factory, which runs inside
+  /// the operation's call, so a "not early" bound measured from it excludes the priming wait.
+  func sinceHandover(until end: TimeInterval) -> TimeInterval? {
+    lock.lock()
+    defer { lock.unlock() }
+    return handedOverAt.map { end - $0 }
   }
 
   /// Replies sent so far.
@@ -185,20 +226,6 @@ final class EndlessReplies: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return sentCount
-  }
-
-  /// Replies taken off the probe socket, or -1 if its queue cannot be counted. Call with `lock`
-  /// held.
-  private func readCount() -> Int {
-    // No socket yet: nothing can have been sent or read.
-    if port == 0 { return 0 }
-    guard socketCopy >= 0 else { return -1 }
-    var queued: Int32 = 0
-    var length = socklen_t(MemoryLayout<Int32>.size)
-    guard getsockopt(socketCopy, SOL_SOCKET, SO_NUMRCVPKT, &queued, &length) == 0 else {
-      return -1
-    }
-    return max(0, sentCount - Int(queued))
   }
 
   /// Stops the replies without waiting. The duplicate descriptor is released here if the replies
@@ -215,24 +242,43 @@ final class EndlessReplies: @unchecked Sendable {
     lock.unlock()
   }
 
-  private func send(_ datagram: [UInt8], to port: UInt16) {
+  /// Sends the primed batch, waits for the operation's first read, then sends one reply every
+  /// ``interval`` until ``stop()``.
+  private func feed(_ datagram: [UInt8], to port: UInt16) {
     lock.lock()
     let network = self.network
+    let copy = socketCopy
     lock.unlock()
-    guard let network else { return }
+    guard let network, copy >= 0 else { return }
     // A test that forgets to stop the replies must not leave them running for the whole suite.
     let safetyStop = monotonicNow() + 60
-    while monotonicNow() < safetyStop {
+    var isStopped: Bool {
       lock.lock()
-      let done = stopped
+      defer { lock.unlock() }
+      return stopped
+    }
+    for _ in 0..<Self.primed where network.send(datagram, toPort: port) {
+      lock.lock()
+      sentCount += 1
       lock.unlock()
-      if done { return }
+    }
+    // The batch is queued whole before the operation gets the socket; it shrinks only when the
+    // operation reads.
+    while !isStopped, monotonicNow() < safetyStop {
+      lock.lock()
+      let handedOver = handedOverAt != nil
+      lock.unlock()
+      if handedOver, queuedDatagrams(copy) < Self.primed { break }
+      usleep(useconds_t(interval * 1_000_000))
+    }
+    lock.lock()
+    if !stopped { readSeenAt = monotonicNow() }
+    lock.unlock()
+    while monotonicNow() < safetyStop {
+      if isStopped { return }
       if network.send(datagram, toPort: port) {
-        let now = monotonicNow()
         lock.lock()
         sentCount += 1
-        if let lastSend { longestGap = max(longestGap, now - lastSend) }
-        lastSend = now
         lock.unlock()
       }
       usleep(useconds_t(interval * 1_000_000))
@@ -287,7 +333,7 @@ final class DescriptorLog: @unchecked Sendable {
 /// Every operation runs under a watchdog, so a handler that holds its queue fails its test
 /// instead of hanging the suite. Bounds come from the operation's configuration, and the main
 /// claim of each liveness test is an event: the operation returned while the replies were still
-/// arriving and its receive loop was reading them (``EndlessReplies/fedAndRead(since:minimumRead:)``),
+/// arriving and its receive loop was reading them (``EndlessReplies/heldReading(minimumReads:)``),
 /// so a test cannot pass on a socket that was idle or a loop that never read.
 @Suite("FaultInjection: receive loop bounds")
 struct FaultInjectionReceiveLoopTests {
@@ -295,6 +341,9 @@ struct FaultInjectionReceiveLoopTests {
 
   /// Generous: an operation that is not held returns within its own window plus scheduling.
   static let watchdog: TimeInterval = 10
+  /// The watchdog around a call that also makes its socket: ``watchdog`` plus the priming the
+  /// factory may wait for. A bound on the operation itself is checked from the handover.
+  static let setupWatchdog = watchdog + EndlessReplies.primingAllowance
 
   // MARK: Trace
 
@@ -309,16 +358,19 @@ struct FaultInjectionReceiveLoopTests {
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: Int(window * 1000), noReverseDNS: true))
 
-    let before = replies.traffic()
-    let (result, elapsed) = try await measure(within: Self.watchdog) {
+    let (result, elapsed) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network, descriptors: descriptors) {
         try await tracer.trace(to: "fake.test")
       }
     }
-    let flow = replies.fedAndRead(since: before)
+    let ended = monotonicNow()
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "the socket was not kept fed and read while the trace ran: \(flow.detail)")
-    #expect(elapsed >= window * 0.9, "the trace ended before its \(window)s window: \(elapsed)s")
+    // From the handover, not the run's start, which includes priming the socket.
+    let ran = try #require(replies.sinceHandover(until: ended))
+    #expect(ran >= window * 0.9, "the trace ended \(ran)s after its socket, \(elapsed)s in all")
+    #expect(ran < Self.watchdog, "the trace ran \(ran)s after its socket")
     #expect(!result.reached)
     #expect(result.hops.count == 4)
     #expect(result.hops.allSatisfy { $0.outcome == .timedOut })
@@ -342,15 +394,14 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: 5) { replies.traffic().read >= 10 },
+      await eventually(within: Self.setupWatchdog) { replies.traffic().readSeen },
       "the trace never read the replies: \(replies.traffic())")
-    let atCancel = replies.traffic()
     trace.cancel()
 
     let (outcome, _) = try await measure(within: Self.watchdog) {
       await trace.result.map { _ in () }
     }
-    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0, minimumRead: 0)
+    let flow = replies.heldReading(minimumReads: 1)
 
     #expect(
       flow.ok, "the socket was not kept fed until the cancelled trace returned: \(flow.detail)")
@@ -369,11 +420,10 @@ struct FaultInjectionReceiveLoopTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 6, maxWaitMs: 5000, noReverseDNS: true))
 
-    let before = replies.traffic()
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network) { try await tracer.trace(to: "fake.test") }
     }
-    let flow = replies.fedAndRead(since: before)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     // Foreign replies were read before the trace completed, so the valid ones came among them.
     #expect(flow.ok, "\(flow.detail)")
@@ -381,6 +431,10 @@ struct FaultInjectionReceiveLoopTests {
     #expect(result.hops.count == 3)
     #expect(result.hops.allSatisfy { $0.ipAddress != nil })
   }
+
+  /// The longest the backlog factory waits for its backlog to be queued: setup, which the
+  /// watchdog around the trace adds.
+  static let backlogAllowance: TimeInterval = 5
 
   @Test("A backlog longer than one read callback is read to the end without new arrivals")
   func traceReadsWholeBacklog() async throws {
@@ -415,7 +469,7 @@ struct FaultInjectionReceiveLoopTests {
       // Loopback delivers on its own thread, so wait until every datagram is queued. Count
       // datagrams, not bytes: Darwin's FIONREAD on a datagram socket includes each datagram's
       // address, so a byte count is reached with only part of the backlog queued.
-      let giveUp = monotonicNow() + 5
+      let giveUp = monotonicNow() + Self.backlogAllowance
       var queued: Int32 = 0
       repeat {
         var optionLength = socklen_t(MemoryLayout<Int32>.size)
@@ -434,7 +488,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 5000, noReverseDNS: true))
 
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.watchdog + Self.backlogAllowance) {
       try await network.install(socketFactory: preloaded) {
         try await tracer.performTrace(
           to: "fake.test", handle: TraceHandle(), flowIdentifier: identifier)
@@ -466,8 +520,7 @@ struct FaultInjectionReceiveLoopTests {
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
     let config = StreamingTraceConfig(probeTimeout: 0.3, retryAfter: nil, maxHops: 4)
 
-    let before = replies.traffic()
-    let (hops, elapsed) = try await measure(within: Self.watchdog) {
+    let (hops, elapsed) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network, descriptors: descriptors) {
         var hops: [StreamingHop] = []
         for try await hop in tracer.traceStream(to: "fake.test", config: config) {
@@ -476,10 +529,16 @@ struct FaultInjectionReceiveLoopTests {
         return hops
       }
     }
-    let flow = replies.fedAndRead(since: before)
+    let ended = monotonicNow()
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "the socket was not kept fed and read while the stream ran: \(flow.detail)")
-    #expect(elapsed >= config.probeTimeout * 0.9, "the stream ended early: \(elapsed)s")
+    // From the handover, not the run's start, which includes priming the socket.
+    let ran = try #require(replies.sinceHandover(until: ended))
+    #expect(
+      ran >= config.probeTimeout * 0.9,
+      "the stream ended \(ran)s after its socket, \(elapsed)s in all")
+    #expect(ran < Self.watchdog, "the stream ran \(ran)s after its socket")
     #expect(hops.map(\.ttl).sorted() == Array(1...4), "one placeholder per TTL")
     #expect(hops.allSatisfy { $0.ipAddress == nil })
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
@@ -503,15 +562,14 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: 5) { replies.traffic().read >= 10 },
+      await eventually(within: Self.setupWatchdog) { replies.traffic().readSeen },
       "the stream never read the replies: \(replies.traffic())")
-    let atCancel = replies.traffic()
     // Cancels the producer, not the consumer: a cancelled consumer stops waiting on its own,
     // which would prove nothing about the receive loop.
     await tracer.cancelActiveTraces()
 
     let (outcome, _) = try await measure(within: Self.watchdog) { await consumer.result }
-    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0, minimumRead: 0)
+    let flow = replies.heldReading(minimumReads: 1)
 
     #expect(flow.ok, "the socket was not kept fed until the cancelled stream ended: \(flow.detail)")
     #expect(outcome.isLibraryCancellation, "\(outcome)")
@@ -528,7 +586,6 @@ struct FaultInjectionReceiveLoopTests {
     // The timeout outlasts the watchdog, so the retry is observed while the stream still runs.
     let config = StreamingTraceConfig(probeTimeout: 60, retryAfter: 0.2, maxHops: 4)
 
-    let before = replies.traffic()
     let consumer = Task {
       try await replies.install(network) {
         for try await _ in tracer.traceStream(to: "fake.test", config: config) {}
@@ -536,8 +593,8 @@ struct FaultInjectionReceiveLoopTests {
     }
     defer { consumer.cancel() }
     // Four initial probes, then the retry re-sends TTLs 1...3.
-    let retried = await eventually(within: Self.watchdog) { network.probes.value == 7 }
-    let flow = replies.fedAndRead(since: before)
+    let retried = await eventually(within: Self.setupWatchdog) { network.probes.value == 7 }
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
     await tracer.cancelActiveTraces()
     _ = try await measure(within: Self.watchdog) { await consumer.result }
 
@@ -555,8 +612,7 @@ struct FaultInjectionReceiveLoopTests {
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
     let config = StreamingTraceConfig(probeTimeout: 5, retryAfter: nil, maxHops: 5)
 
-    let before = replies.traffic()
-    let (hops, _) = try await measure(within: Self.watchdog) {
+    let (hops, _) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network) {
         var hops: [StreamingHop] = []
         for try await hop in tracer.traceStream(to: "fake.test", config: config) {
@@ -565,7 +621,7 @@ struct FaultInjectionReceiveLoopTests {
         return hops
       }
     }
-    let flow = replies.fedAndRead(since: before)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "\(flow.detail)")
     let answered = Set(hops.filter { $0.ipAddress != nil }.map(\.ttl))
@@ -587,19 +643,22 @@ struct FaultInjectionReceiveLoopTests {
     let descriptors = DescriptorLog()
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.05, timeout: 0.3)
-    // Ping also arms a safety timer, at twice its whole schedule plus 5 s (5.8 s here). A ping
-    // that never moved its deadline to the last probe's reply window would end on that timer, so
-    // the watchdog sits a second below it.
+    // Ping also arms a safety timer when it starts, at twice its whole schedule plus 5 s (5.8 s
+    // here). A ping that never moved its deadline to the last probe's reply window would end on
+    // that timer, so the bound checked from the handover sits a second below it; the watchdog
+    // around the call adds the priming the factory may wait for.
     let schedule = Double(config.count - 1) * config.interval + config.timeout
     let safetyBudget = 2 * schedule + 5
 
-    let before = replies.traffic()
-    let (result, elapsed) = try await measure(within: safetyBudget - 1) {
+    let (result, elapsed) = try await measure(
+      within: safetyBudget - 1 + EndlessReplies.primingAllowance
+    ) {
       try await replies.install(network, descriptors: descriptors) {
         try await tracer.ping(to: "fake.test", config: config)
       }
     }
-    let flow = replies.fedAndRead(since: before)
+    let ended = monotonicNow()
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "the socket was not kept fed and read while the ping ran: \(flow.detail)")
     // Ping's sends run on the queue its receive loop drains on, so all three going out shows the
@@ -609,8 +668,13 @@ struct FaultInjectionReceiveLoopTests {
       await eventually(within: 5) { network.probes.value == 3 },
       "the network saw \(network.probes.value) probes")
     #expect(result.statistics.received == 0)
-    // The last probe is owed its full reply window.
-    #expect(elapsed >= 2 * config.interval + config.timeout * 0.9, "returned after \(elapsed)s")
+    // The last probe is owed its full reply window, measured from the handover, not the run's
+    // start, which includes priming the socket.
+    let ran = try #require(replies.sinceHandover(until: ended))
+    #expect(
+      ran >= 2 * config.interval + config.timeout * 0.9,
+      "returned \(ran)s after its socket, \(elapsed)s in all")
+    #expect(ran < safetyBudget - 1, "returned \(ran)s after its socket: on its safety timer")
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
   }
 
@@ -632,15 +696,14 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: 5) { replies.traffic().read >= 10 },
+      await eventually(within: Self.setupWatchdog) { replies.traffic().readSeen },
       "the ping never read the replies: \(replies.traffic())")
-    let atCancel = replies.traffic()
     ping.cancel()
 
     let (outcome, _) = try await measure(within: Self.watchdog) {
       await ping.result.map { _ in () }
     }
-    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0, minimumRead: 0)
+    let flow = replies.heldReading(minimumReads: 1)
 
     #expect(
       flow.ok, "the socket was not kept fed until the cancelled ping returned: \(flow.detail)")
@@ -660,11 +723,10 @@ struct FaultInjectionReceiveLoopTests {
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.1, timeout: 2)
 
-    let before = replies.traffic()
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network) { try await tracer.ping(to: "fake.test", config: config) }
     }
-    let flow = replies.fedAndRead(since: before)
+    let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
 
     #expect(flow.ok, "\(flow.detail)")
     #expect(result.statistics.sent == 3)

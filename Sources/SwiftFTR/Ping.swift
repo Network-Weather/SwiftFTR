@@ -261,7 +261,8 @@ struct PingExecutor: Sendable {
         try self.sendPacket(sockfd: sockfd, packet: packet, to: resolved, sendProbe: sendProbe)
       },
       monotonicTime: { self.monotonicTime() },
-      closeSocket: closeSocket
+      closeSocket: closeSocket,
+      observeReceive: TestSeams.observeProbeReceive
     )
     operationOwnsSocket = true
 
@@ -476,6 +477,7 @@ final class PingOperation: @unchecked Sendable {
   private let sendPacket: @Sendable (Int32, [UInt8], ResolvedHost) throws -> TimeInterval
   private let monotonicTime: @Sendable () -> TimeInterval
   private let closeSocket: @Sendable (Int32) -> Void
+  private let observeReceive: TestSeams.ObserveProbeReceive?
   private var family: Int32 { resolved.family }
 
   private var continuation: CheckedContinuation<PingResult, Error>?
@@ -527,8 +529,10 @@ final class PingOperation: @unchecked Sendable {
     identifier: UInt16,
     sendPacket: @escaping @Sendable (Int32, [UInt8], ResolvedHost) throws -> TimeInterval,
     monotonicTime: @escaping @Sendable () -> TimeInterval,
-    closeSocket: @escaping @Sendable (Int32) -> Void
+    closeSocket: @escaping @Sendable (Int32) -> Void,
+    observeReceive: TestSeams.ObserveProbeReceive? = nil
   ) {
+    self.observeReceive = observeReceive
     self.sockfd = sockfd
     self.target = target
     self.resolved = resolved
@@ -749,7 +753,12 @@ final class PingOperation: @unchecked Sendable {
               msg.msg_control = UnsafeMutableRawPointer(cb.baseAddress)
               msg.msg_controllen = socklen_t(cb.count)
               msg.msg_flags = 0
-              let n = recvmsg(sockfd, &msg, 0)
+              let n: Int
+              if let observeReceive {
+                n = observeReceive(sockfd) { recvmsg(sockfd, &msg, 0) }
+              } else {
+                n = recvmsg(sockfd, &msg, 0)
+              }
               if n >= 0 {
                 // If the kernel had to truncate the ancillary buffer (extra cmsgs
                 // we didn't account for), our readings would be unreliable.
