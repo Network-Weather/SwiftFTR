@@ -493,9 +493,9 @@ func stunGetPublicIPv6(
 let stunNameLookupLimit: TimeInterval = 20
 
 /// Seconds from now until `deadline`, an instant on `monotonicNow()`'s clock, and never less than
-/// zero; `nil` when there is no deadline.
+/// zero (a deadline that is not a number has passed); `nil` when there is no deadline.
 func secondsLeft(until deadline: TimeInterval?) -> TimeInterval? {
-  deadline.map { max($0 - monotonicNow(), 0) }
+  deadline.map { $0.isNaN ? 0 : max($0 - monotonicNow(), 0) }
 }
 
 /// The endpoint for a numeric `host` of `family`, built without the resolver, or `nil` when

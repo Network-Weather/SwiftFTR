@@ -338,6 +338,68 @@ struct LibraryPublicIPResolverTests {
     #expect(held == 0, "\(held) sockets held by abandoned attempts")
   }
 
+  /// How a sweep whose servers never answer is ended.
+  enum SweepEnd: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    /// Cancelled while its name lookups are stalled, so no attempt has taken its socket.
+    case cancelledInLookup
+    /// Cancelled while every exchange waits on a silent server.
+    case cancelledInExchange
+    /// Ended by its deadline while every exchange waits on a silent server.
+    case deadlineInExchange
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "Sweeps ended while every server is silent leave no socket open", arguments: SweepEnd.allCases)
+  func endedSweepsLeaveNoSockets(end: SweepEnd) async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let silent = try HeldUDPServer(family: AF_INET)
+    defer { silent.stop() }
+    let stalled: TestSeams.ResolveSTUNServer = { _, _, _ in
+      gate.wait(limit: 3 * Self.watchdog)
+      return nil
+    }
+    var servers: TestSeams.STUNServers = Self.named(["stun-a.test", "stun-b.test"])
+    if end != .cancelledInLookup {
+      let silentServer = (host: silent.host, port: silent.port)
+      servers = { _ in [silentServer, silentServer] }
+    }
+    let budget: TimeInterval = end == .deadlineInExchange ? 5 : 3 * Self.watchdog
+    let calls = 6
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 8, name: "test.pip-ended")
+    let before = Self.lo0UDPSockets()
+
+    let sweepServers = servers
+    let sweeps = await TestSeams.$blockingIOExecutor.withValue(executor) {
+      await TestSeams.$stunServers.withValue(sweepServers) {
+        await TestSeams.$resolveSTUNServer.withValue(stalled) {
+          (0..<calls).map { _ in
+            Task {
+              try await publicIPDiscovery(
+                family: .v4, stunTimeout: Self.longSTUNTimeout, interface: "lo0", sourceIP: nil,
+                enableLogging: false, budget: budget)
+            }
+          }
+        }
+      }
+    }
+    defer { for sweep in sweeps { sweep.cancel() } }
+    // Every sweep holds both its sockets before it is ended.
+    let opened = await eventually(within: Self.watchdog) {
+      Self.lo0UDPSockets() - before == 2 * calls
+        && (end == .cancelledInLookup || silent.requests.value == 2 * calls)
+    }
+    try #require(opened, "\(Self.lo0UDPSockets() - before) sockets, \(silent.requests.value) sent")
+    if end != .deadlineInExchange { for sweep in sweeps { sweep.cancel() } }
+    for sweep in sweeps {
+      let outcome = try await measure(within: Self.watchdog) { await sweep.result }.0
+      #expect(throws: Error.self) { try outcome.get() }
+    }
+    let held = Self.lo0UDPSockets() - before
+    #expect(held == 0, "\(held) sockets still open after every sweep returned")
+  }
+
   @Test("getPublicIPs cancelled before it starts asks nothing")
   func standaloneCancelledFirst() async throws {
     let requests = RequestLog()
