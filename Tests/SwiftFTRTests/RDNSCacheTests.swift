@@ -191,17 +191,24 @@ struct RDNSCacheTests {
     #expect(hostname == "localhost")
   }
 
-  @Test("A discoverPaths flow cancelled in its reverse-DNS wave returns while the wave stalls")
-  func multipathFlowLeavesStalledWave() async throws {
+  enum SecondWave: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case traceClassified, multipathFlow
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "Cancelled in its second reverse-DNS wave, a classified trace or multipath flow returns while the wave stalls",
+    arguments: SecondWave.allCases)
+  func secondWaveReleasesItsCaller(operation: SecondWave) async throws {
     let gate = StallGate()
     defer { gate.open() }
     let entered = FaultCounter()
     let publicIP = "198.51.100.7"
-    // Only the public address stalls. The hops are looked up inside the flow's trace, which races
-    // its own wave, and answer at once; the public address, which is no hop, is looked up in the
-    // flow's second wave, the one under test. The stall ignores cancellation, so only the flow's
-    // own race can release it. Its hold outlasts the watchdog, and the gate opens only when the
-    // test ends, so a run that returns within the watchdog returned while the wave still stalled.
+    // Only the public address stalls. The hops are looked up inside the trace, which races its own
+    // wave, and answer at once; the public address, which is no hop, is looked up in the second
+    // wave, the one under test. The stall ignores cancellation, so only the operation's own race
+    // can release it. Its hold outlasts the watchdog, and the gate opens only when the test ends,
+    // so an operation that returns within the watchdog returned while the wave still stalled.
     let rdns = stallingRDNSCache(
       gate: gate, limit: 2 * Self.watchdog, entered: entered, only: [publicIP])
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
@@ -211,7 +218,14 @@ struct RDNSCacheTests {
       flowVariations: 1, maxPaths: 4, earlyStopThreshold: 1, timeoutMs: 2000, maxHops: 4)
 
     try await network.install {
-      let task = Task { try await tracer.discoverPaths(to: "fake.test", config: config) }
+      let task = Task {
+        switch operation {
+        case .traceClassified:
+          _ = try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
+        case .multipathFlow:
+          _ = try await tracer.discoverPaths(to: "fake.test", config: config)
+        }
+      }
       #expect(await eventually(within: Self.watchdog) { entered.value > 0 })
       let (outcome, _) = try await measure(within: Self.watchdog) {
         task.cancel()
