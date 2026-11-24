@@ -638,8 +638,12 @@ Observations that are not defects of the library:
   and ping deadline tests are measured from the handover, stamped in the socket factory, rather
   than from the start of the run. They are
   echo replies for sequence 0, which no trace, stream or ping sends, so they need no identifier
-  from the operation. The read count stays an estimate (sent minus queued), which counts replies
-  still in flight as read, so on a loaded host it can overstate what the operation read.
+  from the operation. Whether the operation read is observed, not inferred:
+  the feed sends an exact batch, the socket is handed over only once that batch is queued whole,
+  and nothing more is sent until it shrinks, which only the operation's read can cause. A count
+  of sent minus queued, used before, took replies still in flight for reads, so with the feed
+  started before the handover a cancellation test could cancel during setup and pass (forced
+  with replies held in flight and the factory held for 3 s).
   `FaultInjectionProbeWindowTests.unreachableReported` needed three unreachable replies inside
   0.3 s; hops 1 and 2 now answer unreachable and hop 3 is the destination, with a window past the
   watchdog, so only the destination's reply ends the trace. Two counts of the probes the fake
