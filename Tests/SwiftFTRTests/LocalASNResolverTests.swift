@@ -289,4 +289,173 @@ final class LocalASNResolverTests: XCTestCase {
     XCTAssertEqual(loadsAfter, loadsBefore, "Second tracer should not load the database again")
     withExtendedLifetime(first) {}
   }
+
+  // MARK: - Lookup bounds and shared-load lifetimes
+
+  /// Generous limit on any wait a test expects to end; never a claim about speed.
+  private static let watchdog: TimeInterval = 20
+
+  /// A lookup's timeout reaches the DNS fallback: the fallback is never given longer than the
+  /// caller allowed the whole lookup, whatever `fallbackTimeout` says.
+  func testHybridFallbackGetsNoMoreThanTheCallersTimeout() async throws {
+    let store = LocalASNDatabaseStore(loader: { _ in FakeASNTable([:]) })
+    let dns = TimeoutRecordingResolver()
+    let hybrid = HybridASNResolver(
+      local: LocalASNResolver(source: .embedded, store: store), dns: dns, fallbackTimeout: 30)
+
+    _ = try await hybrid.resolve(ipv4Addrs: ["203.0.113.70"], timeout: 0.5)
+
+    let timeouts = await dns.timeouts
+    XCTAssertEqual(timeouts.count, 1, "the address the table lacks should reach the fallback once")
+    let longest = timeouts.max() ?? 0
+    XCTAssertLessThanOrEqual(longest, 0.5, "the fallback was given \(timeouts), past the caller's 0.5 s")
+  }
+
+  /// With time to spare, the fallback keeps its own, shorter `fallbackTimeout` exactly, so concurrent
+  /// lookups of one address still share one cached flight.
+  func testHybridFallbackKeepsItsShorterTimeout() async throws {
+    let store = LocalASNDatabaseStore(loader: { _ in FakeASNTable([:]) })
+    let dns = TimeoutRecordingResolver()
+    let hybrid = HybridASNResolver(
+      local: LocalASNResolver(source: .embedded, store: store), dns: dns, fallbackTimeout: 0.25)
+
+    _ = try await hybrid.resolve(ipv4Addrs: ["203.0.113.71"], timeout: 60)
+
+    let timeouts = await dns.timeouts
+    XCTAssertEqual(timeouts, [0.25])
+  }
+
+  /// A hybrid lookup whose database is still loading returns at its timeout instead of waiting for
+  /// the load.
+  func testHybridReturnsAtItsTimeoutWhileTheDatabaseLoads() async throws {
+    let loader = GatedASNLoader(FakeASNTable(["203.0.113.72": 64_500]))
+    defer { loader.gate.open() }
+    let store = LocalASNDatabaseStore(loader: loader.load)
+    let dns = TimeoutRecordingResolver()
+    let hybrid = HybridASNResolver(
+      local: LocalASNResolver(source: .embedded, store: store), dns: dns, fallbackTimeout: 1)
+
+    let (result, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await hybrid.resolve(ipv4Addrs: ["203.0.113.72"], timeout: 0.3)
+    }
+
+    XCTAssertEqual(loader.started.value, 1)
+    XCTAssertTrue(result.isEmpty, "nothing could answer before the timeout")
+    let longest = await dns.timeouts.max() ?? 0
+    XCTAssertLessThanOrEqual(longest, 0.3)
+  }
+
+  /// A caller that runs out of time waiting for a shared database load leaves it running for the
+  /// others, and its resolver is not left failed: its next lookup is answered by that same load.
+  func testCallerTimingOutLeavesSharedLoadRunningAndResolverUsable() async throws {
+    let address = "203.0.113.73"
+    let loader = GatedASNLoader(FakeASNTable([address: 64_501]))
+    defer { loader.gate.open() }
+    let store = LocalASNDatabaseStore(loader: loader.load)
+    let leaving = LocalASNResolver(source: .embedded, store: store)
+    let staying = LocalASNResolver(source: .embedded, store: store)
+
+    let (early, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await leaving.resolve(ipv4Addrs: [address], timeout: 0.3)
+    }
+    XCTAssertTrue(early.isEmpty)
+
+    let other = Task { try await staying.resolve(ipv4Addrs: [address], timeout: 60) }
+    loader.gate.open()
+    let (otherResult, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await other.value
+    }
+    let (retry, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await leaving.resolve(ipv4Addrs: [address], timeout: 60)
+    }
+
+    XCTAssertEqual(otherResult[address]?.asn, 64_501, "the other caller lost the shared load")
+    XCTAssertEqual(retry[address]?.asn, 64_501, "the resolver that timed out stayed failed")
+    let loads = await store.loadCount
+    XCTAssertEqual(loads, 1, "the load was started again instead of finishing once")
+    XCTAssertEqual(loader.cancelled.value, 0, "the shared load was cancelled")
+  }
+
+  /// A cancelled caller stops waiting for a shared database load at once, without cancelling the
+  /// load it started for the others or leaving its resolver failed.
+  func testCancelledCallerLeavesSharedLoadRunningAndResolverUsable() async throws {
+    let address = "203.0.113.74"
+    let loader = GatedASNLoader(FakeASNTable([address: 64_502]))
+    defer { loader.gate.open() }
+    let store = LocalASNDatabaseStore(loader: loader.load)
+    let leaving = LocalASNResolver(source: .embedded, store: store)
+    let staying = LocalASNResolver(source: .embedded, store: store)
+
+    // The leaving caller starts the load, so the load is its own work if anything's is.
+    let cancelled = Task { try await leaving.resolve(ipv4Addrs: [address], timeout: 60) }
+    let started = await eventually(within: Self.watchdog) { loader.started.value > 0 }
+    XCTAssertTrue(started, "the lookup never reached the load")
+    let other = Task { try await staying.resolve(ipv4Addrs: [address], timeout: 60) }
+
+    cancelled.cancel()
+    let (outcome, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      () async -> Result<[String: ASNInfo], Error> in await cancelled.result
+    }
+    XCTAssertThrowsError(try outcome.get()) { error in
+      XCTAssertTrue(error is CancellationError, "expected CancellationError, got \(error)")
+    }
+
+    loader.gate.open()
+    let (otherResult, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await other.value
+    }
+    let (retry, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await leaving.resolve(ipv4Addrs: [address], timeout: 60)
+    }
+
+    XCTAssertEqual(otherResult[address]?.asn, 64_502, "the other caller lost the shared load")
+    XCTAssertEqual(retry[address]?.asn, 64_502, "the cancelled caller's resolver stayed failed")
+    let loads = await store.loadCount
+    XCTAssertEqual(loads, 1, "the load was started again instead of finishing once")
+    XCTAssertEqual(loader.cancelled.value, 0, "the shared load was cancelled")
+  }
+}
+
+// MARK: - Fixtures
+
+/// A database stand-in answering a fixed ASN for each listed address.
+private struct FakeASNTable: LocalASNTable {
+  let asns: [String: UInt32]
+  init(_ asns: [String: UInt32]) { self.asns = asns }
+  func lookup(_ ipString: String) -> (asn: UInt32, name: String?)? {
+    asns[ipString].map { ($0, "FAKE-AS\($0)") }
+  }
+}
+
+/// A database load held until `gate` opens. It counts the loads started, and the loads that had
+/// been cancelled by the time the gate let them go; a cancelled load fails, as a cancelled
+/// download would.
+private final class GatedASNLoader: Sendable {
+  let gate = StallGate()
+  let started = FaultCounter()
+  let cancelled = FaultCounter()
+  private let table: FakeASNTable
+
+  init(_ table: FakeASNTable) { self.table = table }
+
+  var load: LocalASNDatabaseStore.Loader {
+    { [self] _ in
+      started.increment()
+      await gate.waitAsync(limit: 60)
+      if Task.isCancelled {
+        cancelled.increment()
+        throw CancellationError()
+      }
+      return table
+    }
+  }
+}
+
+/// A DNS stand-in that records the timeout of every lookup and answers nothing.
+private actor TimeoutRecordingResolver: ASNResolver {
+  private(set) var timeouts: [TimeInterval] = []
+  func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+    timeouts.append(timeout)
+    return [:]
+  }
 }

@@ -21,6 +21,14 @@ public struct HybridASNResolver: ASNResolver, Sendable {
     self.fallbackTimeout = fallbackTimeout
   }
 
+  /// A resolver over `local` and `dns`. Tests pass a local resolver with its own store and a DNS
+  /// resolver that records what it is asked.
+  init(local: LocalASNResolver, dns: ASNResolver, fallbackTimeout: TimeInterval) {
+    self.localResolver = local
+    self.dnsResolver = dns
+    self.fallbackTimeout = fallbackTimeout
+  }
+
   /// Preload the local database for faster first lookups.
   public func preload() async {
     await localResolver.preload()

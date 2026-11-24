@@ -531,6 +531,46 @@ final class SwiftFTRCacheTests: XCTestCase {
     XCTAssertNotNil(retryResult[address])
   }
 
+  /// A caller of the caching resolver returns at its own timeout even when the resolver behind it
+  /// overruns, and leaving does not cancel the flight: it completes, fills the cache, and the next
+  /// caller is answered from it without another upstream call.
+  func testCallerReturnsAtItsTimeoutAndLeavesFlightRunning() async throws {
+    final class OverrunningResolver: ASNResolver, @unchecked Sendable {
+      let gate = StallGate()
+      let calls = FaultCounter()
+      let cancelled = FaultCounter()
+      func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
+        calls.increment()
+        await gate.waitAsync(limit: 60)
+        if Task.isCancelled { cancelled.increment() }
+        var out: [String: ASNInfo] = [:]
+        for ip in ipv4Addrs { out[ip] = ASNInfo(asn: 64_510, name: "Overrun") }
+        return out
+      }
+    }
+
+    let base = OverrunningResolver()
+    defer { base.gate.open() }
+    let caching = CachingASNResolver(base: base)
+    let address = "203.0.113.80"
+
+    let (early, _) = try await SwiftFTRTests.measure(within: 20) {
+      try await caching.resolve(ipv4Addrs: [address], timeout: 0.3)
+    }
+    XCTAssertTrue(early.isEmpty, "nothing could answer before the timeout")
+    let reservations = await _ASNMemoryCache.shared.inFlightReservationCount
+    XCTAssertEqual(reservations, 1, "the flight ended when its only caller left")
+
+    base.gate.open()
+    let filled = await eventually(within: 20) { await _ASNMemoryCache.shared.count > 0 }
+    XCTAssertTrue(filled, "the abandoned flight never filled the cache")
+    let later = try await caching.resolve(ipv4Addrs: [address], timeout: 0.3)
+
+    XCTAssertEqual(later[address]?.asn, 64_510)
+    XCTAssertEqual(base.calls.value, 1, "the flight was started again instead of finishing once")
+    XCTAssertEqual(base.cancelled.value, 0, "the flight was cancelled when its caller left")
+  }
+
   /// Verify concurrent cache access doesn't corrupt data.
   func testCacheConcurrentAccessCorrectness() async throws {
     actor SequenceResolver: ASNResolver {

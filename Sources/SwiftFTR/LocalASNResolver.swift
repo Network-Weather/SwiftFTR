@@ -54,7 +54,7 @@ public actor LocalASNResolver: ASNResolver {
     _ = await getDatabase()
   }
 
-  private func getDatabase() async -> UltraCompactDatabase? {
+  private func getDatabase() async -> (any LocalASNTable)? {
     switch loadState {
     case .loaded(let handle):
       return handle.database
@@ -136,12 +136,22 @@ enum LocalASNSourceKey: Hashable, Sendable {
 /// Resolvers hold the handle strongly and the store holds it weakly, so the database stays resident
 /// exactly as long as at least one resolver for its source is alive.
 final class LocalASNDatabaseHandle: Sendable {
-  let database: UltraCompactDatabase
+  let database: any LocalASNTable
 
-  init(_ database: UltraCompactDatabase) {
+  init(_ database: any LocalASNTable) {
     self.database = database
   }
 }
+
+/// What a loaded database answers: the origin ASN and AS name of an address.
+///
+/// The embedded and remote databases conform; tests load a small table through
+/// ``LocalASNDatabaseStore/init(loader:)`` instead of the real 15 MB one.
+protocol LocalASNTable: Sendable {
+  func lookup(_ ipString: String) -> (asn: UInt32, name: String?)?
+}
+
+extension UltraCompactDatabase: LocalASNTable {}
 
 /// Process-wide store that loads each ``LocalASNSource`` once and shares it between resolvers.
 ///
@@ -156,13 +166,21 @@ actor LocalASNDatabaseStore {
     weak var handle: LocalASNDatabaseHandle?
   }
 
+  /// Loads the database for one source.
+  typealias Loader = @Sendable (LocalASNSource) async throws -> any LocalASNTable
+
   private var resident: [LocalASNSourceKey: WeakHandle] = [:]
   private var inFlight: [LocalASNSourceKey: Task<LocalASNDatabaseHandle, any Error>] = [:]
+  private let loader: Loader
 
   /// Number of loads this store has started. Tests read it to prove that resolvers share.
   private(set) var loadCount = 0
 
-  init() {}
+  /// Creates a store that loads each source with `loader`: the real databases by default, a test's
+  /// own table otherwise.
+  init(loader: @escaping Loader = { try await LocalASNDatabaseStore.load($0) }) {
+    self.loader = loader
+  }
 
   /// Returns the shared handle for `source`, loading it if no live resolver already holds one.
   func handle(for source: LocalASNSource) async throws -> LocalASNDatabaseHandle {
@@ -175,8 +193,9 @@ actor LocalASNDatabaseStore {
     }
 
     loadCount += 1
+    let loader = self.loader
     let task = Task<LocalASNDatabaseHandle, any Error> {
-      LocalASNDatabaseHandle(try await Self.load(source))
+      LocalASNDatabaseHandle(try await loader(source))
     }
     inFlight[key] = task
     defer { inFlight[key] = nil }
@@ -195,7 +214,7 @@ actor LocalASNDatabaseStore {
   #if compiler(>=6.2)
     @concurrent
   #endif
-  private static func load(_ source: LocalASNSource) async throws -> UltraCompactDatabase {
+  private static func load(_ source: LocalASNSource) async throws -> any LocalASNTable {
     switch source {
     case .embedded:
       return try EmbeddedDatabase.loadUltraCompact()
