@@ -107,7 +107,12 @@ instance's network change evicting another's entries.
   agreeing, or only alongside a STUN answer).
 
 ### IPv6 hardening
-Remaining v6 follow-ups: happy-eyeballs racing (RFC 8305), v6-capable CI runner. Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).
+**Goal**: every operation works on a dual-stack network and on an IPv6-only one (NAT64/DNS64). Detailed plan in [`docs/IPV6.md`](docs/IPV6.md).
+- **A pass on a real IPv6-only network**: nothing here has been run on one; the gaps below are read from the code.
+- **DNS sockets that only speak IPv4**: Team Cymru ASN lookups go to `1.1.1.1` and `8.8.8.8`, and the DNS query APIs default to `8.8.8.8`, over IPv4 sockets that NAT64 address mapping does not cover. Needs IPv6 server addresses or the system resolver's servers.
+- **Multipath over IPv6**: `discoverPaths` rejects an IPv6 family or source; flows vary IPv4 ICMP identifiers, so IPv6 needs its own flow key.
+- **Happy-eyeballs racing** (RFC 8305) for hostnames in `.auto`.
+- **IPv6 in CI**: on a GitHub-hosted runner with an IPv6 path, when one exists.
 
 ### Swift 6.4 adoption pass
 **Goal**: Take the 6.4 concurrency ergonomics where they simplify teardown, and stay warning-clean.
