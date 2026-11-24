@@ -622,6 +622,84 @@ struct PublicIPResolverTests {
     #expect(resolver.asked.value == 0)
   }
 
+  // MARK: discoverPublicIPWithHostname
+
+  /// `discoverPublicIPWithHostname()` on `tracer` under the watchdog, with the library's discovery
+  /// substituted by one that fails at once, as its result or error.
+  static func discoverFresh(_ tracer: SwiftFTR, discovery: OfflinePublicIPDiscovery) async throws
+    -> Result<String, Error>
+  {
+    try await discovery.install {
+      try await measure(within: Self.watchdog) {
+        do {
+          return Result<String, Error>.success(try await tracer.discoverPublicIPWithHostname().ip)
+        } catch {
+          return .failure(error)
+        }
+      }.0
+    }
+  }
+
+  @Test("discoverPublicIPWithHostname asks the caller's resolver each time, past the configuration")
+  func freshDiscoveryAsksStrategy() async throws {
+    let discovery = OfflinePublicIPDiscovery()
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("8.8.8.8")))
+    let tracer = Self.tracer(.custom(resolver), publicIP: "9.9.9.9", sourceIP: "127.0.0.1")
+
+    let first = try await Self.discoverFresh(tracer, discovery: discovery)
+    let second = try await Self.discoverFresh(tracer, discovery: discovery)
+
+    #expect(try first.get() == "8.8.8.8", "the configured address answered")
+    #expect(try second.get() == "8.8.8.8")
+    #expect(resolver.asked.value == 2, "an answer was served from a cache")
+    #expect(discovery.calls.value == 0, "the library's discovery ran")
+    let request = try #require(resolver.requests.first)
+    #expect(request.family == .v4)
+    #expect(request.sourceIP == "127.0.0.1")
+    #expect(await tracer.publicIP(for: .v4)?.source == .configured, "the answer was cached")
+  }
+
+  @Test("discoverPublicIPWithHostname throws when the strategy is disabled, and asks nothing")
+  func freshDiscoveryDisabled() async throws {
+    let discovery = OfflinePublicIPDiscovery()
+    let outcome = try await Self.discoverFresh(Self.tracer(.disabled), discovery: discovery)
+    guard case .failure(PublicIPError.discoveryDisabled) = outcome else {
+      Issue.record("expected discoveryDisabled, got \(outcome)")
+      return
+    }
+    #expect(discovery.calls.value == 0)
+  }
+
+  @Test(
+    "discoverPublicIPWithHostname refuses an answer that is not a public IPv4 address",
+    arguments: [
+      PublicIPObservation(
+        address: "192.168.1.1", family: .v4, source: PublicIPResolverTests.hostApp),
+      PublicIPObservation(
+        address: "2606:4700::1111", family: .v6, source: PublicIPResolverTests.hostApp),
+    ])
+  func freshDiscoveryRefusesAnswer(answer: PublicIPObservation) async throws {
+    let resolver = ScriptedPublicIPResolver(.answer(answer))
+    let outcome = try await Self.discoverFresh(
+      Self.tracer(.custom(resolver)), discovery: OfflinePublicIPDiscovery())
+    guard case .failure(PublicIPError.noAddress) = outcome else {
+      Issue.record("expected noAddress, got \(outcome)")
+      return
+    }
+    #expect(resolver.asked.value == 1)
+  }
+
+  @Test("discoverPublicIPWithHostname reports the library's failure as noAddress")
+  func freshDiscoveryLibraryFails() async throws {
+    let discovery = OfflinePublicIPDiscovery()
+    let outcome = try await Self.discoverFresh(Self.tracer(.library), discovery: discovery)
+    guard case .failure(PublicIPError.noAddress) = outcome else {
+      Issue.record("expected noAddress, got \(outcome)")
+      return
+    }
+    #expect(discovery.calls.value == 1)
+  }
+
   // MARK: Results
 
   @Test("The source is encoded beside the address, and JSON without it still decodes")

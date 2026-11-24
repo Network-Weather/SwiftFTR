@@ -18,12 +18,21 @@ enum TestSeams {
   /// socket for `family`.
   typealias MakeICMPSocket = @Sendable (_ family: Int32) throws -> Int32
 
-  /// The library resolver's public-address discovery of one family, in place of STUN (with its
-  /// DNS fallback for IPv4). It runs under the discovery budget, which cancels it when it passes.
-  typealias DiscoverPublicIP = @Sendable (_ family: IPAddressFamily) async throws -> STUNPublicIP
+  /// The library resolver's public-address discovery for `request`, in place of the STUN sweep.
+  /// It runs under the discovery budget, which cancels it when it passes; `request.deadline` is
+  /// that budget's end (about 30 years out for ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``,
+  /// which has none).
+  typealias DiscoverPublicIP = @Sendable (_ request: PublicIPRequest) async throws -> STUNPublicIP
 
   /// The STUN servers to try, in order, for one address family.
   typealias STUNServers = @Sendable (_ family: Int32) -> [(host: String, port: UInt16)]
+
+  /// Resolution of a STUN server's name for `family`, in place of `getaddrinfo`. Runs in an
+  /// executor slot, as the lookup does.
+  typealias ResolveSTUNServer =
+    @Sendable (_ host: String, _ port: UInt16, _ family: Int32) -> (
+      server: sockaddr_storage, serverLen: socklen_t
+    )?
 
   /// `fcntl(2)` with an integer argument, in place of the system call a trace, ping, UDP
   /// exchange, TCP probe or UDP probe uses to make its socket non-blocking. Returns what `fcntl` would and sets `errno`
@@ -98,9 +107,13 @@ enum TestSeams {
   /// a test can point each family at loopback fixtures by numeric address.
   @TaskLocal static var stunServers: STUNServers?
 
-  /// The DNS servers the IPv4 whoami fallback asks, in place of its built-in ones. Pair with
-  /// ``dnsServerPort`` to reach a loopback fixture.
-  @TaskLocal static var whoamiServers: [String]?
+  /// Resolves the names in a STUN sweep. A numeric server address is never passed to it.
+  @TaskLocal static var resolveSTUNServer: ResolveSTUNServer?
+
+  /// `send(2)` of a STUN sweep's binding request, in place of the system call, called with the
+  /// request's own socket. Returns what `send` would and sets `errno` the same way. Captured by the
+  /// sweep, since each exchange runs in an executor slot.
+  @TaskLocal static var sendSTUNRequest: SendDatagram?
 
   /// Arms the wake-up at a caller's public-IP resolver's deadline in place of a sleeping task, and
   /// returns the call that stops it. A test can leave the race unwoken, or wake it early.

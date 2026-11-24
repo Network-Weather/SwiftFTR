@@ -48,9 +48,6 @@ public struct PublicIPObservationSource: RawRepresentable, Hashable, Sendable, C
   public static let gatewayReported = PublicIPObservationSource(rawValue: "gatewayReported")
   /// The library's resolver, from a STUN Binding response sent from this host.
   public static let stun = PublicIPObservationSource(rawValue: "stun")
-  /// The library's resolver, from its IPv4 fallback: a whoami TXT query answered through a public
-  /// recursive resolver. The address it reports can belong to another host than this one.
-  public static let dnsWhoami = PublicIPObservationSource(rawValue: "dnsWhoami")
 }
 
 extension PublicIPSource {
@@ -117,10 +114,31 @@ public protocol PublicIPResolver: Sendable {
   func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation?
 }
 
+/// Why ``SwiftFTR/discoverPublicIPWithHostname()`` found no public address.
+public enum PublicIPError: Error, CustomStringConvertible, Sendable {
+  /// ``SwiftFTRConfig/publicIPResolver`` is ``PublicIPResolverStrategy/disabled``, so nothing was
+  /// asked and nothing sent.
+  case discoveryDisabled
+  /// The strategy gave no globally routable IPv4 address before
+  /// ``SwiftFTRConfig/publicIPDiscoveryTimeout`` passed. `reason` says what happened instead, for
+  /// a log: STUN's failure, the resolver's own error, no answer in time, or an answer refused.
+  case noAddress(reason: String)
+
+  public var description: String {
+    switch self {
+    case .discoveryDisabled:
+      return "Public-IP discovery is disabled (publicIPResolver is .disabled)"
+    case .noAddress(let reason):
+      return "No public IP address found: \(reason)"
+    }
+  }
+}
+
 /// How a tracer finds its public address when none of the family is configured, seeded or cached.
 public enum PublicIPResolverStrategy: Sendable {
-  /// The library's own resolver: STUN, with a DNS whoami fallback for IPv4. Bounded by
-  /// ``SwiftFTRConfig/publicIPDiscoveryTimeout``.
+  /// The library's own resolver: STUN only, over the family asked for, from sockets bound to the
+  /// tracer's interface and source address. Bounded by ``SwiftFTRConfig/publicIPDiscoveryTimeout``.
+  /// Where STUN gets no answer there is no address.
   case library
   /// No discovery: nothing is sent, and a trace without a configured or seeded address of its
   /// family classifies without one.
@@ -158,19 +176,6 @@ func secondsUntil(_ instant: ContinuousClock.Instant) -> TimeInterval {
   let components = ContinuousClock.now.duration(to: instant).components
   let seconds = TimeInterval(components.seconds) + TimeInterval(components.attoseconds) * 1e-18
   return max(seconds, 0)
-}
-
-/// The library's resolver: the discovery of ``publicIPDiscovery(family:stunTimeout:dnsTimeout:interface:sourceIP:enableLogging:budget:)``,
-/// bounded by the request's deadline, which it holds itself.
-struct LibraryPublicIPResolver: PublicIPResolver {
-  let enableLogging: Bool
-
-  func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation? {
-    try await publicIPDiscovery(
-      family: request.family, stunTimeout: 2.0, dnsTimeout: 3.0, interface: request.interface,
-      sourceIP: request.sourceIP, enableLogging: enableLogging,
-      budget: secondsUntil(request.deadline))
-  }
 }
 
 /// Asks a caller's `resolver`, and returns its answer, or `nil` if it does not answer before

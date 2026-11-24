@@ -7,13 +7,12 @@ import Foundation
 /// Public IP discovered via a STUN Binding request. The `ip` string is in
 /// canonical `inet_ntop` form for v4 (`x.x.x.x`) or v6 (for example,
 /// `2001:4860:4860::8888`).
-public struct STUNPublicIP: Sendable {
-  public let ip: String
+struct STUNPublicIP: Sendable {
+  let ip: String
   /// Address family of the discovered IP. `AF_INET` (2) or `AF_INET6` (30 on Darwin).
-  /// Added for Stage-4 dual-stack discovery; older callers can ignore it.
-  public let family: Int32
+  let family: Int32
 
-  public init(ip: String, family: Int32 = AF_INET) {
+  init(ip: String, family: Int32 = AF_INET) {
     self.ip = ip
     self.family = family
   }
@@ -96,11 +95,6 @@ enum STUNError: Error, CustomStringConvertible {
   }
 }
 
-/// Family-parameterized STUN core. Builds the binding request, sends it, and
-/// parses the XOR-MAPPED-ADDRESS attribute. Supports both AF_INET and AF_INET6.
-///
-/// Pass `family: AF_INET6` to discover the v6 public IP; the resolver, socket,
-/// and bind paths all dispatch on family. The XOR-MAPPED-ADDRESS parser handles
 /// Resolves a STUN server host and port for the given family.
 internal func resolveSTUNServer(
   host: String,
@@ -125,23 +119,14 @@ internal func resolveSTUNServer(
   return (server, serverLen)
 }
 
-/// Family-parameterized STUN core with pre-resolved endpoint. Builds the binding request,
-/// sends it, and parses the XOR-MAPPED-ADDRESS attribute. Supports both AF_INET and AF_INET6.
-internal func stunGetPublicIP(
-  family: Int32,
-  server: sockaddr_storage,
-  serverLen: socklen_t,
-  serverLabel: String,
-  timeout: TimeInterval = 1.0,
-  interface: String? = nil,
-  sourceIP: String? = nil,
-  enableLogging: Bool = false
-) throws -> STUNPublicIP {
-  guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
-    throw STUNError.invalidTimeout(timeout)
-  }
-
-  var server = server
+/// A UDP socket of `family` bound to `interface` and `sourceIP`, where given, for one STUN
+/// exchange. Nothing has been sent on it. The caller owns the descriptor.
+///
+/// This comes before the server's name is resolved, so a bind that fails ends the attempt before
+/// any traffic, the lookup included.
+internal func makeBoundSTUNSocket(
+  family: Int32, interface: String?, sourceIP: String?, enableLogging: Bool
+) throws -> Int32 {
   let fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
   if fd < 0 {
     let error = errno
@@ -149,8 +134,19 @@ internal func stunGetPublicIP(
       errno: error,
       details: "Unable to create UDP socket for STUN. May indicate system resource limits.")
   }
-  defer { close(fd) }
+  do {
+    try bindSTUNSocket(
+      fd, family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+    return fd
+  } catch {
+    close(fd)
+    throw error
+  }
+}
 
+private func bindSTUNSocket(
+  _ fd: Int32, family: Int32, interface: String?, sourceIP: String?, enableLogging: Bool
+) throws {
   if let interfaceName = interface {
     if enableLogging {
       print("[STUN] Binding socket to interface '\(interfaceName)'...")
@@ -190,6 +186,74 @@ internal func stunGetPublicIP(
     }
     if enableLogging { print("[STUN] Bound to source IP '\(srcIP)'") }
   }
+}
+
+/// A bound STUN socket made before its server's name is resolved, handed to the one attempt that
+/// uses it. Whichever of that attempt and the last reference to this object comes first closes
+/// the descriptor: an attempt that takes it closes it when done, and an attempt that never runs
+/// (abandoned while queued, or never started because the sweep ended) leaves it to `deinit`.
+final class BoundSTUNSocket: @unchecked Sendable {
+  private let lock = NSLock()
+  private var descriptor: Int32
+
+  init(family: Int32, interface: String?, sourceIP: String?, enableLogging: Bool) throws {
+    descriptor = try makeBoundSTUNSocket(
+      family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+  }
+
+  /// The descriptor, which the caller now owns and must close; `nil` if it was taken before.
+  func take() -> Int32? {
+    lock.withLock {
+      let fd = descriptor
+      descriptor = -1
+      return fd >= 0 ? fd : nil
+    }
+  }
+
+  deinit {
+    if descriptor >= 0 { close(descriptor) }
+  }
+}
+
+/// Family-parameterized STUN core with pre-resolved endpoint. Builds the binding request,
+/// sends it, and parses the XOR-MAPPED-ADDRESS attribute. Supports both AF_INET and AF_INET6.
+internal func stunGetPublicIP(
+  family: Int32,
+  server: sockaddr_storage,
+  serverLen: socklen_t,
+  serverLabel: String,
+  timeout: TimeInterval = 1.0,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
+) throws -> STUNPublicIP {
+  guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
+    throw STUNError.invalidTimeout(timeout)
+  }
+  let fd = try makeBoundSTUNSocket(
+    family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+  defer { close(fd) }
+  return try stunExchange(
+    fd: fd, family: family, server: server, serverLen: serverLen, serverLabel: serverLabel,
+    timeout: timeout)
+}
+
+/// One STUN Binding exchange on `fd`, a socket already bound by ``makeBoundSTUNSocket(family:interface:sourceIP:enableLogging:)``:
+/// connect to `server`, send the request with `send` (the system call by default), and parse the
+/// reply. Blocks for up to `timeout` on each of the send and the receive. Does not close `fd`.
+internal func stunExchange(
+  fd: Int32,
+  family: Int32,
+  server: sockaddr_storage,
+  serverLen: socklen_t,
+  serverLabel: String,
+  timeout: TimeInterval,
+  send: TestSeams.SendDatagram? = nil
+) throws -> STUNPublicIP {
+  guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
+    throw STUNError.invalidTimeout(timeout)
+  }
+  var server = server
 
   // Connect the datagram socket before sending. Besides simplifying I/O, this
   // makes the kernel discard datagrams from peers other than the resolved STUN
@@ -247,7 +311,7 @@ internal func stunGetPublicIP(
   }
 
   let sent = req.withUnsafeBytes { raw in
-    send(fd, raw.baseAddress!, raw.count, 0)
+    send?(fd, raw) ?? Darwin.send(fd, raw.baseAddress!, raw.count, 0)
   }
   if sent < 0 {
     let error = errno
@@ -364,7 +428,8 @@ internal func parseSTUNBindingResponse(
   throw STUNError.invalidResponse("missing mapped address for requested family")
 }
 
-/// Resolves and queries a STUN server by hostname and port.
+/// Queries a STUN server by hostname and port. The socket is bound before the name is resolved,
+/// so a failed bind sends nothing, the lookup included.
 internal func stunGetPublicIP(
   family: Int32,
   host: String,
@@ -377,6 +442,9 @@ internal func stunGetPublicIP(
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
     throw STUNError.invalidTimeout(timeout)
   }
+  let fd = try makeBoundSTUNSocket(
+    family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+  defer { close(fd) }
   guard let (server, serverLen) = resolveSTUNServer(host: host, port: port, family: family) else {
     let error = errno
     let famName = family == AF_INET6 ? "v6" : "v4"
@@ -384,9 +452,9 @@ internal func stunGetPublicIP(
       errno: error,
       details: "Failed to resolve STUN server '\(host):\(port)' (\(famName))")
   }
-  return try stunGetPublicIP(
-    family: family, server: server, serverLen: serverLen, serverLabel: "\(host):\(port)",
-    timeout: timeout, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+  return try stunExchange(
+    fd: fd, family: family, server: server, serverLen: serverLen,
+    serverLabel: "\(host):\(port)", timeout: timeout)
 }
 
 /// Back-compat wrapper for v4-only callers. Same signature/behavior as before
@@ -482,9 +550,10 @@ private func resolveSTUNEndpoints(
         if let literal = literalSTUNEndpoint(host: server.host, port: server.port, family: family) {
           return (index, literal)
         }
+        let resolve = TestSeams.resolveSTUNServer ?? resolveSTUNServer
         do {
           let resolved = try await runDetachedBlockingIO(deadline: secondsLeft(until: deadline)) {
-            resolveSTUNServer(host: server.host, port: server.port, family: family).map {
+            resolve(server.host, server.port, family).map {
               STUNEndpoint(
                 host: server.host, port: server.port, server: $0.server, serverLen: $0.serverLen)
             }
@@ -504,6 +573,10 @@ private func resolveSTUNEndpoints(
 /// Attempts to discover the public IP of a given family by trying multiple STUN servers in
 /// sequence, after resolving all their names at once. Falls back through the server list until
 /// one succeeds.
+///
+/// One socket per server is created and bound to `interface` and `sourceIP` first, before any
+/// name is resolved. If a bind fails the sweep throws that failure at once, having sent nothing
+/// and looked up no name. The lookups use the system resolver, which is not bound.
 ///
 /// Each attempt is a blocking exchange submitted to the executor on its own, under
 /// ``stunAttemptDeadline(_:)``, so the sweep waits on no thread, and cancelling the calling task
@@ -539,6 +612,13 @@ internal func stunGetPublicIPWithFallback(
   var lastError: Error = STUNError.recvTimeout
   let famName = family == AF_INET6 ? "v6" : "v4"
 
+  // Bound first: nothing is resolved or sent unless every socket could be bound.
+  let sockets = try servers.map { _ in
+    try BoundSTUNSocket(
+      family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+  }
+  let send = TestSeams.sendSTUNRequest
+
   if enableLogging {
     print("[STUN] Resolving \(servers.count) servers concurrently (\(famName))...")
   }
@@ -571,11 +651,13 @@ internal func stunGetPublicIPWithFallback(
       print("[STUN] Trying \(label) (\(famName))...")
     }
     do {
+      let socket = sockets[index]
       let result = try await runDetachedBlockingIO(deadline: attemptDeadline) {
-        try stunGetPublicIP(
-          family: family, server: endpoint.server, serverLen: endpoint.serverLen,
-          serverLabel: label, timeout: timeout,
-          interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
+        guard let fd = socket.take() else { throw STUNError.recvTimeout }
+        defer { close(fd) }
+        return try stunExchange(
+          fd: fd, family: family, server: endpoint.server, serverLen: endpoint.serverLen,
+          serverLabel: label, timeout: timeout, send: send)
       }
       if enableLogging {
         print("[STUN] Success from \(label) (\(famName)) -> \(result.ip)")
@@ -592,361 +674,4 @@ internal func stunGetPublicIPWithFallback(
   }
 
   throw lastError
-}
-
-// MARK: - DNS-Based Public IP Discovery
-
-/// Error type for DNS-based public IP discovery
-enum DNSPublicIPError: Error, CustomStringConvertible, Sendable {
-  case queryFailed(String)
-  case noIPInResponse
-
-  var description: String {
-    switch self {
-    case .queryFailed(let reason):
-      return "DNS public IP query failed: \(reason)"
-    case .noIPInResponse:
-      return "DNS response did not contain an IP address"
-    }
-  }
-}
-
-/// Discovers public IPv4 via DNS TXT query to Akamai's whoami service.
-/// This works in captive portal environments where STUN may be blocked,
-/// because DNS queries are typically allowed (needed for the captive portal itself).
-///
-/// Queries: whoami.ds.akahelp.net TXT
-/// Response format: "ip" "x.x.x.x", "ecs" "x.x.x.0/24/24", "ns" "x.x.x.x"
-///
-/// - Parameters:
-///   - timeout: Query timeout (default 2.0s)
-///   - servers: DNS servers to try (default: Cloudflare + Google)
-///   - enableLogging: Enable debug logging
-///   - deadline: An instant on `monotonicNow()`'s clock after which no server is asked, or `nil`
-/// - Returns: Public IP from DNS response
-/// - Throws: DNSPublicIPError on failure, including when the calling task is cancelled
-func getPublicIPv4ViaDNS(
-  timeout: TimeInterval = 2.0,
-  servers: [String] = DNSClient.defaultTXTServers,
-  enableLogging: Bool = false,
-  deadline: TimeInterval? = nil
-) async throws -> STUNPublicIP {
-  if enableLogging {
-    print("[DNS-IP] Querying whoami.ds.akahelp.net TXT...")
-  }
-
-  // Tries each server in turn, each for `timeout` or the time left before `deadline`, whichever
-  // is shorter. The wait holds no thread, and cancellation ends it.
-  var answer: [String]?
-  for server in TestSeams.whoamiServers ?? servers {
-    var serverTimeout = timeout
-    if let left = secondsLeft(until: deadline) {
-      guard left > 0 else { break }
-      serverTimeout = min(serverTimeout, left)
-    }
-    answer = await DNSClient.queryTXT(
-      name: "whoami.ds.akahelp.net", timeout: serverTimeout, servers: [server])
-    if answer != nil { break }
-  }
-  guard let txtRecords = answer else {
-    throw DNSPublicIPError.queryFailed("No response from DNS servers")
-  }
-
-  if enableLogging {
-    print("[DNS-IP] Got \(txtRecords.count) TXT records")
-  }
-
-  // Parse response - looking for the "ip" record
-  // Akamai returns multiple TXT records: "ns<IP>", "ecs<subnet>", "ip<IP>"
-  // The TXT character-strings are concatenated, so we see e.g. "ip4.36.162.212"
-  for record in txtRecords {
-    if enableLogging {
-      print("[DNS-IP] Record: \(record)")
-    }
-
-    let trimmed = record.trimmingCharacters(in: .whitespaces)
-
-    // Look for record starting with "ip" prefix
-    if trimmed.hasPrefix("ip") {
-      // Extract the IP address after the "ip" prefix
-      var ipPart = String(trimmed.dropFirst(2))
-      ipPart = ipPart.trimmingCharacters(in: CharacterSet(charactersIn: " \""))
-
-      // Validate it's a valid IPv4 address
-      let octets = ipPart.split(separator: ".").compactMap { Int($0) }
-      if octets.count == 4, octets.allSatisfy({ $0 >= 0 && $0 <= 255 }) {
-        if enableLogging {
-          print("[DNS-IP] Found public IP: \(ipPart)")
-        }
-        return STUNPublicIP(ip: ipPart)
-      }
-    }
-  }
-
-  throw DNSPublicIPError.noIPInResponse
-}
-
-// MARK: - Unified Public IP Discovery
-
-/// Error type for unified public IP discovery
-public enum PublicIPError: Error, CustomStringConvertible, Sendable {
-  case allMethodsFailed(stunError: String, dnsError: String)
-
-  public var description: String {
-    switch self {
-    case .allMethodsFailed(let stunError, let dnsError):
-      return "Failed to discover public IP. STUN: \(stunError). DNS: \(dnsError)"
-    }
-  }
-}
-
-/// Discovers public IPv4 using a tiered fallback strategy:
-/// 1. STUN (fastest, tries multiple servers)
-/// 2. DNS whoami (reliable fallback, works behind captive portals)
-///
-/// - Parameters:
-///   - stunTimeout: Timeout per STUN server (default 0.8s)
-///   - dnsTimeout: Timeout for DNS query (default 2.0s)
-///   - interface: Network interface to bind to (optional)
-///   - sourceIP: Source IP address to bind to (optional)
-///   - enableLogging: Enable debug logging
-///   - deadline: An instant on `monotonicNow()`'s clock that bounds both tiers together: name
-///     lookups, every STUN attempt and the DNS fallback. `nil` bounds each step on its own. The
-///     STUN tier also ends at its own share of the time (``stunPhaseDeadline(servers:stunTimeout:dnsTimeout:start:deadline:)``),
-///     so the fallback is always tried.
-/// - Returns: Public IP from first successful method, with the tier that found it as its source
-/// - Throws: PublicIPError if all methods fail, or `CancellationError` when the calling task is
-///   cancelled
-func getPublicIPv4(
-  stunTimeout: TimeInterval = 0.8,
-  dnsTimeout: TimeInterval = 2.0,
-  interface: String? = nil,
-  sourceIP: String? = nil,
-  enableLogging: Bool = false,
-  deadline: TimeInterval? = nil
-) async throws -> PublicIPObservation {
-  // Tier 1: Try STUN (fastest), within its share of the time.
-  let stunDeadline = stunPhaseDeadline(
-    servers: (TestSeams.stunServers?(AF_INET) ?? stunServers).count, stunTimeout: stunTimeout,
-    dnsTimeout: dnsTimeout, start: monotonicNow(), deadline: deadline)
-  var stunErrorMsg = "Unknown error"
-  do {
-    let found = try await stunGetPublicIPWithFallback(
-      family: AF_INET,
-      timeout: stunTimeout,
-      interface: interface,
-      sourceIP: sourceIP,
-      enableLogging: enableLogging,
-      deadline: stunDeadline
-    )
-    return PublicIPObservation(address: found.ip, family: .v4, source: .stun)
-  } catch is CancellationError {
-    throw CancellationError()
-  } catch {
-    stunErrorMsg = String(describing: error)
-    if enableLogging {
-      print("[PublicIP] STUN failed, trying DNS fallback...")
-    }
-  }
-
-  // Tier 2: Try DNS whoami (last resort fallback)
-  // WARNING: On carrier networks with CGNAT, DNS traffic exits through a different
-  // NAT pool than HTTP/STUN traffic. The Akamai whoami TXT record returns the IP
-  // visible to the recursive DNS resolver, not the actual exit IP that websites see.
-  // For example, T-Mobile returns 172.32.0.x via DNS but 172.56.x.x via STUN/HTTP.
-  // This fallback is only useful when STUN is completely blocked (e.g., UDP-filtered
-  // enterprise networks). Callers should prefer HTTP-based IP discovery when available.
-  var dnsErrorMsg = "Unknown error"
-  do {
-    let found = try await getPublicIPv4ViaDNS(
-      timeout: dnsTimeout,
-      enableLogging: enableLogging,
-      deadline: deadline
-    )
-    return PublicIPObservation(address: found.ip, family: .v4, source: .dnsWhoami)
-  } catch {
-    dnsErrorMsg = String(describing: error)
-    if enableLogging {
-      print("[PublicIP] DNS fallback also failed")
-    }
-  }
-
-  try Task.checkCancellation()
-  throw PublicIPError.allMethodsFailed(stunError: stunErrorMsg, dnsError: dnsErrorMsg)
-}
-
-/// Gives up on public-IP discovery that outlived its budget.
-struct PublicIPDiscoveryTimeout: Error {}
-
-/// When the STUN tier of ``getPublicIPv4(stunTimeout:dnsTimeout:interface:sourceIP:enableLogging:deadline:)``
-/// gives up, so that the DNS fallback after it always gets time to ask.
-///
-/// STUN's share is `servers × stunTimeout` from `start`: what its attempts take when every server
-/// is silent, so in that case the fallback starts no later than it would without this deadline.
-/// Name lookups that cannot get an executor slot are abandoned at it too, instead of using up the
-/// whole discovery. With an overall `deadline`, the share is also cut so that at least
-/// `min(dnsTimeout, budget) / 2` is left for the fallback, `budget` being the time from `start` to
-/// `deadline`. For the default 6 s budget that cut never applies: the library's resolver (2 s per
-/// server, two servers) ends STUN at 4 s, leaving 2 s.
-func stunPhaseDeadline(
-  servers: Int, stunTimeout: TimeInterval, dnsTimeout: TimeInterval, start: TimeInterval,
-  deadline: TimeInterval?
-) -> TimeInterval {
-  var share = Double(servers) * stunTimeout
-  if let deadline {
-    let budget = max(deadline - start, 0)
-    share = min(share, budget - min(dnsTimeout, budget) / 2)
-  }
-  return start + max(share, 0)
-}
-
-/// The outcome of a budgeted public-IP discovery whose first finished child gave `result`,
-/// decided at `now` against `deadline`.
-///
-/// Cancellation of the calling task comes first. Then a failure once `deadline` has passed is
-/// reported as ``PublicIPDiscoveryTimeout``, whichever timer noticed first, so a discovery that ran
-/// out of time is always told apart from one that got definite failures in time. An address
-/// that was found is returned.
-func publicIPDiscoveryOutcome<Found>(
-  _ result: Result<Found, Error>, now: TimeInterval, deadline: TimeInterval,
-  cancelled: Bool
-) throws -> Found {
-  if cancelled { throw CancellationError() }
-  switch result {
-  case .success(let address):
-    return address
-  case .failure(let error):
-    if now >= deadline { throw PublicIPDiscoveryTimeout() }
-    throw error
-  }
-}
-
-/// Public-address discovery of one family for the library's resolver: the test substitute when one
-/// is bound, otherwise STUN, with its DNS fallback for IPv4, ended once `budget` seconds pass.
-///
-/// The budget bounds the whole discovery, however many steps it takes: one absolute deadline,
-/// `budget` seconds from entry, is passed down to every name lookup, STUN attempt and DNS query,
-/// and no step outlives it. The same instant also bounds the discovery as a whole: when it
-/// passes, the discovery (or a test substitute) is cancelled and awaited, which ends it at once,
-/// since every wait in it is cancellable. A STUN attempt or lookup stalled in a blocking call
-/// keeps only its executor slot. A `budget` that is not finite is no bound; one that is not
-/// positive ends discovery before it starts.
-///
-/// The answer's source names the tier that found it: ``PublicIPObservationSource/stun`` or, for
-/// the IPv4 fallback, ``PublicIPObservationSource/dnsWhoami``. A test substitute's answer is
-/// reported as STUN's.
-///
-/// - Throws: ``PublicIPDiscoveryTimeout`` when the budget passes, `CancellationError` when the
-///   calling task is cancelled, or the discovery's own error.
-func publicIPDiscovery(
-  family: IPAddressFamily,
-  stunTimeout: TimeInterval,
-  dnsTimeout: TimeInterval,
-  interface: String?,
-  sourceIP: String?,
-  enableLogging: Bool,
-  budget: TimeInterval
-) async throws -> PublicIPObservation {
-  let bounded = budget.isFinite && budget < 1e9
-  let deadline = bounded ? monotonicNow() + budget : nil
-  let discover: @Sendable () async throws -> PublicIPObservation
-  if let substitute = TestSeams.discoverPublicIP {
-    discover = {
-      let found = try await substitute(family)
-      return PublicIPObservation(address: found.ip, family: family, source: .stun)
-    }
-  } else if family == .v6 {
-    discover = {
-      let found = try await stunGetPublicIPWithFallback(
-        family: AF_INET6, timeout: stunTimeout, interface: interface, sourceIP: sourceIP,
-        enableLogging: enableLogging, deadline: deadline)
-      return PublicIPObservation(address: found.ip, family: .v6, source: .stun)
-    }
-  } else {
-    discover = {
-      try await getPublicIPv4(
-        stunTimeout: stunTimeout, dnsTimeout: dnsTimeout, interface: interface,
-        sourceIP: sourceIP, enableLogging: enableLogging, deadline: deadline)
-    }
-  }
-  guard let deadline else { return try await discover() }
-  guard budget > 0 else { throw PublicIPDiscoveryTimeout() }
-  return try await withThrowingTaskGroup(of: PublicIPObservation.self) { group in
-    group.addTask { try await discover() }
-    group.addTask {
-      let left = secondsLeft(until: deadline) ?? 0
-      try await Task.sleep(nanoseconds: UInt64(left * 1_000_000_000))
-      throw PublicIPDiscoveryTimeout()
-    }
-    // The first child to finish is the outcome; the other is cancelled and awaited.
-    defer { group.cancelAll() }
-    let first: Result<PublicIPObservation, Error>
-    do {
-      guard let value = try await group.next() else { throw PublicIPDiscoveryTimeout() }
-      first = .success(value)
-    } catch {
-      first = .failure(error)
-    }
-    return try publicIPDiscoveryOutcome(
-      first, now: monotonicNow(), deadline: deadline, cancelled: Task.isCancelled)
-  }
-}
-
-/// Discovers both v4 and v6 public IPs in parallel via STUN. Returns whatever
-/// succeeded — either or both fields of `PublicIPs` may be nil. Never throws:
-/// callers see "no IP discovered" as `PublicIPs(v4: nil, v6: nil)` rather than
-/// having to handle exceptions for the common "this network is v4-only" or
-/// "this network is v6-only" cases.
-///
-/// Each family-specific sweep walks the same STUN server list
-/// using `stunGetPublicIPWithFallback`. Neither sweep invokes the DNS-whoami fallback used by
-/// `getPublicIPv4`; both families are STUN-only in this API.
-///
-/// The two sweeps are child tasks of the caller's. Cancelling the calling task ends both at once,
-/// and the call returns what had been found by then. Each server attempt is bounded by
-/// `stunTimeout`; resolving the server names has no deadline of its own.
-///
-/// - Parameters:
-///   - stunTimeout: Per-server timeout (default 0.8s).
-///   - interface: Optional interface to bind to (applied to both families).
-///   - sourceIP: Optional source IP. If v4, only the v4 STUN sweep gets it;
-///               if v6, only the v6 sweep. (Cross-family bind would fail.)
-///   - enableLogging: Verbose logging.
-public func getPublicIPs(
-  stunTimeout: TimeInterval = 0.8,
-  interface: String? = nil,
-  sourceIP: String? = nil,
-  enableLogging: Bool = false
-) async -> PublicIPs {
-  // Detect family of sourceIP (if provided) so we only pass it to the matching sweep.
-  let sourceFamily = sourceIP.map { detectAddressFamily($0) } ?? -1
-  let v4Source = (sourceFamily == AF_INET) ? sourceIP : nil
-  let v6Source = (sourceFamily == AF_INET6) ? sourceIP : nil
-
-  async let v4 = stunSweepAddress(
-    family: AF_INET, timeout: stunTimeout, interface: interface, sourceIP: v4Source,
-    enableLogging: enableLogging)
-  async let v6 = stunSweepAddress(
-    family: AF_INET6, timeout: stunTimeout, interface: interface, sourceIP: v6Source,
-    enableLogging: enableLogging)
-  return await PublicIPs(v4: v4, v6: v6)
-}
-
-/// One family's STUN sweep for ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``:
-/// the address, or `nil` if the sweep failed or was cancelled.
-private func stunSweepAddress(
-  family: Int32, timeout: TimeInterval, interface: String?, sourceIP: String?,
-  enableLogging: Bool
-) async -> String? {
-  do {
-    return try await stunGetPublicIPWithFallback(
-      family: family, timeout: timeout, interface: interface, sourceIP: sourceIP,
-      enableLogging: enableLogging
-    ).ip
-  } catch {
-    if enableLogging {
-      print("[STUN] \(family == AF_INET6 ? "v6" : "v4") sweep failed: \(error)")
-    }
-    return nil
-  }
 }
