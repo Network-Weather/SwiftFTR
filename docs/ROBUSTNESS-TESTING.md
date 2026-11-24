@@ -24,7 +24,7 @@ that fail when any phase can wait without a bound or strand its caller.
   socket factory used by trace and ping, IPv4 public-address discovery, a hook that holds
   `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping,
   UDP exchange, TCP probe or UDP probe socket non-blocking, the `sendto` a trace, stream or ping
-  sends its probes with, and for the event-based UDP transport (`UDPExchange`) its
+  sends its probes with, an observer of each read it makes from its probe socket, and for the event-based UDP transport (`UDPExchange`) its
   `send` and `close` calls and the DNS server port. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
@@ -649,3 +649,14 @@ Observations that are not defects of the library:
   watchdog, so only the destination's reply ends the trace. Two counts of the probes the fake
   network saw, read as the trace or ping returned, are now awaited. Under that load these two files
   recorded issues in 9 of 10 runs on main (20 issues), 2 of 10 strict.
+- **Whether a receive loop's socket ran dry is observed at the receiver** (#103). The deadline
+  tests' premise that the socket never ran dry was counted at the fixture's sends: a sender
+  descheduled past the one-second receive timeout let a read come back empty, and the overdue
+  deadline then ended the operation, while the fixture's own bookkeeping still looked fed. The
+  three reads of a probe socket in the library (`recvmsg` and `recvfrom` in `recvTraceMessage`,
+  `recvmsg` in ping) now go through `TestSeams.observeProbeReceive` when one is bound, so
+  `EndlessReplies` counts, on the operation's own queue, the reads that returned a datagram and
+  those that found the socket empty. `heldReading` requires at least 20 reads and none empty.
+  With the feed paused for 1.5 s after the first read, the tests now fail on "reads 10, empty
+  reads 1"; under the unbounded drain fixed in 29716fc they still outlive their watchdog.
+
