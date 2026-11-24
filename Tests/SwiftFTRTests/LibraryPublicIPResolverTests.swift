@@ -286,6 +286,28 @@ struct LibraryPublicIPResolverTests {
     for call in calls { _ = try await measure(within: Self.watchdog) { await call.value } }
   }
 
+  @Test("A sweep abandoned at its deadline leaves no socket in its queued attempt")
+  func abandonedAttemptsHoldNoSockets() async throws {
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-abandon")
+    let occupant = StallGate()
+    defer { occupant.open() }
+    Task { try? await executor.run(priority: .userInitiated) { occupant.wait(limit: 60) } }
+    let refusing = try RefusingUDPPort()
+    let before = Self.lo0UDPSockets()
+    // Each discovery's one attempt queues behind the occupant until the budget abandons it.
+    for _ in 0..<8 {
+      _ = try? await TestSeams.$blockingIOExecutor.withValue(executor) {
+        try await TestSeams.$stunServers.withValue({ _ in [("127.0.0.1", refusing.port)] }) {
+          try await publicIPDiscovery(
+            family: .v4, stunTimeout: 0.2, interface: "lo0", sourceIP: nil, enableLogging: false,
+            budget: 0.3)
+        }
+      }
+    }
+    let held = Self.lo0UDPSockets() - before
+    #expect(held == 0, "\(held) sockets held by abandoned attempts")
+  }
+
   @Test("getPublicIPs cancelled before it starts asks nothing")
   func standaloneCancelledFirst() async throws {
     let requests = RequestLog()
