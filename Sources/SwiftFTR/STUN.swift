@@ -623,6 +623,10 @@ internal func stunGetPublicIPWithFallback(
     try BoundSTUNSocket(
       family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
   }
+  // On the way out, close what no running attempt took, so an attempt abandoned in the queue
+  // holds no socket while it waits for a worker to discard it.
+  defer { for socket in sockets { socket.take().map { _ = close($0) } } }
+  if let left = secondsLeft(until: deadline), left <= 0 { throw STUNError.recvTimeout }
   let send = TestSeams.sendSTUNRequest
 
   if enableLogging {
