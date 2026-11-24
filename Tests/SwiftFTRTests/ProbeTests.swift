@@ -92,7 +92,7 @@ struct UDPProbeTests {
   func testUnreachableHost() async throws {
     // A loopback peer that reads every datagram and never answers, so the probe times out as it
     // would for a host that does not answer, without sending anything off the host.
-    let silent = try LoopbackUDPResponder { _ in nil }
+    let silent = try LoopbackUDPResponder(accepts: .payload([])) { _ in nil }
     defer { silent.stop() }
     let result = try await udpProbe(host: "127.0.0.1", port: Int(silent.port), timeout: 2.0)
 
@@ -219,7 +219,7 @@ struct DNSProbeTests {
   func testUnreachableServer() async throws {
     // A loopback server that reads the query and stays silent. A host with nothing listening on
     // the port answers with a refusal instead, which dnsProbe reports as reachable.
-    let server = try LoopbackUDPResponder { _ in nil }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "example.com")) { _ in nil }
     defer { server.stop() }
     let result = try await TestSeams.$dnsServerPort.withValue(server.port) {
       try await dnsProbe(server: "127.0.0.1", query: "example.com", timeout: 0.3)

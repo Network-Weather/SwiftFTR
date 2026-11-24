@@ -129,7 +129,7 @@ struct DNSErrorReplyValidationTests {
   }
 
   static func server(_ shape: Shape) throws -> LoopbackUDPResponder {
-    try LoopbackUDPResponder { query in
+    try LoopbackUDPResponder(accepts: .dnsQuery(named: "nx.example")) { query in
       // A query too short to carry a name gets no reply; none of the clients below sends one.
       guard query.count > 13 else { return nil }
       return (shape.reply(to: query), 0)

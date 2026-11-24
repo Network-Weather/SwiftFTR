@@ -44,6 +44,16 @@ enum TestSeams {
   typealias ConnectSocket =
     @Sendable (_ fd: Int32, _ address: UnsafePointer<sockaddr>, _ length: socklen_t) -> Int32
 
+  /// `sendto(2)` of one echo request to `destination`, in place of the system call a trace,
+  /// stream or ping sends its probes with. Returns what `sendto` would and sets `errno` the same
+  /// way. Captured when the operation is built, since a stream's retries and ping's sends run on
+  /// dispatch queues.
+  typealias SendProbe =
+    @Sendable (
+      _ fd: Int32, _ bytes: UnsafeRawBufferPointer, _ destination: UnsafePointer<sockaddr>,
+      _ length: socklen_t
+    ) -> Int
+
   /// `close(2)`, in place of the system call a ``UDPExchange`` closes its socket with. A substitute
   /// must close `fd` (or the test leaks it) and return what `close` would.
   typealias CloseDescriptor = @Sendable (_ fd: Int32) -> Int32
@@ -71,6 +81,8 @@ enum TestSeams {
   @TaskLocal static var dnsService: DNSServiceCalls?
 
   @TaskLocal static var makeICMPSocket: MakeICMPSocket?
+
+  @TaskLocal static var sendProbe: SendProbe?
 
   @TaskLocal static var discoverPublicIP: DiscoverPublicIP?
 

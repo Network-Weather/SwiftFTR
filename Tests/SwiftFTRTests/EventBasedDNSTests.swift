@@ -22,7 +22,7 @@ struct EventBasedDNSTests {
 
   @Test("With every blocking-I/O worker held, DNS queries and dnsProbe still answer")
   func answersWithEveryWorkerHeld() async throws {
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "gate.example")) { query in
       (FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord), 0)
     }
     defer { server.stop() }
@@ -55,7 +55,7 @@ struct EventBasedDNSTests {
   @Test("Round-trip time runs from sending the query to reading the reply")
   func roundTripTimeCoversTheExchange() async throws {
     let delay: TimeInterval = 0.2
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "rtt.example")) { query in
       (
         FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord),
         delay
@@ -77,7 +77,7 @@ struct EventBasedDNSTests {
   @Test("Round-trip time includes a sending thread descheduled after the datagram left")
   func roundTripTimeStartsBeforeTheSend() async throws {
     let delay: TimeInterval = 0.2
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "stall.example")) { query in
       (
         FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord),
         delay
@@ -104,7 +104,7 @@ struct EventBasedDNSTests {
 
   @Test("A deadline that passes before the first send is a send failure, and nothing is sent")
   func deadlineBeforeTheFirstSend() async throws {
-    let server = try LoopbackUDPResponder { _ in nil }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "late.example")) { _ in nil }
     defer { server.stop() }
     let attempts = FaultCounter()
     let send: TestSeams.SendDatagram = { fd, bytes in
@@ -175,7 +175,8 @@ struct EventBasedDNSTests {
 
   @Test("An empty datagram carries no transaction ID: it is ignored, and the query times out")
   func emptyDatagram() async throws {
-    let server = try LoopbackUDPResponder { _ in ([], 0) }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "empty.example")) { _ in ([], 0)
+    }
     defer { server.stop() }
     let timeout: TimeInterval = 0.3
 
@@ -211,7 +212,7 @@ struct EventBasedDNSTests {
     "Send pressure is retried with the whole datagram and the query answers",
     arguments: SendPressure.allCases)
   func sendPressureIsRetried(pressure: SendPressure) async throws {
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "pressure.example")) { query in
       (FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord), 0)
     }
     defer { server.stop() }
@@ -246,7 +247,7 @@ struct EventBasedDNSTests {
     "A send that never leaves whole fails as a send failure, within the timeout",
     arguments: SendFault.allCases)
   func sendFailure(fault: SendFault) async throws {
-    let server = try LoopbackUDPResponder { _ in nil }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "send.example")) { _ in nil }
     defer { server.stop() }
     let send: TestSeams.SendDatagram = { fd, bytes in
       switch fault {
@@ -365,7 +366,7 @@ struct EventBasedDNSTests {
   @Test("A datagram that arrives before the request has left does not complete the exchange")
   func datagramBeforeTheSendIsIgnored() async throws {
     let replies = FaultCounter()
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "stale.example")) { query in
       replies.increment()
       // The stale reply carries 192.0.2.1, the one to the request that left carries 192.0.2.2.
       let last: UInt8 = replies.value == 1 ? 1 : 2
@@ -394,7 +395,8 @@ struct EventBasedDNSTests {
   func refusalBeforeTheSendIsIgnored() async throws {
     // Refuses the first datagram, then answers: the real send goes to a server that replies, so
     // its outcome does not depend on Darwin suppressing a second port-unreachable to one peer.
-    let port = try RefusingThenAnsweringUDPPort { query in
+    let port = try RefusingThenAnsweringUDPPort(accepts: .dnsQuery(named: "stale.example")) {
+      query in
       FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord)
     }
     defer { port.stop() }
@@ -415,11 +417,36 @@ struct EventBasedDNSTests {
     #expect(answers.first?.rdata == Data([192, 0, 2, 9]))
   }
 
+  @Test("The refusing-then-answering port answers its query after strays queued ahead of it")
+  func refusingThenAnsweringIgnoresStrays() async throws {
+    // Its thread answers one request and exits, so a stray taken as the request would leave the
+    // real query unanswered.
+    let gate = StallGate()
+    defer { gate.open() }
+    let port = try RefusingThenAnsweringUDPPort(
+      accepts: .dnsQuery(named: "stray.example"), readsAfter: gate
+    ) { query in
+      FaultInjectionWireTests.dnsResponse(to: query, answers: FaultInjectionWireTests.aRecord)
+    }
+    defer { port.stop() }
+    port.startAnswering()
+    #expect(Strays.send(to: port.port))
+    try #require(await eventually(within: 10) { port.queued >= 2 }, "queued: \(port.queued)")
+    gate.open()
+
+    let (answers, _) = try await measure(within: Self.watchdog) {
+      try await __dnsQuery(
+        server: "127.0.0.1", port: port.port, name: "stray.example", type: 1, timeout: 10)
+    }
+    #expect(answers.first?.rdata == Data([192, 0, 2, 9]))
+    #expect(port.ignored.value >= 2, "ignored: \(port.ignored.value)")
+  }
+
   // MARK: Setup
 
   @Test("A failure to make the socket non-blocking is reported, and nothing is sent")
   func nonBlockingFailure() async throws {
-    let server = try LoopbackUDPResponder { _ in nil }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "setup.example")) { _ in nil }
     defer { server.stop() }
     let fileControl: TestSeams.FileControl = { fd, command, argument in
       guard command == F_SETFL else { return fcntl(fd, command, argument) }
@@ -446,7 +473,7 @@ struct EventBasedDNSTests {
 
   @Test("Cancelling a query returns while the server is still silent")
   func cancellationWhileSilent() async throws {
-    let server = try LoopbackUDPResponder { _ in nil }
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "cancel.example")) { _ in nil }
     defer { server.stop() }
     let timeout: TimeInterval = 30
     let task = Task {
@@ -485,7 +512,7 @@ struct EventBasedDNSTests {
 
   @Test("The socket is closed exactly once, before the caller resumes", arguments: Exit.allCases)
   func descriptorClosedOnce(exit: Exit) async throws {
-    let server = try LoopbackUDPResponder { query in
+    let server = try LoopbackUDPResponder(accepts: .dnsQuery(named: "ledger.example")) { query in
       switch exit {
       case .answered:
         return (
@@ -703,13 +730,16 @@ final class DescriptorLedger: @unchecked Sendable {
   }
 }
 
-/// A loopback UDP port that refuses datagrams until ``startAnswering()``, then answers one.
+/// A loopback UDP port that refuses datagrams until ``startAnswering()``, then answers one request
+/// its filter accepts.
 ///
 /// Until then its socket is connected to another loopback port, so the kernel answers anyone else
-/// with ICMP port-unreachable. `startAnswering()` dissolves that association, so the next
-/// datagram reaches the socket and is answered with `reply`.
+/// with ICMP port-unreachable. `startAnswering()` dissolves that association, so later datagrams
+/// reach the socket; the first the filter accepts is answered with `reply`, and every other one is
+/// a stray (``DatagramFilter``), counted in ``ignored``.
 final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
   let port: UInt16
+  let ignored = FaultCounter()
   /// Owned by ``stop()`` until ``startAnswering()``, and by the answering thread after it, which
   /// closes it as it exits.
   private let fd: Int32
@@ -717,13 +747,21 @@ final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
   /// ``stop()``.
   private let ipv6Guard: Int32?
   private let reply: @Sendable ([UInt8]) -> [UInt8]
+  private let filter: DatagramFilter
+  private let gate: StallGate?
   private let lock = NSLock()
   private var answering = false
   private var stopped = false
   /// How long the answering thread waits for its datagram.
   private let answerWindow: TimeInterval = 5
 
-  init(reply: @escaping @Sendable ([UInt8]) -> [UInt8]) throws {
+  /// - Parameter gate: when given, the answering thread reads nothing until it opens.
+  init(
+    accepts filter: DatagramFilter, readsAfter gate: StallGate? = nil,
+    reply: @escaping @Sendable ([UInt8]) -> [UInt8]
+  ) throws {
+    self.filter = filter
+    self.gate = gate
     let refusing = try bindRefusingUDP(family: AF_INET)
     // Short, so the answering thread sees `stop()` promptly between receives.
     setReceiveTimeout(refusing.fd, seconds: 0.02)
@@ -738,6 +776,10 @@ final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
     defer { lock.unlock() }
     return stopped
   }
+
+  /// Datagrams waiting on the socket (`SO_NUMRCVPKT`). Read it only while the socket is certainly
+  /// open: before ``stop()``, and after ``startAnswering()`` only while the gate holds the thread.
+  var queued: Int32 { queuedDatagrams(fd) }
 
   /// Disconnects the socket and answers the next datagram on a thread of its own.
   func startAnswering() {
@@ -754,23 +796,27 @@ final class RefusingThenAnsweringUDPPort: @unchecked Sendable {
     _ = connect(fd, &unspecified, socklen_t(MemoryLayout<sockaddr>.size))
     Thread.detachNewThread { [self] in
       defer { close(fd) }
+      gate?.wait(limit: 60)
       var buffer = [UInt8](repeating: 0, count: 2048)
       var source = sockaddr_storage()
       var sourceLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
       let giveUp = monotonicNow() + answerWindow
-      var received = -1
-      while received < 0, !isStopped, monotonicNow() < giveUp {
+      var request: [UInt8]?
+      while request == nil, !isStopped, monotonicNow() < giveUp {
         sourceLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        received = buffer.withUnsafeMutableBytes { raw in
+        let received = buffer.withUnsafeMutableBytes { raw in
           withUnsafeMutablePointer(to: &source) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
               recvfrom(fd, raw.baseAddress, raw.count, 0, $0, &sourceLength)
             }
           }
         }
+        guard received >= 0 else { continue }
+        let datagram = Array(buffer.prefix(received))
+        if filter.accepts(datagram) { request = datagram } else { ignored.increment() }
       }
-      guard received > 0, !isStopped else { return }
-      let answer = reply(Array(buffer.prefix(received)))
+      guard let request, !isStopped else { return }
+      let answer = reply(request)
       _ = answer.withUnsafeBytes { raw in
         withUnsafePointer(to: &source) {
           $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {

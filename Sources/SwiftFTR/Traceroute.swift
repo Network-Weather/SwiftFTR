@@ -749,9 +749,11 @@ public actor SwiftFTR {
       print("[SwiftFTR] Streaming trace: sending \(maxHops) probes...")
     }
     let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
+    let sendProbe = TestSeams.sendProbe
     let unsentTTLs = try sendTraceBurst(
       sockfd: fd, resolved: resolved, identifier: identifier, maxHops: maxHops,
-      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, outstanding: &outstanding)
+      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, sendProbe: sendProbe,
+      outstanding: &outstanding)
 
     // Collect responses via DispatchSourceRead with retry support.
     if config.enableLogging {
@@ -784,6 +786,7 @@ public actor SwiftFTR {
       resolved: resolved,
       streamConfig: streamConfig,
       enableLogging: config.enableLogging,
+      sendProbe: sendProbe,
       yield: yield
     )
     receiveOwnsSocket = true
@@ -909,7 +912,8 @@ public actor SwiftFTR {
     let sendRetryDeadline = monotonicNow() + traceBurstSendRetryBudget
     let unsentTTLs = try sendTraceBurst(
       sockfd: fd, resolved: resolved, identifier: identifier, maxHops: maxHops,
-      payloadSize: payloadSize, retryDeadline: sendRetryDeadline, outstanding: &outstanding)
+      payloadSize: payloadSize, retryDeadline: sendRetryDeadline,
+      sendProbe: TestSeams.sendProbe, outstanding: &outstanding)
 
     // Collect responses via DispatchSourceRead (kqueue-backed on macOS).
     // All probes are already in-flight; we wait for responses until the deadline
@@ -1698,7 +1702,8 @@ internal func bindTraceSourceIP(
 /// - Returns: TTLs that never left the host, mapped to the errno that stopped them.
 internal func sendTraceBurst(
   sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, maxHops: Int, payloadSize: Int,
-  retryDeadline: TimeInterval, outstanding: inout [UInt16: TraceSendInfo]
+  retryDeadline: TimeInterval, sendProbe: TestSeams.SendProbe?,
+  outstanding: inout [UInt16: TraceSendInfo]
 ) throws -> [Int: Int32] {
   var unsent: [Int: Int32] = [:]
   var lastTransientError: Error?
@@ -1710,7 +1715,8 @@ internal func sendTraceBurst(
     do {
       try sendTraceProbe(
         sockfd: sockfd, resolved: resolved, identifier: identifier,
-        sequence: seq, payloadSize: payloadSize, retryDeadline: retryDeadline)
+        sequence: seq, payloadSize: payloadSize, retryDeadline: retryDeadline,
+        sendProbe: sendProbe)
       outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
     } catch let error as TracerouteError {
       guard case .sendFailed(let code) = error, isTransientSendErrno(code) else { throw error }
@@ -1735,7 +1741,7 @@ internal func sendTraceBurst(
 /// bounded budget. Non-transient errnos propagate on the first attempt.
 internal func sendTraceProbe(
   sockfd: Int32, resolved: ResolvedHost, identifier: UInt16, sequence: UInt16,
-  payloadSize: Int, retryDeadline: TimeInterval
+  payloadSize: Int, retryDeadline: TimeInterval, sendProbe: TestSeams.SendProbe?
 ) throws {
   let packet: [UInt8]
   if resolved.family == AF_INET6 {
@@ -1750,7 +1756,8 @@ internal func sendTraceProbe(
     packet.withUnsafeBytes { raw in
       withUnsafePointer(to: &addr) { ap -> ssize_t in
         ap.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-          sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
+          if let sendProbe { return sendProbe(sockfd, raw, sa, resolved.addressLen) }
+          return sendto(sockfd, raw.baseAddress, raw.count, 0, sa, resolved.addressLen)
         }
       }
     }
@@ -2134,6 +2141,7 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
   private let resolved: ResolvedHost
   private let streamConfig: StreamingTraceConfig
   private let enableLogging: Bool
+  private let sendProbe: TestSeams.SendProbe?
   private let yieldHop: @Sendable (StreamingHop) -> Bool
 
   private var outstanding: [UInt16: TraceSendInfo]
@@ -2165,8 +2173,10 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
     resolved: ResolvedHost,
     streamConfig: StreamingTraceConfig,
     enableLogging: Bool,
+    sendProbe: TestSeams.SendProbe?,
     yield: @Sendable @escaping (StreamingHop) -> Bool
   ) {
+    self.sendProbe = sendProbe
     self.family = family
     self.identifier = identifier
     self.outstanding = outstanding
@@ -2369,7 +2379,8 @@ private final class StreamingTraceReceiveOperation: @unchecked Sendable {
       do {
         try sendTraceProbe(
           sockfd: socket.fd, resolved: resolved, identifier: identifier,
-          sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline)
+          sequence: seq, payloadSize: payloadSize, retryDeadline: sendRetryDeadline,
+          sendProbe: sendProbe)
         outstanding[seq] = TraceSendInfo(ttl: ttl, sentAt: sentAt)
       } catch {
         // Best-effort retry — silently skip if send fails (will time out instead).

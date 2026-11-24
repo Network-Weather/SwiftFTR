@@ -18,12 +18,10 @@ struct DNSQuestionMatchTests {
 
   static let watchdog: TimeInterval = 20
 
-  /// The end of the query's first question name: the offset of its QTYPE.
-  static func questionTypeOffset(_ message: [UInt8]) -> Int {
-    var offset = 12
-    while message[offset] != 0 { offset += 1 + Int(message[offset]) }
-    return offset + 1
-  }
+  /// The end of the query's first question name: the offset of its QTYPE, or `nil` unless the
+  /// question reads to its end with its type and class. A peer's filter hands its script only
+  /// queries that do, and the script checks again rather than index past a short datagram.
+  static func questionTypeOffset(_ message: [UInt8]) -> Int? { dnsQuestionTypeOffset(message) }
 
   /// How a reply's echoed question differs from the query's.
   enum Echo: String, CaseIterable, CustomTestStringConvertible, Sendable {
@@ -37,7 +35,7 @@ struct DNSQuestionMatchTests {
     /// `reply` (whose question is the query's) with its question changed.
     func apply(_ reply: [UInt8]) -> [UInt8] {
       var copy = reply
-      let typeOffset = DNSQuestionMatchTests.questionTypeOffset(reply)
+      guard let typeOffset = DNSQuestionMatchTests.questionTypeOffset(reply) else { return reply }
       switch self {
       case .otherName:
         copy[13] = copy[13] == UInt8(ascii: "x") ? UInt8(ascii: "y") : UInt8(ascii: "x")
@@ -113,7 +111,8 @@ struct DNSQuestionMatchTests {
   func otherCaseAnswers() async throws {
     let peer = try ScriptedDNSPeer { query in
       var reply = Foreign.answer(query, last: 7)
-      let end = Self.questionTypeOffset(reply) - 1
+      guard let typeOffset = Self.questionTypeOffset(reply) else { return [] }
+      let end = typeOffset - 1
       for i in 13..<end where (0x61...0x7A).contains(reply[i]) { reply[i] -= 0x20 }
       return [(reply, 0)]
     }
@@ -203,12 +202,14 @@ struct DNSQuestionMatchTests {
     let timeout: TimeInterval = 0.3
 
     let (thrown, elapsed) = try await measure(within: Self.watchdog) {
-      await TestSeams.$fileControl.withValue(Foreign.leaveBlocking) {
-        await TestSeams.$receiveDatagram.withValue(Foreign.countingReceive(reads)) {
-          await EventBasedDNSTests.error {
-            try await __dnsQuery(
-              server: Foreign.loopback(family), port: peer.port, name: "endless.example",
-              type: 1, timeout: timeout)
+      await peer.endingFeedAtClose {
+        await TestSeams.$fileControl.withValue(Foreign.leaveBlocking) {
+          await TestSeams.$receiveDatagram.withValue(Foreign.countingReceive(reads)) {
+            await EventBasedDNSTests.error {
+              try await __dnsQuery(
+                server: Foreign.loopback(family), port: peer.port, name: "endless.example",
+                type: 1, timeout: timeout)
+            }
           }
         }
       }
@@ -216,6 +217,7 @@ struct DNSQuestionMatchTests {
     let flow = peer.keptFeeding(since: 0, limit: Foreign.neverDryTimeout)
 
     #expect(flow.ok, "the socket was not kept fed while the query waited: \(flow.detail)")
+    try await Foreign.expectFeedEndedAtClose(peer)
     #expect(reads.value >= 10, "the query read only \(reads.value) datagrams")
     #expect(EventBasedDNSTests.isTimeout(thrown), "\(String(describing: thrown))")
     #expect(elapsed >= timeout * 0.95, "ended after \(elapsed)s against a \(timeout)s timeout")

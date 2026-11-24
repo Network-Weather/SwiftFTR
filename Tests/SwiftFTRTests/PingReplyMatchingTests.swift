@@ -562,7 +562,8 @@ final class DirectPing: @unchecked Sendable {
         }
         before?(seq, fd)
         if fails { throw TracerouteError.sendFailed(errno: ENOBUFS) }
-        let time = try executor.sendPacket(sockfd: fd, packet: packet, to: resolved)
+        let time = try executor.sendPacket(
+          sockfd: fd, packet: packet, to: resolved, sendProbe: FakeICMPNetwork.connectingSend)
         state.lock.withLock { state.sent[seq] = time }
         after?(seq, fd)
         return time

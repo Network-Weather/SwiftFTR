@@ -67,7 +67,7 @@ struct TransientSendRetryTests {
     for ttl in 1...30 {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,
-        sequence: UInt16(ttl), payloadSize: 56, retryDeadline: deadline)
+        sequence: UInt16(ttl), payloadSize: 56, retryDeadline: deadline, sendProbe: nil)
     }
 
     // The socket had no free space when the burst began, so these probes only
@@ -87,7 +87,7 @@ struct TransientSendRetryTests {
     let outcome = await sendOffThread {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,
-        sequence: 1, payloadSize: 56, retryDeadline: monotonicNow() + budget)
+        sequence: 1, payloadSize: 56, retryDeadline: monotonicNow() + budget, sendProbe: nil)
     }
     let (thrown, elapsed) = try #require(outcome, "the send was still retrying past its budget")
 
@@ -113,7 +113,7 @@ struct TransientSendRetryTests {
     let firstThrown = captureSendErrno {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,
-        sequence: 1, payloadSize: 56, retryDeadline: deadline)
+        sequence: 1, payloadSize: 56, retryDeadline: deadline, sendProbe: nil)
     }
     let first = monotonicNow() - firstStart
     #expect(firstThrown == EWOULDBLOCK)
@@ -129,7 +129,7 @@ struct TransientSendRetryTests {
     let secondThrown = captureSendErrno {
       try sendTraceProbe(
         sockfd: pair.writer, resolved: resolved, identifier: 0x1234,
-        sequence: 2, payloadSize: 56, retryDeadline: deadline)
+        sequence: 2, payloadSize: 56, retryDeadline: deadline, sendProbe: nil)
     }
     let second = monotonicNow() - secondStart
 
@@ -148,7 +148,8 @@ struct TransientSendRetryTests {
     let outcome = await sendOffThread {
       try sendTraceProbe(
         sockfd: -1, resolved: resolved, identifier: 0x1234,
-        sequence: 1, payloadSize: 56, retryDeadline: monotonicNow() + 15 * giveUpWatchdog)
+        sequence: 1, payloadSize: 56, retryDeadline: monotonicNow() + 15 * giveUpWatchdog,
+        sendProbe: nil)
     }
     let (thrown, _) = try #require(outcome, "a send of a fail-fast errno was still retrying")
 

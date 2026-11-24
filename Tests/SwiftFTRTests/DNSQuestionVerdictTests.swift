@@ -58,7 +58,9 @@ struct DNSQuestionVerdictTests {
 
     /// The reply to `query`, carrying its transaction ID.
     func datagram(_ query: [UInt8]) -> [UInt8] {
-      let typeOffset = DNSQuestionMatchTests.questionTypeOffset(query)
+      // A name of at least one label, so it has a byte 1 to change below.
+      guard let typeOffset = DNSQuestionMatchTests.questionTypeOffset(query), typeOffset > 14
+      else { return [] }
       let name = Array(query[12..<typeOffset])
       let typeClass = Array(query[typeOffset..<typeOffset + 4])
       var otherName = name
@@ -191,6 +193,29 @@ struct DNSQuestionVerdictTests {
       // Both waited out their deadlines.
       #expect(elapsed >= 2 * timeout * 0.95, "ended after \(elapsed)s")
     }
+  }
+
+  @Test("The scripted peer answers its query after a short and an empty stray queued ahead of it")
+  func peerIgnoresStrays() async throws {
+    // The shape script reads the query's question, so a stray shorter than one handed to it
+    // would end the test process (#169).
+    let gate = StallGate()
+    defer { gate.open() }
+    let name = "question.example"
+    let peer = try ScriptedDNSPeer(accepts: .dnsQuery(named: name), readsAfter: gate) { query in
+      [(Shape.matching.datagram(query), 0)]
+    }
+    defer { peer.stop() }
+    #expect(Strays.send(to: peer.port))
+    try #require(await eventually(within: 10) { peer.queued >= 2 }, "queued: \(peer.queued)")
+    gate.open()
+
+    let (answers, _) = try await measure(within: Self.watchdog) {
+      try await __dnsQuery(server: "127.0.0.1", port: peer.port, name: name, type: 1, timeout: 10)
+    }
+    #expect(!answers.isEmpty)
+    #expect(peer.requests.value == 1)
+    #expect(peer.ignored.value >= 2, "ignored: \(peer.ignored.value)")
   }
 
   // MARK: TXT lookups

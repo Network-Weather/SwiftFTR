@@ -98,7 +98,8 @@ struct SendBurstDegradationTests {
     #expect(throws: (any Error).self) {
       _ = try sendTraceBurst(
         sockfd: invalidDescriptor, resolved: resolved, identifier: 1, maxHops: 5,
-        payloadSize: 56, retryDeadline: monotonicNow() + 0.05, outstanding: &outstanding)
+        payloadSize: 56, retryDeadline: monotonicNow() + 0.05, sendProbe: nil,
+        outstanding: &outstanding)
     }
     #expect(outstanding.isEmpty)
   }
@@ -111,7 +112,8 @@ struct SendBurstDegradationTests {
     #expect(throws: (any Error).self) {
       _ = try sendTraceBurst(
         sockfd: invalidDescriptor, resolved: resolved, identifier: 1, maxHops: 3,
-        payloadSize: 56, retryDeadline: monotonicNow() + 0.05, outstanding: &outstanding)
+        payloadSize: 56, retryDeadline: monotonicNow() + 0.05, sendProbe: nil,
+        outstanding: &outstanding)
     }
   }
 
@@ -124,7 +126,8 @@ struct SendBurstDegradationTests {
 
     let unsent = try sendTraceBurst(
       sockfd: fd, resolved: resolved, identifier: 0x4242, maxHops: 5,
-      payloadSize: 56, retryDeadline: monotonicNow() + 0.25, outstanding: &outstanding)
+      payloadSize: 56, retryDeadline: monotonicNow() + 0.25, sendProbe: nil,
+      outstanding: &outstanding)
 
     #expect(unsent.isEmpty)
     #expect(outstanding.count == 5)

@@ -23,7 +23,8 @@ that fail when any phase can wait without a bound or strand its caller.
   overrides, all `nil` in production: the blocking-I/O executor, forward resolution, the ICMP
   socket factory used by trace and ping, IPv4 public-address discovery, a hook that holds
   `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping,
-  UDP exchange, TCP probe or UDP probe socket non-blocking, and for the event-based UDP transport (`UDPExchange`) its
+  UDP exchange, TCP probe or UDP probe socket non-blocking, the `sendto` a trace, stream or ping
+  sends its probes with, and for the event-based UDP transport (`UDPExchange`) its
   `send` and `close` calls and the DNS server port. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
@@ -34,6 +35,9 @@ that fail when any phase can wait without a bound or strand its caller.
   The trace sends its real echo requests to that peer, which replies with whatever a test scripts:
   silence, late replies, time-exceeded and echo replies, truncated or garbage datagrams, replies
   carrying another identifier. The trace's own receive loop and parser handle them unchanged.
+  Each probe socket is connected to its peer before its first send, through the send seam (Darwin
+  refuses a `sendto` that names an address on a connected datagram socket), so the kernel
+  delivers to it only what that peer sends, and the peer answers only sockets it made.
 - **Local fixtures for every other protocol.** TCP listeners that refuse, accept and stay silent,
   reset mid-response or answer slowly; an HTTP responder on the same listener; UDP responders for
   STUN and DNS that stay silent, answer late or answer garbage. All bind `127.0.0.1` or `::1` on an
@@ -92,7 +96,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails; for the probes, the result, nothing sent or connected, and the socket closed, against a pass-through control | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ReceiveLoop`, `ProbeNonBlockingSetupTests` |
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
-| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; refusing TCP port reserved; TCP `stop()` returns without waiting for its handlers and `stopAndWait()` joins them; a stopped UDP fixture's thread closes its own socket | fixtures | `Fixture` |
+| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; a probe socket connected to its fake network receiving only the network's datagrams, against an unconnected control; trace, stream and ping probe sockets connected through the send seam; a fake network answering only the sockets it made, bound by their first send or later; every UDP responder and counter (the shared responder, the scripted DNS peer, the held STUN server, the refusing-then-answering port, the UDP probe server and sink) answering or counting its request after a short and an empty stray queued ahead of it; the DNS query filter; refusing TCP port reserved; TCP `stop()` returns without waiting for its handlers and `stopAndWait()` joins them; a stopped UDP fixture's thread closes its own socket | fixtures | `Fixture` |
 
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`,
 `DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport,
@@ -513,13 +517,8 @@ Observations that are not defects of the library:
   handed the same number: `DNSWireHardeningTests.productionQueryRejectsInvalidHeaders` read a
   16-byte echo reply as its query, failed, and left the query to time out (once in 15 full debug
   runs; 5 of 5 with the ordering forced). `FakeICMPNetwork` now holds a duplicate of every socket
-  it opens until it stops, so the port number stays taken while it can still send, and the DNS
-  fixture answers only the query for the name its test asked about. The same exposure remains in
-  responders that take the first datagram that arrives, or count every one:
-  `LoopbackUDPResponder` (which counts and answers any datagram; several tests assert its exact
-  request count), `ScriptedDNSPeer`, `RefusingThenAnsweringUDPPort`, and the UDP probe tests'
-  `LoopbackUDPServer`. A late sender that can still reach them is `ScriptedDNSPeer`'s feed, which
-  keeps sending to the client's port from the moment the query ends until its test stops it.
+  it opens until it stops, so the port number stays taken while it can still send, and every
+  loopback responder takes only the datagram its test asked for (see the stray crash below).
 - **`--repeat-until fail` over several suites at once is not a valid gate: it slows loopback for
   the whole host.** It repeats every test on its own and in parallel, so the quick ones run flat
   out together. Run with the filter `DNSWireHardeningTests|FaultInjection|PingReplyMatching`, it
@@ -544,8 +543,13 @@ Observations that are not defects of the library:
   --filter '<suites>' || break; done` passed 30 of 30 on main and on the branch, and 15 of 15
   each under `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`. The tests themselves still assume a
   loopback answer within 0.3 to 0.5 s, a wall-clock bound in disguise that a loaded host breaks.
-  Only the three `DNSWireHardeningTests` queries the fixture must answer have been given a
-  generous timeout so far (below).
+  The rule they now follow, file by file (#103): a call the fixture must answer gets a generous
+  timeout that the answer ends; a count of what a fixture saw is awaited, not read when the call
+  returns; a ping or trace whose result depends on which replies land inside a short window is
+  restaged so that it does not. A call whose own timeout is the thing tested keeps it short.
+  Measured by running `DNSWireHardeningTests|FaultInjection|PingReplyMatching|TCPProbeTests|
+  AsyncPublicIP|UDPProbeBinding` as whole runs while a second process runs the repeated filter
+  from a main worktree, and counting the issues in the files a change touched.
 - **A `DNSWireHardeningTests` query timed out because its responder started late.** The fixture's
   responder starts from a `Task`, so it first needs a cooperative-pool thread. Repeated under
   `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, 187 of 1,507 responders entered more than 0.1 s late
@@ -554,12 +558,50 @@ Observations that are not defects of the library:
   `productionQueryRejectsInvalidHeaders`, whose queries had 0.5 s. Delaying the responder by
   0.6 s failed all four of their cases with that signature. The three queries the fixture must answer now
   take `answeredQueryTimeout` (10 s); the answer ends them, so a passing run waits no longer.
-- **A short stray datagram crashes the test process through a DNS fault script.**
-  `FaultInjectionWireTests.dnsFaults` builds its replies with `dnsResponse(to:)`, which writes
+- **A short stray datagram crashed the test process through a fixture's script** (#169).
+  `FaultInjectionWireTests.dnsFaults` built its replies with `dnsResponse(to:)`, which wrote
   bytes 2, 3, 6 and 7 of whatever datagram reached the responder, so a stray under 8 bytes (a
-  STUN or DNS "garbage" reply, a zero-byte request) traps with "Index out of range" and ends
-  every test in the process. It happened in 4 of about 70 repeated runs, on main and on this
-  branch, while loopback was slow enough that late replies reached recycled ports. Another
-  suite's run on the same machine trapped the same way in
-  `DNSQuestionMatchTests.questionTypeOffset`, reached through `ScriptedDNSPeer` from
-  `DNSQuestionVerdictTests`. Not fixed.
+  silent STUN server's 4-byte garbage, an empty probe) trapped with "Index out of range" and
+  ended every test in the process: 4 of about 70 repeated runs, while loopback was slow enough
+  that late datagrams reached recycled ports. `DNSQuestionMatchTests.questionTypeOffset`, reached
+  through `ScriptedDNSPeer` from `DNSQuestionVerdictTests`, trapped the same way. A 4-byte
+  datagram sent to either fixture reproduced both traps on demand. Fixed by one rule for every
+  loopback responder: a `DatagramFilter` names the one request it takes (a DNS query for the
+  test's name, a STUN binding request, the test's own payload), and everything else, empty
+  datagrams included, is counted as ignored and never answered, counted as a request or handed
+  to a script. `LoopbackUDPResponder`, `ScriptedDNSPeer`, `HeldUDPServer`,
+  `RefusingThenAnsweringUDPPort`, the UDP probe tests' `LoopbackUDPServer` and `DatagramSink`
+  follow it, and the shared DNS readers check lengths rather than index past a short datagram.
+  Each has a test that queues a short and an empty stray ahead of its request (confirmed with
+  `SO_NUMRCVPKT`, the fixture's first read held behind a gate) and fails when the filter is
+  bypassed. `ScriptedDNSPeer`'s feed, which kept sending to the client's port after the query
+  ended, now stops, under its send lock, before the query's socket closes (through the
+  transport's close seam), and the peer holds a duplicate of that socket until it stops.
+- **Strays that remain possible.** None can reach a probe socket: each is connected to its fake
+  network, and a connected datagram socket receives only from its peer (a short and an empty
+  stray from another socket: `SO_NUMRCVPKT` 1, the network's reply alone, against 3 unconnected),
+  and the fake network answers only sockets it made, so another test's late request is neither
+  counted nor scripted. Tests that count what is queued on a probe socket can therefore count
+  exactly. Strays can still reach the unconnected sides: a fixture's port, and a test-side
+  client socket. A fixture that holds a port releases it once it stops sending, but a datagram
+  it sent just before can still be in flight on a loaded host (round trips of 200 to 750 ms were
+  measured) and land on the next socket handed that number; `FakeICMPNetwork`'s replies and
+  `EndlessReplies`' feed, at 500 a second, are the largest sources. `HeldUDPServer` answers its held clients with a 4-byte datagram when released, which
+  reaches a client only while its STUN attempt is still blocked in `recv`: every test that
+  releases one with attempts outstanding gives them a 60 s receive timeout, and the one whose
+  attempts have 0.2 s asserts that none reached the server. Receivers no longer act on such
+  datagrams, and a DNS filter given no name still takes another test's late query: the tests
+  that assert an exact request count name their query.
+- **The wire tests waited on loopback inside sub-second budgets** (#103). Under that load
+  `FaultInjectionWireTests` recorded issues in 9 of 10 runs on main (93 issues), 3 of 10 with
+  `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`: DNS error replies, the open TCP port and the refusing
+  UDP port arrived after their 0.3 to 1 s timeouts and were reported as timeouts, and request
+  and connection counts were read before the fixture's thread had counted. Every call the
+  fixture answers now has a 10 s timeout its answer ends; an HTTP fault the server itself ends
+  (refusal, reset, close) has a timeout past the watchdog, so a probe that missed it trips the
+  watchdog; counts are awaited. A silent DNS or STUN server keeps 0.3 s. An HTTP server that
+  accepts and stays silent, or answers after the watchdog, keeps a timeout the test is about, and
+  that timeout starts before URLSession has connected: at 0.5 s the server had not accepted when
+  the probe gave up in 3 of 20 loaded runs (6 cases), so it is 3 s, which still depends on connecting
+  within it; a hook at the accept would remove that. The compression-loop reply is now required
+  to be `malformedResponse`, not any `DNSError`.
