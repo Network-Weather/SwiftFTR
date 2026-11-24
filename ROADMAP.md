@@ -42,7 +42,7 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
 - **A tripwire that keeps the offline selection offline**: nothing stops a new test from reaching
   the network with `SKIP_NETWORK_TESTS=1` set (the #92 sweep found 20 that did). A test-only flag
   in `TestSeams`, set when that variable is, would make the real forward resolver, ICMP socket,
-  public-IP discovery, `getnameinfo`, DNS send and URLSession paths record a test issue when
+  public-IP discovery, reverse-DNS daemon query, DNS send and URLSession paths record a test issue when
   entered without a substitute. It needs a check on each real path in `Sources/`, so it waits for a
   release that may touch them. Running the suite under `sandbox-exec` with outbound network denied
   catches only leaks whose test then fails: 2 of the 20.
