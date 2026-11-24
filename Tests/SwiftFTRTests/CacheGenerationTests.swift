@@ -180,7 +180,8 @@ struct CacheGenerationTests {
   func tracerScopedEviction() async {
     // Lookups answer from a local stub, so populating the cache sends no reverse-DNS query.
     let tracer = SwiftFTR(
-      config: SwiftFTRConfig(noReverseDNS: false), rdnsCache: RDNSCache { _, _ in .answer("name.example") },
+      config: SwiftFTRConfig(noReverseDNS: false),
+      rdnsCache: RDNSCache { _, _ in .answer("name.example") },
       asnResolver: EmptyASNResolver(), publicIPCache: [:])
     _ = await tracer.rdnsCache.lookup("192.168.1.1")
     _ = await tracer.rdnsCache.lookup("1.1.1.1")
