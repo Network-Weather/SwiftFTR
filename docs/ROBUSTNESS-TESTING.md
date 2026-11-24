@@ -23,7 +23,8 @@ that fail when any phase can wait without a bound or strand its caller.
   overrides, all `nil` in production: the blocking-I/O executor, forward resolution, the ICMP
   socket factory used by trace and ping, IPv4 public-address discovery, a hook that holds
   `discoverPaths` at the step where it commits its result, the `fcntl` that makes a trace, ping,
-  UDP exchange, TCP probe or UDP probe socket non-blocking, and for the event-based UDP transport (`UDPExchange`) its
+  UDP exchange, TCP probe or UDP probe socket non-blocking, the `sendto` a trace, stream or ping
+  sends its probes with, and for the event-based UDP transport (`UDPExchange`) its
   `send` and `close` calls and the DNS server port. Task-locals
   scope an override to the test task and its children, so no test touches process-wide state and
   parallel tests cannot see each other's overrides. Production behavior is unchanged when they are
@@ -34,6 +35,9 @@ that fail when any phase can wait without a bound or strand its caller.
   The trace sends its real echo requests to that peer, which replies with whatever a test scripts:
   silence, late replies, time-exceeded and echo replies, truncated or garbage datagrams, replies
   carrying another identifier. The trace's own receive loop and parser handle them unchanged.
+  Each probe socket is connected to its peer before its first send, through the send seam (Darwin
+  refuses a `sendto` that names an address on a connected datagram socket), so the kernel
+  delivers to it only what that peer sends, and the peer answers only sockets it made.
 - **Local fixtures for every other protocol.** TCP listeners that refuse, accept and stay silent,
   reset mid-response or answer slowly; an HTTP responder on the same listener; UDP responders for
   STUN and DNS that stay silent, answer late or answer garbage. All bind `127.0.0.1` or `::1` on an
@@ -92,7 +96,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Concurrency | many simultaneous operations on one tracer and across tracers under faults, with a network change mid-flight | trace, traceClassified | `Enrichment` |
 | Non-blocking switch | either `fcntl` call that sets `O_NONBLOCK` fails; for the probes, the result, nothing sent or connected, and the socket closed, against a pass-through control | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ReceiveLoop`, `ProbeNonBlockingSetupTests` |
 | Receive loop | a socket that never reports it is empty, fed well-formed replies for another identifier: the deadline, cancellation, ping's sends and a stream's retry still happen, and valid replies among them are recorded; a backlog longer than one read callback is read to the end; the socket is closed when the operation returns | trace, traceStream, ping | `ReceiveLoop` |
-| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; every UDP responder and counter (the shared responder, the scripted DNS peer, the held STUN server, the refusing-then-answering port, the UDP probe server and sink) answering or counting its request after a short and an empty stray queued ahead of it; the DNS query filter; refusing TCP port reserved; TCP `stop()` returns without waiting for its handlers and `stopAndWait()` joins them; a stopped UDP fixture's thread closes its own socket | fixtures | `Fixture` |
+| The fixtures themselves | stall gate release rules; the watchdog; zero-byte UDP; a probe socket connected to its fake network receiving only the network's datagrams, against an unconnected control; trace, stream and ping probe sockets connected through the send seam; a fake network answering only the sockets it made, bound by their first send or later; every UDP responder and counter (the shared responder, the scripted DNS peer, the held STUN server, the refusing-then-answering port, the UDP probe server and sink) answering or counting its request after a short and an empty stray queued ahead of it; the DNS query filter; refusing TCP port reserved; TCP `stop()` returns without waiting for its handlers and `stopAndWait()` joins them; a stopped UDP fixture's thread closes its own socket | fixtures | `Fixture` |
 
 Test suites are `FaultInjection<Name>Tests`, plus `EventBasedDNSTests`, `DNSProbeOutcomeTests`,
 `DNSForeignReplyTests` and `DNSErrorReplyValidationTests` for the event-based DNS transport,
@@ -573,11 +577,16 @@ Observations that are not defects of the library:
   bypassed. `ScriptedDNSPeer`'s feed, which kept sending to the client's port after the query
   ended, now stops, under its send lock, before the query's socket closes (through the
   transport's close seam), and the peer holds a duplicate of that socket until it stops.
-- **Strays that remain possible.** A fixture that holds a port releases it once it stops
-  sending, but a datagram it sent just before can still be in flight on a loaded host (round
-  trips of 200 to 750 ms were measured) and land on the next socket handed that number:
-  `FakeICMPNetwork`'s replies and `EndlessReplies`' feed, at 500 a second, are the largest
-  sources. `HeldUDPServer` answers its held clients with a 4-byte datagram when released, which
+- **Strays that remain possible.** None can reach a probe socket: each is connected to its fake
+  network, and a connected datagram socket receives only from its peer (a short and an empty
+  stray from another socket: `SO_NUMRCVPKT` 1, the network's reply alone, against 3 unconnected),
+  and the fake network answers only sockets it made, so another test's late request is neither
+  counted nor scripted. Tests that count what is queued on a probe socket can therefore count
+  exactly. Strays can still reach the unconnected sides: a fixture's port, and a test-side
+  client socket. A fixture that holds a port releases it once it stops sending, but a datagram
+  it sent just before can still be in flight on a loaded host (round trips of 200 to 750 ms were
+  measured) and land on the next socket handed that number; `FakeICMPNetwork`'s replies and
+  `EndlessReplies`' feed, at 500 a second, are the largest sources. `HeldUDPServer` answers its held clients with a 4-byte datagram when released, which
   reaches a client only while its STUN attempt is still blocked in `recv`: every test that
   releases one with attempts outstanding gives them a 60 s receive timeout, and the one whose
   attempts have 0.2 s asserts that none reached the server. Receivers no longer act on such

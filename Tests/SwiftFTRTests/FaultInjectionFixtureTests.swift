@@ -392,6 +392,176 @@ struct FaultInjectionFixtureTests {
       "the port stayed taken after the network stopped")
   }
 
+  /// An echo request for `seq`, as the library sends one on a datagram socket.
+  static func echoRequest(seq: UInt16) -> [UInt8] {
+    [8, 0, 0, 0, 0x12, 0x34, UInt8(seq >> 8), UInt8(seq & 0xFF)] + [UInt8](repeating: 0, count: 8)
+  }
+
+  /// Sends `bytes` to the network on `fd` as the library would, through `send` (the isolating
+  /// send, or plain `sendto` when `nil`).
+  static func sendProbe(
+    _ bytes: [UInt8], on fd: Int32, to network: FakeICMPNetwork, with send: TestSeams.SendProbe?
+  ) -> Int {
+    var address = network.resolved.address
+    let length = network.resolved.addressLen
+    return bytes.withUnsafeBytes { raw in
+      withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+          if let send { return send(fd, raw, sa, length) }
+          return sendto(fd, raw.baseAddress, raw.count, 0, sa, length)
+        }
+      }
+    }
+  }
+
+  static func localPort(_ fd: Int32) -> UInt16 {
+    var local = sockaddr_storage()
+    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    _ = withUnsafeMutablePointer(to: &local) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(fd, $0, &length) }
+    }
+    return withUnsafeBytes(of: local) {
+      UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self))
+    }
+  }
+
+  @Test(
+    "A probe socket the fake network connects receives only what the network sends",
+    arguments: [true, false])
+  func isolatedProbeSocketRefusesStrays(isolated: Bool) async throws {
+    // Isolated: the socket is connected to the network on its first send, so the kernel refuses
+    // a short and an empty stray from other sockets; each stray's sender is connected to the
+    // probe's port, so a refusal comes back to it as ECONNREFUSED. Not isolated (main's
+    // behaviour, the control): both strays are queued beside the network's own reply.
+    let network = try FakeICMPNetwork { _ in [] }
+    defer { network.stop() }
+    let probe = try network.makeSocket(AF_INET)
+    defer { close(probe) }
+    let send = isolated ? FakeICMPNetwork.connectingSend : nil
+    let request = Self.echoRequest(seq: 1)
+    #expect(Self.sendProbe(request, on: probe, to: network, with: send) == request.count)
+    #expect(await eventually(within: 10) { network.probes.value == 1 })
+
+    // A sender of its own per stray, each connected to the probe's port: a refusal of the first
+    // would otherwise come back as the second send's error, though isolation had worked.
+    var senders: [Int32] = []
+    defer { for sender in senders { close(sender) } }
+    var (address, length) = loopbackAddress(family: AF_INET, port: Self.localPort(probe))
+    for datagram in [Strays.short, Strays.empty] {
+      let sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+      try #require(sender >= 0)
+      senders.append(sender)
+      let connected = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(sender, $0, length) }
+      }
+      try #require(connected == 0)
+      #expect(datagram.withUnsafeBytes { Darwin.send(sender, $0.baseAddress, $0.count, 0) } >= 0)
+    }
+    #expect(
+      network.inject(.init(ICMPWire.echoReply(family: AF_INET, id: 0x1234, seq: 1)), to: probe))
+
+    if isolated {
+      // The refusal ends the wait as soon as it comes back. ICMP errors are rate-limited host
+      // wide, so on a loaded host it may not come, and the wait then ends at its bound: a stray
+      // still in flight after it would go unseen, which can only let this pass, never fail it.
+      let strays = senders
+      let refused = await eventually(within: 2) {
+        strays.allSatisfy { sender in
+          var byte: UInt8 = 0
+          return recv(sender, &byte, 1, MSG_DONTWAIT) < 0 && errno == ECONNREFUSED
+        }
+      }
+      #expect(await eventually(within: 10) { queuedDatagrams(probe) >= 1 })
+      #expect(
+        queuedDatagrams(probe) == 1,
+        "queued: \(queuedDatagrams(probe)), stray refused: \(refused)")
+    } else {
+      #expect(
+        await eventually(within: 10) { queuedDatagrams(probe) == 3 },
+        "queued: \(queuedDatagrams(probe))")
+    }
+  }
+
+  @Test("A fake network answers only the sockets it made, however they were bound")
+  func fakeNetworkAnswersOnlyItsOwnSockets() async throws {
+    let network = try FakeICMPNetwork { probe in
+      [.init(ICMPWire.echoReply(family: AF_INET, id: probe.identifier, seq: probe.sequence))]
+    }
+    defer { network.stop() }
+    // Bound by its first send, as the library leaves it.
+    let implicit = try network.makeSocket(AF_INET)
+    defer { close(implicit) }
+    // Bound after the network made it, as the library does with a source address.
+    let late = try network.makeSocket(AF_INET)
+    defer { close(late) }
+    var (any, anyLength) = loopbackAddress(family: AF_INET, port: 0)
+    _ = withUnsafePointer(to: &any) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(late, $0, anyLength) }
+    }
+    // Another test's socket, sending to this network's port.
+    let stranger = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    defer { close(stranger) }
+    let request = Self.echoRequest(seq: 1)
+    for fd in [stranger, implicit, late] {
+      #expect(Self.sendProbe(request, on: fd, to: network, with: nil) == request.count)
+    }
+    #expect(
+      await eventually(within: 10) { network.probes.value == 2 && network.foreignProbes.value == 1 }
+    )
+    #expect(network.probes.value == 2, "probes: \(network.probes.value)")
+    #expect(network.foreignProbes.value == 1, "foreign: \(network.foreignProbes.value)")
+    // Two replies in all, so none went to the stranger.
+    #expect(await eventually(within: 10) { network.repliesSent.value == 2 })
+    let settled = await eventually(within: 0.5) { network.repliesSent.value > 2 }
+    #expect(!settled, "replies: \(network.repliesSent.value)")
+  }
+
+  enum Operation: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case trace, stream, ping
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "Trace, stream and ping send through the isolating send, so their probe sockets are connected",
+    arguments: Operation.allCases)
+  func operationsConnectTheirProbeSockets(operation: Operation) async throws {
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 1))
+    defer { network.stop() }
+    // A duplicate of every probe socket, kept past the operation's close to ask its peer.
+    let copies = DescriptorCopies()
+    defer { for fd in copies.all { close(fd) } }
+    let factory: TestSeams.MakeICMPSocket = { family in
+      let fd = try network.makeSocket(family)
+      copies.add(dup(fd))
+      return fd
+    }
+    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 60_000, noReverseDNS: true))
+    _ = try await measure(within: 20) {
+      try await network.install(socketFactory: factory) {
+        switch operation {
+        case .trace: _ = try await tracer.trace(to: "fake.test")
+        case .stream:
+          for try await _ in tracer.traceStream(
+            to: "fake.test", config: StreamingTraceConfig(probeTimeout: 60, maxHops: 1))
+          {}
+        case .ping:
+          _ = try await tracer.ping(to: "fake.test", config: PingConfig(count: 1, timeout: 60))
+        }
+      }
+    }
+    let fds = copies.all
+    try #require(fds.count == 1, "sockets made: \(fds.count)")
+    var peer = sockaddr_storage()
+    var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+    let connected = withUnsafeMutablePointer(to: &peer) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fds[0], $0, &length) }
+    }
+    #expect(connected == 0, "the \(operation) probe socket was not connected")
+    #expect(
+      withUnsafeBytes(of: peer) { UInt16(bigEndian: $0.load(fromByteOffset: 2, as: UInt16.self)) }
+        == network.port)
+  }
+
   @Test("A stopped UDP fixture's own thread closes its socket")
   func udpFixtureThreadClosesItsSocket() async throws {
     let responder = try LoopbackUDPResponder(accepts: .payload([])) { _ in nil }
@@ -406,4 +576,13 @@ struct FaultInjectionFixtureTests {
     }
     #expect(released, "a serve thread did not close its socket")
   }
+}
+
+/// Descriptors a socket factory duplicated, for a test to inspect after the operation closed its own.
+private final class DescriptorCopies: @unchecked Sendable {
+  private let lock = NSLock()
+  private var fds: [Int32] = []
+
+  func add(_ fd: Int32) { lock.withLock { fds.append(fd) } }
+  var all: [Int32] { lock.withLock { fds } }
 }
