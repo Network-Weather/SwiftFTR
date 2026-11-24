@@ -627,40 +627,22 @@ Observations that are not defects of the library:
   send loop enqueues each send and sleeps on its own, so a hook cannot keep probe 2 back until a
   reply is read. Its reply is now injected (one loopback crossing, not two) and its interval is
   2 s, which still has to outlast delivery; a seam on the send loop's sleep would remove that.
-- **The receive-loop deadline tests' feed started too late to feed anything** (#103). Under that
-  load `traceDeadline` and `streamDeadline` failed with "sent 0 -> 0": `EndlessReplies` began its
-  replies when the fake network saw the first probe, and that probe crossed loopback after the
-  0.3 s window had closed. The two strict failures reported earlier (294 replies sent, 4 read) are
-  the same start, landing just before the window closed; the sent count is read after the trace
-  returns, while the feed runs on. The replies now start as the probe socket is made, and the
-  socket is handed over only once ten are queued, so it is fed when the window opens. The
-  priming wait sits inside the operation's call, so the "not early" bounds of the trace, stream
-  and ping deadline tests are measured from the handover, stamped in the socket factory, rather
-  than from the start of the run. They are
-  echo replies for sequence 0, which no trace, stream or ping sends, so they need no identifier
-  from the operation. Whether the operation read is observed, not inferred:
-  the feed sends an exact batch, the socket is handed over only once that batch is queued whole,
-  and nothing more is sent until it shrinks, which only the operation's read can cause. A count
-  of sent minus queued, used before, took replies still in flight for reads, so with the feed
-  started before the handover a cancellation test could cancel during setup and pass (forced
-  with replies held in flight and the factory held for 3 s).
-  `FaultInjectionProbeWindowTests.unreachableReported` needed three unreachable replies inside
-  0.3 s; hops 1 and 2 now answer unreachable and hop 3 is the destination, with a window past the
-  watchdog, so only the destination's reply ends the trace. Two counts of the probes the fake
-  network saw, read as the trace or ping returned, are now awaited. Under that load these two files
-  recorded issues in 9 of 10 runs on main (20 issues), 2 of 10 strict.
-- **Whether a receive loop's socket ran dry is observed at the receiver** (#103). The deadline
-  tests' premise that the socket never ran dry was counted at the fixture's sends: a sender
-  descheduled past the one-second receive timeout let a read come back empty, and the overdue
-  deadline then ended the operation, while the fixture's own bookkeeping still looked fed. The three
-  reads of a probe socket in the library (`recvmsg` and `recvfrom` in `recvTraceMessage`, `recvmsg`
-  in ping) now go through `TestSeams.observeProbeReceive` when one is bound, so `EndlessReplies`
-  counts, on the operation's own queue, the reads that returned a datagram and those that found the
-  socket empty. `heldReading` requires a read past the primed batch (one fed reply read) and no
-  empty read; a count of reads in the window would be a loopback-throughput budget again (11 to 17
-  reads in 0.3 s under load). With the feed paused for 1.5 s after the first read, the tests now
-  fail on "reads 10, empty reads 1"; under the unbounded drain fixed in 29716fc they still outlive
-  their watchdog.
+- **The receive-loop tests waited on loopback and inferred what the operation did** (#103). Under
+  that load `traceDeadline` and `streamDeadline` failed with "sent 0 -> 0": `EndlessReplies` started
+  its feed only when the fake network saw the first probe, which crossed loopback after the 0.3 s
+  window had closed (the strict "294 sent, 4 read" failures were the same start, just before it
+  closed). The feed now starts as the probe socket is made, with an exact batch of echo replies for
+  sequence 0, which no operation sends, and the socket is handed over only once the batch is queued
+  whole. Nothing is inferred from the fixture's side: the operation's first read is the batch
+  shrinking, and its every read passes through `TestSeams.observeProbeReceive` (the three
+  probe-socket reads in the library), so `heldReading` asks for a read past the batch and no empty
+  read, counted on the operation's own queue. Sent minus queued had taken replies in flight for
+  reads, and the sender's pace had hidden a read that came back empty. Bounds are measured from the
+  handover: "not early" from it, and each upper bound from it too, with the factory's priming under
+  its own allowance, so pingDeadline still tells its reply window from its 5.8 s safety timer.
+  `unreachableReported` ends on a destination reply instead of needing three replies within 0.3 s,
+  and two probe counts are awaited. Under that load these files recorded issues in 9 of 10 runs on
+  main (20 issues), 2 of 10 strict.
 - **Two fixture and probe tests assumed a quiet host** (#103). `ProbeTests.testClosedPort` probed
   port 9999 on the assumption that nothing listens there and required the reset within 100 ms, a
   wall-clock upper bound that failed even unloaded (rtt 0.155 s in a release run; 5 of 60

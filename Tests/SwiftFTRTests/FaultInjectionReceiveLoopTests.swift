@@ -42,6 +42,10 @@ final class EndlessReplies: @unchecked Sendable {
   private let receiveTimeout: TimeInterval = 1
   /// Replies queued on the probe socket before it is handed to the operation.
   static let primed: Int32 = 10
+  /// The longest the factory waits for that batch to arrive: setup, timed apart from the
+  /// operation, so a watchdog around a call that includes it adds this and checks its own bound
+  /// from the handover.
+  static let primingAllowance: TimeInterval = 10
   private let lock = NSLock()
   private var started = false
   private var stopped = false
@@ -123,7 +127,7 @@ final class EndlessReplies: @unchecked Sendable {
       startFeed()
       // Waiting for replies that have to cross loopback, not for the operation, which has not
       // sent anything yet. Bounded, and a short wait on a thread the call already holds.
-      let giveUp = monotonicNow() + 10
+      let giveUp = monotonicNow() + Self.primingAllowance
       while queuedDatagrams(fd) < Self.primed, monotonicNow() < giveUp { usleep(1000) }
       // Exactly the batch: the socket hears only the network, and the feed sends nothing more
       // until the operation has read.
@@ -363,6 +367,9 @@ struct FaultInjectionReceiveLoopTests {
 
   /// Generous: an operation that is not held returns within its own window plus scheduling.
   static let watchdog: TimeInterval = 10
+  /// The watchdog around a call that also makes its socket: ``watchdog`` plus the priming the
+  /// factory may wait for. A bound on the operation itself is checked from the handover.
+  static let setupWatchdog = watchdog + EndlessReplies.primingAllowance
 
   // MARK: Trace
 
@@ -377,7 +384,7 @@ struct FaultInjectionReceiveLoopTests {
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: Int(window * 1000), noReverseDNS: true))
 
-    let (result, elapsed) = try await measure(within: Self.watchdog) {
+    let (result, elapsed) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network, descriptors: descriptors) {
         try await tracer.trace(to: "fake.test")
       }
@@ -389,6 +396,7 @@ struct FaultInjectionReceiveLoopTests {
     // From the handover, not the run's start, which includes priming the socket.
     let ran = try #require(replies.sinceHandover(until: ended))
     #expect(ran >= window * 0.9, "the trace ended \(ran)s after its socket, \(elapsed)s in all")
+    #expect(ran < Self.watchdog, "the trace ran \(ran)s after its socket")
     #expect(!result.reached)
     #expect(result.hops.count == 4)
     #expect(result.hops.allSatisfy { $0.outcome == .timedOut })
@@ -412,7 +420,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: Self.watchdog) { replies.traffic().readSeen },
+      await eventually(within: Self.setupWatchdog) { replies.traffic().readSeen },
       "the trace never read the replies: \(replies.traffic())")
     trace.cancel()
 
@@ -438,7 +446,7 @@ struct FaultInjectionReceiveLoopTests {
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 6, maxWaitMs: 5000, noReverseDNS: true))
 
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network) { try await tracer.trace(to: "fake.test") }
     }
     let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
@@ -449,6 +457,10 @@ struct FaultInjectionReceiveLoopTests {
     #expect(result.hops.count == 3)
     #expect(result.hops.allSatisfy { $0.ipAddress != nil })
   }
+
+  /// The longest the backlog factory waits for its backlog to be queued: setup, which the
+  /// watchdog around the trace adds.
+  static let backlogAllowance: TimeInterval = 5
 
   @Test("A backlog longer than one read callback is read to the end without new arrivals")
   func traceReadsWholeBacklog() async throws {
@@ -483,7 +495,7 @@ struct FaultInjectionReceiveLoopTests {
       // Loopback delivers on its own thread, so wait until every datagram is queued. Count
       // datagrams, not bytes: Darwin's FIONREAD on a datagram socket includes each datagram's
       // address, so a byte count is reached with only part of the backlog queued.
-      let giveUp = monotonicNow() + 5
+      let giveUp = monotonicNow() + Self.backlogAllowance
       var queued: Int32 = 0
       repeat {
         var optionLength = socklen_t(MemoryLayout<Int32>.size)
@@ -502,7 +514,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 1, maxWaitMs: 5000, noReverseDNS: true))
 
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.watchdog + Self.backlogAllowance) {
       try await network.install(socketFactory: preloaded) {
         try await tracer.performTrace(
           to: "fake.test", handle: TraceHandle(), flowIdentifier: identifier)
@@ -534,7 +546,7 @@ struct FaultInjectionReceiveLoopTests {
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
     let config = StreamingTraceConfig(probeTimeout: 0.3, retryAfter: nil, maxHops: 4)
 
-    let (hops, elapsed) = try await measure(within: Self.watchdog) {
+    let (hops, elapsed) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network, descriptors: descriptors) {
         var hops: [StreamingHop] = []
         for try await hop in tracer.traceStream(to: "fake.test", config: config) {
@@ -552,6 +564,7 @@ struct FaultInjectionReceiveLoopTests {
     #expect(
       ran >= config.probeTimeout * 0.9,
       "the stream ended \(ran)s after its socket, \(elapsed)s in all")
+    #expect(ran < Self.watchdog, "the stream ran \(ran)s after its socket")
     #expect(hops.map(\.ttl).sorted() == Array(1...4), "one placeholder per TTL")
     #expect(hops.allSatisfy { $0.ipAddress == nil })
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
@@ -575,7 +588,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: Self.watchdog) { replies.traffic().readSeen },
+      await eventually(within: Self.setupWatchdog) { replies.traffic().readSeen },
       "the stream never read the replies: \(replies.traffic())")
     // Cancels the producer, not the consumer: a cancelled consumer stops waiting on its own,
     // which would prove nothing about the receive loop.
@@ -606,7 +619,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     defer { consumer.cancel() }
     // Four initial probes, then the retry re-sends TTLs 1...3.
-    let retried = await eventually(within: Self.watchdog) { network.probes.value == 7 }
+    let retried = await eventually(within: Self.setupWatchdog) { network.probes.value == 7 }
     let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
     await tracer.cancelActiveTraces()
     _ = try await measure(within: Self.watchdog) { await consumer.result }
@@ -625,7 +638,7 @@ struct FaultInjectionReceiveLoopTests {
     let tracer = offlineTracer(SwiftFTRConfig(noReverseDNS: true))
     let config = StreamingTraceConfig(probeTimeout: 5, retryAfter: nil, maxHops: 5)
 
-    let (hops, _) = try await measure(within: Self.watchdog) {
+    let (hops, _) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network) {
         var hops: [StreamingHop] = []
         for try await hop in tracer.traceStream(to: "fake.test", config: config) {
@@ -656,13 +669,16 @@ struct FaultInjectionReceiveLoopTests {
     let descriptors = DescriptorLog()
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.05, timeout: 0.3)
-    // Ping also arms a safety timer, at twice its whole schedule plus 5 s (5.8 s here). A ping
-    // that never moved its deadline to the last probe's reply window would end on that timer, so
-    // the watchdog sits a second below it.
+    // Ping also arms a safety timer when it starts, at twice its whole schedule plus 5 s (5.8 s
+    // here). A ping that never moved its deadline to the last probe's reply window would end on
+    // that timer, so the bound checked from the handover sits a second below it; the watchdog
+    // around the call adds the priming the factory may wait for.
     let schedule = Double(config.count - 1) * config.interval + config.timeout
     let safetyBudget = 2 * schedule + 5
 
-    let (result, elapsed) = try await measure(within: safetyBudget - 1) {
+    let (result, elapsed) = try await measure(
+      within: safetyBudget - 1 + EndlessReplies.primingAllowance
+    ) {
       try await replies.install(network, descriptors: descriptors) {
         try await tracer.ping(to: "fake.test", config: config)
       }
@@ -684,6 +700,7 @@ struct FaultInjectionReceiveLoopTests {
     #expect(
       ran >= 2 * config.interval + config.timeout * 0.9,
       "returned \(ran)s after its socket, \(elapsed)s in all")
+    #expect(ran < safetyBudget - 1, "returned \(ran)s after its socket: on its safety timer")
     #expect(descriptors.opened == 1 && descriptors.allClosed, "the probe socket was left open")
   }
 
@@ -705,7 +722,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: Self.watchdog) { replies.traffic().readSeen },
+      await eventually(within: Self.setupWatchdog) { replies.traffic().readSeen },
       "the ping never read the replies: \(replies.traffic())")
     ping.cancel()
 
@@ -732,7 +749,7 @@ struct FaultInjectionReceiveLoopTests {
     let tracer = offlineTracer(SwiftFTRConfig())
     let config = PingConfig(count: 3, interval: 0.1, timeout: 2)
 
-    let (result, _) = try await measure(within: Self.watchdog) {
+    let (result, _) = try await measure(within: Self.setupWatchdog) {
       try await replies.install(network) { try await tracer.ping(to: "fake.test", config: config) }
     }
     let flow = replies.heldReading(minimumReads: Int(EndlessReplies.primed) + 1)
