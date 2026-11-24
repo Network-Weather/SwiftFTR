@@ -218,37 +218,42 @@ struct PingReplyMatchingTests {
 
   @Test("A reply to a sequence not yet sent is not counted for it", arguments: families)
   func futureSequenceIsNotCounted(family: Int32) async throws {
-    // Right after probe 1 leaves, a reply for sequence 2, marked to be ignored, is queued on the
-    // probe socket, before probe 2 can be sent (both happen on the ping's queue). Whether the ping
-    // reads that reply before or after probe 2 leaves, it answered nothing sent. Every probe is
-    // then answered, so the ping ends on its third real reply and no reply window is involved: a
-    // ping that took the early reply for probe 2 would keep its mark and drop the real one.
+    // Right after probe 1 leaves, a reply for sequence 2 is queued on the probe socket, before
+    // probe 2 is sent. Probe 2 itself is never answered, so no genuine reply can stand in for a
+    // false match: a ping that took the early reply would show probe 2 answered. Probe 2 leaves
+    // only once probe 1's reply and the early one are both queued, so both are read inside its
+    // window however slow loopback is.
     let ping = try DirectPing(
-      family: family, config: PingConfig(count: 3, interval: 0.05, timeout: Self.windowPastWatchdog)
+      family: family, config: PingConfig(count: 2, interval: 0.05, timeout: 0.5)
     ) { probe in
-      [Self.reply(family, id: probe.identifier, seq: probe.sequence)]
+      probe.sequence == 1 ? [Self.reply(family, id: probe.identifier, seq: 1)] : []
     }
     defer { ping.stop() }
     ping.afterSend = { seq, fd in
       guard seq == 1 else { return }
-      // Probe 1's own reply, still unread behind this hook, would meet a bare "one queued" while
-      // the injected reply is in flight; if probe 2's send ran late enough to follow at once,
-      // that reply would then land after it and be kept. Wait for the injected reply itself.
-      let injected = ping.network.inject(
-        Self.reply(family, id: DirectPing.identifier, seq: 2, mark: Self.ignored), to: fd)
-      ping.premise(injected && ping.waitUntilEveryReplyQueuedOrRead(fd))
+      ping.premise(
+        ping.network.inject(
+          Self.reply(family, id: DirectPing.identifier, seq: 2, mark: Self.ignored), to: fd))
+    }
+    ping.beforeSend = { seq, fd in
+      guard seq == 2 else { return }
+      ping.premise(ping.waitUntilReplied(2, fd))
     }
 
-    let (result, _) = try await measure(within: Self.watchdog, diagnose: ping.network.journal) {
+    let config = ping.config
+    let (result, _) = try await measure(
+      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
+    ) {
       try await ping.run()
     }
-    #expect(ping.premiseHeld, "the early reply was never queued ahead of probe 2's send")
+    #expect(ping.premiseHeld, "the early reply and probe 1's were not queued before probe 2 left")
     let s = result.statistics
-    #expect(s.sent == 3 && s.received == 3, "\(Self.summary(result))")
-    #expect((s.minRTT ?? -1) >= 0, "\(Self.summary(result))")
+    #expect(s.sent == 2 && s.received == 1, "\(Self.summary(result))")
     #expect(
-      result.responses.allSatisfy { $0.ttl == Int(Self.kept) },
+      result.responses.map { $0.rtt != nil } == [true, false],
       "the reply queued before probe 2 left was counted for it: \(Self.summary(result))")
+    #expect((s.minRTT ?? -1) >= 0, "\(Self.summary(result))")
+    #expect(result.responses.compactMap(\.ttl).allSatisfy { $0 == Int(Self.kept) })
   }
 
   // MARK: Duplicates
