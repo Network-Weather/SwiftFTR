@@ -367,6 +367,23 @@ final class LocalASNResolverTests: XCTestCase {
     XCTAssertLessThan(table.lookups.value, addresses.count, "the batch ran past its deadline")
   }
 
+  /// Preparing a batch, the pass every resolver makes over its addresses before any lookup, stops
+  /// once the deadline has passed instead of finishing the pass.
+  func testPreparingABatchStopsAtTheDeadline() {
+    let keyed = FaultCounter()
+    let addresses = (0..<65_536).map { "8.8.\($0 / 256).\($0 % 256)" }
+
+    let late = prepareASNBatch(addresses, until: .now + .nanoseconds(1)) { address in
+      keyed.increment()
+      return address
+    }
+    let unbounded = prepareASNBatch(addresses + ["", "8.8.0.0"], until: nil) { $0 }
+
+    XCTAssertNil(late, "a pass whose deadline passed reported itself complete")
+    XCTAssertLessThan(keyed.value, addresses.count, "the pass went on past its deadline")
+    XCTAssertEqual(unbounded?.count, addresses.count, "empty and repeated addresses are dropped")
+  }
+
   /// One caller's batch does not hold the resolver: a lookup started while it runs is answered
   /// before it ends.
   func testLookupIsNotQueuedBehindAnotherBatch() async throws {

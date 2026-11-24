@@ -79,6 +79,74 @@ func asnDeadline(after timeout: TimeInterval) -> ContinuousClock.Instant? {
   return .now + .seconds(timeout)
 }
 
+/// A deadline checked once every 64 steps of a pass over a batch, so that preparing or scanning a
+/// large batch stops when the time does, for little more than the cost of the pass.
+struct DeadlineClock {
+  private let deadline: ContinuousClock.Instant?
+  private var steps = 0
+
+  init(_ deadline: ContinuousClock.Instant?) { self.deadline = deadline }
+
+  /// Counts one step, and on every 64th says whether the deadline has passed.
+  mutating func expired() -> Bool {
+    steps &+= 1
+    guard let deadline, steps & 63 == 0 else { return false }
+    return ContinuousClock.now >= deadline
+  }
+}
+
+/// Each distinct, non-empty address of `addresses` with the key `key` gives it, leaving out those
+/// it gives none; `nil` if `deadline` passes first.
+func prepareASNBatch(
+  _ addresses: [String], until deadline: ContinuousClock.Instant?, key: (String) -> String?
+) -> [String: String]? {
+  var clock = DeadlineClock(deadline)
+  var keys: [String: String] = [:]
+  for address in addresses {
+    if clock.expired() { return nil }
+    guard !address.isEmpty, keys[address] == nil, let found = key(address) else { continue }
+    keys[address] = found
+  }
+  return keys
+}
+
+/// The answers one shared ASN lookup has received so far, keyed by the caller's address.
+///
+/// The resolver doing the lookup publishes each answer here as it arrives (a Team Cymru origin
+/// before its AS name, then the entry again with the name), and a caller whose time runs out
+/// takes what is here for its own addresses. ``publish(_:)`` is the one place a lookup's progress
+/// is recorded.
+final class ASNAnswerLog: @unchecked Sendable {
+  private let lock = NSLock()
+  private var answers: [String: ASNInfo] = [:]
+
+  /// Records `new`, replacing earlier answers for the same addresses.
+  func publish(_ new: [String: ASNInfo]) {
+    lock.lock()
+    defer { lock.unlock() }
+    answers.merge(new) { _, latest in latest }
+  }
+
+  /// The answers received so far for `addresses`.
+  func answers(for addresses: [String]) -> [String: ASNInfo] {
+    lock.lock()
+    defer { lock.unlock() }
+    var out: [String: ASNInfo] = [:]
+    for address in addresses {
+      if let info = answers[address] { out[address] = info }
+    }
+    return out
+  }
+}
+
+/// A resolver that publishes its answers as they arrive, so a cached lookup's callers whose time
+/// runs out get what it has learned. A caller's own ``ASNResolver`` has no way to do this: its
+/// answers reach waiting callers only when its call returns.
+protocol ASNProgressReporting: ASNResolver {
+  func resolve(ipv4Addrs: [String], timeout: TimeInterval, publishing log: ASNAnswerLog)
+    async throws -> [String: ASNInfo]
+}
+
 /// Work shared by several callers, each of which may stop waiting on its own.
 ///
 /// One observer per piece of work waits for its task. A caller registers while it waits and takes
@@ -117,12 +185,24 @@ final class SharedWork<Value: Sendable>: @unchecked Sendable {
     outcome = .success(value)
   }
 
-  /// The value, if the work has finished with one; never waits.
-  var finishedValue: Value? {
+  /// How the work ended, or `nil` while it runs; never waits.
+  var finishedResult: Result<Value, Error>? {
     lock.lock()
     defer { lock.unlock() }
-    if case .success(let value)? = outcome { return value }
-    return nil
+    return outcome
+  }
+
+  /// Waits until the work ends or `deadline` passes, without taking its result.
+  ///
+  /// - Returns: Whether the work ended, with a value or an error.
+  /// - Throws: `CancellationError` when the calling task is cancelled.
+  func waitForEnd(until deadline: ContinuousClock.Instant?) async throws -> Bool {
+    do {
+      return try await value(until: deadline) != nil
+    } catch {
+      if Task.isCancelled { throw CancellationError() }
+      return true
+    }
   }
 
   /// Callers registered and not yet released. For tests.
@@ -252,6 +332,8 @@ actor _ASNMemoryCache {
     let id: UInt64
     let keys: [LookupKey]
     let work: SharedWork<[String: ASNInfo]>
+    /// What the lookup has answered so far, for callers whose time runs out before it ends.
+    let answers: ASNAnswerLog
     var joinCount: Int
   }
 
@@ -292,8 +374,12 @@ actor _ASNMemoryCache {
   /// overlapping keys await that shared task, while calls for disjoint keys start independent
   /// tasks. The task, rather than its first caller, owns the reservation, so caller cancellation
   /// cannot cancel or poison work shared with another caller. Each caller stops waiting at
-  /// `deadline` with what it has by then, the answers of every flight that had finished included,
-  /// and the flights run on.
+  /// `deadline`, and the flights run on.
+  ///
+  /// A caller gets every answer it has when it returns, whatever order it looked at its flights
+  /// in: cached ones, those of flights that ended, and those a flight still running has published
+  /// (see ``ASNAnswerLog``). It throws only when it has none and one of its flights failed: the
+  /// error of the earliest such flight.
   fileprivate func resolve(
     _ addresses: [String],
     timeout: TimeInterval,
@@ -303,53 +389,57 @@ actor _ASNMemoryCache {
   ) async throws -> [String: ASNInfo] {
     try Task.checkCancellation()
 
-    var resolved = getMany(addresses)
-    let missing = addresses.filter { resolved[$0] == nil }
-    guard !missing.isEmpty else { return resolved }
-
-    var workByFlightID: [UInt64: SharedWork<[String: ASNInfo]>] = [:]
-    var joinedFlightIDs: Set<UInt64> = []
+    var clock = DeadlineClock(deadline)
+    var resolved: [String: ASNInfo] = [:]
+    var addressesByFlight: [UInt64: [String]] = [:]
     var unreserved: [String] = []
-
-    for address in missing {
+    for address in addresses {
+      // Out of time before any lookup was asked: what the cache had is the answer.
+      if clock.expired() { return resolved }
+      if let info = map[address] {
+        resolved[address] = info
+        continue
+      }
       let key = LookupKey(scope: scope, address: address, timeout: timeout)
-      if let flightID = flightIDByKey[key], let flight = flightsByID[flightID] {
-        joinedFlightIDs.insert(flightID)
-        workByFlightID[flightID] = flight.work
+      if let flightID = flightIDByKey[key], flightsByID[flightID] != nil {
+        addressesByFlight[flightID, default: []].append(address)
       } else {
         unreserved.append(address)
       }
     }
-
-    for flightID in joinedFlightIDs {
+    var flights: [Flight] = []
+    for flightID in addressesByFlight.keys {
       flightsByID[flightID]?.joinCount += 1
+      if let flight = flightsByID[flightID] { flights.append(flight) }
     }
-
     if !unreserved.isEmpty {
       let flight = startFlight(
-        addresses: unreserved,
-        timeout: timeout,
-        using: resolver,
-        scope: scope
-      )
-      workByFlightID[flight.id] = flight.work
+        addresses: unreserved, timeout: timeout, using: resolver, scope: scope)
+      addressesByFlight[flight.id] = unreserved
+      flights.append(flight)
     }
+    flights.sort { $0.id < $1.id }
 
-    // Each flight's own answer is collected, never read back from the cache, which may already
-    // have evicted it.
-    var expired = false
-    for work in workByFlightID.values {
-      let loaded: [String: ASNInfo]?
-      if expired {
-        loaded = work.finishedValue
-      } else {
-        loaded = try await work.value(until: deadline)
-        expired = loaded == nil
-      }
-      for address in addresses {
-        if let info = loaded?[address] { resolved[address] = info }
+    // Wait for every flight to end, or for the deadline; then read each, in one fixed order, so
+    // the outcome does not depend on which ended first.
+    for flight in flights {
+      guard try await flight.work.waitForEnd(until: deadline) else { break }
+    }
+    var failure: Error?
+    for flight in flights {
+      let mine = addressesByFlight[flight.id] ?? []
+      switch flight.work.finishedResult {
+      case .success(let loaded)?:
+        for address in mine {
+          if let info = loaded[address] { resolved[address] = info }
+        }
+      case .failure(let error)?:
+        if failure == nil { failure = error }
+      case nil:
+        resolved.merge(flight.answers.answers(for: mine)) { cached, _ in cached }
       }
     }
+    if resolved.isEmpty, let failure { throw failure }
     return resolved
   }
 
@@ -363,11 +453,13 @@ actor _ASNMemoryCache {
     nextFlightID &+= 1
     let flightGeneration = generation
     let keys = addresses.map { LookupKey(scope: scope, address: $0, timeout: timeout) }
+    let answers = ASNAnswerLog()
     let work = SharedWork(
       Self.makeLoadTask(
         resolver: resolver,
         addresses: addresses,
         timeout: timeout,
+        answers: answers,
         cache: self,
         flightID: flightID,
         generation: flightGeneration
@@ -377,6 +469,7 @@ actor _ASNMemoryCache {
       id: flightID,
       keys: keys,
       work: work,
+      answers: answers,
       joinCount: 0
     )
     flightsByID[flightID] = flight
@@ -391,6 +484,7 @@ actor _ASNMemoryCache {
     resolver: ASNResolver,
     addresses: [String],
     timeout: TimeInterval,
+    answers: ASNAnswerLog,
     cache: _ASNMemoryCache,
     flightID: UInt64,
     generation: UInt64
@@ -398,7 +492,13 @@ actor _ASNMemoryCache {
     Task.detached(priority: Task.currentPriority) {
       do {
         try Task.checkCancellation()
-        let result = try await resolver.resolve(ipv4Addrs: addresses, timeout: timeout)
+        let result: [String: ASNInfo]
+        if let reporting = resolver as? any ASNProgressReporting {
+          result = try await reporting.resolve(
+            ipv4Addrs: addresses, timeout: timeout, publishing: answers)
+        } else {
+          result = try await resolver.resolve(ipv4Addrs: addresses, timeout: timeout)
+        }
         try Task.checkCancellation()
         guard await cache.completeFlight(id: flightID, generation: generation, result: result)
         else {
@@ -489,14 +589,15 @@ public struct CachingASNResolver: ASNResolver {
     ipv4Addrs: [String], timeout: TimeInterval,
     waitingUntil callerDeadline: ContinuousClock.Instant?
   ) async throws -> [String: ASNInfo] {
-    let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
-    if ips.isEmpty { return [:] }
     var deadline = asnDeadline(after: timeout)
     if let callerDeadline, deadline.map({ callerDeadline < $0 }) ?? true {
       deadline = callerDeadline
     }
+    guard let prepared = prepareASNBatch(ipv4Addrs, until: deadline, key: { $0 }),
+      !prepared.isEmpty
+    else { return [:] }
     return try await _ASNMemoryCache.shared.resolve(
-      ips,
+      Array(prepared.keys),
       timeout: timeout,
       until: deadline,
       using: base,
@@ -572,7 +673,7 @@ private struct _OriginASNResult: Sendable {
 
 // Team Cymru DNS-based resolver using TXT queries.
 /// Team Cymru DNS-based resolver using TXT queries for origin ASN and AS names.
-public struct CymruDNSResolver: ASNResolver {
+public struct CymruDNSResolver: ASNResolver, ASNProgressReporting {
   /// One TXT query for `name` to one server, answered by `deadline` or not at all.
   typealias TXTQuery =
     @Sendable (_ name: String, _ server: String, _ deadline: ContinuousClock.Instant) async ->
@@ -623,53 +724,76 @@ public struct CymruDNSResolver: ASNResolver {
     ASNInfo]
   {
     try _validateDNSTimeout(timeout)
-    return await resolve(ipv4Addrs: ipv4Addrs, until: .now + .seconds(timeout))
+    return await resolve(ipv4Addrs: ipv4Addrs, until: .now + .seconds(timeout), publishing: nil)
   }
 
-  /// Resolves `ipv4Addrs`, returning by `deadline` with whatever has answered.
-  func resolve(ipv4Addrs: [String], until deadline: ContinuousClock.Instant) async -> [String:
-    ASNInfo]
+  /// Resolves as ``resolve(ipv4Addrs:timeout:)`` does, publishing each answer to `log` as it
+  /// arrives: an origin with an empty AS name at once, and the entry again when its name comes.
+  func resolve(ipv4Addrs: [String], timeout: TimeInterval, publishing log: ASNAnswerLog)
+    async throws -> [String: ASNInfo]
   {
-    let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
-    if ips.isEmpty { return [:] }
+    try _validateDNSTimeout(timeout)
+    return await resolve(ipv4Addrs: ipv4Addrs, until: .now + .seconds(timeout), publishing: log)
+  }
 
-    // Cymru only has meaningful origin data for globally routable addresses.
-    // Mapped IPv4 is normalized so it uses origin.asn.cymru.com, not origin6.
-    let lookupIPs = Array(Set(ips.compactMap(asnLookupAddress)))
-    if lookupIPs.isEmpty { return [:] }
+  /// Resolves `ipv4Addrs`, returning by `deadline` with whatever has answered, and publishing each
+  /// answer to `log`, when given, as it arrives.
+  func resolve(
+    ipv4Addrs: [String], until deadline: ContinuousClock.Instant,
+    publishing log: ASNAnswerLog? = nil
+  ) async -> [String: ASNInfo] {
+    // Cymru only has meaningful origin data for globally routable addresses. Mapped IPv4 is
+    // normalized so it uses origin.asn.cymru.com, not origin6; results stay keyed by the caller's
+    // own presentation of each address.
+    guard let keyByInput = prepareASNBatch(ipv4Addrs, until: deadline, key: asnLookupAddress)
+    else { return [:] }
+    var clock = DeadlineClock(deadline)
+    var inputsByKey: [String: [String]] = [:]
+    for (input, key) in keyByInput {
+      if clock.expired() { return [:] }
+      inputsByKey[key, default: []].append(input)
+    }
+    if inputsByKey.isEmpty { return [:] }
 
-    // Phase 1: Parallel origin ASN lookups
-    let originResults = await Self.concurrentLookups(of: lookupIPs, until: deadline) { ip in
-      await self.lookupOriginASN(ip: ip, until: deadline)
+    func info(_ origin: _OriginASNResult, name: String) -> ASNInfo {
+      ASNInfo(
+        asn: origin.asn, name: name, prefix: origin.prefix, countryCode: origin.cc,
+        registry: origin.registry)
     }
 
+    // Phase 1: origin ASNs, each published, without its name, as it arrives.
+    var keysByASN: [Int: [String]] = [:]
+    let originResults = await Self.concurrentLookups(
+      of: Array(inputsByKey.keys), until: deadline,
+      { key in await self.lookupOriginASN(ip: key, until: deadline) },
+      onResult: { key, origin in
+        keysByASN[origin.asn, default: []].append(key)
+        guard let log else { return }
+        let answered = info(origin, name: "")
+        log.publish(
+          Dictionary(uniqueKeysWithValues: (inputsByKey[key] ?? []).map { ($0, answered) }))
+      })
     if originResults.isEmpty { return [:] }
 
-    // Phase 2: Parallel AS name lookups for unique ASNs only
-    let uniqueASNs = Array(Set(originResults.values.map { $0.asn }))
-    let asnNames = await Self.concurrentLookups(of: uniqueASNs, until: deadline) { asn in
-      await self.lookupASName(asn: asn, until: deadline)
-    }
+    // Phase 2: AS names for unique ASNs only, each published, with its entries, as it arrives.
+    let asnNames = await Self.concurrentLookups(
+      of: Array(keysByASN.keys), until: deadline,
+      { asn in await self.lookupASName(asn: asn, until: deadline) },
+      onResult: { asn, name in
+        guard let log else { return }
+        var named: [String: ASNInfo] = [:]
+        for key in keysByASN[asn] ?? [] {
+          guard let origin = originResults[key] else { continue }
+          for input in inputsByKey[key] ?? [] { named[input] = info(origin, name: name) }
+        }
+        log.publish(named)
+      })
 
-    // Combine results
-    var lookupResults: [String: ASNInfo] = [:]
-    for (ip, origin) in originResults {
-      lookupResults[ip] = ASNInfo(
-        asn: origin.asn,
-        name: asnNames[origin.asn] ?? "",
-        prefix: origin.prefix,
-        countryCode: origin.cc,
-        registry: origin.registry
-      )
-    }
-
-    // Preserve the protocol contract that results are keyed by the caller's
-    // input presentation, even when the network query used a normalized key.
+    // Combine, keyed by the caller's input presentation.
     var result: [String: ASNInfo] = [:]
-    for ip in ips {
-      if let lookupIP = asnLookupAddress(for: ip), let info = lookupResults[lookupIP] {
-        result[ip] = info
-      }
+    for (key, origin) in originResults {
+      let answered = info(origin, name: asnNames[origin.asn] ?? "")
+      for input in inputsByKey[key] ?? [] { result[input] = answered }
     }
     return result
   }
@@ -716,7 +840,8 @@ public struct CymruDNSResolver: ASNResolver {
   /// batch stops when its time does instead of waking every queued key to find it gone.
   private static func concurrentLookups<Key: Hashable & Sendable, Value: Sendable>(
     of keys: [Key], until deadline: ContinuousClock.Instant,
-    _ lookup: @escaping @Sendable (Key) async -> Value?
+    _ lookup: @escaping @Sendable (Key) async -> Value?,
+    onResult: (Key, Value) -> Void = { _, _ in }
   ) async -> [Key: Value] {
     await withTaskGroup(of: (Key, Value?).self) { group in
       var remaining = keys.makeIterator()
@@ -729,7 +854,10 @@ public struct CymruDNSResolver: ASNResolver {
       for _ in 0..<maxConcurrentQueries where !startNext() { break }
       var results: [Key: Value] = [:]
       while let (key, value) = await group.next() {
-        if let value { results[key] = value }
+        if let value {
+          results[key] = value
+          onResult(key, value)
+        }
         _ = startNext()
       }
       return results

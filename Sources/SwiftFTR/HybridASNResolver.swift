@@ -48,23 +48,24 @@ public struct HybridASNResolver: ASNResolver, Sendable {
   {
     let deadline = asnDeadline(after: timeout)
 
-    // Filter and deduplicate input
-    let publicIPs = Set(ipv4Addrs)
-      .filter(isGloballyRoutableIPAddress)
-    guard !publicIPs.isEmpty else { return [:] }
+    // Filter and deduplicate input, under the deadline.
+    guard
+      let publicIPs = prepareASNBatch(
+        ipv4Addrs, until: deadline, key: { isGloballyRoutableIPAddress($0) ? $0 : nil }),
+      !publicIPs.isEmpty
+    else { return [:] }
 
     // Try local first
     let localResults = try? await localResolver.resolve(
-      ipv4Addrs: Array(publicIPs), until: deadline)
+      ipv4Addrs: Array(publicIPs.keys), until: deadline)
 
     // Find missing IPs
-    let resolvedIPs: Set<String>
-    if let keys = localResults?.keys {
-      resolvedIPs = Set(keys)
-    } else {
-      resolvedIPs = []
+    var clock = DeadlineClock(deadline)
+    var missingIPs: [String] = []
+    for ip in publicIPs.keys where localResults?[ip] == nil {
+      if clock.expired() { return localResults ?? [:] }
+      missingIPs.append(ip)
     }
-    let missingIPs = publicIPs.filter { !resolvedIPs.contains($0) }
 
     guard !missingIPs.isEmpty, deadline.map({ ContinuousClock.now < $0 }) ?? true else {
       return localResults ?? [:]
@@ -72,7 +73,7 @@ public struct HybridASNResolver: ASNResolver, Sendable {
 
     // Fall back to DNS for missing IPs
     let dnsResults = try? await dnsResolver.resolve(
-      ipv4Addrs: Array(missingIPs), timeout: fallbackTimeout, waitingUntil: deadline)
+      ipv4Addrs: missingIPs, timeout: fallbackTimeout, waitingUntil: deadline)
 
     // Merge results (local takes precedence)
     var merged = localResults ?? [:]

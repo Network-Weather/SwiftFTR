@@ -115,29 +115,20 @@ public actor LocalASNResolver: ASNResolver {
   nonisolated func resolve(ipv4Addrs: [String], until deadline: ContinuousClock.Instant?)
     async throws -> [String: ASNInfo]
   {
-    /// How many addresses go between checks of the clock.
-    let checkEvery = 32
-    func expired(_ step: Int) -> Bool {
-      guard let deadline, step % checkEvery == checkEvery - 1 else { return false }
-      return ContinuousClock.now >= deadline
-    }
-
     // Each input with a lookup key; several inputs can share one (mapped IPv4, for example).
-    var keyByInput: [String: String] = [:]
-    for (step, ip) in Set(ipv4Addrs).enumerated() {
-      if expired(step) { return [:] }
-      if let key = asnLookupAddress(for: ip) { keyByInput[ip] = key }
-    }
-    guard !keyByInput.isEmpty else { return [:] }
+    guard let keyByInput = prepareASNBatch(ipv4Addrs, until: deadline, key: asnLookupAddress),
+      !keyByInput.isEmpty
+    else { return [:] }
 
     guard let db = try await database(until: deadline) else {
       return [:]  // Failed to load, or still loading at the deadline
     }
 
+    var clock = DeadlineClock(deadline)
     var infoByKey: [String: ASNInfo?] = [:]
     var results: [String: ASNInfo] = [:]
-    for (step, (ip, key)) in keyByInput.enumerated() {
-      if expired(step) { break }
+    for (ip, key) in keyByInput {
+      if clock.expired() { break }
       let info: ASNInfo?
       if let known = infoByKey[key] {
         info = known
