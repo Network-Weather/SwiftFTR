@@ -105,8 +105,10 @@ Notes:
   `clearCaches()` or `networkChanged()`. A seed fills only its own family's slot. `PublicIPSource`
   has cases `.validatedCallerCache` and `.gatewayReported`; the seed is cached with it and reported
   as `ClassifiedTrace.publicIPSource`.
-- `discoverPublicIPWithHostname()` discovers IPv4 via STUN through the configured interface, with
-  an unbound DNS fallback, and ignores `SwiftFTRConfig.publicIP`.
+- `discoverPublicIPWithHostname()` asks the `publicIPResolver` strategy once for a fresh IPv4
+  address, ignoring `SwiftFTRConfig.publicIP` and the cache. It throws
+  `PublicIPError.discoveryDisabled` for `.disabled` and `PublicIPError.noAddress(reason:)` when no
+  globally routable IPv4 address comes back in time.
 
 ### 2. SwiftFTRConfig
 
@@ -152,7 +154,7 @@ public struct SwiftFTRConfig: Sendable {
 }
 
 public enum PublicIPResolverStrategy: Sendable {
-    case library                       // STUN, with a DNS whoami fallback for IPv4
+    case library                       // STUN only, every socket bound before it sends
     case disabled                      // nothing sent; classify without an address
     case custom(any PublicIPResolver)  // the caller's, held to publicIPDiscoveryTimeout
 }
@@ -304,9 +306,10 @@ public struct ClassifiedHop: Sendable, Codable {
 `traceClassified` asks for the public IP once its probes have returned, for the family they used:
 `config.publicIP` if it is a globally routable address of that family, then the seeded or cached
 observation of that family, then the `publicIPResolver` strategy, asked once. The library's
-resolver is IPv4 STUN then a DNS TXT query to `whoami.ds.akahelp.net`, or IPv6 STUN, under one
-`publicIPDiscoveryTimeout` deadline shared by every name lookup, STUN attempt and DNS query (STUN
-stops at its own share, servers × per-server timeout, so the DNS fallback always gets time). A
+resolver (`LibraryPublicIPResolver.swift`) is STUN only, over the family asked for, under one
+`publicIPDiscoveryTimeout` deadline shared by every server-name lookup and STUN attempt; each
+STUN socket is bound to the tracer's interface and source address before its name is resolved,
+and a failed bind sends nothing. It never asks a recursive resolver for a whoami record. A
 caller's resolver is held to the same deadline by the tracer: one that never returns or ignores
 cancellation is abandoned there, and an answer handled after it is a miss, never cached. Every
 answer must be a globally routable address of the family asked for (`::ffff:a.b.c.d` is IPv4). A miss is not cached, so the next trace asks
@@ -702,8 +705,12 @@ public struct PublicIPs: Sendable {
 }
 // STUN-only, both families in parallel; failed families are nil. Ignores SwiftFTRConfig.publicIP.
 // stunTimeout is per server. Cancelling the caller ends it at once with what it had found.
+// A sourceIP runs only its own family's sweep, bound to it; one that is not an IP sends nothing.
 public func getPublicIPs(stunTimeout: TimeInterval = 0.8, interface: String? = nil,
                          sourceIP: String? = nil, enableLogging: Bool = false) async -> PublicIPs
+
+// Thrown by discoverPublicIPWithHostname().
+public enum PublicIPError: Error { case discoveryDisabled; case noAddress(reason: String) }
 
 public func isPrivateIPv4(_ ip: String) -> Bool   // RFC 1918 or 169.254/16; strict parsing
 public func isCGNATIPv4(_ ip: String) -> Bool     // 100.64.0.0/10; strict parsing
@@ -1070,7 +1077,7 @@ struct TraceView: View {
 
 - **ICMP / ICMPv6** Echo Request over `SOCK_DGRAM` sockets; no root on macOS.
 - **DNS**: Team Cymru TXT (`origin.asn.cymru.com`, `origin6.asn.cymru.com`) for `.dns` and
-  `.hybrid` misses; PTR for reverse DNS; `whoami.ds.akahelp.net` TXT as the public-IP fallback.
+  `.hybrid` misses; PTR for reverse DNS.
 - **STUN** (RFC 5389 Binding Request) for public-IP discovery.
 - **TCP connect / UDP / HTTP(S)** for the probe APIs.
 

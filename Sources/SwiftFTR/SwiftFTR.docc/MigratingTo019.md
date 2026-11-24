@@ -16,7 +16,8 @@ To find the call sites to review, search the consumer for `switch` over `DNSErro
 `.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, `getPublicIPs(`, `publicIPDiscoveryTimeout`,
 `.classify(`, `.publicIP` read from a `SwiftFTR` tracer, `SwiftFTRConfig(` calls that pass `publicIP:`,
 `traceClassified(` results whose `publicIP` or `clientASN` is read for an IPv6 destination,
-`discoverPaths(` followed by a read of the public-IP cache, and any
+`discoverPaths(` followed by a read of the public-IP cache, `PublicIPError`,
+`discoverPublicIPWithHostname(`, `STUNPublicIP`, `getPublicIPs(` calls that pass `sourceIP:`, and any
 script that reads the output of `swift-ftr probe dns`.
 
 ## Update the package
@@ -297,35 +298,155 @@ show(v4: ips.v4 ?? "no IPv4 path", v6: ips.v6 ?? "no IPv6 path")
 **What changed.** In ``SwiftFTR/SwiftFTR/traceClassified(to:vpnContext:resolver:)`` and
 ``SwiftFTR/SwiftFTR/discoverPaths(to:config:)``, public-IP discovery is bounded by one deadline:
 ``SwiftFTRConfig/publicIPDiscoveryTimeout`` (6 s by default) from the moment discovery starts.
-Every STUN server-name lookup, STUN attempt and whoami DNS query is cut at that deadline, and the
-discovery stops there. In 0.18 the caller was released at the budget while the discovery ran on
-in a slot of the blocking-I/O executor. STUN also ends at its own share of the budget (the number
-of servers times the per-server timeout), so the whoami fallback always has time to run, and that
-fallback no longer needs an executor slot.
+Every STUN server-name lookup and STUN attempt is cut at that deadline, and the discovery stops
+there. In 0.18 the caller was released at the budget while the discovery ran on in a slot of the
+blocking-I/O executor.
 
 **What a caller sees.** No signature changes and no new errors: a discovery that finds nothing
-still leaves `publicIP` as `nil` in the classified result. Two results differ:
+still leaves `publicIP` as `nil` in the classified result. A stalled STUN attempt no longer goes on
+using an executor slot's worth of work after the trace has returned.
 
-- With every executor slot held (for example by stalled reverse-DNS lookups), discovery can now
-  return an address from the whoami fallback where 0.18 returned `nil`.
-- With a budget smaller than STUN's share plus the fallback's DNS timeout, STUN gets less time
-  than in 0.18, because the fallback is reserved at least half its DNS timeout (or half the
-  budget, if that is smaller). With the default 6 s budget nothing is cut.
+**What to change.** Nothing: the same configuration now ends the work at the budget, not only
+the caller's wait.
 
-**What to change.** Nothing for a caller using the default budget. A caller that sets
-`publicIPDiscoveryTimeout` below about 4 s and relies on STUN answering should check the value
-still leaves STUN the time it needs, or leave the budget at its default.
+## The library's public-IP resolver is STUN only
+
+**What changed.** When IPv4 STUN got no answer, 0.18 asked the public recursive resolvers
+`1.1.1.1` and `8.8.8.8` for the `whoami.ds.akahelp.net` TXT record and reported its `ip` field. That
+field is built from the client-subnet hint the resolver forwards, not from this host's address, so
+it named another host, or another network, than the caller's (#153), and the query was not bound
+to the tracer's interface (#151). The fallback is deleted, with nothing in its place: the
+library's resolver (``PublicIPResolverStrategy/library``) is STUN only. Every STUN socket is
+created and bound to the tracer's interface and source address before its server name is
+resolved, and when a bind fails nothing is sent, the lookup included. The lookups themselves use
+the system resolver, which is not bound to the interface.
+
+**What a caller sees.**
+
+- Where UDP to the STUN servers is blocked, a classified trace or multipath run reports
+  `publicIP == nil` and `clientASN == nil` where 0.18 may have reported the whoami address, and
+  hops in the client's own network are labelled TRANSIT rather than ISP.
+- ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` throws in the same case (see below).
+- With STUN silent, discovery ends once both servers' attempts have timed out, about 4 s with the
+  defaults, rather than going on to the fallback.
+- A tracer bound to an interface or source address it cannot bind sends no STUN name lookups.
+
+**What to change.** Nothing, if STUN reaches its servers. A host app that knows its public
+address on networks where STUN is blocked (from its gateway, its own HTTPS echo, or an earlier
+observation) supplies it, through a seed or its own resolver:
 
 Before:
 
 ```swift
-let config = SwiftFTRConfig(publicIPDiscoveryTimeout: 1.0)  // STUN had the whole second
+let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))
+// 0.18 fell back to a whoami record when STUN failed
 ```
 
 After:
 
 ```swift
-let config = SwiftFTRConfig(publicIPDiscoveryTimeout: 4.0)  // STUN and the fallback both fit
+let tracer = SwiftFTR(config: SwiftFTRConfig(interface: "en0"))
+if let known = myGatewayReportedWAN {
+  _ = await tracer.seedPublicIP(known, source: .gatewayReported)
+}
+// or: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(myResolver))
+```
+
+## discoverPublicIPWithHostname asks the strategy, and PublicIPError has new cases
+
+**What changed.** ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` ran the library's
+discovery whatever the tracer's strategy. It now asks the configured
+``SwiftFTRConfig/publicIPResolver`` once for a fresh IPv4 address, bypassing
+``SwiftFTRConfig/publicIP`` and the cache and caching nothing, as before, and returns only a
+globally routable IPv4 address. ``PublicIPError`` loses `allMethodsFailed(stunError:dnsError:)`,
+which described a DNS tier that no longer exists, and gains ``PublicIPError/discoveryDisabled``
+and ``PublicIPError/noAddress(reason:)``.
+
+**What a caller sees.**
+
+- With ``PublicIPResolverStrategy/disabled`` the call throws ``PublicIPError/discoveryDisabled``
+  and sends nothing; 0.18 sent STUN.
+- With ``PublicIPResolverStrategy/custom(_:)`` the caller's resolver answers, where 0.18 sent STUN.
+- When the strategy finds no address in time, or answers with an address that is not a public
+  IPv4 address, or the configured source address is IPv6, the call throws
+  ``PublicIPError/noAddress(reason:)``. 0.18 threw `allMethodsFailed`, or an internal timeout
+  error, or returned the address unchecked.
+- Code that matches or builds `PublicIPError.allMethodsFailed` no longer compiles, and an
+  exhaustive `switch` over ``PublicIPError`` must handle the two new cases.
+
+**What to change.** Match the new cases:
+
+Before:
+
+```swift
+do {
+  let (ip, _) = try await tracer.discoverPublicIPWithHostname()
+  show(ip)
+} catch PublicIPError.allMethodsFailed(let stun, let dns) {
+  log("no public IP: STUN \(stun), DNS \(dns)")
+}
+```
+
+After:
+
+```swift
+do {
+  let (ip, _) = try await tracer.discoverPublicIPWithHostname()
+  show(ip)
+} catch PublicIPError.noAddress(let reason) {
+  log("no public IP: \(reason)")
+} catch PublicIPError.discoveryDisabled {
+  // the tracer's publicIPResolver is .disabled
+}
+```
+
+## getPublicIPs binds each family, or sends nothing for it
+
+**What changed.** ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` asks the
+library's resolver for each family. Given a `sourceIP`, it runs only the sweep of that address's
+family, bound to it; 0.18 ran the other family's sweep unbound. A `sourceIP` that is not an IP
+address now sends nothing; 0.18 ran both sweeps unbound. `stunTimeout` is still per server, and
+the call still has no overall deadline and reports the address as the STUN server gave it.
+
+**What a caller sees.** With `sourceIP: "192.0.2.10"`, `v6` is always `nil`; with an IPv6
+`sourceIP`, `v4` is always `nil`; with a malformed one, both are `nil`.
+
+**What to change.** To discover both families with a source address for one of them, make two
+calls:
+
+Before:
+
+```swift
+let ips = await getPublicIPs(sourceIP: v4Source)  // 0.18: v6 swept unbound
+```
+
+After:
+
+```swift
+async let v4 = getPublicIPs(sourceIP: v4Source)
+async let v6 = getPublicIPs(sourceIP: v6Source)  // or no sourceIP for system routing
+let ips = await PublicIPs(v4: v4.v4, v6: v6.v6)
+```
+
+## STUNPublicIP is no longer public
+
+**What changed.** `STUNPublicIP` is internal. No public function returned or accepted it in 0.18.
+
+**What a caller sees.** A reference to `STUNPublicIP` no longer compiles.
+
+**What to change.** Use ``PublicIPObservation``, or ``PublicIPs`` for
+``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``:
+
+Before:
+
+```swift
+let found = STUNPublicIP(ip: address, family: AF_INET)
+```
+
+After:
+
+```swift
+let found = PublicIPObservation(address: address, family: .v4, source: .stun)
 ```
 
 ## TraceClassifier.classify takes the public address and no longer finds it
@@ -393,8 +514,8 @@ let address: String? = v4 ?? v6
 address before probing, whatever the destination, and when that failed the classifier asked again,
 so a failed discovery cost twice ``SwiftFTRConfig/publicIPDiscoveryTimeout``. It now asks once,
 after the probes have returned, for the family they used, through the new
-``SwiftFTRConfig/publicIPResolver`` strategy: the library's resolver by default (STUN, with the DNS
-whoami fallback for IPv4, the discovery 0.18 ran), ``PublicIPResolverStrategy/disabled``, or the
+``SwiftFTRConfig/publicIPResolver`` strategy: the library's resolver by default (STUN only; see
+"The library's public-IP resolver is STUN only"), ``PublicIPResolverStrategy/disabled``, or the
 caller's own ``PublicIPResolver``. An answer that is not a globally routable address of that
 family is not used. ``ClassifiedTrace/publicIPSource`` says where the address came from.
 
@@ -404,8 +525,8 @@ family is not used. ``ClassifiedTrace/publicIPSource`` says where the address ca
   one; with no answer to IPv6 STUN, `publicIP` and `clientASN` are `nil`, and hops in the client's
   own network are labelled TRANSIT rather than ISP.
 - With discovery failing, a classified trace spends one budget on it, not two.
-- An address the library's discovery finds that is not globally routable (the whoami fallback can
-  return one) is no longer used.
+- An address the library's discovery finds that is not globally routable (a STUN server inside
+  the network can report one) is no longer used.
 - `ClassifiedTrace` encodes a new `publicIPSource` key.
 
 **What to change.** Nothing for an IPv4 caller with the default strategy. A caller that needs an

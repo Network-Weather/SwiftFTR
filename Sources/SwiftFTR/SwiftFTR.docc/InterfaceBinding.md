@@ -21,8 +21,8 @@ resolution, system reverse DNS, Team Cymru ASN queries, or URLSession traffic.
 | Ping | ``PingConfig`` values independently override global values; each `nil` value inherits its global counterpart | IPv4 and IPv6 | Probe socket only. |
 | Actor DNS query helpers (`tracer.dns`) | Call-level values independently override global values | IPv4 and IPv6 DNS transports | The numeric DNS server selects the transport family; record type does not. An AAAA query therefore uses IPv4 by default because the default server is `8.8.8.8`. |
 | Standalone DNS query functions and DNS/TCP/UDP probes | Function arguments or operation config only | IPv4 and IPv6 | They do not inherit ``SwiftFTRConfig``; hostname resolution for TCP/UDP remains system-routed. |
-| ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` | Function arguments only | Parallel IPv4 and IPv6 STUN | A source address is applied only to its matching family. |
-| ``SwiftFTR/discoverPublicIPWithHostname()`` | Global config for IPv4 STUN | IPv4 | DNS-whoami fallback and the optional rDNS lookup are system-routed. |
+| ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` | Function arguments only | Parallel IPv4 and IPv6 STUN | A source address runs only its own family's sweep; the other family sends nothing. STUN server-name lookups are system-routed. |
+| ``SwiftFTR/discoverPublicIPWithHostname()`` | Global config, through the ``SwiftFTRConfig/publicIPResolver`` strategy | IPv4 | The library's resolver binds every STUN socket before it sends; its server-name lookups and the optional rDNS lookup are system-routed. |
 | Bufferbloat | Operation values override globals | IPv4 and IPv6 baseline ping | Binding is accepted only when `loadDuration == 0`; loaded tests reject any effective binding. |
 | HTTP/HTTPS probe | None | URLSession-selected | Interface and source-address binding are unavailable. |
 
@@ -225,9 +225,11 @@ let publicIPs = await getPublicIPs(
 print(publicIPs.v4 as Any, publicIPs.v6 as Any)
 ```
 
-``SwiftFTR/discoverPublicIPWithHostname()`` instead inherits the actor's global binding and first
-tries bound IPv4 STUN. If STUN fails, its DNS-whoami fallback drops that binding; the optional
-reverse-DNS lookup is also system-routed.
+``SwiftFTR/discoverPublicIPWithHostname()`` instead inherits the actor's global binding and asks
+its ``SwiftFTRConfig/publicIPResolver`` strategy. The library's resolver binds every STUN socket
+to the interface and source address before anything is sent, the server-name lookup included, and
+sends nothing when a bind fails; it has no fallback that drops the binding. The lookups and the
+optional reverse-DNS lookup are system-routed.
 
 ### HTTP Probe
 
@@ -427,7 +429,8 @@ SwiftFTR uses macOS's `IP_BOUND_IF` and `IPV6_BOUND_IF` socket options for inter
 
 The binding applies only to the ping, traceroute, TCP, UDP, DNS, and STUN sockets identified in the
 support matrix. It does not apply to prerequisite hostname resolution, system rDNS, Team Cymru
-queries, DNS-whoami fallback, URLSession-backed HTTP/HTTPS probes, or bufferbloat load requests.
+queries, STUN server-name lookups, URLSession-backed HTTP/HTTPS probes, or bufferbloat load
+requests.
 
 ## Platform Support
 

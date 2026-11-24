@@ -33,7 +33,7 @@ How It Works
    - Compute RTT with a monotonic clock and place the hop at `ttl - 1`.
    - Stop early once the destination responded and all earlier hops are either filled or have timed out.
 5) Optional classification (when using `traceClassified`):
-   - Enrich classified traces with the public address of the family probed: a configured value, a seeded or cached one, or else one question to the `publicIPResolver` strategy (the library's STUN, with a DNS fallback for IPv4; none; or the caller's own `PublicIPResolver`). The separate `getPublicIPs()` call returns uncached STUN results for v4 and v6 in parallel.
+   - Enrich classified traces with the public address of the family probed: a configured value, a seeded or cached one, or else one question to the `publicIPResolver` strategy (the library's STUN, with no other method; none; or the caller's own `PublicIPResolver`). The separate `getPublicIPs()` call returns uncached STUN results for v4 and v6 in parallel.
    - Batch‑resolve ASNs. By default (`.hybrid(.embedded)`) the embedded swift-ip2asn database answers first and Team Cymru DNS (`origin.asn.cymru.com` for v4, `origin6.asn.cymru.com` for v6) covers only addresses the database misses; `asnResolverStrategy` selects DNS-only, embedded-only, or a remote database instead. Apply heuristics for PRIVATE and CGNAT ranges.
    - Label each hop as LOCAL, ISP, TRANSIT, or DESTINATION and "hole‑fill" missing stretches between identical segments.
 
@@ -139,7 +139,7 @@ Key Features
 
 **Public IP Discovery**
 - `getPublicIPs()` is an uncached, STUN-only call that runs IPv4 and IPv6 in parallel and returns whichever families succeeded
-- `discoverPublicIPWithHostname()` performs fresh IPv4 discovery on each call: STUN first, then an unbound Akamai DNS-whoami fallback, plus optional system-routed rDNS
+- `discoverPublicIPWithHostname()` asks the `publicIPResolver` strategy for a fresh IPv4 address on each call (by default, bound STUN only), plus optional system-routed rDNS; it throws `PublicIPError` when there is none
 - Classified trace honors `SwiftFTRConfig.publicIP` for traces of its family; otherwise it uses a seeded or cached address of the trace's family, or asks the `SwiftFTRConfig.publicIPResolver` strategy once and caches an accepted answer per family until invalidation. Supply your own `PublicIPResolver` with `.custom(_:)`, or send nothing with `.disabled`. Multipath follows the same order once per run, for IPv4, before its first batch, and gives every flow that one answer
 
 **Architecture**
@@ -412,10 +412,10 @@ Configuration and Flags
 - Validate an exact caller-selected name and family-matched address against `NetworkInterfaceDiscovery`; never infer a physical adapter's role from its BSD-name suffix.
 - Traceroute, streaming/classified trace, and IPv4-only multipath use the global `SwiftFTRConfig` binding. Ping supports IPv4 and IPv6; each non-`nil` operation-level binding independently overrides its global counterpart.
 - Actor DNS query helpers inherit globals unless the call overrides them. The numeric DNS server—not A versus AAAA record type—selects the IPv4 or IPv6 transport. Standalone DNS query functions and DNS/TCP/UDP probes use only their function arguments or operation config.
-- `getPublicIPs()` accepts operation-level bindings for parallel IPv4/IPv6 STUN. `discoverPublicIPWithHostname()` applies globals to its IPv4 STUN attempt, but its DNS-whoami fallback and rDNS lookup use system routing.
+- `getPublicIPs()` accepts operation-level bindings for parallel IPv4/IPv6 STUN. `discoverPublicIPWithHostname()` applies globals to its IPv4 STUN sockets, which are bound before anything is sent; STUN server-name lookups and its rDNS lookup use system routing.
 - Bufferbloat honors route binding only for baseline latency (`loadDuration: 0`); loaded tests reject effective binding.
 - HTTP/HTTPS probes use URLSession and do not support either binding option.
-- Socket binding controls the documented probe sockets only. Hostname resolution, system rDNS, DNS-whoami fallback, and Team Cymru ASN lookups are not bound by these settings.
+- Socket binding controls the documented probe sockets only. Hostname resolution (STUN server names included), system rDNS, and Team Cymru ASN lookups are not bound by these settings.
 - CLI: `--public-ip x.y.z.w`, `--verbose`, `--payload-size`, `--max-hops`, `--timeout`, `--interface`, `-s/--source`. Use the long `--interface` form across commands: `-i` is the interface on `trace`, `stream`, `multipath` and the TCP and DNS probes, but the interval on `ping`, whose short interface flag is `-I`.
 
 Design Details
@@ -450,13 +450,13 @@ contributor and release-process notes in [docs/development/README.md](docs/devel
 Every tracked Markdown file has exactly one entry in one of these indexes.
 
 ### Project
-- [Changelog](CHANGELOG.md): release-by-release notes of new API, behavior changes, fixes and dependency changes, newest first. (updated 2026-11-22; update when: a PR merges to `main` or a release is cut)
+- [Changelog](CHANGELOG.md): release-by-release notes of new API, behavior changes, fixes and dependency changes, newest first. (updated 2026-11-24; update when: a PR merges to `main` or a release is cut)
 - [Roadmap](ROADMAP.md): forward-looking work, stack-ranked by priority, with the goal and constraints of each item. (updated 2026-11-22; update when: a PR completes or reprioritizes a roadmap item)
 - [Benchmarks](BENCHMARKS.md): measured ping throughput, embedded ASN database load cost and memory, and ASN resolver strategy timings, each with its release, date and command. (updated 2026-11-21; update when: a release changes the ASN database, resolver defaults or the ping I/O path, or a benchmark is re-run)
 - [Contributing](CONTRIBUTING.md): development setup, formatting, testing, documentation, commit style and the maintainer release checklist. (updated 2026-11-21; update when: the build, test, CI or release procedure changes)
 - [Security policy](SECURITY.md): supported versions, how to report a vulnerability, response timeline and the library's security-relevant design choices. (updated 2026-11-21; update when: a release line is added or dropped from support, or the reporting channel changes)
 - [Code of Conduct](CODE_OF_CONDUCT.md): Contributor Covenant 2.0 terms and the enforcement contact. (updated 2025-09-08; update when: the enforcement contact or Covenant version changes)
-- [Agent guidance](CLAUDE.md): commands, architecture overview, environment variables, conventions and merge/release duties for coding agents working in this repo. (updated 2026-11-21; update when: a command, environment variable, core component or repo convention changes)
+- [Agent guidance](CLAUDE.md): commands, architecture overview, environment variables, conventions and merge/release duties for coding agents working in this repo. (updated 2026-11-24; update when: a command, environment variable, core component or repo convention changes)
 
 ### API guides (DocC articles)
 - [SwiftFTR](Sources/SwiftFTR/SwiftFTR.docc/SwiftFTR.md): DocC landing page with the feature overview, quick samples, configuration and network-change controls, and the Topics map of the public API. (updated 2026-11-22; update when: a public type or `SwiftFTR` method is added or removed, or a `SwiftFTRConfig` default changes)
@@ -466,14 +466,14 @@ Every tracked Markdown file has exactly one entry in one of these indexes.
 - [Probing](Sources/SwiftFTR/SwiftFTR.docc/Probing.md): the TCP, UDP, HTTP and DNS probe functions, their results, errors and binding behavior. (updated 2026-11-22; update when: a probe function, config or result type changes, or HTTP probes gain route binding)
 - [Bufferbloat](Sources/SwiftFTR/SwiftFTR.docc/Bufferbloat.md): `testBufferbloat` usage, load generation, grading and RPM calculation, video-call severity and baseline-only bound mode. (updated 2026-11-22; update when: grading thresholds, the RPM method, default load endpoints or `BufferbloatConfig` change)
 - [Multipath](Sources/SwiftFTR/SwiftFTR.docc/Multipath.md): `discoverPaths` usage, topology analysis, ICMP-versus-UDP limitations and the IPv4-only restriction. (updated 2026-11-21; update when: multipath gains UDP or IPv6 support, or `MultipathConfig` or `NetworkTopology` change)
-- [Interface binding](Sources/SwiftFTR/SwiftFTR.docc/InterfaceBinding.md): which operations honor interface and source-address binding, resolution order and binding errors. (updated 2026-11-21; update when: an operation gains or loses binding support, or HTTP probes become bindable)
-- [Migrating to 0.19](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo019.md): upgrade guide from 0.18 to 0.19 for people and coding agents, one entry per change a caller can observe, with what changed, what a caller sees and before-and-after code. (updated 2026-11-23; update when: a change bound for 0.19 alters behavior or source a caller depends on, or 0.18 adopters no longer need it)
+- [Interface binding](Sources/SwiftFTR/SwiftFTR.docc/InterfaceBinding.md): which operations honor interface and source-address binding, resolution order and binding errors. (updated 2026-11-24; update when: an operation gains or loses binding support, or HTTP probes become bindable)
+- [Migrating to 0.19](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo019.md): upgrade guide from 0.18 to 0.19 for people and coding agents, one entry per change a caller can observe, with what changed, what a caller sees and before-and-after code. (updated 2026-11-24; update when: a change bound for 0.19 alters behavior or source a caller depends on, or 0.18 adopters no longer need it)
 - [Migrating to 0.18](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo018.md): upgrade guide from 0.17 to 0.18 for people and coding agents, one entry per behavior change with what changed, what a caller sees and before-and-after code, including adopting the structured DNS probe outcome. (updated 2026-11-22; update when: a change bound for 0.18 alters behavior a caller can observe, or 0.17 adopters no longer need it)
 - [Migrating to 0.14](Sources/SwiftFTR/SwiftFTR.docc/MigratingTo014.md): upgrade guide from 0.13 to 0.14 covering new `DNSError` cases, behavior and CLI changes, plus runtime changes in later releases. (updated 2026-11-21; update when: a later release changes a behavior it describes, or 0.13 adopters no longer need it)
 
 ### Reference and examples
 - [Examples](docs/guides/EXAMPLES.md): worked Swift examples for each feature area, including trace, hop outcomes, configuration, network-change lifecycle, streaming, DNS, ping, multipath, bufferbloat, SwiftUI, concurrency, errors, DNS probe outcomes and ASN strategies. (updated 2026-11-23; update when: a public API used in a sample changes shape, or a release adds a feature area with no example)
-- [Condensed API reference](docs/reference/AI_REFERENCE.md): public types, method signatures, defaults, enum and error cases and CLI flags with short snippets, sized to load whole into an agent's context. (updated 2026-11-23; update when: a release changes a public signature, default, enum case or CLI flag)
+- [Condensed API reference](docs/reference/AI_REFERENCE.md): public types, method signatures, defaults, enum and error cases and CLI flags with short snippets, sized to load whole into an agent's context. (updated 2026-11-24; update when: a release changes a public signature, default, enum case or CLI flag)
 
 ### Tools and fixtures
 - [hop-monitor](Sources/hop-monitor/README.md): the demo CLI that traces a path and then pings every hop continuously, with its output, statistics and limits. (updated 2026-11-21; update when: `Sources/hop-monitor/main.swift` changes its arguments, limits or statistics)
