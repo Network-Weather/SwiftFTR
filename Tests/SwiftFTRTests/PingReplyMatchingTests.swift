@@ -531,6 +531,7 @@ final class DirectPing: @unchecked Sendable {
     var after: Hook?
     var premises: [Bool] = []
     var holdsGivenUp: [String] = []
+    var runStart: TimeInterval?
     var sent: [UInt16: TimeInterval] = [:]
     var failing: Set<UInt16> = []
     var closed: TimeInterval?
@@ -584,11 +585,12 @@ final class DirectPing: @unchecked Sendable {
     return given.isEmpty ? "no hold gave up" : given.joined(separator: "; ")
   }
 
-  /// The longest ``waitUntilReplied(_:_:limit:)`` holds a send: what is left of the tests'
-  /// watchdog (`safetyTimer - 1`, from the start of the run) once the held probe's reply window
-  /// and half a second are taken off. Ping's safety timer starts with the run, so a hold cannot be
-  /// timed apart from it; past this, a correct ping could no longer end inside the watchdog, so
-  /// the hold gives up and the test fails on its premise instead.
+  /// How far into the run ``waitUntilReplied(_:_:limit:)`` stops holding a send: what is left of
+  /// the tests' watchdog (`safetyTimer - 1`, from the start of the run) once the held probe's
+  /// reply window and half a second are taken off. It is counted from the start of ``run()``, not
+  /// from when the hold begins, since the watchdog and ping's safety timer both start with the
+  /// run; past it a correct ping could no longer end inside the watchdog, so the hold gives up
+  /// and the test fails on its premise instead.
   var holdCap: TimeInterval {
     PingReplyMatchingTests.safetyTimer(config) - 1 - config.timeout - 0.5
   }
@@ -622,8 +624,9 @@ final class DirectPing: @unchecked Sendable {
   /// connected to the network, which answers only this socket, so the count is exact. Returns
   /// whether that happened.
   func waitUntilReplied(_ count: Int, _ fd: Int32, limit: TimeInterval? = nil) -> Bool {
-    let cap = limit ?? holdCap
-    let giveUp = monotonicNow() + cap
+    let began = monotonicNow()
+    let runStart = state.lock.withLock { state.runStart } ?? began
+    let giveUp = limit.map { began + $0 } ?? (runStart + holdCap)
     var held = true
     while network.repliesSent.value < count {
       if monotonicNow() >= giveUp {
@@ -636,8 +639,8 @@ final class DirectPing: @unchecked Sendable {
     if !held {
       let sent = network.repliesSent.value
       let note = String(
-        format: "hold gave up after its %.1f s cap: %d of %d replies sent, %d queued, %d read",
-        cap, sent, count, queuedDatagrams(fd), clock.readingCount)
+        format: "hold gave up %.1f s into the run: %d of %d replies sent, %d queued, %d read",
+        monotonicNow() - runStart, sent, count, queuedDatagrams(fd), clock.readingCount)
       state.lock.withLock { state.holdsGivenUp.append(note) }
     }
     return held
@@ -681,7 +684,10 @@ final class DirectPing: @unchecked Sendable {
       })
   }
 
-  func run() async throws -> PingResult { try await operation.run() }
+  func run() async throws -> PingResult {
+    state.lock.withLock { state.runStart = monotonicNow() }
+    return try await operation.run()
+  }
 
   func stop() {
     // The hooks capture this object; drop them so it and its fixture are released.
