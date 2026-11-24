@@ -21,14 +21,20 @@ struct TCPProbeTests {
 
   @Test("TCP probe to closed port (localhost)")
   func testClosedPort() async throws {
-    // Test against localhost closed port - guaranteed RST response
-    // Connection refused (RST) still counts as reachable
-    let result = try await tcpProbe(host: "127.0.0.1", port: 9999, timeout: 2.0)
+    // A loopback port reserved for the test that answers every SYN with a reset, rather than a
+    // fixed port number some other process may be listening on. The refusal ends the probe: its
+    // timeout outlasts the watchdog, so a probe that missed the reset and waited trips it.
+    let refusing = try RefusingTCPPort()
+    defer { withExtendedLifetime(refusing) {} }
+    let (result, elapsed) = try await measure(within: 20) {
+      try await tcpProbe(host: "127.0.0.1", port: Int(refusing.port), timeout: 60)
+    }
 
-    // Expect success (RST = host reachable, port closed)
+    // A reset means the host is reachable and the port closed.
     #expect(result.isReachable)
-    #expect(result.rtt != nil)
-    #expect(result.rtt.map { $0 < 0.1 } == true)  // Localhost should be instant
+    #expect(result.connectionState == .closed)
+    let rtt = try #require(result.rtt)
+    #expect(rtt > 0 && rtt <= elapsed, "rtt \(rtt)s against \(elapsed)s elapsed")
   }
 
   @Test(
