@@ -324,7 +324,8 @@ nothing, the lookup included. The lookups use the system resolver, which is not 
 - Where UDP to the STUN servers is blocked, `publicIP` and `clientASN` are `nil` where 0.18 may
   have reported the whoami address (own-network hops are TRANSIT, not ISP), and
   ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` throws (see below). With STUN silent,
-  discovery ends once both servers time out, about 4 s by default.
+  discovery ends once both servers time out, about 2 s by default, since they are asked at once
+  (see below).
 - A tracer bound to an interface or source address it cannot bind sends no STUN name lookups.
 
 **What to change.** Nothing, if STUN reaches its servers. A host app that knows its public
@@ -345,6 +346,52 @@ if let known = myGatewayReportedWAN {
   _ = await tracer.seedPublicIP(known, source: .gatewayReported)
 }
 // or: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(myResolver))
+```
+
+## The STUN servers are asked at once, and an address needs them not to disagree
+
+**What changed.** The library's resolver, used by a classified trace, a multipath run,
+``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` and
+``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``, sends to every STUN server at the
+same time, each as soon as its name has resolved; 0.18 tried them one after another and took the
+first answer. Which answer is believed:
+
+- two servers reporting the same address answer at once;
+- otherwise the replies are compared once every attempt has ended, which is at the discovery
+  deadline at the latest: one distinct address is reported, two different ones mean no address.
+
+A datagram that is not a STUN reply to the request (empty, shorter than a STUN header, another
+magic cookie or another transaction ID) is ignored and the wait goes on; in 0.18 it failed that
+server at once. Each STUN server's name lookup is waited for until the earlier of the discovery
+deadline and 20 s; `getPublicIPs`, which has no deadline, waited as long as `getaddrinfo` took.
+
+**What a caller sees.**
+
+- With both default servers answering the same address, the answer comes when the second one
+  replies. With one silent, the other's answer comes when the silent one's attempt times out:
+  `stunTimeout` in `getPublicIPs`, 2 s in a trace.
+- Where the two servers see different addresses (a NAT or load balancer that maps each
+  destination to its own exit), `publicIP` is `nil` in the classified trace and the topology,
+  `getPublicIPs` returns `nil` for that family, and `discoverPublicIPWithHostname()` throws
+  ``PublicIPError/noAddress(reason:)``. 0.18 reported whichever server answered first.
+- A server that sends only malformed datagrams costs its full timeout instead of failing at once.
+- A stalled resolver ends `getPublicIPs` after about 20 s plus `stunTimeout`, instead of holding it
+  until `getaddrinfo` gave up.
+
+**What to change.** Nothing, to keep the library's rule. A host app that would rather take the
+first answer, or that knows which exit a destination uses, supplies its own resolver:
+
+Before:
+
+```swift
+let tracer = SwiftFTR(config: SwiftFTRConfig())
+// 0.18 reported the first STUN server's answer
+```
+
+After:
+
+```swift
+let tracer = SwiftFTR(config: SwiftFTRConfig(publicIPResolver: .custom(myResolver)))
 ```
 
 ## discoverPublicIPWithHostname asks the strategy, and PublicIPError has new cases
@@ -403,7 +450,7 @@ do {
 library's resolver for each family. Given a `sourceIP`, it runs only the sweep of that address's
 family, bound to it; 0.18 ran the other family's sweep unbound. A `sourceIP` that is not an IP
 address now sends nothing; 0.18 ran both sweeps unbound. `stunTimeout` is still per server, and
-the call still has no overall deadline and reports the address as the STUN server gave it.
+the call still has no overall deadline and reports the address as the STUN servers gave it.
 
 **What a caller sees.** With `sourceIP: "192.0.2.10"`, `v6` is always `nil`; with an IPv6
 `sourceIP`, `v4` is always `nil`; with a malformed one, both are `nil`.

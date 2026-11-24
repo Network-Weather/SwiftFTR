@@ -77,7 +77,8 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts; with a failed send, the ping ends once every probe that left is answered, whether the last reply or the end of the send loop comes last, does not end before its remaining probes are sent, and still waits out its window for an unanswered probe (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
 | Public-IP discovery | stalls past its budget; fails; result arriving after a network change; STUN attempts against silent loopback servers, each able to outlast the watchdog, ended by the one discovery deadline; a name lookup waiting for a slot, abandoned at it; a failure at the deadline reported as a timeout whichever timer fired first; the budget a multipath run's question carries; standalone `getPublicIPs` ended by its caller's cancellation, returning the family that answered, and leaving the cooperative pool free with more stalled calls than it has threads | traceClassified, discoverPaths, getPublicIPs | `Enrichment`, `Cancellation`, `AsyncPublicIPDiscoveryTests` |
 | Library public-IP resolver | on a bound request every STUN socket bound to the interface at its send (IPv4 and IPv6); a missing interface or an unbindable source address sending nothing, no server-name lookup included; a source address of the other family, or not an address, sending nothing; STUN failing on a bound request with no DNS query sent after it; `getPublicIPs` with a source address running only that family's sweep, with a malformed one sending nothing, and asking the library's resolver, and asking nothing once cancelled; sweeps waiting for the executor holding no sockets; `discoverPublicIPWithHostname()` asking the strategy past the configured address and cache, throwing for `.disabled`, refusing a private or IPv6 answer, and reporting the library's failure as `noAddress` | the library's resolver, getPublicIPs, discoverPublicIPWithHostname | `LibraryPublicIPResolverTests`, `PublicIPResolverTests` |
-| STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
+| STUN wire | silent, empty, garbage, wrong cookie, wrong transaction, slow server, and a reply with the transaction ID but the wrong message type, all on the event-based transport; sub-microsecond timeout | stunGetPublicIP | `Wire` |
+| Event-based STUN | an empty, short, wrong-cookie or wrong-ID datagram ignored and the real reply behind it taken; an invalid reply carrying the ID failing its server alone, at once; a refused port not delaying the others; two agreeing servers answering while one listed first is silent; a healthy server beside a stalled name lookup answering at the deadline, not before; two disagreeing servers yielding none in either reply order, from the sweep and the resolver; no traffic with no time left (budgets 0, -1, -inf, NaN; past, -inf and NaN deadlines) or a cancelled caller, and far deadlines (inf, 1e300) meaning none; an answer with every executor slot held; sweeps cancelled in their lookups or exchanges, or ended by their deadline, leaving no socket open | the library's resolver, getPublicIPs | `EventBasedSTUNTests`, `LibraryPublicIPResolverTests` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached and, though it ran past the stall threshold, does not count toward the breaker | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
 | Reverse-DNS lookup (`DNSServiceQueryRecord`, not yet used by `RDNSCache`) | the PTR question for IPv4, IPv6, IPv4-mapped and zoned link-local addresses; PTR data that is not one well-formed, uncompressed name (a compression pointer, a reserved label type, truncation, trailing data, over 255 bytes, the root alone); labels from the reverse zone holding `.`, `\`, space, NUL, ESC, DEL, invalid and non-ASCII UTF-8, escaped to printable ASCII with one label reading as one, also over 500 random names; every row of the deadline table on the type, each event before and after the deadline (the start, a failed start or queue call, an added PTR, a malformed one, intermediate CNAMEs and remove events, no such record and no such name, a daemon error, the daemon's timeout, cancellation), with the deadline passed through the `armDeadline` seam and no wake-up, so the lookup's own check decides; cancellation before the start, during a start stalled in the daemon, after the start, racing a reply and racing the deadline, each with one outcome and one deallocate per reference on the lookup's queue and the callback context still alive at every deallocate; each order of a reply against a cancellation and against the wake-up, forced by holding the lookup's queue; a start stalled past the deadline releasing the caller and deallocating when it returns; the real timer's wake-up, off the lookup's queue, and a real deadline already passed when the start runs; the cap on queries in flight, whose permit is held until the reference is gone; one deadline covering the wait for a permit as well as the query, so a queued lookup times out (`timedOutBeforeQuery`) with no query and no permit taken | `ReverseDNSLookup.lookup` | `ReverseDNSLookupTests` |
 | Reverse-DNS lookup against the real daemon | 127.0.0.1 and ::1 only, which the daemon answers from its local records with no query sent; loopback answers started and deallocated on the lookup's queue; with every executor slot held; the cap on queries in flight, with the first starts held until the cap is reached; in a child process, far more lookups than the cap all answering and every daemon connection they opened closed again, counted from the process's own descriptor table, with the child stopped and the test failed, with its output, if it is still running after two minutes (the peak open is printed, not asserted; `SWIFTFTR_RDNS_DESCRIPTOR_STRESS=1` adds the experiment of lowering the child's descriptor limit to what is open plus the cap plus two); a stress loop of 3,000 answered, cancelled and expiring lookups, asserting only what holds in any interleaving; a live comparison with `getnameinfo`, skipped offline | `ReverseDNSLookup.lookup` | `ReverseDNSLookupDaemonTests` |
@@ -251,10 +252,10 @@ numbers are as of the commit that added this section.
    block in `recv`, in plain `Task`s. With one more stalled call than the pool has threads, an
    unrelated task ran only after the STUN server answered; cancelling the caller left the call
    waiting out every attempt (both measured against loopback fixtures before the fix). The sweeps
-   are now child tasks, every lookup and attempt is its own executor request, and cancellation
-   ends the call at once. Still open: the standalone call as a whole has no bound. Each attempt is
-   bounded by `stunTimeout` (its executor deadline is twice that), but name lookups have no
-   deadline, because the public signature has no budget to take one from. Tests:
+   are now child tasks, every name lookup is its own executor request, every exchange waits on
+   Dispatch sources, and cancellation ends the call at once. Still open: the standalone call has
+   no bound the caller chooses. Each exchange is bounded by `stunTimeout` and each lookup wait by a
+   fixed 20 s, because the public signature has no budget to take one from. Tests:
    `AsyncPublicIPDiscoveryTests.standaloneCancellation` and `standaloneLeavesPoolFree`.
 
 10. **A reverse-DNS lookup cut short by cancellation was cached as a miss for 24 hours.**
@@ -592,10 +593,8 @@ Observations that are not defects of the library:
   it sent just before can still be in flight on a loaded host (round trips of 200 to 750 ms were
   measured) and land on the next socket handed that number; `FakeICMPNetwork`'s replies and
   `EndlessReplies`' feed, at 500 a second, are the largest sources. `HeldUDPServer` answers its held clients with a 4-byte datagram when released, which
-  reaches a client only while its STUN attempt is still blocked in `recv`: every test that
-  releases one with attempts outstanding gives them a 60 s receive timeout, and the one whose
-  attempts have 0.2 s asserts that none reached the server. Receivers no longer act on such
-  datagrams, and a DNS filter given no name still takes another test's late query: the tests
+  is not a STUN reply and which STUN, like the other receivers, now ignores. Receivers no longer
+  act on such datagrams, and a DNS filter given no name still takes another test's late query: the tests
   that assert an exact request count name their query.
 - **The wire tests waited on loopback inside sub-second budgets** (#103). Under that load
   `FaultInjectionWireTests` recorded issues in 9 of 10 runs on main (93 issues), 3 of 10 with
@@ -662,8 +661,9 @@ Observations that are not defects of the library:
   asked 0 times, so not a stray (which would count one or more). 229 instrumented strict
   repetitions did not repeat it: the fallback always started 4.000 to 4.012 s into discovery and
   discovery ended at 8.001 to 8.014 s. Not reproduced; the mechanism is not known. The fallback is
-  gone (#153, below), so the test now checks only that the budget ends a stalled STUN attempt and
-  nothing goes on to the next server; its failure timeline went with the fallback.
+  gone (#153, below), so the test now checks only that the budget ends stalled STUN attempts, both
+  asked at once, and that nothing more is sent after it; its failure timeline went with the
+  fallback.
 - **The library's public-IP fallback reported an address that was not the caller's** (#153).
   Confirmed by measurement and fixed by deletion. IPv4 discovery, when STUN failed, asked
   `1.1.1.1` and `8.8.8.8` for `whoami.ds.akahelp.net` TXT, whose `ip` record is built from the
@@ -684,3 +684,14 @@ Observations that are not defects of the library:
 - **`multipathHonoursPublicIPBudget` could not tell its configured budget from the default**
   (#103), its watchdog being the default budget. It now checks the deadline the question carries
   is within the configured 2 s (6 s with the default substituted), under a 20 s watchdog.
+- **STUN servers were tried one after another, and the first answer was believed.** Fixed by the
+  Event-Based STUN stage. A silent first server held the sweep for its whole attempt before the
+  second was asked, each exchange held an executor thread while it waited, a datagram that was
+  not a reply to the request failed the server at once, and whichever server answered first
+  decided the address. Every server is now asked at once on `UDPExchange`, foreign datagrams are
+  ignored, and two servers that report different addresses yield none. The resolver no longer
+  races a second timer against the sweep, which would turn an answer the sweep may give at the
+  deadline into a timeout: with that timer restored, `healthyBesideStalledName` fails with
+  `PublicIPDiscoveryTimeout`. A discovery budget of negative infinity or NaN had been taken as no
+  bound at all; it now ends discovery before anything is sent. Tests: `EventBasedSTUNTests`,
+  `LibraryPublicIPResolverTests.endedSweepsLeaveNoSockets`.

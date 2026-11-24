@@ -809,13 +809,15 @@ func publicIPDiscoveryOutcome<Found>(
 /// "this network is v6-only" cases.
 ///
 /// Each family asks the library's own resolver, the one a classified trace uses by default: STUN
-/// only, every socket bound before anything is sent. Unlike a trace's question, there is no
-/// overall deadline and the address is reported as the STUN server gave it, whether or not it is
-/// globally routable.
+/// only, every socket bound before anything is sent, every server asked at once. A family's
+/// address is reported when two servers report it, or when every attempt has ended with one
+/// distinct address; servers that report different addresses leave the family `nil`. Unlike a
+/// trace's question, there is no overall deadline and the address is reported as the STUN servers
+/// gave it, whether or not it is globally routable.
 ///
 /// The two sweeps are child tasks of the caller's. Cancelling the calling task ends both at once,
-/// and the call returns what had been found by then. Each server attempt is bounded by
-/// `stunTimeout`; resolving the server names has no deadline of its own.
+/// and the call returns what had been found by then. Each server's exchange is bounded by
+/// `stunTimeout`, and the wait on each server's name lookup by 20 s.
 ///
 /// - Parameters:
 ///   - stunTimeout: Per-server timeout (default 0.8s).

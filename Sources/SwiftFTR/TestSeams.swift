@@ -24,7 +24,8 @@ enum TestSeams {
   /// which has none).
   typealias DiscoverPublicIP = @Sendable (_ request: PublicIPRequest) async throws -> STUNPublicIP
 
-  /// The STUN servers to try, in order, for one address family.
+  /// The STUN servers a sweep asks, all at once, for one address family. Their order decides
+  /// only which failure a sweep with no answer reports: the last one's.
   typealias STUNServers = @Sendable (_ family: Int32) -> [(host: String, port: UInt16)]
 
   /// Resolution of a STUN server's name for `family`, in place of `getaddrinfo`. Runs in an
@@ -112,7 +113,7 @@ enum TestSeams {
 
   /// `send(2)` of a STUN sweep's binding request, in place of the system call, called with the
   /// request's own socket. Returns what `send` would and sets `errno` the same way. Captured by the
-  /// sweep, since each exchange runs in an executor slot.
+  /// sweep on the async side; ``sendDatagram`` does not apply to STUN.
   @TaskLocal static var sendSTUNRequest: SendDatagram?
 
   /// Arms the wake-up at a caller's public-IP resolver's deadline in place of a sleeping task, and
