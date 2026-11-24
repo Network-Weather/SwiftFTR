@@ -419,7 +419,7 @@ final class FakeICMPNetwork: @unchecked Sendable {
     let makeSocket: TestSeams.MakeICMPSocket = socketFactory ?? { try self.makeSocket($0) }
     let discover: TestSeams.DiscoverPublicIP =
       TestSeams.discoverPublicIP ?? { _ in
-        throw PublicIPError.allMethodsFailed(stunError: "offline test", dnsError: "offline test")
+        throw STUNError.recvTimeout
       }
     return try await TestSeams.$resolveHost.withValue(resolve) {
       try await TestSeams.$makeICMPSocket.withValue(makeSocket) {
@@ -1303,7 +1303,7 @@ final class SilentTCPPort: @unchecked Sendable {
 
 /// Public-IP discovery that finds nothing, at once, and counts how often it was asked.
 ///
-/// The library's resolver is live STUN with a DNS fallback unless a substitute is bound. Run a call
+/// The library's resolver is live STUN unless a substitute is bound. Run a call
 /// that could ask it inside ``install(_:)`` so it never reaches the network, and read ``calls`` to
 /// check how often discovery reached this substitute.
 final class OfflinePublicIPDiscovery: Sendable {
@@ -1313,7 +1313,7 @@ final class OfflinePublicIPDiscovery: Sendable {
     let calls = self.calls
     let discover: TestSeams.DiscoverPublicIP = { _ in
       calls.increment()
-      throw PublicIPError.allMethodsFailed(stunError: "offline test", dnsError: "offline test")
+      throw STUNError.recvTimeout
     }
     return try await TestSeams.$discoverPublicIP.withValue(discover) { try await body() }
   }

@@ -146,8 +146,8 @@ final class HeldUDPServer: @unchecked Sendable {
 }
 
 /// Public-IP discovery against loopback fixtures only: STUN servers by numeric address through
-/// `TestSeams.stunServers`, and the whoami fallback through `TestSeams.whoamiServers` and
-/// `TestSeams.dnsServerPort`. Nothing here sends a packet off the host.
+/// `TestSeams.stunServers`, or by name through `TestSeams.resolveSTUNServer`, which maps each name
+/// to a loopback fixture without a lookup. Nothing here sends a packet off the host.
 ///
 /// No test bounds from above how long a call took. Each call runs under ``watchdog``, and every
 /// timeout that could end it on the wrong path is set well past the watchdog.
@@ -172,36 +172,19 @@ struct AsyncPublicIPDiscoveryTests {
       + attribute
   }
 
-  /// A whoami TXT answer to `query`, in the form Akamai sends: the string `ip` then the address.
-  static func whoamiAnswer(to query: [UInt8], ip: String) -> [UInt8] {
-    let address = Array(ip.utf8)
-    let rdata: [UInt8] = [2] + Array("ip".utf8) + [UInt8(address.count)] + address
-    let record: [UInt8] =
-      [0xC0, 0x0C, 0, 16, 0, 1, 0, 0, 0, 60, 0, UInt8(rdata.count)] + rdata
-    return FaultInjectionWireTests.dnsResponse(to: query, answers: record)
-  }
-
-  /// The fallback's TXT query, the only datagram a whoami fixture answers or counts.
-  static let whoamiQuery = DatagramFilter.dnsQuery(named: "whoami.ds.akahelp.net")
-
   static func servers(
     v4: [(host: String, port: UInt16)] = [], v6: [(host: String, port: UInt16)] = []
   ) -> TestSeams.STUNServers {
     { family in family == AF_INET6 ? v6 : v4 }
   }
 
-  /// Runs `body` with STUN pointed at `servers`, the whoami fallback at `whoamiPort` on loopback
-  /// (or at nothing), and every blocking attempt on `executor`.
+  /// Runs `body` with STUN pointed at `servers` and every blocking attempt on `executor`.
   static func withFixtures<T>(
-    servers: @escaping TestSeams.STUNServers, whoamiPort: UInt16? = nil,
-    executor: BlockingIOExecutor, _ body: () async throws -> T
+    servers: @escaping TestSeams.STUNServers, executor: BlockingIOExecutor,
+    _ body: () async throws -> T
   ) async rethrows -> T {
     try await TestSeams.$blockingIOExecutor.withValue(executor) {
-      try await TestSeams.$stunServers.withValue(servers) {
-        try await TestSeams.$whoamiServers.withValue(whoamiPort == nil ? [] : ["127.0.0.1"]) {
-          try await TestSeams.$dnsServerPort.withValue(whoamiPort) { try await body() }
-        }
-      }
+      try await TestSeams.$stunServers.withValue(servers) { try await body() }
     }
   }
 
@@ -337,49 +320,7 @@ struct AsyncPublicIPDiscoveryTests {
 
   // MARK: Classified discovery
 
-  @Test("The whoami fallback answers while every executor slot is held")
-  func whoamiWithEveryWorkerHeld() async throws {
-    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-full")
-    let occupant = StallGate()
-    defer { occupant.open() }
-    let occupied = FaultCounter()
-    let released = FaultCounter()
-    Task {
-      try? await executor.run(priority: .userInitiated) {
-        occupied.increment()
-        occupant.wait(limit: 3 * Self.watchdog)
-        released.increment()
-      }
-    }
-    #expect(await eventually(within: Self.watchdog) { occupied.value > 0 })
-
-    // The STUN attempt queues behind the occupant until its deadline; the whoami query needs no
-    // slot. The budget and the DNS timeout both outlive the watchdog.
-    let silent = try HeldUDPServer(family: AF_INET)
-    defer { silent.stop() }
-    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { query in
-      (Self.whoamiAnswer(to: query, ip: "198.51.100.42"), 0)
-    }
-    defer { whoami.stop() }
-
-    let (found, _) = try await measure(within: Self.watchdog) {
-      try await Self.withFixtures(
-        servers: Self.servers(v4: [(silent.host, silent.port)]), whoamiPort: whoami.port,
-        executor: executor
-      ) {
-        try await publicIPDiscovery(
-          family: .v4,
-          stunTimeout: 0.2, dnsTimeout: 3 * Self.watchdog, interface: nil, sourceIP: nil,
-          enableLogging: false, budget: 3 * Self.watchdog)
-      }
-    }
-    #expect(found.address == "198.51.100.42")
-    #expect(released.value == 0, "discovery waited for the occupant to free its slot")
-    #expect(silent.requests.value == 0, "the STUN attempt ran although no slot was free")
-    #expect(whoami.requests.value == 1)
-  }
-
-  @Test("Stalled STUN attempts and a silent fallback cannot keep discovery past its budget")
+  @Test("Stalled STUN attempts cannot keep discovery past its budget")
   func stalledAttemptsBoundedByBudget() async throws {
     let first = try HeldUDPServer(family: AF_INET)
     let second = try HeldUDPServer(family: AF_INET)
@@ -387,72 +328,40 @@ struct AsyncPublicIPDiscoveryTests {
       first.stop()
       second.stop()
     }
-    // When each step happened, attached to the failures below: this test failed once in about
-    // 500 strict repetitions with the fallback never asked, and 229 later ones did not repeat it.
-    let timeline = Timeline()
-    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { _ in
-      timeline.mark("whoami query arrived")
-      return nil
-    }
-    defer { whoami.stop() }
-    // The fallback's query is the only UDP exchange in this test.
-    let send: TestSeams.SendDatagram = { fd, bytes in
-      let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
-      let code = errno
-      timeline.mark("whoami query sent: \(sent) bytes, errno \(sent < 0 ? code : 0)")
-      Darwin.errno = code
-      return sent
-    }
     // One slot, so a call queued after the stalled attempt runs only once that attempt returns.
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-budget")
     let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
 
-    // Each attempt and the fallback could each run past the watchdog on their own; only the
-    // budget can end discovery inside it. The budget is the one real duration here, and
-    // what is checked below must happen inside it: the first attempt sent within STUN's share
-    // (four seconds) and the fallback asked in the four after. On a three-core CI runner with the
-    // rest of the suite running, a one-second budget ended before the first attempt was sent.
-    timeline.mark("discovery started; STUN's share ends at +4 s, the budget at +8 s")
+    // Each attempt could run past the watchdog on its own; only the budget can end discovery
+    // inside it. The budget is the one real duration here, and the first attempt must be sent
+    // inside it: on a three-core CI runner with the rest of the suite running, a one-second budget
+    // ended before the first attempt was sent.
     let outcome = try await measure(within: Self.watchdog) {
-      await Self.withFixtures(servers: servers, whoamiPort: whoami.port, executor: executor) {
-        await TestSeams.$sendDatagram.withValue(send) {
-          do {
-            return Result<PublicIPObservation, Error>.success(
-              try await publicIPDiscovery(
-                family: .v4,
-                stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
-                interface: nil, sourceIP: nil, enableLogging: false, budget: 8))
-          } catch {
-            return .failure(error)
-          }
+      await Self.withFixtures(servers: servers, executor: executor) {
+        do {
+          return Result<PublicIPObservation?, Error>.success(
+            try await publicIPDiscovery(
+              family: .v4, stunTimeout: Self.longSTUNTimeout, interface: nil, sourceIP: nil,
+              enableLogging: false, budget: 4))
+        } catch {
+          return .failure(error)
         }
       }
     }.0
-    timeline.mark("discovery returned")
-    if let asked = first.firstRequestTime { timeline.mark("first STUN request arrived", at: asked) }
     #expect(throws: PublicIPDiscoveryTimeout.self) { try outcome.get() }
     #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
-    // Each fixture counts a request on its own thread, so wait for the counts.
+    // Each fixture counts a request on its own thread, so wait for the count.
     let firstAsked = await eventually(within: 10) { first.requests.value == 1 }
-    #expect(
-      firstAsked, "the first server was asked \(first.requests.value) times; \(timeline.summary)")
-
-    // STUN's share of the budget ends at half of it, so the fallback was asked inside the
-    // budget, and the second server never got time.
-    #expect(second.requests.value == 0)
-    let fallbackAsked = await eventually(within: 10) { whoami.requests.value == 1 }
-    #expect(
-      fallbackAsked, "the fallback was asked \(whoami.requests.value) times; \(timeline.summary)")
+    #expect(firstAsked, "the first server was asked \(first.requests.value) times")
+    #expect(second.requests.value == 0, "the second server was asked inside the stalled budget")
 
     // The discovery itself ended, not only the wait for it: once the stalled attempt lets go of
-    // its slot, nothing goes on to the next server or asks the fallback again.
+    // its slot, nothing goes on to the next server.
     first.release()
     _ = try await measure(within: Self.watchdog) {
       try await executor.run(priority: .userInitiated) {}
     }
-    let carriedOn = await eventually(within: 1) {
-      second.requests.value > 0 || whoami.requests.value > 1
-    }
+    let carriedOn = await eventually(within: 1) { second.requests.value > 0 }
     #expect(!carriedOn, "the abandoned discovery went on after its budget")
   }
 
@@ -464,26 +373,23 @@ struct AsyncPublicIPDiscoveryTests {
       first.stop()
       second.stop()
     }
-    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { _ in nil }
-    defer { whoami.stop() }
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-deadline")
     let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
 
     // No outer race here: only the deadline handed to each step can end this inside the watchdog,
-    // since each attempt and each DNS query could run past it alone.
+    // since each attempt could run past it alone.
     let outcome = try await measure(within: Self.watchdog) {
-      await Self.withFixtures(servers: servers, whoamiPort: whoami.port, executor: executor) {
+      await Self.withFixtures(servers: servers, executor: executor) {
         do {
-          return Result<PublicIPObservation, Error>.success(
-            try await getPublicIPv4(
-              stunTimeout: Self.longSTUNTimeout, dnsTimeout: Self.longSTUNTimeout,
-              deadline: monotonicNow() + 1))
+          return Result<STUNPublicIP, Error>.success(
+            try await stunGetPublicIPWithFallback(
+              family: AF_INET, timeout: Self.longSTUNTimeout, deadline: monotonicNow() + 1))
         } catch {
           return .failure(error)
         }
       }
     }.0
-    #expect(throws: PublicIPError.self) { try outcome.get() }
+    #expect(throws: STUNError.self) { try outcome.get() }
     #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
   }
 
@@ -519,67 +425,6 @@ struct AsyncPublicIPDiscoveryTests {
     }.0
     #expect(throws: STUNError.self) { try outcome.get() }
     #expect(released.value == 0, "the lookup waited for the occupant to free its slot")
-  }
-
-  @Test("The whoami fallback still answers when STUN server names cannot get an executor slot")
-  func whoamiWhenSTUNNamesWaitForSlot() async throws {
-    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-names")
-    let occupant = StallGate()
-    defer { occupant.open() }
-    let occupied = FaultCounter()
-    let released = FaultCounter()
-    Task {
-      try? await executor.run(priority: .userInitiated) {
-        occupied.increment()
-        occupant.wait(limit: 3 * Self.watchdog)
-        released.increment()
-      }
-    }
-    #expect(await eventually(within: Self.watchdog) { occupied.value > 0 })
-
-    // Host names, as the built-in servers are, so each lookup queues for the held slot. Their
-    // 64-character labels are rejected by the resolver without a query, should a lookup run.
-    let names = ["a", "b"].map { String(repeating: $0, count: 64) + ".example" }
-    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { query in
-      (Self.whoamiAnswer(to: query, ip: "198.51.100.43"), 0)
-    }
-    defer { whoami.stop() }
-
-    // The budget and the DNS timeout outlive the watchdog; only STUN's own share of the time,
-    // two servers at 0.5 s, can let the fallback in.
-    let (found, _) = try await measure(within: Self.watchdog) {
-      try await Self.withFixtures(
-        servers: Self.servers(v4: names.map { ($0, 3478) }), whoamiPort: whoami.port,
-        executor: executor
-      ) {
-        try await publicIPDiscovery(
-          family: .v4,
-          stunTimeout: 0.5, dnsTimeout: 3 * Self.watchdog, interface: nil, sourceIP: nil,
-          enableLogging: false, budget: 3 * Self.watchdog)
-      }
-    }
-    #expect(found.address == "198.51.100.43")
-    #expect(released.value == 0, "the lookups ran, so they were not waiting for the held slot")
-    #expect(whoami.requests.value == 1)
-  }
-
-  @Test("STUN's share of the discovery budget, and what it leaves the fallback")
-  func stunPhaseShare() {
-    // The defaults: 6 s budget, two servers.
-    #expect(
-      stunPhaseDeadline(servers: 2, stunTimeout: 2, dnsTimeout: 3, start: 10, deadline: 16) == 14)
-    #expect(
-      stunPhaseDeadline(servers: 2, stunTimeout: 0.8, dnsTimeout: 2, start: 10, deadline: 16)
-        == 11.6)
-    // A budget too small for both: half the DNS timeout is kept for the fallback.
-    #expect(
-      stunPhaseDeadline(servers: 2, stunTimeout: 2, dnsTimeout: 3, start: 10, deadline: 13) == 11.5)
-    // A budget smaller than the DNS timeout: half the budget.
-    #expect(
-      stunPhaseDeadline(servers: 2, stunTimeout: 2, dnsTimeout: 3, start: 10, deadline: 12) == 11)
-    // No overall deadline: STUN's share alone.
-    #expect(
-      stunPhaseDeadline(servers: 2, stunTimeout: 2, dnsTimeout: 3, start: 10, deadline: nil) == 14)
   }
 
   struct DefiniteFailure: Error {}
@@ -643,131 +488,5 @@ struct AsyncPublicIPDiscoveryTests {
     #expect(ips.v4 == nil)
     #expect(released.value == 0, "an attempt waited for the occupant to free its slot")
     #expect(silent.requests.value == 0, "an attempt ran although no slot was free")
-  }
-
-  // MARK: Whoami servers that refuse or cannot be reached
-
-  /// How the first whoami server fails, and the `DNSError` its query throws.
-  enum WhoamiFailure: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    /// ICMP port unreachable after the send: `connectionRefused`.
-    case refused
-    /// ICMP host unreachable after the send: `unreachable`.
-    case hostUnreachable
-    /// This machine has no route, so the send fails: `unreachable`.
-    case noRoute
-    var testDescription: String { rawValue }
-  }
-
-  /// A `recv` whose first call drains the datagram waiting and reports `code`, as the kernel does
-  /// once an ICMP error has arrived for the connected socket; later calls are plain `recv`.
-  static func firstReceiveFails(with code: Int32) -> TestSeams.ReceiveDatagram {
-    let calls = FaultCounter()
-    return { fd, buffer in
-      calls.increment()
-      let received = Darwin.recv(fd, buffer.baseAddress, buffer.count, 0)
-      guard calls.value == 1 else { return received }
-      Darwin.errno = code
-      return -1
-    }
-  }
-
-  /// A `send` whose first call fails with `code` and sends nothing; later calls are plain `send`.
-  static func firstSendFails(with code: Int32) -> TestSeams.SendDatagram {
-    let calls = FaultCounter()
-    return { fd, bytes in
-      calls.increment()
-      guard calls.value > 1 else {
-        Darwin.errno = code
-        return -1
-      }
-      return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
-    }
-  }
-
-  @Test(
-    "A whoami server that refuses or cannot be reached is passed over at once for the next",
-    arguments: WhoamiFailure.allCases)
-  func whoamiFailurePassedOver(failure: WhoamiFailure) async throws {
-    let whoami = try LoopbackUDPResponder(accepts: Self.whoamiQuery) { query in
-      (Self.whoamiAnswer(to: query, ip: "198.51.100.44"), 0)
-    }
-    defer { whoami.stop() }
-
-    // Each server is asked for longer than the watchdog, so only a failure that ends the first
-    // query at once lets the second answer in time.
-    let (found, _) = try await measure(within: Self.watchdog) {
-      try await TestSeams.$whoamiServers.withValue(["127.0.0.1", "127.0.0.1"]) {
-        try await TestSeams.$dnsServerPort.withValue(whoami.port) {
-          switch failure {
-          case .refused, .hostUnreachable:
-            let code = failure == .refused ? ECONNREFUSED : EHOSTUNREACH
-            return try await TestSeams.$receiveDatagram.withValue(
-              Self.firstReceiveFails(with: code)
-            ) {
-              try await getPublicIPv4ViaDNS(timeout: 3 * Self.watchdog)
-            }
-          case .noRoute:
-            return try await TestSeams.$sendDatagram.withValue(
-              Self.firstSendFails(with: ENETUNREACH)
-            ) {
-              try await getPublicIPv4ViaDNS(timeout: 3 * Self.watchdog)
-            }
-          }
-        }
-      }
-    }
-    #expect(found.ip == "198.51.100.44")
-    // A query that failed after its send reached the responder; one with no route did not.
-    let expectedRequests = failure == .noRoute ? 1 : 2
-    #expect(whoami.requests.value == expectedRequests)
-  }
-
-  @Test("With every whoami server refusing, discovery fails at once instead of timing out")
-  func whoamiAllRefused() async throws {
-    let refusing = try RefusingUDPPort()
-    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-refused")
-
-    // No STUN servers, so the fallback decides. The budget and the DNS timeout outlive the
-    // watchdog, so a refusal waited out as silence would fail the test at the watchdog.
-    let (thrown, _) = try await measure(within: Self.watchdog) {
-      await Self.withFixtures(
-        servers: Self.servers(), whoamiPort: refusing.port, executor: executor
-      ) {
-        await TestSeams.$whoamiServers.withValue(["127.0.0.1", "127.0.0.1"]) { () -> Error? in
-          do {
-            _ = try await publicIPDiscovery(
-              family: .v4,
-              stunTimeout: 0.2, dnsTimeout: 3 * Self.watchdog, interface: nil, sourceIP: nil,
-              enableLogging: false, budget: 3 * Self.watchdog)
-            return nil
-          } catch {
-            return error
-          }
-        }
-      }
-    }
-    // A definite failure from both tiers, not the budget running out.
-    guard case PublicIPError.allMethodsFailed(_, let dnsError)? = thrown else {
-      Issue.record("expected allMethodsFailed, got \(String(describing: thrown))")
-      return
-    }
-    #expect(dnsError.contains("No response from DNS servers"), "\(dnsError)")
-  }
-}
-
-/// Named moments of a test, on `monotonicNow()`'s clock, for a failure message.
-final class Timeline: @unchecked Sendable {
-  private let lock = NSLock()
-  private var events: [(String, TimeInterval)] = []
-
-  func mark(_ event: String, at time: TimeInterval = monotonicNow()) {
-    lock.withLock { events.append((event, time)) }
-  }
-
-  /// Every event, in time order, as seconds after the first.
-  var summary: String {
-    let sorted = lock.withLock { events }.sorted { $0.1 < $1.1 }
-    guard let start = sorted.first?.1 else { return "no events" }
-    return sorted.map { String(format: "+%.3f s %@", $0.1 - start, $0.0) }.joined(separator: "; ")
   }
 }

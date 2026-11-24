@@ -225,7 +225,7 @@ struct DNSQuestionMatchTests {
 
   // MARK: TXT lookups
 
-  @Test("A TXT lookup, as the whoami fallback makes it, ignores a reply echoing another question")
+  @Test("A Team Cymru TXT lookup ignores a reply echoing another question")
   func txtOtherQuestionThenValid() async throws {
     let peer = try ScriptedDNSPeer { query in
       // The reply to the other question says "no"; the query's own says "ok".

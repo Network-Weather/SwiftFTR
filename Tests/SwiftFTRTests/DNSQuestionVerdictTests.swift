@@ -9,7 +9,7 @@ import Testing
 #endif
 
 /// Every shape a reply's first question can take, with the verdict each caller gives it: the
-/// event-based query, `dnsProbe`, and the TXT lookup behind the whoami fallback. Each datagram carries the query's
+/// event-based query, `dnsProbe`, and the Team Cymru TXT lookup. Each datagram carries the query's
 /// transaction ID. The question matcher and the validator read the first question by one rule
 /// (`DNSClient.firstQuestion`), so a datagram is either ignored as an answer to another question
 /// or decides the query, never both.
@@ -221,7 +221,7 @@ struct DNSQuestionVerdictTests {
   // MARK: TXT lookups
 
   @Test(
-    "Each first-question shape gets its verdict from the TXT lookup the whoami fallback makes",
+    "Each first-question shape gets its verdict from the Team Cymru TXT lookup",
     arguments: Shape.allCases)
   func txtLookup(shape: Shape) async throws {
     let peer = try ScriptedDNSPeer { query in [(shape.datagram(query), 0)] }

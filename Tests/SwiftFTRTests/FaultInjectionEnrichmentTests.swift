@@ -38,7 +38,7 @@ struct FaultInjectionEnrichmentTests {
       return try await runDetachedBlockingIO {
         gate.wait(limit: 20)
         finished.increment()
-        throw PublicIPError.allMethodsFailed(stunError: "stalled", dnsError: "stalled")
+        throw STUNError.recvTimeout
       }
     }
 
@@ -73,7 +73,7 @@ struct FaultInjectionEnrichmentTests {
     )
     let discovery: TestSeams.DiscoverPublicIP = { _ in
       attempts.increment()
-      throw PublicIPError.allMethodsFailed(stunError: "down", dnsError: "down")
+      throw STUNError.recvTimeout
     }
 
     _ = try await TestSeams.$blockingIOExecutor.withValue(executor) {
@@ -174,7 +174,7 @@ struct FaultInjectionEnrichmentTests {
       attempts.increment()
       return try await runDetachedBlockingIO {
         gate.wait(limit: 20)
-        throw PublicIPError.allMethodsFailed(stunError: "stalled", dnsError: "stalled")
+        throw STUNError.recvTimeout
       }
     }
     let config = MultipathConfig(
