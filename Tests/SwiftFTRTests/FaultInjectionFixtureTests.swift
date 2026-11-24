@@ -464,12 +464,17 @@ struct FaultInjectionFixtureTests {
       // The refusal ends the wait as soon as it comes back. ICMP errors are rate-limited host
       // wide, so on a loaded host it may not come, and the wait then ends at its bound: a stray
       // still in flight after it would go unseen, which can only let this pass, never fail it.
+      // A refusal is read once and then gone, so each sender's is remembered across polls.
+      let refusals = DescriptorCopies()
       let strays = senders
       let refused = await eventually(within: 2) {
-        strays.allSatisfy { sender in
+        for sender in strays where !refusals.all.contains(sender) {
           var byte: UInt8 = 0
-          return recv(sender, &byte, 1, MSG_DONTWAIT) < 0 && errno == ECONNREFUSED
+          if recv(sender, &byte, 1, MSG_DONTWAIT) < 0 && errno == ECONNREFUSED {
+            refusals.add(sender)
+          }
         }
+        return refusals.all.count == strays.count
       }
       #expect(await eventually(within: 10) { queuedDatagrams(probe) >= 1 })
       #expect(
@@ -578,7 +583,8 @@ struct FaultInjectionFixtureTests {
   }
 }
 
-/// Descriptors a socket factory duplicated, for a test to inspect after the operation closed its own.
+/// Descriptors a test collects from another thread or across polls: probe-socket duplicates kept
+/// past the operation's close, or stray senders already seen refused.
 private final class DescriptorCopies: @unchecked Sendable {
   private let lock = NSLock()
   private var fds: [Int32] = []
