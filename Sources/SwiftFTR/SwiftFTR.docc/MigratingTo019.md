@@ -321,12 +321,10 @@ nothing, the lookup included. The lookups use the system resolver, which is not 
 
 **What a caller sees.**
 
-- Where UDP to the STUN servers is blocked, a classified trace or multipath run reports
-  `publicIP == nil` and `clientASN == nil` where 0.18 may have reported the whoami address, and
-  hops in the client's own network are labelled TRANSIT rather than ISP.
-- ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` throws in the same case (see below).
-- With STUN silent, discovery ends once both servers' attempts have timed out, about 4 s with the
-  defaults, rather than going on to the fallback.
+- Where UDP to the STUN servers is blocked, `publicIP` and `clientASN` are `nil` where 0.18 may
+  have reported the whoami address (own-network hops are TRANSIT, not ISP), and
+  ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` throws (see below). With STUN silent,
+  discovery ends once both servers time out, about 4 s by default.
 - A tracer bound to an interface or source address it cannot bind sends no STUN name lookups.
 
 **What to change.** Nothing, if STUN reaches its servers. A host app that knows its public
@@ -361,9 +359,9 @@ and ``PublicIPError/noAddress(reason:)``.
 
 **What a caller sees.**
 
-- With ``PublicIPResolverStrategy/disabled`` the call throws ``PublicIPError/discoveryDisabled``
-  and sends nothing; 0.18 sent STUN.
-- With ``PublicIPResolverStrategy/custom(_:)`` the caller's resolver answers, where 0.18 sent STUN.
+- With ``PublicIPResolverStrategy/disabled`` it throws ``PublicIPError/discoveryDisabled`` and
+  sends nothing; with ``PublicIPResolverStrategy/custom(_:)`` the caller's resolver answers. 0.18
+  sent STUN in both.
 - When the strategy finds no address in time, or answers with an address that is not a public
   IPv4 address, or the configured source address is IPv6, the call throws
   ``PublicIPError/noAddress(reason:)``. 0.18 threw `allMethodsFailed`, or an internal timeout

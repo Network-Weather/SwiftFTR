@@ -75,7 +75,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 | Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
 | Ping reply matching | echo replies with the ping's identifier for sequences never sent (0, 9, 65535) or not yet sent, a reply queued while its request was still being sent, and duplicates, are not counted and neither end the ping early nor hold it; the first reply to a sequence keeps its RTT and TTL; a reply after its probe's `timeout` but within the ping counts; with a failed send, the ping ends once every probe that left is answered, whether the last reply or the end of the send loop comes last, does not end before its remaining probes are sent, and still waits out its window for an unanswered probe (IPv4 and IPv6) | ping | `PingReplyMatchingTests` |
-| Public-IP discovery | stalls past its budget; fails; result arriving after a network change; STUN attempts against silent loopback servers, each able to outlast the watchdog, ended by the one discovery deadline; a name lookup waiting for a slot, abandoned at it; a failure at the deadline reported as a timeout whichever timer fired first; the budget a multipath run's question carries; standalone `getPublicIPs` ended by its caller's cancellation, returning the family that answered, and leaving the cooperative pool free with more stalled calls than it has threads | traceClassified, discoverPaths, getPublicIPs | `Enrichment`, `Cancellation`, `AsyncPublicIPDiscoveryTests` |
+| Public-IP discovery | stalls past its budget; fails; result arriving after a network change; STUN attempts against silent loopback servers, each able to outlast the watchdog, ended by the one discovery deadline; a name lookup waiting for a slot, abandoned at it; a failure at the deadline reported as a timeout whichever timer fired first; standalone `getPublicIPs` ended by its caller's cancellation, returning the family that answered, and leaving the cooperative pool free with more stalled calls than it has threads | traceClassified, discoverPaths, getPublicIPs | `Enrichment`, `Cancellation`, `AsyncPublicIPDiscoveryTests` |
 | Library public-IP resolver | on a bound request every STUN socket bound to the interface at its send (IPv4 and IPv6); a missing interface or an unbindable source address sending nothing, no server-name lookup included; a source address of the other family, or not an address, sending nothing; STUN failing on a bound request with no DNS query sent after it; `getPublicIPs` asking the library's resolver, and asking nothing once cancelled; sweeps waiting for the executor holding no sockets; `discoverPublicIPWithHostname()` asking the strategy past the configured address and cache, throwing for `.disabled`, refusing a private or IPv6 answer, and reporting the library's failure as `noAddress` | the library's resolver, getPublicIPs, discoverPublicIPWithHostname | `LibraryPublicIPResolverTests`, `PublicIPResolverTests` |
 | STUN wire | silent, garbage, wrong transaction, slow server; sub-microsecond timeout | stunGetPublicIP | `Wire` |
 | Reverse DNS | stalls past its deadline; the stall breaker; cancellation during the wave; a cancelled lookup is not cached and, though it ran past the stall threshold, does not count toward the breaker | trace, traceClassified, discoverPaths | `Enrichment`, `Cancellation` |
@@ -659,29 +659,22 @@ Observations that are not defects of the library:
   a 10 s timeout the answer ends, and reads past any other datagram on its client's port.
 - **`AsyncPublicIPDiscoveryTests.stalledAttemptsBoundedByBudget` once found the fallback never
   asked.** It failed once in about 500 strict repetitions of its suite with the whoami responder
-  asked 0 times; 229 instrumented repetitions did not repeat it, and the mechanism was not found.
-  The whoami fallback is gone (see the entry on the library's resolver below), so the test now
-  checks only that the budget ends a stalled STUN attempt and that nothing goes on to the next
-  server afterwards, and the timeline it reported on failure went with the fallback it timed.
+  asked 0 times, so not a stray (which would count one or more). 229 instrumented strict
+  repetitions did not repeat it: the fallback always started 4.000 to 4.012 s into discovery and
+  discovery ended at 8.001 to 8.014 s. Not reproduced; the mechanism is not known. The fallback is
+  gone (#153, below), so the test now checks only that the budget ends a stalled STUN attempt and
+  nothing goes on to the next server; its failure timeline went with the fallback.
 - **The library's public-IP fallback reported an address that was not the caller's** (#153).
-  Confirmed by measurement and fixed by deletion. When STUN failed, IPv4 discovery asked `1.1.1.1`
-  and `8.8.8.8` for `whoami.ds.akahelp.net` TXT and reported its `ip` record, which the authoritative
-  server builds from the client-subnet hint the resolver forwards; on one network it named another
-  host in the right /24 through one resolver and another /24 through the other, on each of four
-  tries. The library's resolver is STUN only (decision 16 in `docs/BLOCKING-IO.md`). Test:
-  `nothingAfterSTUNFails`, with both STUN servers refusing on a bound request and the DNS
-  transport's send seam counting, records no DNS query; with a query added back after the STUN
-  failure it records one.
+  Confirmed by measurement and fixed by deletion. IPv4 discovery, when STUN failed, asked
+  `1.1.1.1` and `8.8.8.8` for `whoami.ds.akahelp.net` TXT, whose `ip` record is built from the
+  client-subnet hint the resolver forwards: on one network another host in the right /24 through
+  one resolver, another /24 through the other, on each of four tries. The resolver is STUN only
+  (decision 16). Test: `nothingAfterSTUNFails` (both STUN servers refusing, bound request) counts
+  no DNS send through the transport's send seam; one with a query added back after STUN fails.
 - **Public-IP discovery sent traffic its binding did not cover** (#151). Confirmed by code reading
-  and fixed. The whoami fallback was never bound to the tracer's interface or source address, and
-  the STUN sweep resolved its server names before it created and bound each socket, so a tracer
-  whose bind failed still sent the lookups. Every STUN socket is now made and bound first, and a
-  failed bind sends nothing. Tests: `everySocketBoundBeforeSend` reads `IP_BOUND_IF` or
-  `IPV6_BOUND_IF` from each socket at its send (0 with the sweep left unbound);
-  `failedBindSendsNothing` counts no lookup through `TestSeams.resolveSTUNServer` (two with the
-  lookups moved back before the bind). The lookups go through the system resolver, which is not
-  bound to the interface.
-- **`multipathHonoursPublicIPBudget` could not tell its configured budget from the default**
-  (#103), its watchdog being the default budget. It now checks the deadline the question carries
-  is within the configured 2 s (6 s with the default substituted), under a 20 s watchdog.
-
+  and fixed. The whoami fallback was never bound, and the STUN sweep resolved its server names
+  before binding each socket, so a failed bind still sent the lookups; now every socket is bound
+  first and a failed bind sends nothing. Tests: `everySocketBoundBeforeSend` reads `IP_BOUND_IF`
+  or `IPV6_BOUND_IF` at each send (0 with the sweep unbound); `failedBindSendsNothing` counts no
+  lookup through `TestSeams.resolveSTUNServer` (two with lookups before the bind). The lookups use
+  the system resolver, which is not bound to the interface.

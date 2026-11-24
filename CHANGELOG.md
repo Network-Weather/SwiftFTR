@@ -113,27 +113,24 @@ Unreleased
   after twice its per-server timeout or at the deadline, whichever is first, so a stalled attempt
   keeps one slot but the discovery moves on to the next server. See `MigratingTo019.md`.
 - **The library's public-IP resolver is STUN only** (#153, decision 16 in
-  `docs/BLOCKING-IO.md`). When IPv4 STUN failed, discovery asked the public recursive resolvers
-  `1.1.1.1` and `8.8.8.8` for `whoami.ds.akahelp.net` TXT and reported the `ip` record. That record
-  is built from the client-subnet hint the resolver forwards, not from this host's address: on one
-  measured network it named a different host in the right /24 through one resolver and a different
-  /24 through the other, on each of four tries. The fallback is deleted, with nothing in its place. Where
-  STUN gets no answer, a classified trace or multipath run now has no public address (`publicIP`
-  and `clientASN` are `nil`) where it may have had a wrong one, and `discoverPublicIPWithHostname()`
-  throws; a host app that knows the address supplies it with `seedPublicIP`, `publicIP` or its own
-  `PublicIPResolver`. With STUN silent, discovery now ends once both servers' attempts have timed
-  out (about 4 s by default) instead of going on to the fallback, and STUN no longer gives up part
-  of the budget to leave the fallback time.
+  `docs/BLOCKING-IO.md`). When IPv4 STUN failed, discovery asked `1.1.1.1` and `8.8.8.8` for
+  `whoami.ds.akahelp.net` TXT, whose `ip` record is built from the client-subnet hint the resolver
+  forwards: on one network a different host in the right /24 through one resolver and a different
+  /24 through the other, on each of four tries. The fallback is deleted, with nothing in its place.
+  Where STUN gets no answer, a trace or multipath run has no public address (`publicIP`,
+  `clientASN` `nil`) where it may have had a wrong one, and `discoverPublicIPWithHostname()`
+  throws; a host app supplies a known address with `seedPublicIP`, `publicIP` or its own
+  `PublicIPResolver`. With STUN silent, discovery ends once both servers time out (about 4 s by
+  default), and STUN no longer gives up part of the budget to the fallback.
 - **Every STUN socket is bound before anything is sent, its server-name lookup included** (#151).
   The sweep resolved its server names before binding, so a tracer whose bind failed still sent the
   lookups; now a failed bind sends nothing. (The deleted fallback was not bound at all.) The
   lookups still use the system resolver, which is not bound to the interface.
-- **`discoverPublicIPWithHostname()` asks the configured `publicIPResolver` strategy.** It ran the
-  library's discovery whatever the strategy; it now asks the strategy once for a fresh IPv4
-  address (still bypassing `SwiftFTRConfig.publicIP` and the cache, and caching nothing), throws
-  `PublicIPError.discoveryDisabled` for `.disabled`, and returns only a globally routable IPv4
-  address, throwing `PublicIPError.noAddress(reason:)` otherwise. A failure that used to escape as
-  an internal timeout error is `noAddress` too.
+- **`discoverPublicIPWithHostname()` asks the configured `publicIPResolver` strategy** once for a
+  fresh IPv4 address (bypassing `SwiftFTRConfig.publicIP` and the cache, caching nothing); it
+  ran the library's discovery whatever the strategy. It throws `PublicIPError.discoveryDisabled` for
+  `.disabled` and returns only a globally routable IPv4 address, throwing
+  `PublicIPError.noAddress(reason:)` otherwise, internal timeouts included.
 - **`getPublicIPs` asks the library's resolver**, so it also binds every socket before its
   lookups. A STUN sweep opens its sockets only once admitted, one sweep per executor worker, so
   sweeps waiting their turn hold none. A call cancelled before it starts asks nothing. An IPv6
