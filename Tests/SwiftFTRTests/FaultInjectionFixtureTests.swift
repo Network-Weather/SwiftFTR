@@ -163,15 +163,25 @@ struct FaultInjectionFixtureTests {
     defer { responder.stop() }
     let client = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
     defer { close(client) }
-    setReceiveTimeout(client, seconds: 1)
+    // Generous: the answer ends the wait, and loopback can be slow on a loaded host.
+    setReceiveTimeout(client, seconds: 10)
     var (address, length) = responder.address
     let sent = withUnsafePointer(to: &address) {
       $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { sendto(client, nil, 0, 0, $0, length) }
     }
     #expect(sent == 0)
-    var reply = [UInt8](repeating: 0, count: 8)
-    let received = recv(client, &reply, reply.count, 0)
-    #expect(received == 1)
+    // On a thread of its own, so the blocking read holds no cooperative thread. The client's
+    // ephemeral port can receive another test's stray, so read until the responder's one byte.
+    let answered = try await onOwnThread { () -> Bool in
+      var reply = [UInt8](repeating: 0, count: 64)
+      while true {
+        let received = recv(client, &reply, reply.count, 0)
+        if received < 0 { return false }
+        if received == 1 && reply[0] == 0x2A { return true }
+      }
+    }
+    #expect(answered, "the responder never answered the zero-byte request")
+    // Counted before the reply was sent.
     #expect(responder.requests.value == 1)
   }
 
