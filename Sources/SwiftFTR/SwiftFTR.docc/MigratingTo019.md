@@ -366,6 +366,8 @@ and ``PublicIPError/noAddress(reason:)``.
   IPv4 address, or the configured source address is IPv6, the call throws
   ``PublicIPError/noAddress(reason:)``. 0.18 threw `allMethodsFailed`, or an internal timeout
   error, or returned the address unchecked.
+- A call cancelled while its reverse-DNS lookup runs throws `CancellationError`; 0.18 returned the
+  address with `hostname == nil`, as if it had no name.
 - Code that matches or builds `PublicIPError.allMethodsFailed` no longer compiles, and an
   exhaustive `switch` over ``PublicIPError`` must handle the two new cases.
 

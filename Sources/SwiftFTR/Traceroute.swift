@@ -1493,6 +1493,8 @@ public actor SwiftFTR {
     } else {
       hostname = nil
     }
+    // The lookup answers nil when cancelled; that is a cancelled call, not an address with no name.
+    try Task.checkCancellation()
     return (ip: ip, hostname: hostname)
   }
 
