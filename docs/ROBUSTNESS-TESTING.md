@@ -626,3 +626,21 @@ Observations that are not defects of the library:
   send loop enqueues each send and sleeps on its own, so a hook cannot keep probe 2 back until a
   reply is read. Its reply is now injected (one loopback crossing, not two) and its interval is
   2 s, which still has to outlast delivery; a seam on the send loop's sleep would remove that.
+- **Two fixture and probe tests assumed a quiet host** (#103). `ProbeTests.testClosedPort` probed
+  port 9999 on the assumption that nothing listens there and required the reset within 100 ms, a
+  wall-clock upper bound that failed even unloaded (rtt 0.155 s in a release run; 5 of 60
+  unloaded runs of the broad filter, and 6 of 10 loaded). It now probes a `RefusingTCPPort`
+  reserved for the test, with a timeout past its watchdog, so only the reset can end it, and
+  checks the round trip against the elapsed time instead of a constant.
+  `FaultInjectionFixtureTests.udpZeroByteRequest` read the responder's answer with a blocking
+  `recv` and a 1 s timeout in the async test body; the read now runs on a thread of its own with
+  a 10 s timeout the answer ends, and reads past any other datagram on its client's port.
+- **`AsyncPublicIPDiscoveryTests.stalledAttemptsBoundedByBudget` once found the fallback never
+  asked.** It failed once in about 500 strict repetitions of its suite with the whoami responder
+  asked 0 times, so not a stray (which would count one or more). 229 instrumented strict
+  repetitions did not repeat it: the fallback always started 4.000 to 4.012 s into discovery and
+  discovery ended at 8.001 to 8.014 s. Not reproduced; the mechanism is not known. On failure
+  the test now reports a timeline: discovery's start and return, the first STUN request's
+  arrival, when the fallback's query was sent and what `send` returned (through the UDP
+  exchange's send seam), and its arrival.
+
