@@ -1,6 +1,6 @@
 # Migrating to SwiftFTR 0.19
 
-Handle the two new DNSError cases, the public-IP resolver, and the DNS, address-validation, ping, bufferbloat, public-IP discovery and CLI changes introduced in SwiftFTR 0.19.
+Handle the two new DNSError cases, the public-IP resolver, and the DNS, address-validation, ping, bufferbloat, public-IP discovery, ASN lookup and CLI changes introduced in SwiftFTR 0.19.
 
 ## Overview
 
@@ -16,7 +16,8 @@ To find the call sites to review, search the consumer for `switch` over `DNSErro
 `.timedOut`, `seedPublicIP(`, `64:ff9b`, `ping(`, `testBufferbloat(`, `getPublicIPs(`, `publicIPDiscoveryTimeout`,
 `.classify(`, `.publicIP` read from a `SwiftFTR` tracer, `SwiftFTRConfig(` calls that pass `publicIP:`,
 `traceClassified(` results whose `publicIP` or `clientASN` is read for an IPv6 destination,
-`discoverPaths(` followed by a read of the public-IP cache, and any
+`discoverPaths(` followed by a read of the public-IP cache, `ASNResolver` conformances and
+`resolve(ipv4Addrs:` calls, `preloadASNDatabase(`, and any
 script that reads the output of `swift-ftr probe dns`.
 
 ## Update the package
@@ -496,3 +497,55 @@ After, to keep the cache as it was:
 let topology = try await tracer.discoverPaths(to: host)
 await tracer.invalidatePublicIP()  // 0.19 caches the run's answer
 ```
+
+## An ASN lookup's timeout bounds the whole call
+
+**What changed.** The `timeout` passed to ``ASNResolver/resolve(ipv4Addrs:timeout:)`` is how long
+the whole call may take, through every built-in resolver it passes, and the call returns what it
+has when it runs out:
+
+| Resolver | 0.18 | 0.19 |
+|---|---|---|
+| ``CymruDNSResolver`` (`.dns`) | each query, each server and each wave of eight queries got the full timeout | every query and the fallback to the second server share one deadline; each server still to try gets an equal share of the time left |
+| ``LocalASNResolver`` (`.embedded`, `.remote`) | waited for a database still loading however long it took | waits for the load until the timeout; the load runs on and answers the next lookup |
+| ``HybridASNResolver`` (the default `.hybrid(.embedded)`) | the same database wait, then DNS with `fallbackTimeout` | the same bounded wait, then DNS with `fallbackTimeout` or the time left, whichever is shorter, or no DNS when none is left |
+| ``CachingASNResolver`` | waited for the resolver behind it | stops waiting at its own timeout; the shared lookup runs on and fills the cache |
+
+A caller that stops waiting, at its timeout or because it was cancelled, stops nothing shared: a
+database load and a cached lookup run on for the other callers, and a resolver whose caller left
+answers its next lookup from that same load. Only a load that failed leaves its resolver without
+a database, as in 0.18.
+
+**What a caller sees.**
+
+- A classified trace spends at most the 1.5 s it passes on ASN lookups. One started before the
+  local database has loaded can come back without ASN data, where 0.18 waited for the load.
+- A `.dns` lookup with a stalled first server returns at its timeout, so fewer addresses may
+  resolve, and AS names (``ASNInfo/name``) can be empty when the origin queries used most of the
+  time.
+- Cancelling a task in ``LocalASNResolver/resolve(ipv4Addrs:timeout:)`` while the database loads
+  throws `CancellationError` at once; it used to wait for the load and answer. A cancelled
+  ``LocalASNResolver/preload()`` returns, leaving the load running.
+- A direct call with a timeout shorter than a cold database load returns an empty map for
+  addresses the database would have answered.
+
+**What to change.** Load the database before the first classified trace if that trace should
+carry ASN data, and give direct lookups a timeout that covers what they wait for:
+
+Before:
+
+```swift
+let tracer = SwiftFTR(config: SwiftFTRConfig())
+let trace = try await tracer.traceClassified(to: host)  // waited for the database to load
+```
+
+After:
+
+```swift
+let tracer = SwiftFTR(config: SwiftFTRConfig())
+await tracer.preloadASNDatabase()  // waits for the load; a lookup no longer does
+let trace = try await tracer.traceClassified(to: host)
+```
+
+A custom ``ASNResolver`` is not raced by the library: honor `timeout` as the bound for the whole
+call, as the built-in resolvers do.

@@ -122,10 +122,11 @@ Not covered, and why:
   `shutdown(SHUT_RD)`, and closing the descriptor under the trace would risk the number being
   reused, so no test stages a read error. The receive loop's deadline timer is independent of the
   read source, which is the property that bounds it; that is shown by the silent-network tests.
-- **A `.remote` ASN database download that stalls** (finding 7). The download is skipped whenever
-  a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which is shared
-  with every other user of SwiftIP2ASN on the machine, and the cache location cannot be redirected
-  from SwiftFTR. A test would have to delete that cache.
+- **A real `.remote` ASN database download that stalls** (finding 7). The download is skipped
+  whenever a database is already cached under `~/Library/Application Support/SwiftIP2ASN`, which
+  is shared with every other user of SwiftIP2ASN on the machine, and the cache location cannot be
+  redirected from SwiftFTR. A test would have to delete that cache. What a stalled load does to
+  its callers is covered with a held stand-in load (`LocalASNDatabaseStore(loader:)`).
 - **Missing authority or additional records.** A reply is checked for the question and answer
   records its header declares, and an NXDOMAIN reply's SOA lives in the authority section, so an
   NXDOMAIN reply whose header declares an authority record it does not carry is still reported as
@@ -233,9 +234,10 @@ numbers are as of the commit that added this section.
    Test: `publicIPDiscoveredOnce`, two attempts before, one after; the classification helpers in
    `SwiftFTRClassificationTests` and `VPNClassificationTests` assert the classifier starts none.
 7. **A `.remote` ASN database download is bounded only by URLSession's request timeout.**
-   Unverified, from reading the code. With no bundled or cached database, the first resolve waits
-   on `RemoteDatabase.load()` (`LocalASNResolver.swift:212`), which uses `URLSession.shared` with
-   its 60 s default, and ignores the resolver `timeout`. Could not be staged (see "Not covered").
+   Unverified, from reading the code. With no bundled or cached database, the first load runs
+   `RemoteDatabase.load()`, which uses `URLSession.shared` with its 60 s default. A lookup no
+   longer waits for it past its own timeout (see the ASN lookup entries below); the download
+   itself runs on. A real download could not be staged (see "Not covered").
 8. **DNS queries waited without limit for an executor slot.** Confirmed and fixed. Every DNS
    query went onto the shared executor with no deadline, so its socket timeouts bounded the query
    but not the queueing: with the executor full, `dnsProbe` with a 0.3 s timeout waited as long as
@@ -435,6 +437,37 @@ numbers are as of the commit that added this section.
   header as the root name and took the reply's REFUSED; and that it had no 255-byte limit, so a
   malformed reply was ignored as a different question. Tests: `DNSQuestionMatchTests`,
   `DNSQuestionVerdictTests`.
+
+- **`HybridASNResolver` ignored the lookup's timeout.** Confirmed and fixed. Its DNS fallback got
+  `fallbackTimeout` whatever the caller passed (30 s for a 0.5 s lookup), and its wait for a
+  database still loading had no bound: with the load held, a 0.3 s lookup was still waiting at a
+  20 s watchdog. One deadline now runs through the local wait and the fallback, which gets the
+  shorter of `fallbackTimeout` and the time left. Tests:
+  `LocalASNResolverTests.testHybridFallbackGetsNoMoreThanTheCallersTimeout`,
+  `testHybridFallbackKeepsItsShorterTimeout` (unchanged behavior: the exact value keeps cached
+  flights shared) and `testHybridReturnsAtItsTimeoutWhileTheDatabaseLoads`.
+- **No caller could leave a shared ASN database load.** Confirmed. `LocalASNResolver` waited for
+  a load still in flight until it ended, whatever its timeout and even when its task was
+  cancelled. The plan's further defect, that a caller leaving cancels the load for the others or
+  leaves its resolver marked failed, did not reproduce: with no way to leave, both held (a
+  cancelled caller was answered once the load finished, one load, not cancelled). Leaving is now
+  possible, at the timeout or on cancellation, and the tests hold those two properties on the new
+  paths: the load belongs to the store, records its own result, and is never cancelled, and a
+  resolver keeps the load it waited on. Tests:
+  `LocalASNResolverTests.testCallerTimingOutLeavesSharedLoadRunningAndResolverUsable` and
+  `testCancelledCallerLeavesSharedLoadRunningAndResolverUsable`, each failing on a mutation that
+  cancels the load when a caller leaves or marks the resolver failed.
+- **A Team Cymru lookup's timeout was per query, per server and per wave.** Confirmed and fixed.
+  Ten addresses against two silent loopback servers with a 0.3 s timeout took 1.22 s (two waves
+  of eight, each waiting out both servers); after, 0.30 s. Every query and the server fallback now
+  share one deadline, each server still to try getting an equal share of what is left. Test:
+  `CymruEventBasedTests.queriesShareTheLookupsDeadline`, which records each query's deadline and
+  fails both when a query outlives the lookup and when a silent first server leaves the second no
+  time.
+- **A `CachingASNResolver` caller waited as long as the resolver behind it.** Confirmed and fixed:
+  with a resolver that overran, a 0.3 s caller was still waiting at a 20 s watchdog. Each caller now
+  stops at its own timeout with what is cached or has arrived; the flight runs on and fills the
+  cache. Test: `SwiftFTRCacheTests.testCallerReturnsAtItsTimeoutAndLeavesFlightRunning`.
 
 Observations that are not defects of the library:
 

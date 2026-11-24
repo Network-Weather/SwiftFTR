@@ -402,6 +402,7 @@ public enum LocalASNSource: Sendable {
 }
 
 public protocol ASNResolver: Sendable {
+    // timeout: how long the whole call may take; the built-in resolvers return what they have then
     func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
 }
 
@@ -434,6 +435,15 @@ last resolver using it goes away, and the next resolver loads it again. Call `pr
 early to move the load off the first classified trace, and keep that tracer alive for as long as
 the database should stay resident. A
 `resolver:` passed to `traceClassified` overrides the configured strategy for that call.
+
+A lookup's `timeout` bounds the whole call through every built-in resolver: Team Cymru's origin
+and AS-name queries and its fallback to the second server share it; a lookup waits for a database
+still loading only until it passes (the load runs on and answers the next lookup, and a caller
+leaving, by timeout or cancellation, never stops it or marks the resolver failed); the hybrid
+resolver's DNS fallback gets `fallbackTimeout` or the time left, whichever is shorter; and a
+`CachingASNResolver` caller stops waiting at its own timeout while the shared lookup fills the
+cache. A classified trace passes 1.5 s. A cancelled caller of `LocalASNResolver.resolve` gets
+`CancellationError`.
 
 ### 12. StreamingTraceConfig and StreamingHop
 

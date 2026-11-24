@@ -140,6 +140,27 @@ Unreleased
   classified trace does, where flows never wrote theirs back, and `NetworkTopology.publicIP` is
   that answer rather than the first path's. A network change during the question ends the run
   with `TracerouteError.cancelled` before any flow probes.
+- **An ASN lookup's `timeout` bounds the whole call**, through every built-in resolver it passes.
+  `CymruDNSResolver` (the `.dns` strategy) gave each query, each server and each wave of eight
+  queries the full timeout, so a silent first server made a lookup of ten addresses with a 0.3 s
+  timeout take 1.2 s; now the origin and AS-name queries and the fallback to the second server
+  share one deadline, and the call returns what has answered when it passes. A classified trace,
+  which passes 1.5 s, spends at most that on ASN lookups. With little time left, AS names can be
+  missing (`ASNInfo.name` empty) where 0.18 waited for them.
+- **A lookup no longer waits past its timeout for the local ASN database to load.**
+  `LocalASNResolver` (`.embedded`, `.remote`) and `HybridASNResolver` (the default
+  `.hybrid(.embedded)`) waited for a database still loading however long it took, a `.remote`
+  download included. A lookup now returns what it has at its timeout; the load runs on and answers
+  the next lookup. A classified trace started before the database has loaded can therefore come
+  back without ASN data; `preloadASNDatabase()` still waits for the load. Cancelling the caller of
+  `LocalASNResolver.resolve` now throws `CancellationError` at once (it waited for the load and
+  answered), and a cancelled `preload()` returns, leaving the load running.
+- **`HybridASNResolver`'s DNS fallback gets `fallbackTimeout` or the time the lookup has left,
+  whichever is shorter**, and is skipped when none is left. It got `fallbackTimeout` whatever
+  timeout the caller passed.
+- **A `CachingASNResolver` caller stops waiting at its own `timeout`** with what is cached or has
+  arrived, even when the resolver behind it overruns. The shared lookup runs on and fills the
+  cache, so the next caller is answered without another upstream call.
 
 ### Bug fixes
 

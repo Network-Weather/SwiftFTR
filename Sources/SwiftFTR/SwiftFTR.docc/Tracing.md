@@ -50,6 +50,9 @@ for hop in classified.hops {
   consulted only for addresses it does not cover. Private, carrier-grade NAT, link-local, loopback,
   multicast and unspecified addresses are never sent to an ASN resolver. Other reserved ranges,
   such as the documentation blocks, are not filtered. Lookups are best-effort, so ASN fields may be `nil`.
+  A classified trace gives its ASN lookups 1.5 seconds in all, the wait for a database still
+  loading included, so call ``SwiftFTR/SwiftFTR/preloadASNDatabase()`` first if the first trace
+  should carry ASN data.
 - Enrichment steps have their own budgets, but a classified trace has no overall deadline.
   ``SwiftFTR/SwiftFTRConfig/rdnsLookupTimeout`` bounds each reverse-DNS lookup and
   ``SwiftFTR/SwiftFTRConfig/publicIPDiscoveryTimeout`` bounds the one public-IP question a

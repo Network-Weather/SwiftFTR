@@ -27,8 +27,13 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   call for as long as `getaddrinfo` takes unless the caller cancels. Needs a budget the public
   signature does not have, for example a new overload.
 - **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code
-  reading). Decide between failing classification fast and loading in the background, and make
-  the SwiftIP2ASN cache directory injectable so a test can stage it without touching the user's.
+  reading). A lookup no longer waits for it past its timeout, but the download runs on, and is not
+  stopped when every caller has left. Make the SwiftIP2ASN cache directory injectable so a test can
+  stage a real download without touching the user's.
+- **A local ASN database that failed to load is never retried by its resolver**: a `.remote`
+  source first used offline leaves that resolver, and so its tracer, without local ASN data for
+  its lifetime, though a new resolver would load it. Retry after a backoff instead of remembering
+  the failure for good.
 - **Report an HTTP status as soon as the headers arrive** (#122, finding 27): URLSession withholds
   the response until body bytes follow it, so a server that stalls after its headers is reported
   only at the timeout, and without its status if no body byte came. Fixing it means reading the
