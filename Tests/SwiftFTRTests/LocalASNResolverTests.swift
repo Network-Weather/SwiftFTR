@@ -370,11 +370,17 @@ final class LocalASNResolverTests: XCTestCase {
   /// One caller's batch does not hold the resolver: a lookup started while it runs is answered
   /// before it ends.
   func testLookupIsNotQueuedBehindAnotherBatch() async throws {
+    // The batch's lookups are synchronous work, as the real database's are, and occupy the thread
+    // they run on. With a one-thread cooperative pool nothing else runs until they end, whatever
+    // the resolver does, so the property this checks needs a second thread.
+    if ProcessInfo.processInfo.environment["LIBDISPATCH_COOPERATIVE_POOL_STRICT"] != nil {
+      throw XCTSkip("needs more than one cooperative thread")
+    }
     let table = SlowASNTable()
     let resolver = LocalASNResolver(
       source: .embedded, store: LocalASNDatabaseStore(loader: { _ in table }))
     await resolver.preload()
-    let batch = (0..<2_000).map { "203.0.\($0 / 256).\($0 % 256)" }
+    let batch = (0..<1_000).map { "203.0.\($0 / 256).\($0 % 256)" }
 
     let long = Task { try await resolver.resolve(ipv4Addrs: batch, timeout: 60) }
     let started = await eventually(within: Self.watchdog) { table.lookups.value > 0 }
