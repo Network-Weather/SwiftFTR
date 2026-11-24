@@ -675,3 +675,108 @@ internal func stunGetPublicIPWithFallback(
 
   throw lastError
 }
+
+// MARK: - Unified Public IP Discovery
+
+/// Why ``SwiftFTR/discoverPublicIPWithHostname()`` found no public address.
+public enum PublicIPError: Error, CustomStringConvertible, Sendable {
+  /// ``SwiftFTRConfig/publicIPResolver`` is ``PublicIPResolverStrategy/disabled``, so nothing was
+  /// asked and nothing sent.
+  case discoveryDisabled
+  /// The strategy gave no globally routable IPv4 address before
+  /// ``SwiftFTRConfig/publicIPDiscoveryTimeout`` passed. `reason` says what happened instead, for
+  /// a log: STUN's failure, the resolver's own error, no answer in time, or an answer refused.
+  case noAddress(reason: String)
+
+  public var description: String {
+    switch self {
+    case .discoveryDisabled:
+      return "Public-IP discovery is disabled (publicIPResolver is .disabled)"
+    case .noAddress(let reason):
+      return "No public IP address found: \(reason)"
+    }
+  }
+}
+
+/// Gives up on public-IP discovery that outlived its budget.
+struct PublicIPDiscoveryTimeout: Error, CustomStringConvertible {
+  var description: String { "no STUN answer before the discovery deadline" }
+}
+
+/// The outcome of a budgeted public-IP discovery whose first finished child gave `result`,
+/// decided at `now` against `deadline`.
+///
+/// Cancellation of the calling task comes first. Then a failure once `deadline` has passed is
+/// reported as ``PublicIPDiscoveryTimeout``, whichever timer noticed first, so a discovery that ran
+/// out of time is always told apart from one that got definite failures in time. An address
+/// that was found is returned.
+func publicIPDiscoveryOutcome<Found>(
+  _ result: Result<Found, Error>, now: TimeInterval, deadline: TimeInterval,
+  cancelled: Bool
+) throws -> Found {
+  if cancelled { throw CancellationError() }
+  switch result {
+  case .success(let address):
+    return address
+  case .failure(let error):
+    if now >= deadline { throw PublicIPDiscoveryTimeout() }
+    throw error
+  }
+}
+
+/// Discovers both v4 and v6 public IPs in parallel via STUN. Returns whatever
+/// succeeded — either or both fields of `PublicIPs` may be nil. Never throws:
+/// callers see "no IP discovered" as `PublicIPs(v4: nil, v6: nil)` rather than
+/// having to handle exceptions for the common "this network is v4-only" or
+/// "this network is v6-only" cases.
+///
+/// Each family asks the library's own resolver, the one a classified trace uses by default: STUN
+/// only, every socket bound before anything is sent. Unlike a trace's question, there is no
+/// overall deadline and the address is reported as the STUN server gave it, whether or not it is
+/// globally routable.
+///
+/// The two sweeps are child tasks of the caller's. Cancelling the calling task ends both at once,
+/// and the call returns what had been found by then. Each server attempt is bounded by
+/// `stunTimeout`; resolving the server names has no deadline of its own.
+///
+/// - Parameters:
+///   - stunTimeout: Per-server timeout (default 0.8s).
+///   - interface: Optional interface to bind to (applied to both families).
+///   - sourceIP: Optional source IP. Only the sweep of its own family runs, bound to it; the
+///               other family sends nothing and is `nil`. A value that is not an IP address
+///               sends nothing for either family.
+///   - enableLogging: Verbose logging.
+public func getPublicIPs(
+  stunTimeout: TimeInterval = 0.8,
+  interface: String? = nil,
+  sourceIP: String? = nil,
+  enableLogging: Bool = false
+) async -> PublicIPs {
+  async let v4 = stunSweepAddress(
+    family: AF_INET, timeout: stunTimeout, interface: interface, sourceIP: sourceIP,
+    enableLogging: enableLogging)
+  async let v6 = stunSweepAddress(
+    family: AF_INET6, timeout: stunTimeout, interface: interface, sourceIP: sourceIP,
+    enableLogging: enableLogging)
+  return await PublicIPs(v4: v4, v6: v6)
+}
+
+/// One family's question to the library's resolver for
+/// ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``, with no overall deadline: the
+/// address, or `nil` if there was none or the call was cancelled.
+private func stunSweepAddress(
+  family: Int32, timeout: TimeInterval, interface: String?, sourceIP: String?,
+  enableLogging: Bool
+) async -> String? {
+  do {
+    return try await publicIPDiscovery(
+      family: family == AF_INET6 ? .v6 : .v4, stunTimeout: timeout, interface: interface,
+      sourceIP: sourceIP, enableLogging: enableLogging, budget: .infinity
+    )?.address
+  } catch {
+    if enableLogging {
+      print("[STUN] \(family == AF_INET6 ? "v6" : "v4") sweep failed: \(error)")
+    }
+    return nil
+  }
+}

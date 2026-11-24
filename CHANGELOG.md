@@ -125,12 +125,9 @@ Unreleased
   out (about 4 s by default) instead of going on to the fallback, and STUN no longer gives up part
   of the budget to leave the fallback time.
 - **Every STUN socket is bound before anything is sent, its server-name lookup included** (#151).
-  The sweep resolved its server names first and bound each socket afterwards, so a tracer whose
-  interface or source address could not be bound still sent the lookups; it now makes and binds
-  one socket per server first, and when a bind fails sends nothing. The fallback this replaced was
-  not bound at all, so on a bound tracer it reported the default route's exit as the bound
-  interface's. The lookups themselves still go through the system resolver, which is not bound to
-  the interface.
+  The sweep resolved its server names before binding, so a tracer whose bind failed still sent the
+  lookups; now a failed bind sends nothing. (The deleted fallback was not bound at all.) The
+  lookups still use the system resolver, which is not bound to the interface.
 - **`discoverPublicIPWithHostname()` asks the configured `publicIPResolver` strategy.** It ran the
   library's discovery whatever the strategy; it now asks the strategy once for a fresh IPv4
   address (still bypassing `SwiftFTRConfig.publicIP` and the cache, and caching nothing), throws

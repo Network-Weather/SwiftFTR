@@ -114,26 +114,6 @@ public protocol PublicIPResolver: Sendable {
   func publicIP(for request: PublicIPRequest) async throws -> PublicIPObservation?
 }
 
-/// Why ``SwiftFTR/discoverPublicIPWithHostname()`` found no public address.
-public enum PublicIPError: Error, CustomStringConvertible, Sendable {
-  /// ``SwiftFTRConfig/publicIPResolver`` is ``PublicIPResolverStrategy/disabled``, so nothing was
-  /// asked and nothing sent.
-  case discoveryDisabled
-  /// The strategy gave no globally routable IPv4 address before
-  /// ``SwiftFTRConfig/publicIPDiscoveryTimeout`` passed. `reason` says what happened instead, for
-  /// a log: STUN's failure, the resolver's own error, no answer in time, or an answer refused.
-  case noAddress(reason: String)
-
-  public var description: String {
-    switch self {
-    case .discoveryDisabled:
-      return "Public-IP discovery is disabled (publicIPResolver is .disabled)"
-    case .noAddress(let reason):
-      return "No public IP address found: \(reason)"
-    }
-  }
-}
-
 /// How a tracer finds its public address when none of the family is configured, seeded or cached.
 public enum PublicIPResolverStrategy: Sendable {
   /// The library's own resolver: STUN only, over the family asked for, from sockets bound to the

@@ -230,7 +230,7 @@ struct LibraryPublicIPResolverTests {
 
   // MARK: getPublicIPs
 
-  @Test("getPublicIPs with a source address runs only the sweep of its family")
+  @Test("getPublicIPs with a source address runs only its family's sweep; a malformed one, none")
   func standaloneSourceSelectsFamily() async throws {
     let answer4 = try Self.answering(AF_INET, ip: Self.mapped4)
     let answer6 = try Self.answering(AF_INET6, ip: Self.mapped6)
@@ -241,46 +241,21 @@ struct LibraryPublicIPResolverTests {
     let servers = AsyncPublicIPDiscoveryTests.servers(
       v4: [("127.0.0.1", answer4.port)], v6: [("::1", answer6.port)])
 
-    for source in ["127.0.0.1", "::1"] {
+    let cases: [(source: String, v4: String?, v6: String?)] = [
+      ("127.0.0.1", "198.51.100.9", nil), ("::1", nil, "2001:db8::9"), ("not-an-ip", nil, nil),
+    ]
+    for (source, v4, v6) in cases {
       let (ips, _) = try await measure(within: Self.watchdog) {
         await TestSeams.$stunServers.withValue(servers) {
           await getPublicIPs(stunTimeout: Self.longSTUNTimeout, sourceIP: source)
         }
       }
-      if source == "::1" {
-        #expect(ips.v6 == "2001:db8::9")
-        #expect(ips.v4 == nil, "the IPv4 sweep ran unbound")
-      } else {
-        #expect(ips.v4 == "198.51.100.9")
-        #expect(ips.v6 == nil, "the IPv6 sweep ran unbound")
-      }
+      #expect(ips.v4 == v4, "source \(source)")
+      #expect(ips.v6 == v6, "source \(source)")
     }
-    #expect(answer4.requests.value == 1)
-    #expect(answer6.requests.value == 1)
-  }
-
-  @Test("getPublicIPs with a source address that is not an address sends nothing")
-  func standaloneInvalidSourceSendsNothing() async throws {
-    let answer4 = try Self.answering(AF_INET, ip: Self.mapped4)
-    let answer6 = try Self.answering(AF_INET6, ip: Self.mapped6)
-    defer {
-      answer4.stop()
-      answer6.stop()
-    }
-    let servers = AsyncPublicIPDiscoveryTests.servers(
-      v4: [("127.0.0.1", answer4.port)], v6: [("::1", answer6.port)])
-    let sends = STUNSends()
-
-    let (ips, _) = try await measure(within: Self.watchdog) {
-      await TestSeams.$stunServers.withValue(servers) {
-        await TestSeams.$sendSTUNRequest.withValue(sends.seam(family: AF_INET)) {
-          await getPublicIPs(stunTimeout: Self.longSTUNTimeout, sourceIP: "not-an-ip")
-        }
-      }
-    }
-    #expect(ips.v4 == nil)
-    #expect(ips.v6 == nil)
-    #expect(sends.boundInterfaces.isEmpty, "a STUN request was sent")
+    // One request per family, each from the source of its own family; none unbound.
+    #expect(await eventually(within: 10) { answer4.requests.value == 1 })
+    #expect(await eventually(within: 10) { answer6.requests.value == 1 })
   }
 
   @Test("getPublicIPs asks the library's resolver for each family, with its bindings")

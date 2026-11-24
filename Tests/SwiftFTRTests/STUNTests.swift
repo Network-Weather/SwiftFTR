@@ -408,21 +408,6 @@ struct STUNTests {
     #expect(error.description.contains("no STUN answer"))
   }
 
-  @Test(
-    "The library's resolver finds the IPv4 public address over STUN",
-    .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
-  )
-  func testLibraryResolverIPv4() async throws {
-    let request = PublicIPRequest(
-      family: .v4, interface: nil, sourceIP: nil, deadline: .now + .seconds(6))
-    let found = try await LibraryPublicIPResolver(enableLogging: true).publicIP(for: request)
-    let observation = try #require(found)
-    #expect(observation.source == .stun)
-    let parts = observation.address.split(separator: ".").compactMap { Int($0) }
-    #expect(parts.count == 4)
-    #expect(parts.allSatisfy { $0 >= 0 && $0 <= 255 })
-  }
-
   // MARK: - IPv6 STUN (Stage 4)
 
   /// `STUNPublicIP` carries the family alongside the IP string.

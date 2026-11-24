@@ -311,15 +311,13 @@ the caller's wait.
 
 ## The library's public-IP resolver is STUN only
 
-**What changed.** When IPv4 STUN got no answer, 0.18 asked the public recursive resolvers
-`1.1.1.1` and `8.8.8.8` for the `whoami.ds.akahelp.net` TXT record and reported its `ip` field. That
-field is built from the client-subnet hint the resolver forwards, not from this host's address, so
-it named another host, or another network, than the caller's (#153), and the query was not bound
-to the tracer's interface (#151). The fallback is deleted, with nothing in its place: the
-library's resolver (``PublicIPResolverStrategy/library``) is STUN only. Every STUN socket is
-created and bound to the tracer's interface and source address before its server name is
-resolved, and when a bind fails nothing is sent, the lookup included. The lookups themselves use
-the system resolver, which is not bound to the interface.
+**What changed.** When IPv4 STUN got no answer, 0.18 asked the recursive resolvers `1.1.1.1` and
+`8.8.8.8` for the `whoami.ds.akahelp.net` TXT record, whose `ip` field is built from the
+client-subnet hint the resolver forwards, so it named another host or network than the caller's
+(#153); the query was not bound to the tracer's interface either (#151). The fallback is deleted:
+``PublicIPResolverStrategy/library`` is STUN only. Every STUN socket is bound to the tracer's
+interface and source address before its server name is resolved, and a failed bind sends
+nothing, the lookup included. The lookups use the system resolver, which is not bound.
 
 **What a caller sees.**
 
@@ -332,8 +330,7 @@ the system resolver, which is not bound to the interface.
 - A tracer bound to an interface or source address it cannot bind sends no STUN name lookups.
 
 **What to change.** Nothing, if STUN reaches its servers. A host app that knows its public
-address on networks where STUN is blocked (from its gateway, its own HTTPS echo, or an earlier
-observation) supplies it, through a seed or its own resolver:
+address where STUN is blocked supplies it, through a seed or its own resolver:
 
 Before:
 
@@ -430,12 +427,9 @@ let ips = await PublicIPs(v4: v4.v4, v6: v6.v6)
 
 ## STUNPublicIP is no longer public
 
-**What changed.** `STUNPublicIP` is internal. No public function returned or accepted it in 0.18.
-
-**What a caller sees.** A reference to `STUNPublicIP` no longer compiles.
-
-**What to change.** Use ``PublicIPObservation``, or ``PublicIPs`` for
-``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``:
+**What changed.** `STUNPublicIP` is internal; no public function returned or took it in 0.18.
+**What a caller sees.** A reference to it no longer compiles. **What to change.** Use
+``PublicIPObservation``:
 
 Before:
 

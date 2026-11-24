@@ -681,14 +681,10 @@ Observations that are not defects of the library:
   `failedBindSendsNothing` counts no lookup through `TestSeams.resolveSTUNServer` (two with the
   lookups moved back before the bind). The lookups go through the system resolver, which is not
   bound to the interface.
-- **`getPublicIPs` ran a family unbound when given a source address of the other one.** Confirmed
-  by code reading and fixed. It passed a source address only to the sweep of its family and ran
-  the other sweep with none, and ran both unbound for a value that is not an address. Tests:
-  `standaloneSourceSelectsFamily` and `standaloneInvalidSourceSendsNothing` (both fail with the
-  old split restored).
+- **`getPublicIPs` ran a family unbound when given a source address of the other one**, and both
+  for a value that is not an address. Confirmed by code reading and fixed. Test:
+  `standaloneSourceSelectsFamily` (fails with the old split restored).
 - **`multipathHonoursPublicIPBudget` could not tell its configured budget from the default**
-  (#103). Its watchdog was the default budget, so a run that used the default ended at about the
-  watchdog. The question's deadline now reaches the discovery seam, and the test checks it is
-  within the configured 2 s (it is 6 s with the default substituted), with a 20 s watchdog and a
-  stall that outlasts it.
+  (#103), its watchdog being the default budget. It now checks the deadline the question carries
+  is within the configured 2 s (6 s with the default substituted), under a 20 s watchdog.
 

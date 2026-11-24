@@ -36,32 +36,6 @@ struct LibraryPublicIPResolver: PublicIPResolver {
   }
 }
 
-/// Gives up on public-IP discovery that outlived its budget.
-struct PublicIPDiscoveryTimeout: Error, CustomStringConvertible {
-  var description: String { "no STUN answer before the discovery deadline" }
-}
-
-/// The outcome of a budgeted public-IP discovery whose first finished child gave `result`,
-/// decided at `now` against `deadline`.
-///
-/// Cancellation of the calling task comes first. Then a failure once `deadline` has passed is
-/// reported as ``PublicIPDiscoveryTimeout``, whichever timer noticed first, so a discovery that ran
-/// out of time is always told apart from one that got definite failures in time. An address
-/// that was found is returned.
-func publicIPDiscoveryOutcome<Found>(
-  _ result: Result<Found, Error>, now: TimeInterval, deadline: TimeInterval,
-  cancelled: Bool
-) throws -> Found {
-  if cancelled { throw CancellationError() }
-  switch result {
-  case .success(let address):
-    return address
-  case .failure(let error):
-    if now >= deadline { throw PublicIPDiscoveryTimeout() }
-    throw error
-  }
-}
-
 /// The library resolver's discovery of one family: the test substitute when one is bound,
 /// otherwise the STUN sweep, ended once `budget` seconds pass. `nil`, with nothing sent, when
 /// `sourceIP` is given and is not an address of `family`.
@@ -130,56 +104,5 @@ func publicIPDiscovery(
     }
     return try publicIPDiscoveryOutcome(
       first, now: monotonicNow(), deadline: deadline, cancelled: Task.isCancelled)
-  }
-}
-
-/// Discovers both v4 and v6 public IPs in parallel via STUN. Returns whatever
-/// succeeded — either or both fields of `PublicIPs` may be nil. Never throws:
-/// callers see "no IP discovered" as `PublicIPs(v4: nil, v6: nil)` rather than
-/// having to handle exceptions for the common "this network is v4-only" or
-/// "this network is v6-only" cases.
-///
-/// Each family asks the library's own resolver, the one a classified trace uses by default: STUN
-/// only, every socket bound before anything is sent. Unlike a trace's question, there is no
-/// overall deadline and the address is reported as the STUN server gave it, whether or not it is
-/// globally routable.
-///
-/// The two sweeps are child tasks of the caller's. Cancelling the calling task ends both at once,
-/// and the call returns what had been found by then. Each server attempt is bounded by
-/// `stunTimeout`; resolving the server names has no deadline of its own.
-///
-/// - Parameters:
-///   - stunTimeout: Per-server timeout (default 0.8s).
-///   - interface: Optional interface to bind to (applied to both families).
-///   - sourceIP: Optional source IP. Only the sweep of its own family runs, bound to it; the
-///               other family sends nothing and is `nil`. A value that is not an IP address
-///               sends nothing for either family.
-///   - enableLogging: Verbose logging.
-public func getPublicIPs(
-  stunTimeout: TimeInterval = 0.8,
-  interface: String? = nil,
-  sourceIP: String? = nil,
-  enableLogging: Bool = false
-) async -> PublicIPs {
-  let resolver = LibraryPublicIPResolver(stunTimeout: stunTimeout, enableLogging: enableLogging)
-  async let v4 = resolver.standaloneAddress(.v4, interface: interface, sourceIP: sourceIP)
-  async let v6 = resolver.standaloneAddress(.v6, interface: interface, sourceIP: sourceIP)
-  return await PublicIPs(v4: v4, v6: v6)
-}
-
-extension LibraryPublicIPResolver {
-  /// One family's sweep for ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``,
-  /// with no overall deadline: the address, or `nil` if there was none or the call was cancelled.
-  fileprivate func standaloneAddress(
-    _ family: IPAddressFamily, interface: String?, sourceIP: String?
-  ) async -> String? {
-    do {
-      return try await publicIPDiscovery(
-        family: family, stunTimeout: stunTimeout, interface: interface, sourceIP: sourceIP,
-        enableLogging: enableLogging, budget: .infinity)?.address
-    } catch {
-      if enableLogging { print("[STUN] \(family) sweep failed: \(error)") }
-      return nil
-    }
   }
 }
