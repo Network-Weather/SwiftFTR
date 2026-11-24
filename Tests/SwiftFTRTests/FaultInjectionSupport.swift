@@ -437,8 +437,9 @@ final class FakeICMPNetwork: @unchecked Sendable {
     return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
   }
 
-  /// Connects `fd`, a socket a test's factory has already bound, to this network, so nothing
-  /// else can queue datagrams on it between the bind and the first send.
+  /// Connects `fd`, an unbound socket from ``makeSocket(_:)``, to this network. The connect
+  /// assigns its local port, so there is no moment at which the socket has a port and no peer: a
+  /// socket bound first could queue a late datagram in between, and connecting keeps it.
   func connectProbe(_ fd: Int32) throws {
     var (address, length) = loopbackAddress(family: family, port: port)
     let connected = withUnsafePointer(to: &address) {

@@ -75,13 +75,9 @@ final class EndlessReplies: @unchecked Sendable {
       let fd = try network.makeSocket(requestedFamily)
       var handedOver = false
       defer { if !handedOver { close(fd) } }
-      var (address, length) = loopbackAddress(family: requestedFamily, port: 0)
-      let bound = withUnsafePointer(to: &address) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, length) }
-      }
-      guard bound == 0 else { throw FixtureError.socket("bind probe socket", errno) }
-      // Connected at once, so only the network can queue anything on it; the replies come from
-      // the network's own socket for that reason.
+      // Connecting assigns the local port, so the socket has no moment with a port and no peer
+      // in which another test's late datagram could be queued; from then on only the network can
+      // reach it, which is why the replies come from the network's own socket.
       try network.connectProbe(fd)
       var actual = sockaddr_storage()
       var actualLength = socklen_t(MemoryLayout<sockaddr_storage>.size)
@@ -428,12 +424,7 @@ struct FaultInjectionReceiveLoopTests {
       let fd = try network.makeSocket(family)
       var handedOver = false
       defer { if !handedOver { close(fd) } }
-      var (address, length) = loopbackAddress(family: family, port: 0)
-      let bound = withUnsafePointer(to: &address) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, length) }
-      }
-      guard bound == 0 else { throw FixtureError.socket("bind probe socket", errno) }
-      // Connected at once, so the backlog below is all that can be queued on it.
+      // Connecting assigns the local port, so nothing but the backlog below can ever be queued.
       try network.connectProbe(fd)
       var actual = sockaddr_storage()
       var actualLength = socklen_t(MemoryLayout<sockaddr_storage>.size)

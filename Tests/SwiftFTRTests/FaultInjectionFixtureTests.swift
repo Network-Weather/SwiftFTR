@@ -430,8 +430,8 @@ struct FaultInjectionFixtureTests {
     arguments: [true, false])
   func isolatedProbeSocketRefusesStrays(isolated: Bool) async throws {
     // Isolated: the socket is connected to the network on its first send, so the kernel refuses
-    // a short and an empty stray from another socket; the stray's sender is connected to the
-    // probe's port, so the refusal comes back to it as ECONNREFUSED. Not isolated (main's
+    // a short and an empty stray from other sockets; each stray's sender is connected to the
+    // probe's port, so a refusal comes back to it as ECONNREFUSED. Not isolated (main's
     // behaviour, the control): both strays are queued beside the network's own reply.
     let network = try FakeICMPNetwork { _ in [] }
     defer { network.stop() }
@@ -442,15 +442,20 @@ struct FaultInjectionFixtureTests {
     #expect(Self.sendProbe(request, on: probe, to: network, with: send) == request.count)
     #expect(await eventually(within: 10) { network.probes.value == 1 })
 
-    let stray = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
-    defer { close(stray) }
+    // A sender of its own per stray, each connected to the probe's port: a refusal of the first
+    // would otherwise come back as the second send's error, though isolation had worked.
+    var senders: [Int32] = []
+    defer { for sender in senders { close(sender) } }
     var (address, length) = loopbackAddress(family: AF_INET, port: Self.localPort(probe))
-    let connected = withUnsafePointer(to: &address) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(stray, $0, length) }
-    }
-    try #require(connected == 0)
     for datagram in [Strays.short, Strays.empty] {
-      #expect(datagram.withUnsafeBytes { Darwin.send(stray, $0.baseAddress, $0.count, 0) } >= 0)
+      let sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+      try #require(sender >= 0)
+      senders.append(sender)
+      let connected = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(sender, $0, length) }
+      }
+      try #require(connected == 0)
+      #expect(datagram.withUnsafeBytes { Darwin.send(sender, $0.baseAddress, $0.count, 0) } >= 0)
     }
     #expect(
       network.inject(.init(ICMPWire.echoReply(family: AF_INET, id: 0x1234, seq: 1)), to: probe))
@@ -459,9 +464,12 @@ struct FaultInjectionFixtureTests {
       // The refusal ends the wait as soon as it comes back. ICMP errors are rate-limited host
       // wide, so on a loaded host it may not come, and the wait then ends at its bound: a stray
       // still in flight after it would go unseen, which can only let this pass, never fail it.
+      let strays = senders
       let refused = await eventually(within: 2) {
-        var byte: UInt8 = 0
-        return recv(stray, &byte, 1, MSG_DONTWAIT) < 0 && errno == ECONNREFUSED
+        strays.allSatisfy { sender in
+          var byte: UInt8 = 0
+          return recv(sender, &byte, 1, MSG_DONTWAIT) < 0 && errno == ECONNREFUSED
+        }
       }
       #expect(await eventually(within: 10) { queuedDatagrams(probe) >= 1 })
       #expect(
