@@ -54,6 +54,8 @@ final class EndlessReplies: @unchecked Sendable {
   /// The network whose socket the replies leave from, set by ``socketFactory(_:)``.
   private var network: FakeICMPNetwork?
   private var handedOverAt: TimeInterval?
+  /// When the fixture first saw the primed batch shrink, the proof that the operation read.
+  private var readSeenAt: TimeInterval?
 
   init(family: Int32 = AF_INET) {
     self.family = family
@@ -105,8 +107,10 @@ final class EndlessReplies: @unchecked Sendable {
       // sent anything yet. Bounded, and a short wait on a thread the call already holds.
       let giveUp = monotonicNow() + 10
       while queuedDatagrams(fd) < Self.primed, monotonicNow() < giveUp { usleep(1000) }
-      guard queuedDatagrams(fd) >= Self.primed else {
-        throw FixtureError.socket("only \(queuedDatagrams(fd)) replies queued before handover", 0)
+      // Exactly the batch: the socket hears only the network, and the feed sends nothing more
+      // until the operation has read.
+      guard queuedDatagrams(fd) == Self.primed else {
+        throw FixtureError.socket("\(queuedDatagrams(fd)) replies queued before handover", 0)
       }
       handedOver = true
       lock.lock()
@@ -147,49 +151,47 @@ final class EndlessReplies: @unchecked Sendable {
         socketCopy = -1
         lock.unlock()
       }
-      send(datagram, to: port)
+      feed(datagram, to: port)
     }
     thread.start()
   }
 
-  /// How much traffic there had been at one moment: replies sent, and how many of them some
-  /// reader had taken off the probe socket.
+  /// How much traffic there had been at one moment: replies sent, and whether the operation had
+  /// been seen reading.
   struct Traffic: Sendable {
     let sent: Int
-    let read: Int
+    let readSeen: Bool
   }
 
-  /// Replies sent so far, and how many have been read from the probe socket. Read counts the
-  /// datagrams no longer queued on it (`SO_NUMRCVPKT` on the fixture's duplicate). It is 0 before
-  /// the socket exists, and -1 if the queue cannot be counted, which no check accepts.
+  /// Replies sent so far, and whether the operation has read from the probe socket: the fixture
+  /// saw the primed batch shrink. Only the operation reads the socket (the fixture's duplicate is
+  /// never read), and nothing is sent between the batch being queued whole and that read, so it
+  /// is an observation of a read, not arithmetic over datagrams that may still be in flight.
   func traffic() -> Traffic {
     lock.lock()
     defer { lock.unlock() }
-    return Traffic(sent: sentCount, read: readCount())
+    return Traffic(sent: sentCount, readSeen: readSeenAt != nil)
   }
 
   /// Whether the socket stayed fed since `mark` and the operation read it: the sender is still
-  /// running, no gap between sends reached the receive timeout (after which a read reports no
-  /// data), neither has the time since the last send, and at least `minimumSent` more replies
-  /// were sent and `minimumRead` more were read. The default of ten reads is far more than
-  /// loopback ever has in flight at this spacing, so those replies were read, not merely still on
-  /// their way. A test that checks reading before it cancels passes zero for both, since a prompt
-  /// return can come before the next reply; the read count is an estimate, so with zero its
-  /// change is not checked at all.
+  /// running, the operation was seen reading (when `requireRead`), no gap between sends after
+  /// that read reached the receive timeout (after which a read reports no data), neither has the
+  /// time since the last send, and at least `minimumSent` more replies were sent. A test that
+  /// checks reading before it cancels passes zero, since a prompt return can come before the next
+  /// reply.
   func fedAndRead(
-    since mark: Traffic, minimumSent: Int = 1, minimumRead: Int = 10
+    since mark: Traffic, minimumSent: Int = 1, requireRead: Bool = true
   ) -> (ok: Bool, detail: String) {
     lock.lock()
     defer { lock.unlock() }
-    let read = readCount()
     let sinceLastSend = lastSend.map { monotonicNow() - $0 }
     let ok =
       !senderGone && !stopped && sentCount > 0 && sentCount - mark.sent >= minimumSent
       && longestGap < receiveTimeout && sinceLastSend.map { $0 < receiveTimeout } == true
-      && mark.read >= 0 && read >= 0 && (minimumRead == 0 || read - mark.read >= minimumRead)
+      && (!requireRead || readSeenAt != nil)
     let detail =
       "sender running: \(!senderGone && !stopped), sent \(mark.sent) -> \(sentCount), "
-      + "read \(mark.read) -> \(read), longest gap \(longestGap)s, "
+      + "read seen: \(readSeenAt != nil), longest gap \(longestGap)s, "
       + "since last send \(sinceLastSend.map { "\($0)s" } ?? "never")"
     return (ok, detail)
   }
@@ -210,20 +212,6 @@ final class EndlessReplies: @unchecked Sendable {
     return sentCount
   }
 
-  /// Replies taken off the probe socket, or -1 if its queue cannot be counted. Call with `lock`
-  /// held.
-  private func readCount() -> Int {
-    // No socket yet: nothing can have been sent or read.
-    if port == 0 { return 0 }
-    guard socketCopy >= 0 else { return -1 }
-    var queued: Int32 = 0
-    var length = socklen_t(MemoryLayout<Int32>.size)
-    guard getsockopt(socketCopy, SOL_SOCKET, SO_NUMRCVPKT, &queued, &length) == 0 else {
-      return -1
-    }
-    return max(0, sentCount - Int(queued))
-  }
-
   /// Stops the replies without waiting. The duplicate descriptor is released here if the replies
   /// never started, and otherwise by the sender as it exits, within one ``interval`` of this call,
   /// so the port stays reserved until the last reply has gone. Safe to call from `defer` in an
@@ -238,18 +226,42 @@ final class EndlessReplies: @unchecked Sendable {
     lock.unlock()
   }
 
-  private func send(_ datagram: [UInt8], to port: UInt16) {
+  /// Sends the primed batch, waits for the operation's first read, then sends one reply every
+  /// ``interval`` until ``stop()``.
+  private func feed(_ datagram: [UInt8], to port: UInt16) {
     lock.lock()
     let network = self.network
+    let copy = socketCopy
     lock.unlock()
-    guard let network else { return }
+    guard let network, copy >= 0 else { return }
     // A test that forgets to stop the replies must not leave them running for the whole suite.
     let safetyStop = monotonicNow() + 60
-    while monotonicNow() < safetyStop {
+    var isStopped: Bool {
       lock.lock()
-      let done = stopped
+      defer { lock.unlock() }
+      return stopped
+    }
+    for _ in 0..<Self.primed where network.send(datagram, toPort: port) {
+      lock.lock()
+      sentCount += 1
       lock.unlock()
-      if done { return }
+    }
+    // The batch is queued whole before the operation gets the socket; it shrinks only when the
+    // operation reads.
+    while !isStopped, monotonicNow() < safetyStop {
+      lock.lock()
+      let handedOver = handedOverAt != nil
+      lock.unlock()
+      if handedOver, queuedDatagrams(copy) < Self.primed { break }
+      usleep(useconds_t(interval * 1_000_000))
+    }
+    lock.lock()
+    if !stopped { readSeenAt = monotonicNow() }
+    // Gaps are measured from the first read on: until then the socket holds the whole batch.
+    lastSend = readSeenAt
+    lock.unlock()
+    while monotonicNow() < safetyStop {
+      if isStopped { return }
       if network.send(datagram, toPort: port) {
         let now = monotonicNow()
         lock.lock()
@@ -336,7 +348,7 @@ final class DescriptorLog: @unchecked Sendable {
 /// Every operation runs under a watchdog, so a handler that holds its queue fails its test
 /// instead of hanging the suite. Bounds come from the operation's configuration, and the main
 /// claim of each liveness test is an event: the operation returned while the replies were still
-/// arriving and its receive loop was reading them (``EndlessReplies/fedAndRead(since:minimumRead:)``),
+/// arriving and its receive loop was reading them (``EndlessReplies/fedAndRead(since:minimumSent:requireRead:)``),
 /// so a test cannot pass on a socket that was idle or a loop that never read.
 @Suite("FaultInjection: receive loop bounds")
 struct FaultInjectionReceiveLoopTests {
@@ -394,7 +406,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: 5) { replies.traffic().read >= 10 },
+      await eventually(within: Self.watchdog) { replies.traffic().readSeen },
       "the trace never read the replies: \(replies.traffic())")
     let atCancel = replies.traffic()
     trace.cancel()
@@ -402,7 +414,7 @@ struct FaultInjectionReceiveLoopTests {
     let (outcome, _) = try await measure(within: Self.watchdog) {
       await trace.result.map { _ in () }
     }
-    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0, minimumRead: 0)
+    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0)
 
     #expect(
       flow.ok, "the socket was not kept fed until the cancelled trace returned: \(flow.detail)")
@@ -560,7 +572,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: 5) { replies.traffic().read >= 10 },
+      await eventually(within: Self.watchdog) { replies.traffic().readSeen },
       "the stream never read the replies: \(replies.traffic())")
     let atCancel = replies.traffic()
     // Cancels the producer, not the consumer: a cancelled consumer stops waiting on its own,
@@ -568,7 +580,7 @@ struct FaultInjectionReceiveLoopTests {
     await tracer.cancelActiveTraces()
 
     let (outcome, _) = try await measure(within: Self.watchdog) { await consumer.result }
-    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0, minimumRead: 0)
+    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0)
 
     #expect(flow.ok, "the socket was not kept fed until the cancelled stream ended: \(flow.detail)")
     #expect(outcome.isLibraryCancellation, "\(outcome)")
@@ -694,7 +706,7 @@ struct FaultInjectionReceiveLoopTests {
     }
     // The loop must be reading the replies when it is cancelled.
     #expect(
-      await eventually(within: 5) { replies.traffic().read >= 10 },
+      await eventually(within: Self.watchdog) { replies.traffic().readSeen },
       "the ping never read the replies: \(replies.traffic())")
     let atCancel = replies.traffic()
     ping.cancel()
@@ -702,7 +714,7 @@ struct FaultInjectionReceiveLoopTests {
     let (outcome, _) = try await measure(within: Self.watchdog) {
       await ping.result.map { _ in () }
     }
-    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0, minimumRead: 0)
+    let flow = replies.fedAndRead(since: atCancel, minimumSent: 0)
 
     #expect(
       flow.ok, "the socket was not kept fed until the cancelled ping returned: \(flow.detail)")
