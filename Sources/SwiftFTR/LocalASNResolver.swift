@@ -27,7 +27,7 @@ public actor LocalASNResolver: ASNResolver {
     case notLoaded
     /// The shared load this resolver is waiting on. Holding it keeps its database alive for this
     /// resolver once it finishes, even when every caller stopped waiting before then.
-    case loading(Task<LocalASNDatabaseHandle, any Error>)
+    case loading(SharedWork<LocalASNDatabaseHandle>)
     case loaded(LocalASNDatabaseHandle)
     case failed
   }
@@ -68,7 +68,7 @@ public actor LocalASNResolver: ASNResolver {
   private func database(until deadline: ContinuousClock.Instant?) async throws -> (
     any LocalASNTable
   )? {
-    let load: Task<LocalASNDatabaseHandle, any Error>
+    let load: SharedWork<LocalASNDatabaseHandle>
     switch loadState {
     case .loaded(let handle):
       return handle.database
@@ -84,7 +84,7 @@ public actor LocalASNResolver: ASNResolver {
     }
 
     do {
-      guard let handle = try await awaitShared(load, until: deadline) else { return nil }
+      guard let handle = try await load.value(until: deadline) else { return nil }
       if case .loading = loadState { loadState = .loaded(handle) }
       return handle.database
     } catch {
@@ -94,48 +94,59 @@ public actor LocalASNResolver: ASNResolver {
     }
   }
 
-  /// Resolves `ipv4Addrs` from the database. `timeout` bounds the wait for a database that is still
-  /// loading; once it is loaded, lookups take microseconds.
+  /// Resolves `ipv4Addrs` from the database. `timeout` bounds the whole call: the wait for a
+  /// database that is still loading, and the lookups, which run off the resolver so one caller's
+  /// batch does not hold up another's.
   ///
   /// - Throws: `CancellationError` when the calling task is cancelled while the database loads.
   #if compiler(>=6.2)
     @concurrent
   #endif
-  public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
+  nonisolated public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws
+    -> [String: ASNInfo]
   {
     try await resolve(ipv4Addrs: ipv4Addrs, until: asnDeadline(after: timeout))
   }
 
-  /// Resolves `ipv4Addrs`, waiting for a database that is still loading until `deadline`.
-  func resolve(ipv4Addrs: [String], until deadline: ContinuousClock.Instant?) async throws
-    -> [String: ASNInfo]
+  /// Resolves `ipv4Addrs`, returning what it has at `deadline`: only acquiring the database runs
+  /// on the resolver, and the batch checks the deadline as it goes.
+  #if compiler(>=6.2)
+    @concurrent
+  #endif
+  nonisolated func resolve(ipv4Addrs: [String], until deadline: ContinuousClock.Instant?)
+    async throws -> [String: ASNInfo]
   {
-    let inputIPs = Set(ipv4Addrs)
-    let lookupIPs = Set(inputIPs.compactMap(asnLookupAddress))
-    guard !lookupIPs.isEmpty else { return [:] }
+    /// How many addresses go between checks of the clock.
+    let checkEvery = 32
+    func expired(_ step: Int) -> Bool {
+      guard let deadline, step % checkEvery == checkEvery - 1 else { return false }
+      return ContinuousClock.now >= deadline
+    }
+
+    // Each input with a lookup key; several inputs can share one (mapped IPv4, for example).
+    var keyByInput: [String: String] = [:]
+    for (step, ip) in Set(ipv4Addrs).enumerated() {
+      if expired(step) { return [:] }
+      if let key = asnLookupAddress(for: ip) { keyByInput[ip] = key }
+    }
+    guard !keyByInput.isEmpty else { return [:] }
 
     guard let db = try await database(until: deadline) else {
       return [:]  // Failed to load, or still loading at the deadline
     }
 
-    var lookupResults: [String: ASNInfo] = [:]
-    for ip in lookupIPs {
-      if let (asn, name) = db.lookup(ip) {
-        lookupResults[ip] = ASNInfo(
-          asn: Int(asn),
-          name: name ?? "",
-          prefix: nil,
-          countryCode: nil,
-          registry: nil
-        )
-      }
-    }
-
+    var infoByKey: [String: ASNInfo?] = [:]
     var results: [String: ASNInfo] = [:]
-    for ip in inputIPs {
-      if let lookupIP = asnLookupAddress(for: ip), let info = lookupResults[lookupIP] {
-        results[ip] = info
+    for (step, (ip, key)) in keyByInput.enumerated() {
+      if expired(step) { break }
+      let info: ASNInfo?
+      if let known = infoByKey[key] {
+        info = known
+      } else {
+        info = db.lookup(key).map { ASNInfo(asn: Int($0.asn), name: $0.name ?? "") }
+        infoByKey[key] = info
       }
+      if let info { results[ip] = info }
     }
     return results
   }
@@ -202,7 +213,7 @@ actor LocalASNDatabaseStore {
   typealias Loader = @Sendable (LocalASNSource) async throws -> any LocalASNTable
 
   private var resident: [LocalASNSourceKey: WeakHandle] = [:]
-  private var inFlight: [LocalASNSourceKey: Task<LocalASNDatabaseHandle, any Error>] = [:]
+  private var inFlight: [LocalASNSourceKey: SharedWork<LocalASNDatabaseHandle>] = [:]
   private let loader: Loader
 
   /// Number of loads this store has started. Tests read it to prove that resolvers share.
@@ -219,10 +230,10 @@ actor LocalASNDatabaseStore {
   ///
   /// The load belongs to the store, not to any caller: it is never cancelled, and it records its
   /// own result here when it ends, however many callers are still waiting for it.
-  func loadTask(for source: LocalASNSource) -> Task<LocalASNDatabaseHandle, any Error> {
+  func loadTask(for source: LocalASNSource) -> SharedWork<LocalASNDatabaseHandle> {
     let key = LocalASNSourceKey(source)
     if let handle = resident[key]?.handle {
-      return Task { handle }
+      return SharedWork(finished: handle)
     }
     if let task = inFlight[key] {
       return task
@@ -240,8 +251,9 @@ actor LocalASNDatabaseStore {
         throw error
       }
     }
-    inFlight[key] = task
-    return task
+    let work = SharedWork(task)
+    inFlight[key] = work
+    return work
   }
 
   private func finishLoad(_ key: LocalASNSourceKey, handle: LocalASNDatabaseHandle?) {

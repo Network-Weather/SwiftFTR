@@ -12,7 +12,7 @@ import Foundation
 /// ```
 public struct HybridASNResolver: ASNResolver, Sendable {
   private let localResolver: LocalASNResolver
-  private let dnsResolver: ASNResolver
+  private let dnsResolver: CachingASNResolver
   private let fallbackTimeout: TimeInterval
 
   public init(source: LocalASNSource, fallbackTimeout: TimeInterval = 1.0) {
@@ -23,7 +23,7 @@ public struct HybridASNResolver: ASNResolver, Sendable {
 
   /// A resolver over `local` and `dns`. Tests pass a local resolver with its own store and a DNS
   /// resolver that records what it is asked.
-  init(local: LocalASNResolver, dns: ASNResolver, fallbackTimeout: TimeInterval) {
+  init(local: LocalASNResolver, dns: CachingASNResolver, fallbackTimeout: TimeInterval) {
     self.localResolver = local
     self.dnsResolver = dns
     self.fallbackTimeout = fallbackTimeout
@@ -37,9 +37,10 @@ public struct HybridASNResolver: ASNResolver, Sendable {
   /// Resolves `ipv4Addrs` from the local database, then asks DNS for the addresses it lacks.
   ///
   /// `timeout` bounds the whole call: a database still loading is waited for only until it runs
-  /// out, and the DNS fallback gets `fallbackTimeout` or the time left, whichever is shorter (none
-  /// once it has run out). A value that is not finite and positive sets no bound, and the fallback
-  /// gets `fallbackTimeout`.
+  /// out, and so is the DNS fallback, which is skipped once no time is left. The fallback itself
+  /// is given `fallbackTimeout`, so concurrent lookups of one address share a cached flight
+  /// whatever time each has left; a caller with less time stops waiting for it at its own
+  /// deadline. A `timeout` that is not finite and positive sets no bound.
   #if compiler(>=6.2)
     @concurrent
   #endif
@@ -65,13 +66,13 @@ public struct HybridASNResolver: ASNResolver, Sendable {
     }
     let missingIPs = publicIPs.filter { !resolvedIPs.contains($0) }
 
-    guard !missingIPs.isEmpty, let dnsTimeout = fallbackTimeout(before: deadline) else {
+    guard !missingIPs.isEmpty, deadline.map({ ContinuousClock.now < $0 }) ?? true else {
       return localResults ?? [:]
     }
 
     // Fall back to DNS for missing IPs
     let dnsResults = try? await dnsResolver.resolve(
-      ipv4Addrs: Array(missingIPs), timeout: dnsTimeout)
+      ipv4Addrs: Array(missingIPs), timeout: fallbackTimeout, waitingUntil: deadline)
 
     // Merge results (local takes precedence)
     var merged = localResults ?? [:]
@@ -81,15 +82,5 @@ public struct HybridASNResolver: ASNResolver, Sendable {
       }
     }
     return merged
-  }
-
-  /// The DNS fallback's timeout: `fallbackTimeout`, cut to the time left before `deadline`, or
-  /// `nil` when none is left. Kept exact when there is time to spare, so concurrent lookups of one
-  /// address share a cached flight, which is keyed by timeout.
-  private func fallbackTimeout(before deadline: ContinuousClock.Instant?) -> TimeInterval? {
-    guard let deadline else { return fallbackTimeout }
-    let left = secondsUntil(deadline)
-    guard left > 0 else { return nil }
-    return left < fallbackTimeout ? left : fallbackTimeout
   }
 }

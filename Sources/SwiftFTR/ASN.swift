@@ -69,53 +69,153 @@ public protocol ASNResolver: Sendable {
 }
 
 /// The instant `timeout` seconds from now, by which an ASN lookup returns what it has, or `nil`
-/// for no bound when `timeout` is not finite and positive.
+/// for no bound when `timeout` is not finite and positive, or longer than
+/// `ConfigurationLimits.maximumTimeout` (about 68 years), past which an instant on the clock could
+/// not be waited for.
 func asnDeadline(after timeout: TimeInterval) -> ContinuousClock.Instant? {
-  guard timeout.isFinite, timeout > 0, timeout < TimeInterval(Int.max) else { return nil }
+  guard timeout.isFinite, timeout > 0, timeout <= ConfigurationLimits.maximumTimeout else {
+    return nil
+  }
   return .now + .seconds(timeout)
 }
 
-/// Waits for `task`, work shared with other callers, until `deadline` passes or the calling task
-/// is cancelled, whichever comes first.
+/// Work shared by several callers, each of which may stop waiting on its own.
 ///
-/// Neither the deadline nor the caller's cancellation cancels `task`: it runs on for the callers
-/// still waiting and for whoever asks next.
-///
-/// - Returns: The task's value, or `nil` once `deadline` has passed without it.
-/// - Throws: `CancellationError` when the calling task is cancelled, or the task's own error.
-func awaitShared<T: Sendable>(
-  _ task: Task<T, Error>, until deadline: ContinuousClock.Instant?
-) async throws -> T? {
-  let pair = AsyncThrowingStream<T?, Error>.makeStream()
-  _ = Task.detached {
-    do {
-      pair.continuation.yield(try await task.value)
-      pair.continuation.finish()
-    } catch {
-      pair.continuation.finish(throwing: error)
-    }
-  }
-  let timer = deadline.map { deadline in
-    Task.detached {
-      do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
-      pair.continuation.yield(nil)
-      pair.continuation.finish()
-    }
-  }
-  defer { timer?.cancel() }
+/// One observer per piece of work waits for its task. A caller registers while it waits and takes
+/// its registration with it when it stops, at its deadline or because it was cancelled, so nothing
+/// of a caller that left stays behind while the work runs on. Neither a deadline nor a caller's
+/// cancellation cancels the task.
+final class SharedWork<Value: Sendable>: @unchecked Sendable {
+  let task: Task<Value, Error>
 
-  return try await withTaskCancellationHandler {
+  private let lock = NSLock()
+  private var outcome: Result<Value, Error>?
+  /// Callers waiting, by registration.
+  private var waiters: [UInt64: CheckedContinuation<Value?, Error>] = [:]
+  /// Registrations not yet ended.
+  private var pending: Set<UInt64> = []
+  /// How a registration ended before its caller had suspended: by its deadline or cancellation.
+  private var endedEarly: [UInt64: Result<Value?, Error>] = [:]
+  private var nextID: UInt64 = 0
+
+  init(_ task: Task<Value, Error>) {
+    self.task = task
+    Task.detached { [self] in
+      let result: Result<Value, Error>
+      do {
+        result = .success(try await task.value)
+      } catch {
+        result = .failure(error)
+      }
+      finish(result)
+    }
+  }
+
+  /// Work that has already produced `value`.
+  init(finished value: Value) {
+    task = Task { value }
+    outcome = .success(value)
+  }
+
+  /// The value, if the work has finished with one; never waits.
+  var finishedValue: Value? {
+    lock.lock()
+    defer { lock.unlock() }
+    if case .success(let value)? = outcome { return value }
+    return nil
+  }
+
+  /// Callers registered and not yet released. For tests.
+  var waiterCount: Int {
+    lock.lock()
+    defer { lock.unlock() }
+    return pending.count
+  }
+
+  /// The work's value, or `nil` once `deadline` has passed without it.
+  ///
+  /// - Throws: `CancellationError` when the calling task is cancelled, or the work's own error.
+  func value(until deadline: ContinuousClock.Instant?) async throws -> Value? {
+    let id = register()
+
+    let timer = deadline.map { deadline in
+      Task.detached { [weak self] in
+        do { try await Task.sleep(until: deadline, clock: .continuous) } catch { return }
+        self?.release(id, with: .success(nil))
+      }
+    }
+    defer { timer?.cancel() }
+
     do {
-      var iterator = pair.stream.makeAsyncIterator()
-      guard let result = try await iterator.next() else { throw CancellationError() }
+      let value = try await withTaskCancellationHandler {
+        try await withCheckedThrowingContinuation { continuation in
+          register(id, continuation)
+        }
+      } onCancel: {
+        release(id, with: .failure(CancellationError()))
+      }
       try Task.checkCancellation()
-      return result
+      return value
     } catch {
       try Task.checkCancellation()
       throw error
     }
-  } onCancel: {
-    pair.continuation.finish(throwing: CancellationError())
+  }
+
+  /// A new registration for a caller about to wait.
+  private func register() -> UInt64 {
+    lock.lock()
+    defer { lock.unlock() }
+    let id = nextID
+    nextID &+= 1
+    pending.insert(id)
+    return id
+  }
+
+  private func register(_ id: UInt64, _ continuation: CheckedContinuation<Value?, Error>) {
+    lock.lock()
+    if let outcome {
+      pending.remove(id)
+      endedEarly[id] = nil
+      lock.unlock()
+      continuation.resume(with: outcome.map { Optional($0) })
+    } else if let ended = endedEarly.removeValue(forKey: id) {
+      pending.remove(id)
+      lock.unlock()
+      continuation.resume(with: ended)
+    } else {
+      waiters[id] = continuation
+      lock.unlock()
+    }
+  }
+
+  /// Ends one registration, whether or not its caller has suspended yet; the first end wins.
+  private func release(_ id: UInt64, with result: Result<Value?, Error>) {
+    lock.lock()
+    guard pending.contains(id) else {
+      lock.unlock()
+      return
+    }
+    if let continuation = waiters.removeValue(forKey: id) {
+      pending.remove(id)
+      lock.unlock()
+      continuation.resume(with: result)
+    } else {
+      if endedEarly[id] == nil { endedEarly[id] = result }
+      lock.unlock()
+    }
+  }
+
+  private func finish(_ result: Result<Value, Error>) {
+    lock.lock()
+    outcome = result
+    let waiting = waiters
+    waiters.removeAll()
+    for id in waiting.keys { pending.remove(id) }
+    lock.unlock()
+    for continuation in waiting.values {
+      continuation.resume(with: result.map { Optional($0) })
+    }
   }
 }
 
@@ -151,7 +251,7 @@ actor _ASNMemoryCache {
   private struct Flight {
     let id: UInt64
     let keys: [LookupKey]
-    let task: LoadTask
+    let work: SharedWork<[String: ASNInfo]>
     var joinCount: Int
   }
 
@@ -191,22 +291,23 @@ actor _ASNMemoryCache {
   /// A flight reserves each `(address, timeout)` key before its resolver task starts. Calls with
   /// overlapping keys await that shared task, while calls for disjoint keys start independent
   /// tasks. The task, rather than its first caller, owns the reservation, so caller cancellation
-  /// cannot cancel or poison work shared with another caller. Each caller stops waiting
-  /// `timeout` seconds after it arrived, with what it has by then, and the flights run on.
+  /// cannot cancel or poison work shared with another caller. Each caller stops waiting at
+  /// `deadline` with what it has by then, the answers of every flight that had finished included,
+  /// and the flights run on.
   fileprivate func resolve(
     _ addresses: [String],
     timeout: TimeInterval,
+    until deadline: ContinuousClock.Instant?,
     using resolver: ASNResolver,
     scope: _ASNResolverScope
   ) async throws -> [String: ASNInfo] {
     try Task.checkCancellation()
-    let deadline = asnDeadline(after: timeout)
 
     var resolved = getMany(addresses)
     let missing = addresses.filter { resolved[$0] == nil }
     guard !missing.isEmpty else { return resolved }
 
-    var tasksByFlightID: [UInt64: LoadTask] = [:]
+    var workByFlightID: [UInt64: SharedWork<[String: ASNInfo]>] = [:]
     var joinedFlightIDs: Set<UInt64> = []
     var unreserved: [String] = []
 
@@ -214,7 +315,7 @@ actor _ASNMemoryCache {
       let key = LookupKey(scope: scope, address: address, timeout: timeout)
       if let flightID = flightIDByKey[key], let flight = flightsByID[flightID] {
         joinedFlightIDs.insert(flightID)
-        tasksByFlightID[flightID] = flight.task
+        workByFlightID[flightID] = flight.work
       } else {
         unreserved.append(address)
       }
@@ -231,19 +332,23 @@ actor _ASNMemoryCache {
         using: resolver,
         scope: scope
       )
-      tasksByFlightID[flight.id] = flight.task
+      workByFlightID[flight.id] = flight.work
     }
 
-    for task in tasksByFlightID.values {
-      guard let loaded = try await awaitShared(task, until: deadline) else { break }
-      for address in addresses {
-        if let info = loaded[address] { resolved[address] = info }
+    // Each flight's own answer is collected, never read back from the cache, which may already
+    // have evicted it.
+    var expired = false
+    for work in workByFlightID.values {
+      let loaded: [String: ASNInfo]?
+      if expired {
+        loaded = work.finishedValue
+      } else {
+        loaded = try await work.value(until: deadline)
+        expired = loaded == nil
       }
-    }
-
-    // A flight not waited for because the deadline passed may still have finished in time.
-    for (address, info) in getMany(addresses) where resolved[address] == nil {
-      resolved[address] = info
+      for address in addresses {
+        if let info = loaded?[address] { resolved[address] = info }
+      }
     }
     return resolved
   }
@@ -258,19 +363,20 @@ actor _ASNMemoryCache {
     nextFlightID &+= 1
     let flightGeneration = generation
     let keys = addresses.map { LookupKey(scope: scope, address: $0, timeout: timeout) }
-    let task = Self.makeLoadTask(
-      resolver: resolver,
-      addresses: addresses,
-      timeout: timeout,
-      cache: self,
-      flightID: flightID,
-      generation: flightGeneration
-    )
+    let work = SharedWork(
+      Self.makeLoadTask(
+        resolver: resolver,
+        addresses: addresses,
+        timeout: timeout,
+        cache: self,
+        flightID: flightID,
+        generation: flightGeneration
+      ))
 
     let flight = Flight(
       id: flightID,
       keys: keys,
-      task: task,
+      work: work,
       joinCount: 0
     )
     flightsByID[flightID] = flight
@@ -328,7 +434,7 @@ actor _ASNMemoryCache {
 
   /// Clear all cached entries. Internal for testing via @testable import.
   func clear() {
-    let tasks = flightsByID.values.map(\.task)
+    let tasks = flightsByID.values.map(\.work.task)
     generation &+= 1
     map.removeAll()
     order.removeAll()
@@ -371,11 +477,28 @@ public struct CachingASNResolver: ASNResolver {
   #endif
   public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
   {
+    try await resolve(ipv4Addrs: ipv4Addrs, timeout: timeout, waitingUntil: nil)
+  }
+
+  /// Resolves through a shared flight keyed by `timeout`, which the resolver behind is given, and
+  /// waits for it until `timeout` has passed or `waitingUntil`, whichever is first.
+  ///
+  /// A caller with less time left than `timeout` passes its own deadline here rather than a
+  /// shorter timeout, so concurrent callers of one address still share a flight.
+  func resolve(
+    ipv4Addrs: [String], timeout: TimeInterval,
+    waitingUntil callerDeadline: ContinuousClock.Instant?
+  ) async throws -> [String: ASNInfo] {
     let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
     if ips.isEmpty { return [:] }
+    var deadline = asnDeadline(after: timeout)
+    if let callerDeadline, deadline.map({ callerDeadline < $0 }) ?? true {
+      deadline = callerDeadline
+    }
     return try await _ASNMemoryCache.shared.resolve(
       ips,
       timeout: timeout,
+      until: deadline,
       using: base,
       scope: scope
     )
@@ -515,45 +638,17 @@ public struct CymruDNSResolver: ASNResolver {
     let lookupIPs = Array(Set(ips.compactMap(asnLookupAddress)))
     if lookupIPs.isEmpty { return [:] }
 
-    let semaphore = _ConcurrencySemaphore(maxConcurrent: Self.maxConcurrentQueries)
-
     // Phase 1: Parallel origin ASN lookups
-    let originResults: [String: _OriginASNResult] = await withTaskGroup(
-      of: (String, _OriginASNResult?).self
-    ) { group in
-      for ip in lookupIPs {
-        group.addTask {
-          guard (try? await semaphore.wait()) != nil else { return (ip, nil) }
-          defer { Task { await semaphore.signal() } }
-          return (ip, await self.lookupOriginASN(ip: ip, until: deadline))
-        }
-      }
-
-      var results: [String: _OriginASNResult] = [:]
-      for await (ip, result) in group {
-        if let r = result { results[ip] = r }
-      }
-      return results
+    let originResults = await Self.concurrentLookups(of: lookupIPs, until: deadline) { ip in
+      await self.lookupOriginASN(ip: ip, until: deadline)
     }
 
     if originResults.isEmpty { return [:] }
 
     // Phase 2: Parallel AS name lookups for unique ASNs only
     let uniqueASNs = Array(Set(originResults.values.map { $0.asn }))
-    let asnNames: [Int: String] = await withTaskGroup(of: (Int, String?).self) { group in
-      for asn in uniqueASNs {
-        group.addTask {
-          guard (try? await semaphore.wait()) != nil else { return (asn, nil) }
-          defer { Task { await semaphore.signal() } }
-          return (asn, await self.lookupASName(asn: asn, until: deadline))
-        }
-      }
-
-      var names: [Int: String] = [:]
-      for await (asn, name) in group {
-        if let n = name { names[asn] = n }
-      }
-      return names
+    let asnNames = await Self.concurrentLookups(of: uniqueASNs, until: deadline) { asn in
+      await self.lookupASName(asn: asn, until: deadline)
     }
 
     // Combine results
@@ -616,6 +711,31 @@ public struct CymruDNSResolver: ASNResolver {
     return _OriginASNResult(asn: asn, prefix: prefix, cc: cc, registry: reg)
   }
 
+  /// Runs `lookup` for each of `keys`, at most ``maxConcurrentQueries`` at a time, and starts the
+  /// next only while `deadline` has not passed and the calling task is not cancelled, so a large
+  /// batch stops when its time does instead of waking every queued key to find it gone.
+  private static func concurrentLookups<Key: Hashable & Sendable, Value: Sendable>(
+    of keys: [Key], until deadline: ContinuousClock.Instant,
+    _ lookup: @escaping @Sendable (Key) async -> Value?
+  ) async -> [Key: Value] {
+    await withTaskGroup(of: (Key, Value?).self) { group in
+      var remaining = keys.makeIterator()
+      func startNext() -> Bool {
+        guard ContinuousClock.now < deadline, !Task.isCancelled, let key = remaining.next()
+        else { return false }
+        group.addTask { (key, await lookup(key)) }
+        return true
+      }
+      for _ in 0..<maxConcurrentQueries where !startNext() { break }
+      var results: [Key: Value] = [:]
+      while let (key, value) = await group.next() {
+        if let value { results[key] = value }
+        _ = startNext()
+      }
+      return results
+    }
+  }
+
   /// TXT strings for `name` from the first of `servers` that answers by `deadline`, or `nil`.
   ///
   /// Each server still to try gets an equal share of the time left, so a silent server cannot use
@@ -623,13 +743,12 @@ public struct CymruDNSResolver: ASNResolver {
   private func queryTXT(name: String, until deadline: ContinuousClock.Instant) async -> [String]? {
     for (index, server) in servers.enumerated() {
       if Task.isCancelled { return nil }
-      // Past the deadline the attempt gets a deadline already passed, and the real query sends
-      // nothing for it.
+      // Past the deadline the attempt is given the deadline itself, already passed, and the real
+      // query sends nothing for it.
       let now = ContinuousClock.now
-      let left = max(now.duration(to: deadline), .zero)
-      if let answer = await query(name, server, now + left / (servers.count - index)) {
-        return answer
-      }
+      let attemptDeadline =
+        now < deadline ? now + now.duration(to: deadline) / (servers.count - index) : deadline
+      if let answer = await query(name, server, attemptDeadline) { return answer }
     }
     return nil
   }

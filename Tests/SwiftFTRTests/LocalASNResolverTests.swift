@@ -295,20 +295,23 @@ final class LocalASNResolverTests: XCTestCase {
   /// Generous limit on any wait a test expects to end; never a claim about speed.
   private static let watchdog: TimeInterval = 20
 
-  /// A lookup's timeout reaches the DNS fallback: the fallback is never given longer than the
-  /// caller allowed the whole lookup, whatever `fallbackTimeout` says.
-  func testHybridFallbackGetsNoMoreThanTheCallersTimeout() async throws {
+  /// A lookup's timeout reaches the DNS fallback: the caller stops waiting for it at its own
+  /// timeout, while the fallback keeps `fallbackTimeout` as the timeout it shares flights by.
+  func testHybridFallbackWaitEndsAtTheCallersTimeout() async throws {
     let store = LocalASNDatabaseStore(loader: { _ in FakeASNTable([:]) })
-    let dns = TimeoutRecordingResolver()
+    let dns = TimeoutRecordingResolver(held: true)
+    defer { dns.gate.open() }
     let hybrid = HybridASNResolver(
-      local: LocalASNResolver(source: .embedded, store: store), dns: dns, fallbackTimeout: 30)
+      local: LocalASNResolver(source: .embedded, store: store),
+      dns: CachingASNResolver(base: dns), fallbackTimeout: 30)
 
-    _ = try await hybrid.resolve(ipv4Addrs: ["203.0.113.70"], timeout: 0.5)
+    let (result, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
+      try await hybrid.resolve(ipv4Addrs: ["203.0.113.70"], timeout: 0.3)
+    }
 
+    XCTAssertTrue(result.isEmpty)
     let timeouts = await dns.timeouts
-    XCTAssertEqual(timeouts.count, 1, "the address the table lacks should reach the fallback once")
-    let longest = timeouts.max() ?? 0
-    XCTAssertLessThanOrEqual(longest, 0.5, "the fallback was given \(timeouts), past the 0.5 s")
+    XCTAssertEqual(timeouts, [30], "the address the table lacks should reach the fallback once")
   }
 
   /// With time to spare, the fallback keeps its own, shorter `fallbackTimeout` exactly, so concurrent
@@ -317,7 +320,8 @@ final class LocalASNResolverTests: XCTestCase {
     let store = LocalASNDatabaseStore(loader: { _ in FakeASNTable([:]) })
     let dns = TimeoutRecordingResolver()
     let hybrid = HybridASNResolver(
-      local: LocalASNResolver(source: .embedded, store: store), dns: dns, fallbackTimeout: 0.25)
+      local: LocalASNResolver(source: .embedded, store: store),
+      dns: CachingASNResolver(base: dns), fallbackTimeout: 0.25)
 
     _ = try await hybrid.resolve(ipv4Addrs: ["203.0.113.71"], timeout: 60)
 
@@ -333,7 +337,8 @@ final class LocalASNResolverTests: XCTestCase {
     let store = LocalASNDatabaseStore(loader: loader.load)
     let dns = TimeoutRecordingResolver()
     let hybrid = HybridASNResolver(
-      local: LocalASNResolver(source: .embedded, store: store), dns: dns, fallbackTimeout: 1)
+      local: LocalASNResolver(source: .embedded, store: store),
+      dns: CachingASNResolver(base: dns), fallbackTimeout: 1)
 
     let (result, _) = try await SwiftFTRTests.measure(within: Self.watchdog) {
       try await hybrid.resolve(ipv4Addrs: ["203.0.113.72"], timeout: 0.3)
@@ -523,11 +528,18 @@ private final class SlowASNTable: LocalASNTable {
   }
 }
 
-/// A DNS stand-in that records the timeout of every lookup and answers nothing.
+/// A DNS stand-in that records the timeout of every lookup and answers nothing, at once or, when
+/// held, once `gate` opens.
 private actor TimeoutRecordingResolver: ASNResolver {
+  nonisolated let gate = StallGate()
+  private let held: Bool
   private(set) var timeouts: [TimeInterval] = []
+
+  init(held: Bool = false) { self.held = held }
+
   func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo] {
     timeouts.append(timeout)
+    if held { await gate.waitAsync(limit: 60) }
     return [:]
   }
 }

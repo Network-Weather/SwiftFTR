@@ -611,6 +611,36 @@ final class SwiftFTRCacheTests: XCTestCase {
     }
   }
 
+  /// Callers that stop waiting for shared work, at their deadline or by cancellation, leave nothing
+  /// registered on it, and the work still answers whoever asks once it finishes.
+  func testWaitersLeavingSharedWorkLeaveNothingBehind() async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let work = SharedWork(
+      Task<Int, Error> {
+        await gate.waitAsync(limit: 60)
+        return 7
+      })
+
+    for _ in 0..<200 {
+      let value = try await work.value(until: .now + .milliseconds(1))
+      XCTAssertNil(value)
+    }
+    let cancelled = Task { try await work.value(until: nil) }
+    let registered = await eventually(within: 20) { work.waiterCount > 0 }
+    XCTAssertTrue(registered)
+    cancelled.cancel()
+    _ = await cancelled.result
+    let left = work.waiterCount
+    XCTAssertEqual(left, 0, "callers that left are still registered")
+
+    gate.open()
+    let (value, _) = try await SwiftFTRTests.measure(within: 20) {
+      try await work.value(until: nil)
+    }
+    XCTAssertEqual(value, 7)
+  }
+
   /// Concurrent hybrid lookups of one address the database lacks share one DNS flight, whatever
   /// time each has left.
   func testConcurrentHybridFallbacksShareOneFlight() async throws {
