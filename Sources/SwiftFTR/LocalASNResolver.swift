@@ -102,8 +102,7 @@ public actor LocalASNResolver: ASNResolver {
   #if compiler(>=6.2)
     @concurrent
   #endif
-  nonisolated public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws
-    -> [String: ASNInfo]
+  public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
   {
     try await resolve(ipv4Addrs: ipv4Addrs, until: asnDeadline(after: timeout))
   }
