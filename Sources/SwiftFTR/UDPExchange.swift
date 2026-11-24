@@ -123,11 +123,32 @@ final class UDPExchange: @unchecked Sendable {
     configure: (Int32) throws -> Void
   ) async throws -> UDPExchangeReply {
     try Task.checkCancellation()
+    let fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
+    guard fd >= 0 else { throw UDPExchangeFailure.socketCreationFailed(errno: errno) }
+    return try await perform(
+      adopting: fd, request: request, timeout: timeout, receiveCapacity: receiveCapacity,
+      accepts: accepts, configure: configure)
+  }
 
+  /// ``perform(family:request:timeout:receiveCapacity:accepts:configure:)`` on `fd`, a UDP socket
+  /// the caller made (and may have bound) but has not sent on. The exchange owns `fd` from the
+  /// call on and closes it exactly once, on every path, a cancellation before setup included.
+  ///
+  /// - Parameter send: The datagram send in place of `TestSeams.sendDatagram` and the system
+  ///   call, or `nil` for those.
+  static func perform(
+    adopting fd: Int32,
+    request: [UInt8],
+    timeout: TimeInterval,
+    receiveCapacity: Int,
+    accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)? = nil,
+    send: TestSeams.SendDatagram? = nil,
+    configure: (Int32) throws -> Void
+  ) async throws -> UDPExchangeReply {
     // Read on the async side: the dispatch queue that runs the exchange cannot see task-locals.
     let sendDatagram =
-      TestSeams.sendDatagram ?? { fd, bytes in
-        send(fd, bytes.baseAddress, bytes.count, 0)
+      send ?? TestSeams.sendDatagram ?? { fd, bytes in
+        Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
       }
     let closeDescriptor = TestSeams.closeDescriptor ?? { fd in close(fd) }
     let receiveDatagram =
@@ -135,10 +156,8 @@ final class UDPExchange: @unchecked Sendable {
         recv(fd, buffer.baseAddress, buffer.count, 0)
       }
 
-    let fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
-    guard fd >= 0 else { throw UDPExchangeFailure.socketCreationFailed(errno: errno) }
-
     do {
+      try Task.checkCancellation()
       // Shared with trace and ping; it reads `TestSeams.fileControl` here, on the async side.
       do {
         try setProbeSocketNonBlocking(fd)

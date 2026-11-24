@@ -33,16 +33,19 @@ struct LibraryPublicIPResolver: PublicIPResolver {
 /// `sourceIP` is given and is not an address of `family`.
 ///
 /// The budget bounds the whole discovery: one absolute deadline, `budget` seconds from entry, is
-/// passed down to every name lookup and STUN attempt, and no step outlives it. The same instant
-/// also bounds the discovery as a whole: when it passes, the discovery (or a test substitute) is
-/// cancelled and awaited, which ends it at once, since every wait in it is cancellable. A STUN
-/// attempt or lookup stalled in a blocking call keeps only its executor slot. A `budget` that is
-/// not finite is no bound; one that is not positive ends discovery before it starts.
+/// passed down to the sweep's admission, every name lookup and every STUN attempt, and no step
+/// outlives it. The sweep decides at that deadline from the replies in hand; no second timer is
+/// raced against it, so an answer it is entitled to give at the deadline is not lost to one. A
+/// lookup stalled in `getaddrinfo` keeps only its executor slot. A test substitute, which can do
+/// anything, is cancelled and awaited when the deadline passes. A `budget` that is infinite or
+/// beyond 10^9 seconds is no bound; one that is not positive, or not a number, ends discovery
+/// before it starts.
 ///
 /// The answer's source is ``PublicIPObservationSource/stun``, a test substitute's included.
 ///
-/// - Throws: ``PublicIPDiscoveryTimeout`` when the budget passes, `CancellationError` when the
-///   calling task is cancelled, or the sweep's own error.
+/// - Throws: ``PublicIPDiscoveryTimeout`` when the budget passes with no address,
+///   ``STUNError/serversDisagree(addresses:)`` when servers reported different addresses,
+///   `CancellationError` when the calling task is cancelled, or the sweep's own error.
 func publicIPDiscovery(
   family: IPAddressFamily,
   stunTimeout: TimeInterval,
@@ -62,27 +65,38 @@ func publicIPDiscovery(
     }
     return nil
   }
+  // `!(budget > 0)` also refuses NaN.
+  guard budget > 0 else { throw PublicIPDiscoveryTimeout() }
   let bounded = budget.isFinite && budget < 1e9
   let deadline = bounded ? monotonicNow() + budget : nil
-  let discover: @Sendable () async throws -> PublicIPObservation
-  if let substitute = TestSeams.discoverPublicIP {
-    let request = PublicIPRequest(
-      family: family, interface: interface, sourceIP: sourceIP,
-      deadline: bounded ? .now + .seconds(budget) : .now + .seconds(1e9))
-    discover = {
-      let found = try await substitute(request)
-      return PublicIPObservation(address: found.ip, family: family, source: .stun)
+
+  guard let substitute = TestSeams.discoverPublicIP else {
+    let outcome: Result<STUNPublicIP, Error>
+    do {
+      outcome = .success(
+        try await stunGetPublicIPWithFallback(
+          family: family.socketFamily, timeout: stunTimeout, interface: interface,
+          sourceIP: sourceIP, enableLogging: enableLogging, deadline: deadline))
+    } catch STUNError.serversDisagree(let addresses) {
+      // A disagreement is a finding, not a timeout, whenever it was decided.
+      if Task.isCancelled { throw CancellationError() }
+      throw STUNError.serversDisagree(addresses: addresses)
+    } catch {
+      outcome = .failure(error)
     }
-  } else {
-    discover = {
-      let found = try await stunGetPublicIPWithFallback(
-        family: family.socketFamily, timeout: stunTimeout, interface: interface,
-        sourceIP: sourceIP, enableLogging: enableLogging, deadline: deadline)
-      return PublicIPObservation(address: found.ip, family: family, source: .stun)
-    }
+    let found = try publicIPDiscoveryOutcome(
+      outcome, now: monotonicNow(), deadline: deadline ?? .infinity, cancelled: Task.isCancelled)
+    return PublicIPObservation(address: found.ip, family: family, source: .stun)
+  }
+
+  let request = PublicIPRequest(
+    family: family, interface: interface, sourceIP: sourceIP,
+    deadline: bounded ? .now + .seconds(budget) : .now + .seconds(1e9))
+  let discover: @Sendable () async throws -> PublicIPObservation = {
+    let found = try await substitute(request)
+    return PublicIPObservation(address: found.ip, family: family, source: .stun)
   }
   guard let deadline else { return try await discover() }
-  guard budget > 0 else { throw PublicIPDiscoveryTimeout() }
   return try await withThrowingTaskGroup(of: PublicIPObservation.self) { group in
     group.addTask { try await discover() }
     group.addTask {

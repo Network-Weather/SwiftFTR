@@ -8,11 +8,9 @@ import Testing
 #endif
 
 /// A loopback UDP server that answers nothing until ``release()``, and from then on answers every
-/// STUN binding request, past and future, with a datagram no STUN client accepts. Any other
-/// datagram is a stray (``DatagramFilter``): counted in ``ignored``, never answered.
-///
-/// A client blocked in `recv` on its connected socket returns once released, so a stalled STUN
-/// attempt gives its executor slot back when the test is done with it.
+/// STUN binding request, past and future, with a 4-byte datagram that is not a STUN reply, which
+/// a STUN client ignores. Any other datagram is a stray (``DatagramFilter``): counted in
+/// ``ignored``, never answered.
 final class HeldUDPServer: @unchecked Sendable {
   let port: UInt16
   let family: Int32
@@ -286,6 +284,9 @@ struct AsyncPublicIPDiscoveryTests {
       ranAt.set(monotonicNow())
       unrelatedRan.signal()
     }.value
+    // The server's answer is not a STUN reply and is ignored, so the calls end by cancellation.
+    #expect(await eventually(within: Self.watchdog) { silent.releaseTime != nil })
+    for lookup in lookups { lookup.cancel() }
     for lookup in lookups { _ = try await measure(within: Self.watchdog) { await lookup.value } }
 
     let ran = try #require(ranAt.value)
@@ -314,13 +315,15 @@ struct AsyncPublicIPDiscoveryTests {
     #expect(silent.requests.value == 1)
     #expect(silent.ignored.value >= 2, "ignored: \(silent.ignored.value)")
     silent.release()
+    // Its answer is not a STUN reply, so the call waits on until it is cancelled.
+    lookup.cancel()
     let (ips, _) = try await measure(within: Self.watchdog) { await lookup.value }
     #expect(ips.v4 == nil, "the held server's garbage was taken as an answer")
   }
 
   // MARK: Classified discovery
 
-  @Test("Stalled STUN attempts cannot keep discovery past its budget")
+  @Test("Stalled STUN servers, all asked at once, cannot keep discovery past its budget")
   func stalledAttemptsBoundedByBudget() async throws {
     let first = try HeldUDPServer(family: AF_INET)
     let second = try HeldUDPServer(family: AF_INET)
@@ -328,7 +331,6 @@ struct AsyncPublicIPDiscoveryTests {
       first.stop()
       second.stop()
     }
-    // One slot, so a call queued after the stalled attempt runs only once that attempt returns.
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-budget")
     let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
 
@@ -350,18 +352,18 @@ struct AsyncPublicIPDiscoveryTests {
     }.0
     #expect(throws: PublicIPDiscoveryTimeout.self) { try outcome.get() }
     #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
-    // Each fixture counts a request on its own thread, so wait for the count.
-    let firstAsked = await eventually(within: 10) { first.requests.value == 1 }
-    #expect(firstAsked, "the first server was asked \(first.requests.value) times")
-    #expect(second.requests.value == 0, "the second server was asked inside the stalled budget")
-
-    // The discovery itself ended, not only the wait for it: once the stalled attempt lets go of
-    // its slot, nothing goes on to the next server.
-    first.release()
-    _ = try await measure(within: Self.watchdog) {
-      try await executor.run(priority: .userInitiated) {}
+    // Both servers are asked at once, each once. Each fixture counts on its own thread.
+    let bothAsked = await eventually(within: 10) {
+      first.requests.value == 1 && second.requests.value == 1
     }
-    let carriedOn = await eventually(within: 1) { second.requests.value > 0 }
+    #expect(bothAsked, "asked \(first.requests.value) and \(second.requests.value) times")
+
+    // The discovery itself ended, not only the wait for it: nothing more is sent.
+    first.release()
+    second.release()
+    let carriedOn = await eventually(within: 1) {
+      first.requests.value + second.requests.value > 2
+    }
     #expect(!carriedOn, "the abandoned discovery went on after its budget")
   }
 
@@ -458,8 +460,7 @@ struct AsyncPublicIPDiscoveryTests {
     #expect(found.ip == "198.51.100.1")
   }
 
-  @Test(
-    "A standalone STUN attempt that cannot get an executor slot is abandoned at its own deadline")
+  @Test("A standalone STUN attempt needs no executor slot, and still ends at its own timeout")
   func standaloneAttemptBoundedWithoutSlot() async throws {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-cap")
     let occupant = StallGate()
@@ -477,8 +478,8 @@ struct AsyncPublicIPDiscoveryTests {
     let silent = try HeldUDPServer(family: AF_INET)
     defer { silent.stop() }
 
-    // getPublicIPs has no budget, so only each attempt's own deadline, twice the 0.2 s
-    // per-server timeout, can end a wait for a slot the occupant holds past the watchdog.
+    // getPublicIPs has no budget, so only each attempt's own 0.2 s timeout can end it inside the
+    // watchdog; the occupant holds the only slot past it.
     let (ips, _) = try await measure(within: Self.watchdog) {
       await Self.withFixtures(
         servers: Self.servers(v4: [(silent.host, silent.port), (silent.host, silent.port)]),
@@ -487,6 +488,7 @@ struct AsyncPublicIPDiscoveryTests {
     }
     #expect(ips.v4 == nil)
     #expect(released.value == 0, "an attempt waited for the occupant to free its slot")
-    #expect(silent.requests.value == 0, "an attempt ran although no slot was free")
+    let asked = await eventually(within: 10) { silent.requests.value == 2 }
+    #expect(asked, "\(silent.requests.value) of 2 attempts reached the server without a slot")
   }
 }
