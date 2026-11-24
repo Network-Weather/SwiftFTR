@@ -14,7 +14,8 @@ import Testing
 /// name that `TestSeams.resolveSTUNServer` maps to a fixture without a lookup. Nothing here sends
 /// a packet off the host. Every call runs under ``watchdog`` and every timeout that could end it on
 /// the wrong path is set well past it.
-@Suite("Library public-IP resolver")
+// Serialized: `queuedSweepsHoldFewSockets` counts this process's lo0-bound UDP sockets.
+@Suite("Library public-IP resolver", .serialized)
 struct LibraryPublicIPResolverTests {
   static let watchdog: TimeInterval = 20
   static let longSTUNTimeout: TimeInterval = 60
@@ -243,6 +244,7 @@ struct LibraryPublicIPResolverTests {
 
     let cases: [(source: String, v4: String?, v6: String?)] = [
       ("127.0.0.1", "198.51.100.9", nil), ("::1", nil, "2001:db8::9"), ("not-an-ip", nil, nil),
+      ("::1%", nil, nil), ("::1%swiftftr-none0", nil, nil),
     ]
     for (source, v4, v6) in cases {
       let (ips, _) = try await measure(within: Self.watchdog) {
@@ -256,6 +258,76 @@ struct LibraryPublicIPResolverTests {
     // One request per family, each from the source of its own family; none unbound.
     #expect(await eventually(within: 10) { answer4.requests.value == 1 })
     #expect(await eventually(within: 10) { answer6.requests.value == 1 })
+  }
+
+  /// UDP sockets of this process bound to lo0's interface index, from its descriptor table.
+  static func lo0UDPSockets() -> Int {
+    let lo0 = if_nametoindex("lo0")
+    return DescriptorSampler.openDescriptors().filter { descriptor in
+      var info = socket_fdinfo()
+      let size = Int32(MemoryLayout<socket_fdinfo>.size)
+      guard descriptor.proc_fdtype == UInt32(PROX_FDTYPE_SOCKET),
+        proc_pidfdinfo(getpid(), descriptor.proc_fd, PROC_PIDFDSOCKETINFO, &info, size) > 0,
+        info.psi.soi_protocol == IPPROTO_UDP
+      else { return false }
+      var index: UInt32 = 0
+      var length = socklen_t(MemoryLayout<UInt32>.size)
+      let v6 = info.psi.soi_family == AF_INET6
+      let found = getsockopt(
+        descriptor.proc_fd, v6 ? IPPROTO_IPV6 : IPPROTO_IP, v6 ? IPV6_BOUND_IF : IP_BOUND_IF,
+        &index, &length)
+      return found == 0 && index == lo0
+    }.count
+  }
+
+  @Test("Sweeps waiting for the executor hold no sockets beyond one sweep's per slot")
+  func queuedSweepsHoldFewSockets() async throws {
+    // Two slots, both held by name lookups stalled in the seam; sixteen calls of two sweeps each,
+    // every sweep two named servers. At most two sweeps may hold their two sockets each.
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.pip-admit")
+    let gate = StallGate()
+    defer { gate.open() }
+    let entered = FaultCounter()
+    let stalled: TestSeams.ResolveSTUNServer = { _, _, _ in
+      entered.increment()
+      gate.wait(limit: 60)
+      return nil
+    }
+    let before = Self.lo0UDPSockets()
+    let calls = await TestSeams.$blockingIOExecutor.withValue(executor) {
+      await TestSeams.$stunServers.withValue(Self.named(["stun-a.test", "stun-b.test"])) {
+        await TestSeams.$resolveSTUNServer.withValue(stalled) {
+          (0..<16).map { _ in Task { await getPublicIPs(interface: "lo0") } }
+        }
+      }
+    }
+    defer { for call in calls { call.cancel() } }
+    #expect(await eventually(within: Self.watchdog) { entered.value == 2 })
+    let most = TimeStamp()
+    let grew = await eventually(within: 2) {
+      let open = Self.lo0UDPSockets() - before
+      most.set(TimeInterval(max(open, Int(most.value ?? 0))))
+      return open > 4
+    }
+    #expect(!grew, "queued sweeps held \(Int(most.value ?? 0)) sockets")
+    for call in calls { call.cancel() }
+    gate.open()
+    for call in calls { _ = try await measure(within: Self.watchdog) { await call.value } }
+  }
+
+  @Test("getPublicIPs cancelled before it starts asks nothing")
+  func standaloneCancelledFirst() async throws {
+    let requests = RequestLog()
+    let discovery: TestSeams.DiscoverPublicIP = { request in
+      requests.append(request)
+      return STUNPublicIP(ip: "198.51.100.5")
+    }
+    let outcome = await TestSeams.$discoverPublicIP.withValue(discovery) {
+      await PublicIPResolverTests.cancelledFirst { await getPublicIPs() }
+    }
+    let ips = try outcome.get()
+    #expect(ips.v4 == nil && ips.v6 == nil)
+    #expect(requests.all.isEmpty, "discovery ran for a call cancelled before it started")
   }
 
   @Test("getPublicIPs asks the library's resolver for each family, with its bindings")

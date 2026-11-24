@@ -656,7 +656,37 @@ struct PublicIPResolverTests {
     let request = try #require(resolver.requests.first)
     #expect(request.family == .v4)
     #expect(request.sourceIP == "127.0.0.1")
-    #expect(await tracer.publicIP(for: .v4)?.source == .configured, "the answer was cached")
+    #expect(await tracer.publicIPCache[.v4] == nil, "the answer was cached")
+  }
+
+  /// `body`'s outcome in a task cancelled before `body` starts.
+  static func cancelledFirst<T: Sendable>(_ body: @escaping @Sendable () async throws -> T) async
+    -> Result<T, Error>
+  {
+    await Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      do { return .success(try await body()) } catch { return .failure(error) }
+    }.value
+  }
+
+  @Test(
+    "A call cancelled before it starts asks no resolver and throws CancellationError",
+    arguments: ["fresh", "fresh-disabled", "question"])
+  func cancelledBeforeAsking(path: String) async throws {
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("8.8.8.8")))
+    let tracer = Self.tracer(path == "fresh-disabled" ? .disabled : .custom(resolver))
+    let outcome = await Self.cancelledFirst {
+      path == "question"
+        ? try await tracer.publicIPObservation(for: .v4, handle: nil)?.address
+        : try await tracer.discoverPublicIPWithHostname().ip
+    }
+    guard case .failure(let error) = outcome, error is CancellationError else {
+      Issue.record("expected CancellationError, got \(outcome)")
+      return
+    }
+    // The resolver runs in a task of its own, so give one that was started time to be seen.
+    let asked = await eventually(within: 2) { resolver.asked.value > 0 }
+    #expect(!asked, "the resolver was asked for a call cancelled before it started")
   }
 
   @Test("discoverPublicIPWithHostname throws when the strategy is disabled, and asks nothing")
