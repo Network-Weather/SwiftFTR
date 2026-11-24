@@ -176,7 +176,7 @@ struct RDNSCacheTests {
 
   @Test("With every blocking-I/O worker held, a lookup through the cache still answers")
   func answersWithEveryWorkerHeld() async throws {
-    let held = await HeldExecutor.fill()
+    let held = await HeldExecutor.fill(limit: 2 * Self.watchdog)
     defer { held.release() }
     // The daemon answers loopback from its local records without sending a query. A limiter of
     // its own, so lookups in other tests cannot hold its permit.
@@ -196,13 +196,17 @@ struct RDNSCacheTests {
     let gate = StallGate()
     defer { gate.open() }
     let entered = FaultCounter()
-    // Ignores cancellation, so only the flow's own race can release it. Its hold outlasts the
-    // watchdog, and the gate opens only when the test ends, so a run that returns within the
-    // watchdog returned while the wave was still stalled.
-    let rdns = stallingRDNSCache(gate: gate, limit: 2 * Self.watchdog, entered: entered)
+    let publicIP = "198.51.100.7"
+    // Only the public address stalls. The hops are looked up inside the flow's trace, which races
+    // its own wave, and answer at once; the public address, which is no hop, is looked up in the
+    // flow's second wave, the one under test. The stall ignores cancellation, so only the flow's
+    // own race can release it. Its hold outlasts the watchdog, and the gate opens only when the
+    // test ends, so a run that returns within the watchdog returned while the wave still stalled.
+    let rdns = stallingRDNSCache(
+      gate: gate, limit: 2 * Self.watchdog, entered: entered, only: [publicIP])
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4), rdns: rdns, publicIP: "198.51.100.7")
+    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4), rdns: rdns, publicIP: publicIP)
     let config = MultipathConfig(
       flowVariations: 1, maxPaths: 4, earlyStopThreshold: 1, timeoutMs: 2000, maxHops: 4)
 

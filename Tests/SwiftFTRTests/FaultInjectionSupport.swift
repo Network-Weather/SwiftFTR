@@ -1251,12 +1251,13 @@ struct EmptyASNResolver: ASNResolver {
 
 /// A reverse-DNS cache whose lookups stall until `gate` opens or `limit` passes, ignoring
 /// cancellation, so only the caller's own race can release it. Each lookup counts in `entered`
-/// once it has begun to stall.
-func stallingRDNSCache(gate: StallGate, limit: TimeInterval, entered: FaultCounter? = nil)
-  -> RDNSCache
-{
-  RDNSCache(lookupDeadline: 30) { _, _ in
-    await withCheckedContinuation { continuation in
+/// once it has begun to stall. With `only`, a lookup of any other address finds no name at once.
+func stallingRDNSCache(
+  gate: StallGate, limit: TimeInterval, entered: FaultCounter? = nil, only: Set<String>? = nil
+) -> RDNSCache {
+  RDNSCache(lookupDeadline: 30) { address, _ in
+    if let only, !only.contains(address) { return .noSuchRecord }
+    return await withCheckedContinuation { continuation in
       DispatchQueue.global().async {
         entered?.increment()
         gate.wait(limit: limit)
