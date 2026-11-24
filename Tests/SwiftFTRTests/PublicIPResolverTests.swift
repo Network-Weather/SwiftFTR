@@ -689,6 +689,31 @@ struct PublicIPResolverTests {
     #expect(!asked, "the resolver was asked for a call cancelled before it started")
   }
 
+  @Test("discoverPublicIPWithHostname cancelled during its hostname lookup throws, not a nil name")
+  func freshDiscoveryCancelledDuringHostname() async throws {
+    let entered = FaultCounter()
+    // A reverse lookup that runs until its task is cancelled, then has no name.
+    let rdns = RDNSCache(lookupDeadline: 3 * Self.watchdog) { _ in
+      entered.increment()
+      try? await Task.sleep(nanoseconds: UInt64(3 * Self.watchdog * 1e9))
+      return nil
+    }
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("8.8.8.8")))
+    let tracer = offlineTracer(
+      SwiftFTRConfig(
+        publicIPDiscoveryTimeout: 3 * Self.watchdog, publicIPResolver: .custom(resolver)),
+      rdns: rdns)
+
+    let task = Task { try await tracer.discoverPublicIPWithHostname() }
+    #expect(await eventually(within: Self.watchdog) { entered.value == 1 }, "no hostname lookup")
+    task.cancel()
+    let outcome = try await measure(within: Self.watchdog) { await task.result }.0
+    guard case .failure(let error) = outcome, error is CancellationError else {
+      Issue.record("expected CancellationError, got \(outcome)")
+      return
+    }
+  }
+
   @Test("discoverPublicIPWithHostname throws when the strategy is disabled, and asks nothing")
   func freshDiscoveryDisabled() async throws {
     let discovery = OfflinePublicIPDiscovery()
