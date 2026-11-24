@@ -178,8 +178,9 @@ struct RDNSCacheTests {
   func answersWithEveryWorkerHeld() async throws {
     let held = await HeldExecutor.fill()
     defer { held.release() }
-    // The daemon answers loopback from its local records without sending a query.
-    let cache = RDNSCache(lookupDeadline: 120)
+    // The daemon answers loopback from its local records without sending a query. A limiter of
+    // its own, so lookups in other tests cannot hold its permit.
+    let cache = RDNSCache(lookupDeadline: 120, limiter: _ConcurrencySemaphore(maxConcurrent: 1))
     let (hostname, _) = try await measure(within: Self.watchdog) {
       await TestSeams.$blockingIOExecutor.withValue(held.executor) {
         await cache.lookup("127.0.0.1")
