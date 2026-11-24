@@ -150,7 +150,9 @@ Unreleased
   `getnameinfo` returned it raw.
 - **Only hostnames are cached by reverse DNS.** An address with no name, or whose lookup timed
   out or failed, is asked again by the next trace, where 0.18 cached "no hostname" for the whole
-  TTL (a day by default), a timeout included.
+  TTL (a day by default), a timeout included. Within one trace each hop address is asked once:
+  a classified trace and a multipath flow no longer ask again, after the probes, about a hop
+  that found no name, and an address seen at several TTLs is asked once.
 - **A link-local hop's reverse lookup gets at most one second.** The daemon asks fe80::/10 and
   169.254.0.0/16 addresses by multicast on the link, which never answers "no such name", so an
   unanswered one used to wait out the whole `rdnsLookupTimeout`.
