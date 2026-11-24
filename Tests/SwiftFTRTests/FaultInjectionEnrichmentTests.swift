@@ -117,10 +117,11 @@ struct FaultInjectionEnrichmentTests {
     }
   }
 
-  @Test("A stalled reverse-DNS wave costs its deadline once, then the breaker skips it")
+  @Test("Each stalled reverse-DNS wave costs its deadline once, and two open the breaker")
   func reverseDNSStallBounded() async throws {
     // A daemon that takes every question and never answers, behind the real lookup and its real
-    // deadline timer, as a resolver that stopped answering looks.
+    // deadline timer, as a resolver that stopped answering looks. Every hop of the fake path
+    // answers from one address, so each trace asks one question.
     let daemon = FakeDNSService(deadline: .timer)
     let rdns = RDNSCache(
       lookupDeadline: 0.3, limiter: _ConcurrencySemaphore(maxConcurrent: 32))
@@ -133,11 +134,14 @@ struct FaultInjectionEnrichmentTests {
         let (first, _) = try await measure(within: Self.watchdog) {
           try await tracer.trace(to: "fake.test")
         }
-        #expect(daemon.startedCount > 0, "reverse DNS was never asked")
+        #expect(daemon.startedCount == 1, "one trace asked \(daemon.startedCount) questions")
         #expect(first.reached)
         #expect(first.hops.allSatisfy { $0.hostname == nil })
+        #expect(await rdns.isSuppressingLookups == false, "one stall opened the breaker")
 
-        // Nothing was cached, so a second trace asks again only if the breaker let it.
+        // Nothing was cached, so the second trace asks again, and its stall is the second.
+        _ = try await measure(within: Self.watchdog) { try await tracer.trace(to: "fake.test") }
+        #expect(daemon.startedCount == 2)
         let before = daemon.startedCount
         _ = try await measure(within: Self.watchdog) { try await tracer.trace(to: "fake.test") }
         let unseen = try await measure(within: Self.watchdog) { await rdns.lookup("198.51.100.77") }
