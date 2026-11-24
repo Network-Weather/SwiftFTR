@@ -236,4 +236,68 @@ struct RDNSCacheTests {
       #expect(cancelled, "\(outcome)")
     }
   }
+
+  enum OneTrace: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case trace, traceClassified, multipathFlow
+    var testDescription: String { rawValue }
+  }
+
+  /// Records every address a resolver is asked, and reports `outcome(address)`.
+  private final class AskLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var asked: [String] = []
+    func record(_ address: String) {
+      lock.lock()
+      asked.append(address)
+      lock.unlock()
+    }
+    func count(of address: String) -> Int {
+      lock.lock()
+      defer { lock.unlock() }
+      return asked.filter { $0 == address }.count
+    }
+  }
+
+  @Test(
+    "One trace asks about each hop address once: a hop that times out costs one budget and one stall",
+    arguments: OneTrace.allCases, [1, 2])
+  func eachHopAskedOncePerTrace(operation: OneTrace, destinationTTL: Int) async throws {
+    let log = AskLog()
+    let publicIP = "198.51.100.7"
+    // Every hop answers from the fake peer at 127.0.0.1, the destination included: one hop that
+    // is the destination, or one address at two TTLs. Its PTR query times out. The public address, which is no hop,
+    // fails with an outcome that neither counts toward the breaker nor resets it, so the count
+    // after the call is exactly the stalls the hop address caused. Each ask of the hop is one
+    // more lookup budget spent.
+    let rdns = RDNSCache { address, _ in
+      log.record(address)
+      return address == publicIP
+        ? .error(.daemon(DNSServiceStatus.serviceNotRunning)) : .timedOut
+    }
+    let network = try FakeICMPNetwork(script: pathScript(destinationTTL: destinationTTL))
+    defer { network.stop() }
+    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4), rdns: rdns, publicIP: publicIP)
+    let config = MultipathConfig(
+      flowVariations: 1, maxPaths: 4, earlyStopThreshold: 1, timeoutMs: 2000, maxHops: 4)
+
+    try await network.install {
+      _ = try await measure(within: Self.watchdog) {
+        switch operation {
+        case .trace:
+          _ = try await tracer.trace(to: "fake.test")
+        case .traceClassified:
+          _ = try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
+        case .multipathFlow:
+          _ = try await tracer.discoverPaths(to: "fake.test", config: config)
+        }
+      }
+    }
+    let hopAsks = log.count(of: "127.0.0.1")
+    #expect(hopAsks == 1, "the hop address was asked \(hopAsks) times in one \(operation)")
+    let stalls = await rdns.stallCount
+    #expect(stalls == 1, "one unanswered hop counted \(stalls) stalls")
+    if operation != .trace {
+      #expect(log.count(of: publicIP) == 1, "the public address, no hop, was not asked once")
+    }
+  }
 }

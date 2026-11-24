@@ -91,6 +91,9 @@ actor RDNSCache {
       }
   }
 
+  /// Stalls counted since the breaker last reset, for tests.
+  var stallCount: Int { consecutiveStalls }
+
   /// Whether reverse DNS is currently suppressed because lookups keep stalling.
   var isSuppressingLookups: Bool {
     consecutiveStalls >= Self.stallsBeforeSuppressing
