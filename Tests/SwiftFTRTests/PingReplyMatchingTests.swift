@@ -130,11 +130,7 @@ struct PingReplyMatchingTests {
     }
 
     let config = ping.config
-    let (result, elapsed) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
-    ) {
-      try await ping.run()
-    }
+    let (result, elapsed) = try await ping.runWatched(within: Self.safetyTimer(config) - 1)
     #expect(
       ping.premiseHeld,
       "the six replies were never queued before probe 3's send: \(ping.holdDetail)")
@@ -243,11 +239,7 @@ struct PingReplyMatchingTests {
     }
 
     let config = ping.config
-    let (result, _) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
-    ) {
-      try await ping.run()
-    }
+    let (result, _) = try await ping.runWatched(within: Self.safetyTimer(config) - 1)
     #expect(
       ping.premiseHeld,
       "the early reply and probe 1's were not queued before probe 2 left: \(ping.holdDetail)")
@@ -365,11 +357,7 @@ struct PingReplyMatchingTests {
     }
 
     let config = ping.config
-    let (result, _) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
-    ) {
-      try await ping.run()
-    }
+    let (result, _) = try await ping.runWatched(within: Self.safetyTimer(config) - 1)
     #expect(
       ping.premiseHeld,
       "probe 1's late reply was never queued before probe 3's send: \(ping.holdDetail)")
@@ -491,11 +479,7 @@ struct PingReplyMatchingTests {
     }
 
     let config = ping.config
-    let (result, elapsed) = try await measure(
-      within: Self.safetyTimer(config) - 1, diagnose: ping.network.journal
-    ) {
-      try await ping.run()
-    }
+    let (result, elapsed) = try await ping.runWatched(within: Self.safetyTimer(config) - 1)
     #expect(
       ping.premiseHeld, "probe 2's reply was never queued before probe 3's send: \(ping.holdDetail)"
     )
@@ -587,7 +571,7 @@ final class DirectPing: @unchecked Sendable {
 
   /// How far into the run ``waitUntilReplied(_:_:limit:)`` stops holding a send: what is left of
   /// the tests' watchdog (`safetyTimer - 1`, from the start of the run) once the held probe's
-  /// reply window and half a second are taken off. It is counted from the start of ``run()``, not
+  /// reply window and half a second are taken off. It is counted from the start of the run, not
   /// from when the hold begins, since the watchdog and ping's safety timer both start with the
   /// run; past it a correct ping could no longer end inside the watchdog, so the hold gives up
   /// and the test fails on its premise instead.
@@ -685,8 +669,19 @@ final class DirectPing: @unchecked Sendable {
   }
 
   func run() async throws -> PingResult {
-    state.lock.withLock { state.runStart = monotonicNow() }
+    state.lock.withLock { state.runStart = state.runStart ?? monotonicNow() }
     return try await operation.run()
+  }
+
+  /// Runs the ping under a watchdog of `limit` seconds, as ``measure(within:diagnose:_:)`` does.
+  /// The start of the run is recorded here, before the watchdog is started, because the watchdog
+  /// and the ping run in separate tasks: taken inside the ping's task it could be later than the
+  /// watchdog's start, and a hold could then outlast the watchdog instead of giving up first.
+  func runWatched(within limit: TimeInterval) async throws -> (PingResult, TimeInterval) {
+    state.lock.withLock { state.runStart = monotonicNow() }
+    return try await measure(within: limit, diagnose: self.network.journal) {
+      try await self.run()
+    }
   }
 
   func stop() {
