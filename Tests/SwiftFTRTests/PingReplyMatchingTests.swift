@@ -135,7 +135,9 @@ struct PingReplyMatchingTests {
     ) {
       try await ping.run()
     }
-    #expect(ping.premiseHeld, "the six replies were never queued before probe 3's send")
+    #expect(
+      ping.premiseHeld,
+      "the six replies were never queued before probe 3's send: \(ping.holdDetail)")
     let s = result.statistics
     #expect(
       s.sent == 3,
@@ -246,7 +248,9 @@ struct PingReplyMatchingTests {
     ) {
       try await ping.run()
     }
-    #expect(ping.premiseHeld, "the early reply and probe 1's were not queued before probe 2 left")
+    #expect(
+      ping.premiseHeld,
+      "the early reply and probe 1's were not queued before probe 2 left: \(ping.holdDetail)")
     let s = result.statistics
     #expect(s.sent == 2 && s.received == 1, "\(Self.summary(result))")
     #expect(
@@ -366,7 +370,9 @@ struct PingReplyMatchingTests {
     ) {
       try await ping.run()
     }
-    #expect(ping.premiseHeld, "probe 1's late reply was never queued before probe 3's send")
+    #expect(
+      ping.premiseHeld,
+      "probe 1's late reply was never queued before probe 3's send: \(ping.holdDetail)")
     let s = result.statistics
     #expect(s.sent == 3 && s.received == 2, "\(Self.summary(result))")
     #expect(
@@ -490,7 +496,9 @@ struct PingReplyMatchingTests {
     ) {
       try await ping.run()
     }
-    #expect(ping.premiseHeld, "probe 2's reply was never queued before probe 3's send")
+    #expect(
+      ping.premiseHeld, "probe 2's reply was never queued before probe 3's send: \(ping.holdDetail)"
+    )
     let s = result.statistics
     #expect(s.sent == 2 && s.received == 1, "\(Self.summary(result))")
     // Probe 3 is owed its 0.5 s window from its own send, which the hold above delays.
@@ -522,6 +530,7 @@ final class DirectPing: @unchecked Sendable {
     var before: Hook?
     var after: Hook?
     var premises: [Bool] = []
+    var holdsGivenUp: [String] = []
     var sent: [UInt16: TimeInterval] = [:]
     var failing: Set<UInt16> = []
     var closed: TimeInterval?
@@ -569,6 +578,21 @@ final class DirectPing: @unchecked Sendable {
 
   func premise(_ held: Bool) { state.lock.withLock { state.premises.append(held) } }
 
+  /// Why a hold gave up, if one did, for a test's premise message.
+  var holdDetail: String {
+    let given = state.lock.withLock { state.holdsGivenUp }
+    return given.isEmpty ? "no hold gave up" : given.joined(separator: "; ")
+  }
+
+  /// The longest ``waitUntilReplied(_:_:limit:)`` holds a send: what is left of the tests'
+  /// watchdog (`safetyTimer - 1`, from the start of the run) once the held probe's reply window
+  /// and half a second are taken off. Ping's safety timer starts with the run, so a hold cannot be
+  /// timed apart from it; past this, a correct ping could no longer end inside the watchdog, so
+  /// the hold gives up and the test fails on its premise instead.
+  var holdCap: TimeInterval {
+    PingReplyMatchingTests.safetyTimer(config) - 1 - config.timeout - 0.5
+  }
+
   /// Waits, blocking this thread for at most `limit` seconds, until every datagram the network
   /// has sent to `fd` is either queued there or already read by the ping. Returns whether that
   /// happened.
@@ -597,13 +621,26 @@ final class DirectPing: @unchecked Sendable {
   /// starts at the send does not depend on how fast loopback delivers. The probe socket is
   /// connected to the network, which answers only this socket, so the count is exact. Returns
   /// whether that happened.
-  func waitUntilReplied(_ count: Int, _ fd: Int32, limit: TimeInterval = 10) -> Bool {
-    let giveUp = monotonicNow() + limit
+  func waitUntilReplied(_ count: Int, _ fd: Int32, limit: TimeInterval? = nil) -> Bool {
+    let cap = limit ?? holdCap
+    let giveUp = monotonicNow() + cap
+    var held = true
     while network.repliesSent.value < count {
-      if monotonicNow() >= giveUp { return false }
+      if monotonicNow() >= giveUp {
+        held = false
+        break
+      }
       usleep(500)
     }
-    return waitUntilEveryReplyQueuedOrRead(fd, limit: max(0, giveUp - monotonicNow()))
+    if held { held = waitUntilEveryReplyQueuedOrRead(fd, limit: max(0, giveUp - monotonicNow())) }
+    if !held {
+      let sent = network.repliesSent.value
+      let note = String(
+        format: "hold gave up after its %.1f s cap: %d of %d replies sent, %d queued, %d read",
+        cap, sent, count, queuedDatagrams(fd), clock.readingCount)
+      state.lock.withLock { state.holdsGivenUp.append(note) }
+    }
+    return held
   }
 
   init(family: Int32, config: PingConfig, script: @escaping FakeICMPNetwork.Script) throws {
