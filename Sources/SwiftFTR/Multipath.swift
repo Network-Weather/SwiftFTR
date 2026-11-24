@@ -792,8 +792,11 @@ extension SwiftFTR {
     var hostnameMap: [String: String] = [:]
     if !config.noReverseDNS {
       // Get any missing hostnames
+      // The trace has already asked about every hop address, so only addresses that are no hop
+      // (the destination when it did not answer, the public address) are asked here. Asking again
+      // about a hop that found no name would spend a second budget, and count a second stall.
       let ipsNeedingRDNS = allIPs.filter { ip in
-        !tr.hops.contains { $0.ipAddress == ip && $0.hostname != nil }
+        !tr.hops.contains { $0.ipAddress == ip }
       }
       if !ipsNeedingRDNS.isEmpty {
         // Raced against cancellation like the classification below, so a cancelled flow returns

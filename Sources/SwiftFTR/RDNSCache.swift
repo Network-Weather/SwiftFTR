@@ -158,12 +158,13 @@ actor RDNSCache {
     return hostname
   }
 
-  /// Batch lookup multiple IP addresses concurrently.
-  /// - Parameter ips: Array of IP addresses to resolve
+  /// Batch lookup multiple IP addresses concurrently, each distinct address once.
+  /// - Parameter ips: Array of IP addresses to resolve; an address listed more than once (one
+  ///   router answering at several TTLs) is asked once, so it costs one lookup and one stall.
   /// - Returns: Dictionary mapping IP addresses to hostnames (only successful lookups included)
   func batchLookup(_ ips: [String]) async -> [String: String] {
     await withTaskGroup(of: (String, String?).self) { group in
-      for ip in ips {
+      for ip in Set(ips) {
         group.addTask {
           await (ip, self.lookup(ip))
         }
