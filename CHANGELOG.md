@@ -184,6 +184,28 @@ Unreleased
   that answer rather than the first path's. A network change during the question ends the run
   with `TracerouteError.cancelled` before any flow probes.
 
+- **An ASN lookup's `timeout` bounds the whole call through every built-in resolver**
+  (Enrichment Lifetimes in docs/BLOCKING-IO.md). One deadline is taken when `resolve` is called
+  and passed down unchanged. `CymruDNSResolver` (`.dns`) ends every origin and AS-name query, on
+  every server, by it; it no longer gives each query, server and wave of eight the full timeout
+  again, so a silent first server can use up the budget before the second is asked.
+  `HybridASNResolver` (the default `.hybrid(.embedded)`), which ignored its timeout, waits for a
+  database still loading only until it, and its DNS fallback ends at the earlier of it and
+  `fallbackTimeout` and is not started once it has passed. `LocalASNResolver` waits for its
+  database only until it. `CachingASNResolver` stops each caller at it, even when the resolver
+  behind it overruns. A timeout of zero, below zero or NaN has passed on entry, so only cached
+  or already loaded answers come back; infinity never passes.
+- **A lookup returns every answer it has when its time runs out**, an AS number whose name has
+  not arrived included, with an empty `name` (David, 2026-11-24: "yes on partials"). Team Cymru's
+  origin answers are published as they arrive, so a caller of the cache, the hybrid or `.dns`
+  gets them at its deadline. An entry without a name is not cached, so the next lookup asks for
+  the name again. A lookup throws only when it has no answer and a lookup it waited on failed.
+- **A caller that stops waiting stops nothing shared.** A cached lookup, the database load and a
+  hybrid's DNS fallback run on for every other caller when one reaches its deadline or is
+  cancelled, and the resolver answers its next lookup from the same load. A cancelled caller of
+  `LocalASNResolver.resolve` gets `CancellationError` while the database is loading (it used to
+  wait for the load), and a cancelled `preload()` returns while the load continues.
+
 ### Bug fixes
 
 - **A ping whose send failed ends once every probe that was sent is answered** (#138). Early
@@ -197,6 +219,13 @@ Unreleased
 
 ### Tooling
 
+- **`testDatabaseReleasedAfterLastResolverGoesAway` waits for the release** (#189). It failed
+  intermittently in CI because it read the store the instant the resolver's scope ended, and the
+  release is not that prompt: on 0.18 the task that loaded the database still held it as its
+  result until the runtime freed the finished task, after the caller had resumed. Under CPU load
+  7 of 300 repetitions found it still resident at that instant, every one released within about
+  1 ms, and none with the load's result held elsewhere. Not a leak, so the test now waits for the
+  release under a 20 s watchdog.
 - **Fixture teardown no longer parks a thread of Swift's cooperative pool** (#129). `stop()` on
   the loopback test fixtures (`FakeICMPNetwork`, `LoopbackUDPResponder`, `LoopbackTCPServer`,
   `ScriptedDNSPeer`, `RefusingThenAnsweringUDPPort`, `EndlessReplies`) and
