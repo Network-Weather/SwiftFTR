@@ -167,6 +167,41 @@ struct RDNSSharedLookupTests {
     #expect(await cache.count == 0, "an answer from the old network was cached")
   }
 
+  @Test(
+    "A reset stops the queries it drops: one running ends, one waiting for a slot is never sent",
+    arguments: Reset.allCases)
+  func resetStopsDroppedQueries(reset: Reset) async throws {
+    let limiter = _ConcurrencySemaphore(maxConcurrent: 1)
+    let daemon = FakeDNSService()
+    let cache = RDNSCache(lookupDeadline: 120, limiter: limiter)
+
+    try await daemon.install {
+      let running = Task { await cache.lookup("192.0.2.1") }
+      #expect(await eventually(within: Self.watchdog) { daemon.scheduledCount == 1 })
+      let queued = Task { await cache.lookup("192.0.2.2") }
+      #expect(await eventually(within: Self.watchdog) { await limiter.waitingCount == 1 })
+
+      switch reset {
+      case .clear: await cache.clear()
+      case .invalidateNetworkScoped: await cache.invalidateNetworkScoped()
+      }
+      for task in [running, queued] {
+        let hostname = try await measure(within: Self.watchdog) { await task.value }.0
+        #expect(hostname == nil)
+      }
+      #expect(
+        await eventually(within: Self.watchdog) { daemon.liveCount == 0 },
+        "the running query outlived the reset")
+      #expect(await eventually(within: Self.watchdog) { await limiter.waitingCount == 0 })
+      // The slot is free again and nothing is waiting: the queued question would have gone by now.
+      let fresh = Task { await cache.lookup("192.0.2.3") }
+      #expect(await eventually(within: Self.watchdog) { daemon.startedCount == 2 })
+      #expect(daemon.deliver(to: 1, rdata: PTRData.name("fresh.example")))
+      #expect(try await measure(within: Self.watchdog) { await fresh.value }.0 == "fresh.example")
+    }
+    #expect(daemon.startedCount == 2, "a question from before the reset was sent after it")
+  }
+
   @Test("A shared query takes one permit from the limiter, however many lookups wait on it")
   func onePermitPerQuery() async throws {
     let limiter = _ConcurrencySemaphore(maxConcurrent: 1)

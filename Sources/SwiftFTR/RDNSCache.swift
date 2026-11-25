@@ -254,11 +254,18 @@ actor RDNSCache {
     }
   }
 
+  /// Forgets every query in flight and cancels it, so a request from before a reset neither
+  /// goes out afterwards nor keeps a lookup slot from the new network's questions.
+  private func dropInFlight() {
+    for query in inFlight.values { query.task.cancel() }
+    inFlight.removeAll()
+  }
+
   /// Clear all cached entries.
   func clear() {
     cache.removeAll()
     holdoffs.removeAll()
-    inFlight.removeAll()
+    dropInFlight()
     resetStalls()
   }
 
@@ -272,7 +279,7 @@ actor RDNSCache {
   func invalidateNetworkScoped() {
     cache = cache.filter { _, entry in entry.isGlobal }
     holdoffs.removeAll()
-    inFlight.removeAll()
+    dropInFlight()
     resetStalls()
   }
 
