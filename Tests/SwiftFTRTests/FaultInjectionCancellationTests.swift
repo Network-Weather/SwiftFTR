@@ -301,6 +301,10 @@ struct FaultInjectionCancellationTests {
         }
       }
     }
+    // The trace left its wave at once; the shared queries run on to their deadline, which the
+    // test now passes, and end.
+    daemon.expireDeadlines()
+    #expect(await eventually(within: Self.watchdog) { daemon.liveCount == 0 })
     #expect(await eventually(within: Self.watchdog) { await tracer.activeTraces.isEmpty })
   }
 
@@ -327,7 +331,9 @@ struct FaultInjectionCancellationTests {
         }
       }
     }
-    // The cancelled wave's queries were stopped, not abandoned.
+    // The trace left its wave at once; the shared queries run on to their deadline, which the
+    // test now passes, and are then stopped.
+    daemon.expireDeadlines()
     #expect(await eventually(within: Self.watchdog) { daemon.liveCount == 0 })
   }
 
@@ -545,32 +551,25 @@ struct FaultInjectionCancellationTests {
   }
 
   @Test(
-    "Reverse-DNS lookups cut short by cancellation are not cached and do not trip the stall breaker"
+    "Reverse-DNS lookups by callers already cancelled ask nothing and do not trip the stall breaker"
   )
   func cancelledLookupNotCached() async throws {
     let calls = FaultCounter()
-    let stalled = ["198.51.100.20", "198.51.100.21"]
-    let rdns = RDNSCache { ip, _ in
+    let rdns = RDNSCache { _, _ in
       calls.increment()
-      guard stalled.contains(ip) else { return .timedOut }
-      // The worst a resolver can do: report a wait its caller cancelled as a stall.
-      try? await Task.sleep(nanoseconds: 60_000_000_000)
       return .timedOut
     }
 
-    // Two lookups, each cancelled while it waits and then reported as a stall, so the
-    // cancellation guard is all that keeps them from opening the breaker, which two stalls do.
-    for (index, ip) in stalled.enumerated() {
-      let lookup = Task { await rdns.lookup(ip) }
-      defer { lookup.cancel() }
-      #expect(await eventually(within: Self.watchdog) { calls.value == index + 1 })
-      let (hostname, _) = try await measure(within: Self.watchdog) {
-        lookup.cancel()
-        return await lookup.value
-      }
+    // Two callers cancelled before they look up: they start nothing, so two stalls cannot come
+    // of them.
+    for ip in ["198.51.100.20", "198.51.100.21"] {
+      let hostname = await Task {
+        withUnsafeCurrentTask { $0?.cancel() }
+        return await rdns.lookup(ip)
+      }.value
       #expect(hostname == nil)
     }
-    #expect(await rdns.count == 0, "a cancelled lookup was cached")
+    #expect(calls.value == 0, "a cancelled caller started a query")
     let suppressedByCancelled = await rdns.isSuppressingLookups
     #expect(!suppressedByCancelled, "cancelled lookups counted toward the stall breaker")
 

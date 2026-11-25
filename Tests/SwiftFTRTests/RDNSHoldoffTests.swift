@@ -149,28 +149,18 @@ struct RDNSHoldoffTests {
     #expect(await cache.holdoffCount == 0)
   }
 
-  @Test("A lookup whose caller cancelled holds nothing off, whatever it reports")
-  func cancelledLookupHoldsNothingOff() async throws {
-    let asked = FaultCounter()
-    let cache = RDNSCache { _, _ in
-      asked.increment()
-      guard asked.value == 1 else { return .timedOut }
-      // The first ask waits until its query is cancelled, then reports a timeout anyway.
-      try? await Task.sleep(nanoseconds: 120_000_000_000)
-      return .timedOut
-    }
-    let lookup = Task { await cache.lookup("192.0.2.1") }
-    #expect(await eventually(within: Self.watchdog) { asked.value == 1 })
-    _ = try await measure(within: Self.watchdog) {
-      lookup.cancel()
-      return await lookup.value
-    }
-    // The abandoned query has ended, and its timeout was handled, once it is no longer tracked.
-    #expect(await eventually(within: Self.watchdog) { await cache.inFlightCount == 0 })
+  @Test("A caller cancelled before it looks up asks nothing and holds nothing off")
+  func cancelledCallerHoldsNothingOff() async {
+    let daemon = Daemon { _ in .timedOut }
+    let cache = Self.cache(daemon)
+    let hostname = await Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      return await cache.lookup("192.0.2.1")
+    }.value
+    #expect(hostname == nil)
+    #expect(daemon.asks("192.0.2.1") == 0, "a cancelled caller started a query")
     #expect(await cache.holdoffCount == 0)
     #expect(await cache.stallCount == 0)
-    _ = await cache.lookup("192.0.2.1")
-    #expect(asked.value == 2, "a cancelled lookup held the address off")
   }
 
   @Test("A timeout from before a reset holds nothing off after it")

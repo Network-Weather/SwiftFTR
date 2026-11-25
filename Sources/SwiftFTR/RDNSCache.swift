@@ -3,16 +3,24 @@ import Foundation
 /// Actor-based cache for reverse DNS lookups with TTL and size-bounded eviction.
 ///
 /// Each lookup is a PTR query through the system's DNS daemon (``ReverseDNSLookup``), which holds
-/// no thread while it waits and is stopped when its caller stops waiting. Only answers are
+/// no thread while it waits and ends at its deadline. Only answers are
 /// cached: "no such record" cannot be told apart from a question the daemon suppressed, and a
 /// timeout, an error or a cancellation says nothing about the name, so an address without one is
 /// asked again by the next lookup, with one exception: an address whose question was asked and
 /// timed out is held off for ``stalledAddressHoldoff`` (see there).
 ///
 /// Lookups of one address share one query (David, 2026-11-24: "Build share lookups"): a lookup
-/// that arrives while a query for its address is in flight waits for that query, so every
-/// address has at most one query at a time, one outcome per query, and that outcome is applied
-/// to the cache, the breaker and the holdoffs once. See ``SharedLookup``.
+/// that arrives while a query for its address is in flight awaits that query, so every address
+/// has at most one query at a time, taking one permit, and the query's one outcome is applied to
+/// the cache, the breaker and the holdoffs once, whoever is still waiting for it. A query is
+/// never cancelled because a caller left: it is bounded by its own timeout, and its outcome is
+/// true evidence about the address. A caller cancelled before it calls ``lookup(_:)`` starts and
+/// joins nothing; one cancelled while it waits gets `nil` when the query ends, so a caller that
+/// must be released at once races the wait itself, as the traces do with `withTraceCancellation`.
+///
+/// Every table is keyed by the PTR question an address asks (``ReverseDNSQuestion``: its name and
+/// interface index), so an IPv4 address and its IPv4-mapped IPv6 spelling, or two spellings of
+/// one IPv6 address, are one address, and a link-local address keeps its zone's interface.
 ///
 /// When an insertion takes the cache past `maxSize`, the entry stored longest ago is evicted; a
 /// cache hit does not refresh an entry, so this is insertion-order eviction, not
@@ -26,6 +34,14 @@ actor RDNSCache {
   private struct CacheEntry {
     let hostname: String
     let timestamp: ContinuousClock.Instant
+    /// Whether the address is globally routable, so ``invalidateNetworkScoped()`` keeps it.
+    let isGlobal: Bool
+  }
+
+  /// The query in flight for one address key.
+  private struct InFlight {
+    let id: UInt64
+    let task: Task<ReverseDNSLookupOutcome, Never>
   }
 
   /// How long a single reverse lookup may take before the caller stops waiting for it.
@@ -86,9 +102,10 @@ actor RDNSCache {
   private var stalledInStreak: Set<String> = []
   /// When each held-off address timed out. Bounded by `maxSize`, oldest inserted evicted first.
   private var holdoffs: [String: ContinuousClock.Instant] = [:]
-  /// The query in flight for each address, which a new lookup of it joins. Removed when it ends
-  /// or on a reset; an entry every waiter has left is replaced by the next lookup.
-  private var inFlight: [String: SharedLookup] = [:]
+  /// The query in flight for each address key, which a new lookup of it awaits. Removed when it
+  /// ends, or on a reset, so a lookup after a reset starts a fresh one.
+  private var inFlight: [String: InFlight] = [:]
+  private var nextQueryID: UInt64 = 0
   private let now: @Sendable () -> ContinuousClock.Instant
 
   /// Initialize a new rDNS cache.
@@ -132,62 +149,75 @@ actor RDNSCache {
 
   /// Look up a hostname for an IP address, using cache if available.
   /// - Parameter ip: The IP address to resolve, with a zone if it has one.
-  /// - Returns: The hostname if one was found, nil otherwise
+  /// - Returns: The hostname if one was found, nil otherwise, and nil for a cancelled caller.
   func lookup(_ ip: String) async -> String? {
+    // A caller cancelled already starts nothing and joins nothing.
+    guard !Task.isCancelled else { return nil }
+    let question = ReverseDNSQuestion(address: ip)
+    let key = question.map { "\($0.name)%\($0.interfaceIndex)" } ?? ip
     let now = self.now()
 
-    // Check cache first
-    if let entry = cache[ip], now < entry.timestamp + ttl {
+    if let entry = cache[key], now < entry.timestamp + ttl {
       return entry.hostname
     }
 
-    // Asked recently and unanswered: not asked again until the holdoff passes.
-    if let since = holdoffs[ip] {
-      if now < since + Self.stalledAddressHoldoff { return nil }
-      holdoffs.removeValue(forKey: ip)
-    }
-
-    // Lookups keep stalling, so skip the wait and report numerically until the breaker resets.
-    guard !isSuppressingLookups else { return nil }
-
-    if let shared = inFlight[ip], let waiter = shared.join() {
-      return await shared.wait(waiter)
-    }
-    let shared = SharedLookup()
-    let waiter = shared.join()!
-    inFlight[ip] = shared
-    startQuery(for: ip, shared: shared)
-    return await shared.wait(waiter)
-  }
-
-  /// Starts the one query `shared` stands for. Its timeout depends only on the address and this
-  /// cache's settings, so it is the timeout every lookup that joins it would have had; a lookup
-  /// that joins later has its answer no later than its own deadline would have passed.
-  private func startQuery(for ip: String, shared: SharedLookup) {
-    let isMulticast = ReverseDNSQuestion(address: ip)?.isMulticast ?? false
-    let timeout = isMulticast ? min(linkLocalLookupDeadline, lookupDeadline) : lookupDeadline
     let isScoped = ipAddressScope(of: ip) != .global
     let generation = isScoped ? scopedGeneration : globalGeneration
-    let breakerGeneration = self.breakerGeneration
-    let resolver = self.resolver
-    shared.start(
-      Task {
-        let outcome = await resolver(ip, timeout)
-        await self.finish(
-          ip, shared: shared, outcome: outcome, isMulticast: isMulticast, isScoped: isScoped,
-          generation: generation, breakerGeneration: breakerGeneration)
-      })
+    let task: Task<ReverseDNSLookupOutcome, Never>
+    if let running = inFlight[key] {
+      // The breaker and the holdoff stop a query from starting, not a lookup from joining one.
+      task = running.task
+    } else {
+      // Asked recently and unanswered: not asked again until the holdoff passes.
+      if let since = holdoffs[key] {
+        if now < since + Self.stalledAddressHoldoff { return nil }
+        holdoffs.removeValue(forKey: key)
+      }
+      // Lookups keep stalling, so skip the wait and report numerically until the breaker resets.
+      guard !isSuppressingLookups else { return nil }
+      task = startQuery(
+        ip, key: key, isMulticast: question?.isMulticast ?? false, isScoped: isScoped,
+        generation: generation)
+    }
+
+    awaiting += 1
+    let outcome = await task.value
+    awaiting -= 1
+    // A result from an invalidated network generation must not reach a caller that asked before
+    // it. Network-scoped invalidation rejects scoped lookups in flight; clear() rejects both.
+    guard !Task.isCancelled, case .answer(let hostname) = outcome,
+      generation == (isScoped ? scopedGeneration : globalGeneration)
+    else { return nil }
+    return hostname
   }
 
-  /// Applies a query's one outcome, once, and hands every waiter still there the hostname.
+  /// Starts the one query for `key`. Its timeout depends only on the address and this cache's
+  /// settings, so it is the timeout any lookup awaiting it would have had.
+  private func startQuery(
+    _ ip: String, key: String, isMulticast: Bool, isScoped: Bool, generation: UInt64
+  ) -> Task<ReverseDNSLookupOutcome, Never> {
+    let timeout = isMulticast ? min(linkLocalLookupDeadline, lookupDeadline) : lookupDeadline
+    let breakerGeneration = self.breakerGeneration
+    let resolver = self.resolver
+    let id = nextQueryID
+    nextQueryID &+= 1
+    let task = Task {
+      let outcome = await resolver(ip, timeout)
+      self.finish(
+        key, id: id, outcome: outcome, isMulticast: isMulticast, isScoped: isScoped,
+        generation: generation, breakerGeneration: breakerGeneration)
+      return outcome
+    }
+    inFlight[key] = InFlight(id: id, task: task)
+    return task
+  }
+
+  /// Applies a query's one outcome, once.
   private func finish(
-    _ ip: String, shared: SharedLookup, outcome: ReverseDNSLookupOutcome, isMulticast: Bool,
+    _ key: String, id: UInt64, outcome: ReverseDNSLookupOutcome, isMulticast: Bool,
     isScoped: Bool, generation: UInt64, breakerGeneration: UInt64
   ) {
-    if inFlight[ip] === shared { inFlight.removeValue(forKey: ip) }
-    // Every waiter left first, so the query was cancelled, or ended unwaited for: it says nothing
-    // anyone asked to know, and is recorded nowhere.
-    guard shared.claim() else { return }
+    if inFlight[key]?.id == id { inFlight.removeValue(forKey: key) }
 
     // Only a query started under the current breaker generation may update breaker state or hold
     // an address off: one from before a network change must not re-trip or reset the breaker on
@@ -196,9 +226,9 @@ actor RDNSCache {
     if breakerGeneration == self.breakerGeneration {
       switch outcome {
       case .timedOut:
-        holdOff(ip, since: now())
+        holdOff(key, since: now())
         // Asked and unanswered: the resolver is stalled.
-        if !isMulticast, stalledInStreak.insert(ip).inserted { consecutiveStalls += 1 }
+        if !isMulticast, stalledInStreak.insert(key).inserted { consecutiveStalls += 1 }
       case .answer, .noSuchRecord:
         // The resolver answered.
         if !isMulticast { resetStalls() }
@@ -208,18 +238,13 @@ actor RDNSCache {
       }
     }
 
-    // A result from an invalidated network generation must neither reach the waiters nor
-    // repopulate the newly invalidated cache. Network-scoped invalidation rejects in-flight
-    // scoped lookups while allowing global lookups to finish; clear() rejects both.
-    var hostname: String?
+    // An answer from an invalidated generation must not repopulate the newly invalidated cache.
     if case .answer(let name) = outcome,
       generation == (isScoped ? scopedGeneration : globalGeneration)
     {
-      cache[ip] = CacheEntry(hostname: name, timestamp: now())
+      cache[key] = CacheEntry(hostname: name, timestamp: now(), isGlobal: !isScoped)
       if cache.count > maxSize { evictOldest() }
-      hostname = name
     }
-    shared.deliver(hostname)
   }
 
   /// Batch lookup multiple IP addresses concurrently, each distinct address once.
@@ -265,7 +290,7 @@ actor RDNSCache {
   func invalidateNetworkScoped() {
     scopedGeneration &+= 1
     breakerGeneration &+= 1
-    cache = cache.filter { ip, _ in ipAddressScope(of: ip) == .global }
+    cache = cache.filter { _, entry in entry.isGlobal }
     holdoffs.removeAll()
     inFlight.removeAll()
     resetStalls()
@@ -274,11 +299,11 @@ actor RDNSCache {
   /// Addresses currently held off, expired or not, for tests.
   var holdoffCount: Int { holdoffs.count }
 
-  /// Queries in flight, abandoned ones included until they end or are replaced, for tests.
+  /// Queries in flight, for tests.
   var inFlightCount: Int { inFlight.count }
 
-  /// Lookups waiting on the query in flight for `ip`, for tests.
-  func waiterCount(for ip: String) -> Int { inFlight[ip]?.waiterCount ?? 0 }
+  /// Lookups awaiting a query, for tests: they can tell when every lookup has joined.
+  private(set) var awaiting = 0
 
   private func resetStalls() {
     consecutiveStalls = 0
@@ -310,114 +335,5 @@ actor RDNSCache {
     if let oldest = cache.min(by: { $0.value.timestamp < $1.value.timestamp }) {
       cache.removeValue(forKey: oldest.key)
     }
-  }
-}
-
-/// One reverse-DNS query and the lookups waiting for it.
-///
-/// Each waiter holds a registration and, once it suspends, a continuation; a waiter whose task is
-/// cancelled leaves at once, taking both with it, and the query runs on for the others. When the
-/// last waiter leaves before the outcome, the query is abandoned: its task is cancelled, and no
-/// lookup joins it again. There is no timer per waiter: every waiter's deadline is at or after the
-/// query's own (see `RDNSCache.startQuery`).
-final class SharedLookup: @unchecked Sendable {
-  private let lock = NSLock()
-  private var task: Task<Void, Never>?
-  /// The hostname to hand waiters, once delivered (`.some(nil)` when there is none).
-  private var delivered: String??
-  /// Whether the outcome is being applied, after which no waiter can abandon the query.
-  private var claimed = false
-  private var abandoned = false
-  private var pending: Set<UInt64> = []
-  private var waiters: [UInt64: CheckedContinuation<String?, Never>] = [:]
-  /// Registrations that left before their waiter suspended.
-  private var leftEarly: Set<UInt64> = []
-  private var nextID: UInt64 = 0
-
-  /// Registers a waiter, or returns `nil` when the query has ended or been abandoned.
-  func join() -> UInt64? {
-    lock.lock()
-    defer { lock.unlock() }
-    guard delivered == nil, !claimed, !abandoned else { return nil }
-    let id = nextID
-    nextID &+= 1
-    pending.insert(id)
-    return id
-  }
-
-  /// Gives the query its task, cancelling it at once if every waiter has already left.
-  func start(_ task: Task<Void, Never>) {
-    lock.lock()
-    self.task = task
-    let cancel = abandoned
-    lock.unlock()
-    if cancel { task.cancel() }
-  }
-
-  /// Waits for the hostname; `nil` when there is none or this waiter's task was cancelled.
-  func wait(_ id: UInt64) async -> String? {
-    await withTaskCancellationHandler {
-      await withCheckedContinuation { (continuation: CheckedContinuation<String?, Never>) in
-        lock.lock()
-        if let delivered {
-          pending.remove(id)
-          lock.unlock()
-          continuation.resume(returning: delivered)
-        } else if leftEarly.remove(id) != nil {
-          lock.unlock()
-          continuation.resume(returning: nil)
-        } else {
-          waiters[id] = continuation
-          lock.unlock()
-        }
-      }
-    } onCancel: {
-      leave(id)
-    }
-  }
-
-  /// Ends the outcome's race with abandonment: `false` when every waiter had already left.
-  func claim() -> Bool {
-    lock.lock()
-    defer { lock.unlock() }
-    guard !abandoned else { return false }
-    claimed = true
-    return true
-  }
-
-  /// Hands every waiter still registered the hostname.
-  func deliver(_ hostname: String?) {
-    lock.lock()
-    delivered = .some(hostname)
-    let waiting = waiters
-    waiters.removeAll()
-    pending.subtract(waiting.keys)
-    lock.unlock()
-    for continuation in waiting.values { continuation.resume(returning: hostname) }
-  }
-
-  /// Registrations not yet ended, for tests.
-  var waiterCount: Int {
-    lock.lock()
-    defer { lock.unlock() }
-    return pending.count
-  }
-
-  private func leave(_ id: UInt64) {
-    lock.lock()
-    guard pending.remove(id) != nil else {
-      lock.unlock()
-      return
-    }
-    let continuation = waiters.removeValue(forKey: id)
-    if continuation == nil { leftEarly.insert(id) }
-    var cancel: Task<Void, Never>?
-    if pending.isEmpty && delivered == nil && !claimed {
-      abandoned = true
-      cancel = task
-    }
-    lock.unlock()
-    continuation?.resume(returning: nil)
-    cancel?.cancel()
   }
 }
