@@ -92,6 +92,10 @@ enum TestSeams {
   /// a deadline, as a system sleep does, without waiting for it.
   @TaskLocal static var monotonicClock: (@Sendable () -> TimeInterval)?
 
+  /// How long a wait for a discovery deadline sleeps before reading its clock again, in place of
+  /// 0.01 s on a test clock: a long slice keeps the wake-up out of a test of the other decisions.
+  @TaskLocal static var deadlineSleepSlice: TimeInterval?
+
   /// The longest a STUN name lookup is waited for, in place of `stunNameLookupLimit`.
   @TaskLocal static var stunNameLookupLimit: TimeInterval?
 

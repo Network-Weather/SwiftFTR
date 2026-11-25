@@ -369,12 +369,15 @@ struct EventBasedSTUNTests {
     let (address, length) = loopbackAddress(family: AF_INET, port: server.port)
     let cutoff = monotonicNow() + 3 * Self.watchdog
     let exchange = Task {
-      await TestSeams.$monotonicClock.withValue(clock.now) {
-        await TestSeams.$receiveDatagram.withValue(receive) {
-          await resultOf {
-            try await stunExchange(
-              fd: fd, family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
-              timeout: 3 * Self.watchdog, cutoff: cutoff)
+      // The wake-up at the cutoff sleeps on real time here, so only the read can decide.
+      await TestSeams.$deadlineSleepSlice.withValue(1e9) {
+        await TestSeams.$monotonicClock.withValue(clock.now) {
+          await TestSeams.$receiveDatagram.withValue(receive) {
+            await resultOf {
+              try await stunExchange(
+                fd: fd, family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
+                timeout: 3 * Self.watchdog, cutoff: cutoff)
+            }
           }
         }
       }

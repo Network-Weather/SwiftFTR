@@ -499,7 +499,9 @@ func discoveryClock() -> @Sendable () -> TimeInterval { TestSeams.monotonicClock
 /// How long one wait on ``sleep(untilMonotonic:clock:slice:)`` may last before it reads the clock
 /// again: unbounded on the real clock, which the continuous sleep follows, and short on a test
 /// clock, which a test moves without real time passing.
-func discoverySleepSlice() -> TimeInterval { TestSeams.monotonicClock == nil ? 1e9 : 0.01 }
+func discoverySleepSlice() -> TimeInterval {
+  TestSeams.deadlineSleepSlice ?? (TestSeams.monotonicClock == nil ? 1e9 : 0.01)
+}
 
 /// Seconds from now until `deadline`, an instant on ``discoveryClock()``, and never less than
 /// zero (a deadline that is not a number has passed); `nil` when there is no deadline.
