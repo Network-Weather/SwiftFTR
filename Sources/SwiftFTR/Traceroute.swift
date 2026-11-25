@@ -1294,24 +1294,31 @@ public actor SwiftFTR {
     return try await runner.run()
   }
 
-  /// Discover public IPv4 with the library's discovery: STUN, with the DNS whoami fallback.
+  /// A fresh IPv4 observation from the configured ``SwiftFTRConfig/publicIPResolver`` strategy,
+  /// asked once, bypassing the configured address and the cache and writing nothing to it.
+  ///
+  /// - Throws: ``PublicIPError/discoveryDisabled`` when the strategy is disabled,
+  ///   ``PublicIPError/noAddress(reason:)`` when it gives no globally routable IPv4 address in time,
+  ///   or the cancellation of `handle` or of the calling task.
   internal func discoverPublicIP(handle: TraceHandle? = nil) async throws -> String {
-    let interface = config.interface
-    let sourceIP = config.sourceIP
-    let enableLogging = config.enableLogging
-
-    let budget = config.publicIPDiscoveryTimeoutForOperation
-
-    return try await withTraceCancellation(handle: handle) {
-      try await publicIPDiscovery(
-        family: .v4,
-        stunTimeout: 2.0,
-        dnsTimeout: 3.0,
-        interface: interface,
-        sourceIP: sourceIP,
-        enableLogging: enableLogging,
-        budget: budget
-      ).address
+    try Task.checkCancellation()
+    let strategy = config.publicIPResolver
+    if case .disabled = strategy { throw PublicIPError.discoveryDisabled }
+    guard let request = publicIPRequest(for: .v4) else {
+      throw PublicIPError.noAddress(
+        reason: "the configured source address \(config.sourceIP ?? "") cannot send IPv4")
+    }
+    switch try await ask(strategy, request, handle: handle) {
+    case .failure(let error):
+      throw PublicIPError.noAddress(reason: String(describing: error))
+    case .success(nil):
+      throw PublicIPError.noAddress(reason: "the resolver reported no address")
+    case .success(let answer?):
+      guard let accepted = validatedPublicIP(answer, for: .v4) else {
+        throw PublicIPError.noAddress(
+          reason: "\(answer.address) (\(answer.family)) is not a public IPv4 address")
+      }
+      return accepted.address
     }
   }
 
@@ -1336,30 +1343,55 @@ public actor SwiftFTR {
     async throws -> PublicIPObservation?
   {
     let strategy = config.publicIPResolver
-    let enableLogging = config.enableLogging
     return try await effectivePublicIP(for: family) { request in
-      let ask: @Sendable () async throws -> PublicIPObservation?
-      switch strategy {
-      case .disabled:
-        return nil
-      case .library:
-        ask = {
-          try await LibraryPublicIPResolver(enableLogging: enableLogging).publicIP(for: request)
-        }
-      case .custom(let resolver):
-        ask = { try await askWithinDeadline(resolver, request) }
+      // A failure is a miss; only a cancellation is thrown.
+      let outcome = try await self.ask(strategy, request, handle: handle)
+      return try? outcome.get()
+    }
+  }
+
+  /// `request` put to `strategy`, inside `handle`'s cancellation. Only a cancellation is thrown;
+  /// the resolver's answer, `nil` for ``PublicIPResolverStrategy/disabled``, or its failure (a
+  /// caller's resolver that does not answer before the deadline answers `nil`) is returned.
+  private nonisolated func ask(
+    _ strategy: PublicIPResolverStrategy, _ request: PublicIPRequest, handle: TraceHandle?
+  ) async throws -> Result<PublicIPObservation?, any Error> {
+    // Cancelled already: no resolver is started, not even one whose outcome would be discarded.
+    if let reason = handle?.cancellationError() { throw reason }
+    try Task.checkCancellation()
+    let ask: @Sendable () async throws -> PublicIPObservation?
+    switch strategy {
+    case .disabled:
+      return .success(nil)
+    case .library:
+      let enableLogging = config.enableLogging
+      ask = {
+        try await LibraryPublicIPResolver(enableLogging: enableLogging).publicIP(for: request)
       }
-      return try await withTraceCancellation(handle: handle) {
-        do {
-          return try await ask()
-        } catch {
-          // Only a cancellation ends the call; every other failure is a miss.
-          if let reason = handle?.cancellationError() { throw reason }
-          if Task.isCancelled { throw CancellationError() }
-          return nil
-        }
+    case .custom(let resolver):
+      ask = { try await askWithinDeadline(resolver, request) }
+    }
+    return try await withTraceCancellation(handle: handle) {
+      do {
+        return .success(try await ask())
+      } catch {
+        // Only a cancellation ends the call; every other failure is returned.
+        if let reason = handle?.cancellationError() { throw reason }
+        if Task.isCancelled { throw CancellationError() }
+        return .failure(error)
       }
     }
+  }
+
+  /// The question for `family` the configuration asks: the tracer's interface and source address
+  /// and a deadline ``SwiftFTRConfig/publicIPDiscoveryTimeout`` from now. `nil` when the
+  /// configured source address cannot be bound for `family`, which is not a request for system
+  /// routing: nothing is asked rather than let a resolver send from another address.
+  private func publicIPRequest(for family: IPAddressFamily) -> PublicIPRequest? {
+    if let source = config.sourceIP, IPAddressFamily(address: source) != family { return nil }
+    return PublicIPRequest(
+      family: family, interface: config.interface, sourceIP: config.sourceIP,
+      deadline: .now + .seconds(config.publicIPDiscoveryTimeoutForOperation))
   }
 
   /// The configured, seeded or cached observation of `family`, or else `ask`'s answer to a request
@@ -1374,13 +1406,7 @@ public actor SwiftFTR {
     if let cached = publicIPCache[family] { return cached }
 
     let generation = publicIPGenerations[family, default: 0]
-    // A source address that cannot be bound for this family is not a request for system routing:
-    // ask nothing rather than let a resolver send from another address.
-    if let source = config.sourceIP, IPAddressFamily(address: source) != family { return nil }
-    let sourceIP = config.sourceIP
-    let request = PublicIPRequest(
-      family: family, interface: config.interface, sourceIP: sourceIP,
-      deadline: .now + .seconds(config.publicIPDiscoveryTimeoutForOperation))
+    guard let request = publicIPRequest(for: family) else { return nil }
     let answer = try await ask(request)
     guard generation == publicIPGenerations[family, default: 0], publicIPCache[family] == nil
     else { return publicIPCache[family] }
@@ -1427,15 +1453,23 @@ public actor SwiftFTR {
     await NetworkInterfaceDiscovery().discover()
   }
 
-  /// Discover public IPv4 via STUN through the configured (or default) interface.
+  /// Discover public IPv4 through the configured ``SwiftFTRConfig/publicIPResolver`` strategy.
   ///
-  /// The interface and source address apply to the STUN attempt. If STUN fails, the DNS-whoami
-  /// fallback uses system routing. The optional reverse-DNS lookup also uses system routing.
-  /// Returns both the discovered address and its reverse-DNS hostname when available.
+  /// Asks the strategy once, under ``SwiftFTRConfig/publicIPDiscoveryTimeout``, for a fresh IPv4
+  /// address: the configured ``SwiftFTRConfig/publicIP`` and the cache are bypassed, and nothing
+  /// is cached. With the default strategy that is the library's resolver, STUN only, from sockets
+  /// bound to the configured interface and source address before anything is sent; the STUN
+  /// server-name lookups use the system resolver. The optional reverse-DNS lookup uses system
+  /// routing. Returns both the address and its reverse-DNS hostname when available. Only a
+  /// globally routable IPv4 address is returned.
   ///
-  /// The result does not identify whether STUN or the unbound fallback succeeded, so it is not by
-  /// itself proof of a selected interface's exit. For route-specific dual-stack STUN results, use
+  /// For dual-stack STUN results with per-call binding, use
   /// ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)`` instead.
+  ///
+  /// - Throws: ``PublicIPError/discoveryDisabled`` when the strategy is
+  ///   ``PublicIPResolverStrategy/disabled``, ``PublicIPError/noAddress(reason:)`` when it finds
+  ///   none in time (including when the configured source address is IPv6), or
+  ///   `CancellationError` when the calling task is cancelled.
   ///
   /// ## Example
   /// ```swift
@@ -1463,6 +1497,8 @@ public actor SwiftFTR {
     } else {
       hostname = nil
     }
+    // The lookup answers nil when cancelled; that is a cancelled call, not an address with no name.
+    try Task.checkCancellation()
     return (ip: ip, hostname: hostname)
   }
 

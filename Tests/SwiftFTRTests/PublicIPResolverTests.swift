@@ -622,6 +622,140 @@ struct PublicIPResolverTests {
     #expect(resolver.asked.value == 0)
   }
 
+  // MARK: discoverPublicIPWithHostname
+
+  /// `discoverPublicIPWithHostname()` on `tracer` under the watchdog, with the library's discovery
+  /// substituted by one that fails at once, as its result or error.
+  static func discoverFresh(_ tracer: SwiftFTR, discovery: OfflinePublicIPDiscovery) async throws
+    -> Result<String, Error>
+  {
+    try await discovery.install {
+      try await measure(within: Self.watchdog) {
+        do {
+          return Result<String, Error>.success(try await tracer.discoverPublicIPWithHostname().ip)
+        } catch {
+          return .failure(error)
+        }
+      }.0
+    }
+  }
+
+  @Test("discoverPublicIPWithHostname asks the caller's resolver each time, past the configuration")
+  func freshDiscoveryAsksStrategy() async throws {
+    let discovery = OfflinePublicIPDiscovery()
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("8.8.8.8")))
+    let tracer = Self.tracer(.custom(resolver), publicIP: "9.9.9.9", sourceIP: "127.0.0.1")
+
+    let first = try await Self.discoverFresh(tracer, discovery: discovery)
+    let second = try await Self.discoverFresh(tracer, discovery: discovery)
+
+    #expect(try first.get() == "8.8.8.8", "the configured address answered")
+    #expect(try second.get() == "8.8.8.8")
+    #expect(resolver.asked.value == 2, "an answer was served from a cache")
+    #expect(discovery.calls.value == 0, "the library's discovery ran")
+    let request = try #require(resolver.requests.first)
+    #expect(request.family == .v4)
+    #expect(request.sourceIP == "127.0.0.1")
+    #expect(await tracer.publicIPCache[.v4] == nil, "the answer was cached")
+  }
+
+  /// `body`'s outcome in a task cancelled before `body` starts.
+  static func cancelledFirst<T: Sendable>(_ body: @escaping @Sendable () async throws -> T) async
+    -> Result<T, Error>
+  {
+    await Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      do { return .success(try await body()) } catch { return .failure(error) }
+    }.value
+  }
+
+  @Test(
+    "A call cancelled before it starts asks no resolver and throws CancellationError",
+    arguments: ["fresh", "fresh-disabled", "question"])
+  func cancelledBeforeAsking(path: String) async throws {
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("8.8.8.8")))
+    let tracer = Self.tracer(path == "fresh-disabled" ? .disabled : .custom(resolver))
+    let outcome = await Self.cancelledFirst {
+      path == "question"
+        ? try await tracer.publicIPObservation(for: .v4, handle: nil)?.address
+        : try await tracer.discoverPublicIPWithHostname().ip
+    }
+    guard case .failure(let error) = outcome, error is CancellationError else {
+      Issue.record("expected CancellationError, got \(outcome)")
+      return
+    }
+    // The resolver runs in a task of its own, so give one that was started time to be seen.
+    let asked = await eventually(within: 2) { resolver.asked.value > 0 }
+    #expect(!asked, "the resolver was asked for a call cancelled before it started")
+  }
+
+  @Test("discoverPublicIPWithHostname cancelled during its hostname lookup throws, not a nil name")
+  func freshDiscoveryCancelledDuringHostname() async throws {
+    let entered = FaultCounter()
+    // A reverse lookup that runs until its task is cancelled, then reports it was cancelled, as
+    // the daemon lookup does.
+    let rdns = RDNSCache(lookupDeadline: 3 * Self.watchdog) { _, _ in
+      entered.increment()
+      try? await Task.sleep(nanoseconds: UInt64(3 * Self.watchdog * 1e9))
+      return .cancelled
+    }
+    let resolver = ScriptedPublicIPResolver(.answer(Self.observation("8.8.8.8")))
+    let tracer = offlineTracer(
+      SwiftFTRConfig(
+        publicIPDiscoveryTimeout: 3 * Self.watchdog, publicIPResolver: .custom(resolver)),
+      rdns: rdns)
+
+    let task = Task { try await tracer.discoverPublicIPWithHostname() }
+    #expect(await eventually(within: Self.watchdog) { entered.value == 1 }, "no hostname lookup")
+    task.cancel()
+    let outcome = try await measure(within: Self.watchdog) { await task.result }.0
+    guard case .failure(let error) = outcome, error is CancellationError else {
+      Issue.record("expected CancellationError, got \(outcome)")
+      return
+    }
+  }
+
+  @Test("discoverPublicIPWithHostname throws when the strategy is disabled, and asks nothing")
+  func freshDiscoveryDisabled() async throws {
+    let discovery = OfflinePublicIPDiscovery()
+    let outcome = try await Self.discoverFresh(Self.tracer(.disabled), discovery: discovery)
+    guard case .failure(PublicIPError.discoveryDisabled) = outcome else {
+      Issue.record("expected discoveryDisabled, got \(outcome)")
+      return
+    }
+    #expect(discovery.calls.value == 0)
+  }
+
+  @Test(
+    "discoverPublicIPWithHostname refuses an answer that is not a public IPv4 address",
+    arguments: [
+      PublicIPObservation(
+        address: "192.168.1.1", family: .v4, source: PublicIPResolverTests.hostApp),
+      PublicIPObservation(
+        address: "2606:4700::1111", family: .v6, source: PublicIPResolverTests.hostApp),
+    ])
+  func freshDiscoveryRefusesAnswer(answer: PublicIPObservation) async throws {
+    let resolver = ScriptedPublicIPResolver(.answer(answer))
+    let outcome = try await Self.discoverFresh(
+      Self.tracer(.custom(resolver)), discovery: OfflinePublicIPDiscovery())
+    guard case .failure(PublicIPError.noAddress) = outcome else {
+      Issue.record("expected noAddress, got \(outcome)")
+      return
+    }
+    #expect(resolver.asked.value == 1)
+  }
+
+  @Test("discoverPublicIPWithHostname reports the library's failure as noAddress")
+  func freshDiscoveryLibraryFails() async throws {
+    let discovery = OfflinePublicIPDiscovery()
+    let outcome = try await Self.discoverFresh(Self.tracer(.library), discovery: discovery)
+    guard case .failure(PublicIPError.noAddress) = outcome else {
+      Issue.record("expected noAddress, got \(outcome)")
+      return
+    }
+    #expect(discovery.calls.value == 1)
+  }
+
   // MARK: Results
 
   @Test("The source is encoded beside the address, and JSON without it still decodes")

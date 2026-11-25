@@ -20,12 +20,18 @@ Unreleased
 - **`SwiftFTR.publicIP` is replaced by `publicIP(for:)`**, which takes an `IPAddressFamily` and
   returns a `PublicIPObservation` (address, family, source). The cache holds one address per
   family, so a single property could no longer say which one it meant.
+- **`PublicIPError` has new cases** (#153). `allMethodsFailed(stunError:dnsError:)` described a
+  STUN tier and a DNS tier, and the DNS tier is gone. `discoverPublicIPWithHostname()` now throws
+  `.discoveryDisabled` when the strategy is `.disabled` and `.noAddress(reason:)` when the
+  strategy finds no public IPv4 address in time. An exhaustive `switch` over `PublicIPError`, or
+  code that builds `allMethodsFailed`, no longer compiles.
+- **`STUNPublicIP` is no longer public.** No public API returned or took it, in 0.18 either.
 
 ### New public API
 
 - **`PublicIPResolver`**, and `SwiftFTRConfig.publicIPResolver` with a
-  `PublicIPResolverStrategy`: `.library` (the default, the discovery 0.18 ran), `.disabled` (send
-  nothing) or `.custom(_:)` (the caller's resolver). A resolver answers a `PublicIPRequest` (one
+  `PublicIPResolverStrategy`: `.library` (the default: STUN only, see Behavior changes),
+  `.disabled` (send nothing) or `.custom(_:)` (the caller's resolver). A resolver answers a `PublicIPRequest` (one
   `IPAddressFamily`, the tracer's interface and source address, and a `ContinuousClock` deadline)
   with a `PublicIPObservation` or `nil`. The tracer holds a caller's resolver to the deadline: one
   that never returns or ignores cancellation is abandoned there and its task cancelled, and an
@@ -34,8 +40,8 @@ Unreleased
   nothing. The option comes as a further `SwiftFTRConfig` initializer, so existing calls resolve
   as before.
 - **`ClassifiedTrace.publicIPSource`** (`PublicIPObservationSource?`) says where `publicIP` came
-  from: `.configured`, `.validatedCallerCache` or `.gatewayReported` (a seed), `.stun` or
-  `.dnsWhoami` (the library's resolver), or whatever a caller's resolver names. It is encoded
+  from: `.configured`, `.validatedCallerCache` or `.gatewayReported` (a seed), `.stun` (the
+  library's resolver), or whatever a caller's resolver names. It is encoded
   beside `publicIP`; JSON without it decodes as `nil`. A further `ClassifiedTrace` initializer
   takes it. **`NetworkTopology.publicIPSource`** does the same for a multipath run, with a further
   `NetworkTopology` initializer.
@@ -56,7 +62,7 @@ Unreleased
   transaction ID was accepted whatever question it echoed, and its answers were reported for the
   name that was asked. A datagram whose first question is readable and names another name
   (compared without regard to ASCII case), type or class is now ignored like one with a foreign
-  transaction ID (RFC 5452 sections 3 and 9.1), by every DNS query, the whoami fallback's
+  transaction ID (RFC 5452 sections 3 and 9.1), by every DNS query, Team Cymru lookups
   included, and the query waits on to its deadline. A server that sends only such replies now makes
   the query methods throw `DNSError.timeout` (they returned its answers) and `dnsProbe` report
   `outcome == .timedOut`, `isReachable == false` (it reported `.answered`). A reply with no
@@ -102,25 +108,45 @@ Unreleased
   `MigratingTo019.md`.
 - **Public-IP discovery in `traceClassified` and `discoverPaths` stops at
   `publicIPDiscoveryTimeout` instead of running on in an executor slot.** Discovery is async: one
-  deadline, `publicIPDiscoveryTimeout` from its start, bounds every STUN name lookup, STUN attempt
-  and whoami DNS query, and is passed down to each. Each STUN attempt is its own executor request,
-  abandoned after twice its per-server timeout or at the deadline, whichever is first, so a
-  stalled attempt keeps one slot but the discovery moves on to the next server and the fallback.
-  The STUN tier, name lookups included, also ends at its own share of the time: the number of
-  servers times the per-server timeout, cut where needed to leave the whoami fallback at least
-  half its DNS timeout (or half the budget, if that is smaller). With the default 6 s budget the
-  cut never applies: STUN ends by 4 s (2 s per server), leaving the fallback 2 s, so with free
-  slots and silent servers the fallback starts when it did in 0.18.1. The whoami fallback uses the
-  event-based DNS transport and needs no slot, so with every slot held, STUN's name lookups give
-  up at STUN's share and the fallback can still find the address where discovery used to find
-  none. See `MigratingTo019.md`.
+  deadline, `publicIPDiscoveryTimeout` from its start, bounds every STUN name lookup and STUN
+  attempt, and is passed down to each. Each STUN attempt is its own executor request, abandoned
+  after twice its per-server timeout or at the deadline, whichever is first, so a stalled attempt
+  keeps one slot but the discovery moves on to the next server. See `MigratingTo019.md`.
+- **The library's public-IP resolver is STUN only** (#153, decision 16 in
+  `docs/BLOCKING-IO.md`). When IPv4 STUN failed, discovery asked `1.1.1.1` and `8.8.8.8` for
+  `whoami.ds.akahelp.net` TXT, whose `ip` record is built from the client-subnet hint the resolver
+  forwards: on one network a different host in the right /24 through one resolver and a different
+  /24 through the other, on each of four tries. The fallback is deleted, with nothing in its place.
+  Where STUN gets no answer, a trace or multipath run has no public address (`publicIP`,
+  `clientASN` `nil`) where it may have had a wrong one, and `discoverPublicIPWithHostname()`
+  throws; a host app supplies a known address with `seedPublicIP`, `publicIP` or its own
+  `PublicIPResolver`. With STUN silent, discovery ends once both servers time out (about 4 s by
+  default), and STUN no longer gives up part of the budget to the fallback.
+- **Every STUN socket is bound before anything is sent, its server-name lookup included** (#151).
+  The sweep resolved its server names before binding, so a tracer whose bind failed still sent the
+  lookups; now a failed bind sends nothing. (The deleted fallback was not bound at all.) The
+  lookups still use the system resolver, which is not bound to the interface.
+- **`discoverPublicIPWithHostname()` asks the configured `publicIPResolver` strategy** once for a
+  fresh IPv4 address (bypassing `SwiftFTRConfig.publicIP` and the cache, caching nothing); it
+  ran the library's discovery whatever the strategy. It throws `PublicIPError.discoveryDisabled` for
+  `.disabled` and returns only a globally routable IPv4 address, throwing
+  `PublicIPError.noAddress(reason:)` otherwise, internal timeouts included. Cancelled during its
+  hostname lookup, it throws `CancellationError`; it returned the address with a `nil` hostname.
+- **`getPublicIPs` with a `sourceIP` runs only that family's sweep**, bound to it, and returns
+  `nil` for the other family, which it used to sweep unbound. A `sourceIP` that is not an IP
+  address sends nothing and returns both fields `nil`; it used to run both sweeps unbound.
+- **`getPublicIPs` asks the library's resolver**, so it also binds every socket before its
+  lookups. A STUN sweep opens its sockets only once admitted, one sweep per executor worker, so
+  sweeps waiting their turn hold none. A call cancelled before it starts asks nothing. An IPv6
+  source address whose `%zone` is empty or names no interface (`::1%`) now sends nothing for its
+  family, where it was bound with no scope.
 
 - **A classified trace asks for its public address once, after its probes, for the family they
   used** (decision 12). It asked for IPv4 before the probes, whatever the destination, and when
   that failed the classifier asked again with the same budget, so a failed discovery cost two
   budgets (finding 6 in `docs/ROBUSTNESS-TESTING.md`); it now costs one, and a deadline that
   passes during the question finds the hops already measured. An IPv6 trace now asks for an IPv6
-  address (the library's resolver uses IPv6 STUN, with no DNS fallback) where it was labelled with
+  address (the library's resolver uses IPv6 STUN) where it was labelled with
   the IPv4 one, so `publicIP` and `clientASN` describe the IPv6 path, or are `nil` where IPv6 STUN
   gets no answer.
 - **Public addresses are kept per family and must be public.** A seed fills only its own family's
@@ -211,9 +237,10 @@ Unreleased
   uncancelled lookups of the same length as the control that does. The previous version, which
   cancelled one lookup at once, passed with the cancellation check moved below the breaker
   update; this one fails.
-- **The blocking DNS query behind the whoami fallback is removed**; every DNS query now uses the
-  event-based transport. The public-IP test seam is async, and new task-local seams point STUN
-  and the whoami fallback at loopback fixtures.
+- **The blocking DNS query is removed**; every DNS query now uses the event-based transport. The
+  public-IP test seam is async and receives the resolver's request, and task-local seams point
+  STUN servers at loopback fixtures, resolve their names without a lookup, and observe each STUN
+  send.
 
 0.18.1 — 2026-11-22
 -------------------

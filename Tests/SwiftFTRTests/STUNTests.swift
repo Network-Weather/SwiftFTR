@@ -399,121 +399,13 @@ struct STUNTests {
     #expect(result.ip.contains("."))
   }
 
-  // MARK: - DNS-Based Public IP Discovery Tests
+  // MARK: - Public-IP errors
 
-  @Test("DNSPublicIPError descriptions")
-  func testDNSPublicIPErrorDescriptions() {
-    let queryFailed = DNSPublicIPError.queryFailed("timeout")
-    #expect(queryFailed.description.contains("timeout"))
-
-    let noIP = DNSPublicIPError.noIPInResponse
-    #expect(noIP.description.contains("IP"))
-  }
-
-  @Test("DNSPublicIPError is Sendable")
-  func testDNSPublicIPErrorSendable() {
-    let error = DNSPublicIPError.queryFailed("test")
-
-    Task {
-      let desc = error.description
-      #expect(desc.contains("test"))
-    }
-  }
-
-  @Test(
-    "DNS-based public IP discovery via Akamai whoami",
-    .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
-  )
-  func testDNSPublicIPDiscovery() async throws {
-    let result = try await getPublicIPv4ViaDNS(timeout: 5.0)
-
-    // Should get a valid IPv4 address
-    #expect(result.ip.contains("."))
-    let parts = result.ip.split(separator: ".").compactMap { Int($0) }
-    #expect(parts.count == 4)
-    #expect(parts.allSatisfy { $0 >= 0 && $0 <= 255 })
-  }
-
-  @Test(
-    "DNS public IP with logging",
-    .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
-  )
-  func testDNSPublicIPWithLogging() async throws {
-    let result = try await getPublicIPv4ViaDNS(timeout: 5.0, enableLogging: true)
-    #expect(result.ip.contains("."))
-  }
-
-  // MARK: - Unified Public IP Discovery Tests
-
-  @Test("PublicIPError description")
+  @Test("PublicIPError descriptions")
   func testPublicIPErrorDescription() {
-    let error = PublicIPError.allMethodsFailed(stunError: "timeout", dnsError: "no response")
-    #expect(error.description.contains("STUN"))
-    #expect(error.description.contains("DNS"))
-    #expect(error.description.contains("timeout"))
-    #expect(error.description.contains("no response"))
-  }
-
-  @Test("PublicIPError is Sendable")
-  func testPublicIPErrorSendable() {
-    let error = PublicIPError.allMethodsFailed(stunError: "err1", dnsError: "err2")
-
-    Task {
-      let desc = error.description
-      #expect(desc.contains("err1"))
-    }
-  }
-
-  @Test(
-    "Unified getPublicIPv4 succeeds",
-    .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
-  )
-  func testUnifiedPublicIPDiscovery() async throws {
-    // Should succeed via STUN (fast path) or DNS (fallback)
-    let result = try await getPublicIPv4(stunTimeout: 2.0, dnsTimeout: 5.0)
-
-    #expect(result.address.contains("."))
-    let parts = result.address.split(separator: ".").compactMap { Int($0) }
-    #expect(parts.count == 4)
-    #expect(parts.allSatisfy { $0 >= 0 && $0 <= 255 })
-  }
-
-  @Test(
-    "Unified getPublicIPv4 with logging",
-    .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
-  )
-  func testUnifiedPublicIPWithLogging() async throws {
-    let result = try await getPublicIPv4(
-      stunTimeout: 2.0,
-      dnsTimeout: 5.0,
-      enableLogging: true
-    )
-    #expect(result.address.contains("."))
-  }
-
-  @Test(
-    "STUN and DNS both return valid public IPs",
-    .enabled(if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil)
-  )
-  func testSTUNAndDNSBothWork() async throws {
-    // Both methods should return valid public IPv4 addresses
-    // Note: They may differ on VPNs or multi-homed networks, so we just verify both work
-    let stunResult = try await stunGetPublicIPWithFallback(family: AF_INET, timeout: 2.0)
-    let dnsResult = try await getPublicIPv4ViaDNS(timeout: 5.0)
-
-    // Validate STUN result
-    let stunParts = stunResult.ip.split(separator: ".").compactMap { Int($0) }
-    #expect(stunParts.count == 4, "STUN should return valid IPv4")
-    #expect(stunParts.allSatisfy { $0 >= 0 && $0 <= 255 })
-
-    // Validate DNS result
-    let dnsParts = dnsResult.ip.split(separator: ".").compactMap { Int($0) }
-    #expect(dnsParts.count == 4, "DNS should return valid IPv4")
-    #expect(dnsParts.allSatisfy { $0 >= 0 && $0 <= 255 })
-
-    // Both should be non-private (public) IPs
-    #expect(stunParts[0] != 10, "STUN IP should be public, not 10.x.x.x")
-    #expect(dnsParts[0] != 10, "DNS IP should be public, not 10.x.x.x")
+    #expect(PublicIPError.discoveryDisabled.description.contains("disabled"))
+    let error = PublicIPError.noAddress(reason: "no STUN answer")
+    #expect(error.description.contains("no STUN answer"))
   }
 
   // MARK: - IPv6 STUN (Stage 4)
