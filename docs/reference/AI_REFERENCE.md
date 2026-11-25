@@ -310,9 +310,8 @@ resolver (`LibraryPublicIPResolver.swift`) is STUN only, over the family asked f
 `publicIPDiscoveryTimeout` deadline shared by every server-name lookup and STUN attempt; each
 STUN socket is bound to the tracer's interface and source address before its name is resolved,
 and a failed bind sends nothing. Every server is asked at once, with no thread held while it
-waits; two servers reporting one address answer at once, otherwise the replies are compared when
-every attempt has ended (at the deadline at the latest): one distinct address is reported, two
-different ones yield none. A datagram that is not a STUN reply to the request is ignored. It never asks a recursive resolver for a whoami record. A
+waits, and the first valid reply from any server is the answer (David, 2026-11-24); the other
+attempts are cancelled. A datagram that is not a STUN reply to the request is ignored. It never asks a recursive resolver for a whoami record. A
 caller's resolver is held to the same deadline by the tracer: one that never returns or ignores
 cancellation is abandoned there, and an answer handled after it is a miss, never cached. Every
 answer must be a globally routable address of the family asked for (`::ffff:a.b.c.d` is IPv4). A miss is not cached, so the next trace asks
@@ -707,8 +706,8 @@ public struct PublicIPs: Sendable {
     public var any: String? { get }   // v6 ?? v4
 }
 // STUN-only, both families in parallel; failed families are nil. Ignores SwiftFTRConfig.publicIP.
-// stunTimeout is per server; servers are asked at once and must not disagree (two different
-// addresses yield nil). Each name lookup is waited for at most 20 s.
+// stunTimeout is per server; servers are asked at once and the first answer is the family's.
+// Each name lookup is waited for at most 20 s.
 // Cancelling the caller ends it at once with what it had found.
 // A sourceIP runs only its own family's sweep, bound to it; one that is not an IP sends nothing.
 public func getPublicIPs(stunTimeout: TimeInterval = 0.8, interface: String? = nil,

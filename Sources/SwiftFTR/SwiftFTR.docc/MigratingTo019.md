@@ -348,51 +348,29 @@ if let known = myGatewayReportedWAN {
 // or: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(myResolver))
 ```
 
-## The STUN servers are asked at once, and an address needs them not to disagree
+## The STUN servers are asked at once, and the first answer decides
 
 **What changed.** The library's resolver, used by a classified trace, a multipath run,
 ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` and
 ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``, sends to every STUN server at the
-same time, each as soon as its name has resolved; 0.18 tried them one after another and took the
-first answer. Which answer is believed:
-
-- two servers reporting the same address answer at once;
-- otherwise the replies are compared once every attempt has ended, which is at the discovery
-  deadline at the latest: one distinct address is reported, two different ones mean no address.
-
-A datagram that is not a STUN reply to the request (empty, shorter than a STUN header, another
-magic cookie or another transaction ID) is ignored and the wait goes on; in 0.18 it failed that
-server at once. Each STUN server's name lookup is waited for until the earlier of the discovery
-deadline and 20 s; `getPublicIPs`, which has no deadline, waited as long as `getaddrinfo` took.
+same time, each as soon as its name has resolved; 0.18 tried them one after another. The first
+valid reply from any server is the answer and ends that family's discovery at once; the other
+attempts are cancelled (David, 2026-11-24). A datagram that is not a STUN reply to the request
+(empty, shorter than a STUN header, another magic cookie or another transaction ID) is ignored
+and the wait goes on; in 0.18 it failed that server at once. Each STUN server's name lookup is
+waited for until the earlier of the discovery deadline and 20 s; `getPublicIPs`, which has no
+deadline, waited as long as `getaddrinfo` took.
 
 **What a caller sees.**
 
-- With both default servers answering the same address, the answer comes when the second one
-  replies. With one silent, the other's answer comes when the silent one's attempt times out:
-  `stunTimeout` in `getPublicIPs`, 2 s in a trace.
-- Where the two servers see different addresses (a NAT or load balancer that maps each
-  destination to its own exit), `publicIP` is `nil` in the classified trace and the topology,
-  `getPublicIPs` returns `nil` for that family, and `discoverPublicIPWithHostname()` throws
-  ``PublicIPError/noAddress(reason:)``. 0.18 reported whichever server answered first.
-- A server that sends only malformed datagrams costs its full timeout instead of failing at once.
+- The answer comes as soon as the fastest server replies. A silent or refusing server no longer
+  delays it: in 0.18 a silent first server cost its whole timeout before the second was asked.
+- A server that sends only malformed datagrams costs its full timeout instead of failing at once,
+  but no longer delays an answer from another server.
 - A stalled resolver ends `getPublicIPs` after about 20 s plus `stunTimeout`, instead of holding it
   until `getaddrinfo` gave up.
 
-**What to change.** Nothing, to keep the library's rule. A host app that would rather take the
-first answer, or that knows which exit a destination uses, supplies its own resolver:
-
-Before:
-
-```swift
-let tracer = SwiftFTR(config: SwiftFTRConfig())
-// 0.18 reported the first STUN server's answer
-```
-
-After:
-
-```swift
-let tracer = SwiftFTR(config: SwiftFTRConfig(publicIPResolver: .custom(myResolver)))
-```
+**What to change.** Nothing.
 
 ## discoverPublicIPWithHostname asks the strategy, and PublicIPError has new cases
 

@@ -48,15 +48,14 @@ Unreleased
 
 ### Behavior changes
 
-- **The library's public-IP resolver asks every STUN server at once, and believes an address only
-  when the servers do not contradict it.** Each server's request goes out as soon as its name has
-  resolved, on the event-based UDP transport, so a silent or slow server no longer delays the
-  others and no STUN exchange holds an executor thread. An address is reported as soon as two
-  servers report it; otherwise the replies are compared once every attempt has ended (at the
-  discovery deadline at the latest): one distinct address is reported, two different ones yield
-  none. 0.18 took the first server that answered. So on a network whose NAT maps the two default
-  servers to different addresses, `publicIP` in a classified trace, and the family in
-  `getPublicIPs`, is now `nil`, and `discoverPublicIPWithHostname()` throws `noAddress`.
+- **The library's public-IP resolver asks every STUN server at once, and the first answer
+  decides** (David, 2026-11-24: "return as decisive the first public IP we get … The goal is to
+  be as fast as possible"). Each server's request goes out as soon as its name has resolved, on
+  the event-based UDP transport, so a silent, slow or refusing server no longer delays the
+  others, and no STUN exchange holds an executor thread. The first valid reply from any server
+  ends the family's discovery at once; the other attempts are cancelled. 0.18 also took the first
+  answer, but asked the servers one after another, so a silent first server cost its whole
+  timeout before the second was asked.
 - **A datagram that is not a STUN reply to the request is ignored until the timeout** (empty,
   shorter than a STUN header, another magic cookie, another transaction ID), as DNS ignores a
   foreign reply; 0.18 failed that server at once. A reply carrying the request's transaction ID
