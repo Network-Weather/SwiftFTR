@@ -487,8 +487,8 @@ struct AsyncPublicIPDiscoveryTests {
       ) { await getPublicIPs(stunTimeout: 0.2) }
     }
     #expect(ips.v4 == nil)
+    // Completion only: whether a 0.2 s exchange sends before its timeout depends on when its
+    // queue first runs. `answersWithEveryExecutorSlotHeld` shows sends and replies without a slot.
     #expect(released.value == 0, "an attempt waited for the occupant to free its slot")
-    let asked = await eventually(within: 10) { silent.requests.value == 2 }
-    #expect(asked, "\(silent.requests.value) of 2 attempts reached the server without a slot")
   }
 }

@@ -87,6 +87,10 @@ enum TestSeams {
 
   @TaskLocal static var connectSocket: ConnectSocket?
 
+  /// `monotonicNow()` in place of the real clock, for a ``UDPExchange``'s decisions against its
+  /// cutoff, so a test can move the clock past the cutoff (as a system sleep does) without sleeping.
+  @TaskLocal static var monotonicClock: (@Sendable () -> TimeInterval)?
+
   /// UDP port every event-based DNS query sends to, in place of 53, so a query to a loopback
   /// literal reaches a test responder on an ephemeral port.
   @TaskLocal static var dnsServerPort: UInt16?

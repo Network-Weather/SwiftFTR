@@ -34,8 +34,10 @@ struct LibraryPublicIPResolver: PublicIPResolver {
 ///
 /// The budget bounds the whole discovery: one absolute deadline, `budget` seconds from entry, is
 /// passed down to the sweep's admission, every name lookup and every STUN attempt, and no step
-/// outlives it. The sweep decides at that deadline from the replies in hand; no second timer is
-/// raced against it, so an answer it is entitled to give at the deadline is not lost to one. A
+/// outlives it. The deadline is on `monotonicNow()`'s clock, which counts system sleep, and every
+/// decision against it (admission, each lookup, each send, each reply) reads that clock. The
+/// sweep ends by the deadline on its own; no second timer is raced against it, so a reply taken
+/// in time is not lost to one. A
 /// lookup stalled in `getaddrinfo` keeps only its executor slot. A test substitute, which can do
 /// anything, is cancelled and awaited when the deadline passes. A `budget` that is infinite or
 /// beyond 10^9 seconds is no bound; one that is not positive, or not a number, ends discovery
@@ -44,7 +46,6 @@ struct LibraryPublicIPResolver: PublicIPResolver {
 /// The answer's source is ``PublicIPObservationSource/stun``, a test substitute's included.
 ///
 /// - Throws: ``PublicIPDiscoveryTimeout`` when the budget passes with no address,
-///   ``STUNError/serversDisagree(addresses:)`` when servers reported different addresses,
 ///   `CancellationError` when the calling task is cancelled, or the sweep's own error.
 func publicIPDiscovery(
   family: IPAddressFamily,
@@ -77,10 +78,6 @@ func publicIPDiscovery(
         try await stunGetPublicIPWithFallback(
           family: family.socketFamily, timeout: stunTimeout, interface: interface,
           sourceIP: sourceIP, enableLogging: enableLogging, deadline: deadline))
-    } catch STUNError.serversDisagree(let addresses) {
-      // A disagreement is a finding, not a timeout, whenever it was decided.
-      if Task.isCancelled { throw CancellationError() }
-      throw STUNError.serversDisagree(addresses: addresses)
     } catch {
       outcome = .failure(error)
     }

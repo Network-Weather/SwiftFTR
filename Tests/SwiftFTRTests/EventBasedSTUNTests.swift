@@ -186,7 +186,7 @@ struct EventBasedSTUNTests {
     #expect(try beside.get().ip == "198.51.100.7")
   }
 
-  // MARK: Servers asked at once
+  // MARK: The first answer decides
 
   @Test("A refused port does not delay the other servers")
   func refusedPortDoesNotDelay() async throws {
@@ -198,125 +198,220 @@ struct EventBasedSTUNTests {
     #expect(found.ip == "198.51.100.7")
   }
 
-  @Test("Two servers that agree answer at once, while a server listed first is still silent")
-  func twoAgreeAnswerAtOnce() async throws {
-    // The agreeing servers hold their replies until all three requests have arrived, so the
-    // silent server's request is outstanding when agreement is reached.
-    let replies = StallGate()
-    defer { replies.open() }
-    let silent = try HeldUDPServer(family: AF_INET)
-    let first = try Self.answering(Self.mappedX, gate: replies)
-    let second = try Self.answering(Self.mappedX, gate: replies)
-    defer {
-      silent.stop()
-      first.stop()
-      second.stop()
-    }
-    let servers = [(silent.host, silent.port), first.server, second.server]
-    let sweep = Task { try await Self.sweep(servers) }
-    defer { sweep.cancel() }
-    let allAsked = await eventually(within: Self.watchdog) {
-      silent.requests.value == 1 && first.requests.value == 1 && second.requests.value == 1
-    }
-    try #require(
-      allAsked, "asked \(silent.requests.value), \(first.requests.value), \(second.requests.value)")
-    replies.open()
-    let found = try await measure(within: Self.watchdog) { try await sweep.value }.0.get()
-    // The silent server never answers, so only agreement can end the sweep inside the watchdog.
-    #expect(found.ip == "198.51.100.7")
-  }
-
-  @Test("A healthy server beside a stalled name lookup yields its address at the deadline")
-  func healthyBesideStalledName() async throws {
-    let gate = StallGate()
-    defer { gate.open() }
-    let entered = FaultCounter()
-    let stalled: TestSeams.ResolveSTUNServer = { _, _, _ in
-      entered.increment()
-      gate.wait(limit: 3 * Self.watchdog)
-      return nil
-    }
-    let healthy = try Self.answering(Self.mappedX)
-    defer { healthy.stop() }
-    // Its own executor, so the stalled lookup is entered at once whatever else is running. The
-    // budget leaves the healthy fixture time to answer on a loaded host.
-    let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.stun-stalled")
-    let budget: TimeInterval = 4
-
-    let (found, elapsed) = try await measure(within: Self.watchdog) {
-      try await TestSeams.$blockingIOExecutor.withValue(executor) {
-        try await TestSeams.$stunServers.withValue({ _ in
-          [("stalled.test", 3478), healthy.server]
-        }) {
-          try await TestSeams.$resolveSTUNServer.withValue(stalled) {
-            try await publicIPDiscovery(
-              family: .v4, stunTimeout: Self.longTimeout, interface: nil, sourceIP: nil,
-              enableLogging: false, budget: budget)
-          }
-        }
-      }
-    }
-    #expect(found?.address == "198.51.100.7")
-    #expect(entered.value == 1)
-    // Not early: one answer with another attempt still running is compared at the deadline.
-    #expect(elapsed >= budget, "decided after \(elapsed)s, before the \(budget)s deadline")
-  }
-
   enum ReplyOrder: String, CaseIterable, CustomTestStringConvertible, Sendable {
     case xFirst, yFirst
     var testDescription: String { rawValue }
   }
 
+  /// `servers` asked through `entry` ("sweep" or "discovery"), with a long timeout and deadline.
+  static func ask(_ entry: String, _ servers: [(host: String, port: UInt16)]) async -> Result<
+    String, Error
+  > {
+    let list: TestSeams.STUNServers = { _ in servers }
+    return await TestSeams.$stunServers.withValue(list) {
+      do {
+        if entry == "sweep" {
+          return .success(
+            try await stunGetPublicIPWithFallback(family: AF_INET, timeout: longTimeout).ip)
+        }
+        return .success(
+          try await publicIPDiscovery(
+            family: .v4, stunTimeout: longTimeout, interface: nil, sourceIP: nil,
+            enableLogging: false, budget: 3 * watchdog)?.address ?? "none")
+      } catch {
+        return .failure(error)
+      }
+    }
+  }
+
   @Test(
-    "Two servers that disagree yield no address, whichever replies first",
+    "The first answer is returned at once, while a different one is still pending",
     arguments: ReplyOrder.allCases)
-  func disagreementYieldsNone(order: ReplyOrder) async throws {
-    for ask in ["sweep", "discovery"] {
-      // Fresh for each entry point: the later server answers only once the sweep has read the
-      // earlier one's reply.
-      let later = StallGate()
-      defer { later.open() }
-      let x = try Self.answering(Self.mappedX, gate: order == .yFirst ? later : nil)
-      let y = try Self.answering(Self.mappedY, gate: order == .xFirst ? later : nil)
+  func firstAnswerDecides(order: ReplyOrder) async throws {
+    for entry in ["sweep", "discovery"] {
+      // Both servers hold their replies; only the earlier one is ever released before the call
+      // returns, so the later server's different answer is pending and cannot be consulted.
+      let gateX = StallGate()
+      let gateY = StallGate()
+      defer {
+        gateX.open()
+        gateY.open()
+      }
+      let x = try Self.answering(Self.mappedX, gate: gateX)
+      let y = try Self.answering(Self.mappedY, gate: gateY)
       defer {
         x.stop()
         y.stop()
       }
-      let earlierPort = order == .xFirst ? x.port : y.port
-      let receive: TestSeams.ReceiveDatagram = { fd, buffer in
-        let n = recv(fd, buffer.baseAddress, buffer.count, 0)
-        var peer = sockaddr_in()
-        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-        let named = withUnsafeMutablePointer(to: &peer) {
-          $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fd, $0, &length) }
-        }
-        if n >= 20, named == 0, UInt16(bigEndian: peer.sin_port) == earlierPort { later.open() }
-        return n
+      let servers = [x.server, y.server]
+      let call = Task { await Self.ask(entry, servers) }
+      defer { call.cancel() }
+      let bothAsked = await eventually(within: Self.watchdog) {
+        x.requests.value == 1 && y.requests.value == 1
       }
-      let outcome = try await measure(within: Self.watchdog) {
-        await TestSeams.$stunServers.withValue({ _ in [x.server, y.server] }) {
+      try #require(bothAsked, "\(entry): asked \(x.requests.value), \(y.requests.value)")
+      (order == .xFirst ? gateX : gateY).open()
+      let found = try await measure(within: Self.watchdog) { await call.value }.0
+      let expected = order == .xFirst ? "198.51.100.7" : "203.0.113.9"
+      #expect((try? found.get()) == expected, "\(entry): \(found)")
+    }
+  }
+
+  enum Beside: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    case silent, refusing, stalledName
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "A healthy server beside a failing one answers at once, not at the deadline",
+    arguments: Beside.allCases)
+  func healthyBesideFailing(beside: Beside) async throws {
+    // The healthy server answers only once the other server's failure is in force: its request
+    // has arrived, its refusal has been read, or its name lookup is stalled.
+    let release = StallGate()
+    let stall = StallGate()
+    defer {
+      release.open()
+      stall.open()
+    }
+    let healthy = try Self.answering(Self.mappedX, gate: release)
+    let silent = try HeldUDPServer(family: AF_INET)
+    let refusing = try RefusingUDPPort()
+    defer {
+      healthy.stop()
+      silent.stop()
+    }
+    let entered = FaultCounter()
+    let stallEnded = FaultCounter()
+    let resolve: TestSeams.ResolveSTUNServer = { _, _, _ in
+      entered.increment()
+      stall.wait(limit: 3 * Self.watchdog)
+      stallEnded.increment()
+      return nil
+    }
+    let refusals = FaultCounter()
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      let n = recv(fd, buffer.baseAddress, buffer.count, 0)
+      let code = errno
+      if n < 0, code == ECONNREFUSED { refusals.increment() }
+      errno = code
+      return n
+    }
+    let other: (host: String, port: UInt16) =
+      switch beside {
+      case .silent: (silent.host, silent.port)
+      case .refusing: ("127.0.0.1", refusing.port)
+      case .stalledName: ("stalled.test", 3478)
+      }
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.stun-beside")
+
+    let call = Task {
+      await TestSeams.$blockingIOExecutor.withValue(executor) {
+        await TestSeams.$resolveSTUNServer.withValue(resolve) {
           await TestSeams.$receiveDatagram.withValue(receive) {
-            do {
-              if ask == "sweep" {
-                return Result<String, Error>.success(
-                  try await stunGetPublicIPWithFallback(family: AF_INET, timeout: Self.longTimeout)
-                    .ip)
-              }
-              return Result<String, Error>.success(
-                try await publicIPDiscovery(
-                  family: .v4, stunTimeout: Self.longTimeout, interface: nil, sourceIP: nil,
-                  enableLogging: false, budget: 3 * Self.watchdog)?.address ?? "none")
-            } catch {
-              return .failure(error)
-            }
+            await Self.ask("discovery", [other, healthy.server])
           }
         }
-      }.0
-      var disagreed = false
-      if case .failure(STUNError.serversDisagree(let addresses)) = outcome {
-        disagreed = Set(addresses) == ["198.51.100.7", "203.0.113.9"]
       }
-      #expect(disagreed, "\(ask): \(outcome)")
+    }
+    defer { call.cancel() }
+    let inForce = await eventually(within: Self.watchdog) {
+      guard healthy.requests.value == 1 else { return false }
+      switch beside {
+      case .silent: return silent.requests.value == 1
+      case .refusing: return refusals.value == 1
+      case .stalledName: return entered.value == 1
+      }
+    }
+    try #require(inForce, "the \(beside) server's failure never took effect")
+    release.open()
+    // The deadline is three watchdogs out, so returning inside one is returning before it.
+    let found = try await measure(within: Self.watchdog) { await call.value }.0
+    #expect((try? found.get()) == "198.51.100.7", "\(found)")
+    #expect(stallEnded.value == 0, "the stalled lookup ended before the answer was returned")
+  }
+
+  // MARK: One clock for the deadline
+
+  /// A clock that reads `monotonicNow()` plus an offset a test can move, as a system sleep moves
+  /// the real one while Dispatch's uptime clock stands still.
+  final class MovableClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var offset: TimeInterval = 0
+    func jump(by seconds: TimeInterval) { lock.withLock { offset += seconds } }
+    var now: @Sendable () -> TimeInterval {
+      { monotonicNow() + self.lock.withLock { self.offset } }
+    }
+  }
+
+  @Test("A reply read once the cutoff has passed on its own clock is not taken")
+  func replyAfterCutoffNotTaken() async throws {
+    let release = StallGate()
+    defer { release.open() }
+    let server = try Self.answering(Self.mappedX, gate: release)
+    defer { server.stop() }
+    let clock = MovableClock()
+    let replies = FaultCounter()
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      let n = recv(fd, buffer.baseAddress, buffer.count, 0)
+      if n >= 20 { replies.increment() }
+      return n
+    }
+    let fd = try makeBoundSTUNSocket(
+      family: AF_INET, interface: nil, sourceIP: nil, enableLogging: false)
+    let (address, length) = loopbackAddress(family: AF_INET, port: server.port)
+    let cutoff = monotonicNow() + 3 * Self.watchdog
+    let exchange = Task {
+      await TestSeams.$monotonicClock.withValue(clock.now) {
+        await TestSeams.$receiveDatagram.withValue(receive) {
+          await Result {
+            try await stunExchange(
+              fd: fd, family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
+              timeout: 3 * Self.watchdog, cutoff: cutoff)
+          }
+        }
+      }
+    }
+    defer { exchange.cancel() }
+    try #require(await eventually(within: Self.watchdog) { server.requests.value == 1 })
+    // Past the cutoff on the deadline's clock, far short of it on Dispatch's.
+    clock.jump(by: 6 * Self.watchdog)
+    release.open()
+    let outcome = try await measure(within: Self.watchdog) { await exchange.value }.0
+    #expect(replies.value == 1, "the reply was never read")
+    #expect(throws: STUNError.self) { try outcome.get() }
+  }
+
+  @Test("Nothing is sent once the cutoff has passed on its own clock")
+  func noSendAfterCutoff() async throws {
+    let server = try Self.answering(Self.mappedX)
+    defer { server.stop() }
+    let clock = MovableClock()
+    clock.jump(by: 6 * Self.watchdog)
+    let sends = FaultCounter()
+    let send: TestSeams.SendDatagram = { fd, bytes in
+      sends.increment()
+      return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+    }
+    let fd = try makeBoundSTUNSocket(
+      family: AF_INET, interface: nil, sourceIP: nil, enableLogging: false)
+    let (address, length) = loopbackAddress(family: AF_INET, port: server.port)
+    let cutoff = monotonicNow() + 3 * Self.watchdog
+    let outcome = try await measure(within: Self.watchdog) {
+      await TestSeams.$monotonicClock.withValue(clock.now) {
+        await Result {
+          try await stunExchange(
+            fd: fd, family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
+            timeout: 3 * Self.watchdog, cutoff: cutoff, send: send)
+        }
+      }
+    }.0
+    #expect(sends.value == 0, "sent after the cutoff")
+    #expect {
+      try outcome.get()
+    } throws: { error in
+      guard case STUNError.sendFailed = error else { return false }
+      return true
     }
   }
 
@@ -362,17 +457,19 @@ struct EventBasedSTUNTests {
             #expect(throws: CancellationError.self) { try cancelled.get() }
             // A deadline too far out to be an instant is no deadline, not an overflow.
             for deadline in [TimeInterval.infinity, 1e300] {
-              let found = try await stunGetPublicIPWithFallback(
-                family: AF_INET, timeout: 10, deadline: deadline)
+              let found = try await TestSeams.$stunServers.withValue({ _ in [healthy.server] }) {
+                try await stunGetPublicIPWithFallback(
+                  family: AF_INET, timeout: 10, deadline: deadline)
+              }
               #expect(found.ip == "198.51.100.7")
             }
           }
         }
       }
     }
-    // Only the two far-deadline sweeps sent, each to both servers, with one lookup each.
-    #expect(sends.value == 4, "sent \(sends.value) requests")
-    #expect(lookups.value == 2, "looked up \(lookups.value) names")
+    // Only the two far-deadline sweeps sent, each to its one server, and nothing was looked up.
+    #expect(sends.value == 2, "sent \(sends.value) requests")
+    #expect(lookups.value == 0, "looked up \(lookups.value) names")
   }
 
   @Test("An exchange whose setup outlasts the discovery deadline sends nothing")
@@ -382,8 +479,10 @@ struct EventBasedSTUNTests {
     let budget: TimeInterval = 0.2
     // Making the socket non-blocking is the exchange's first setup step. Held from its own entry
     // until a budget has passed, it ends after the deadline, which was set before it was entered.
+    let setups = FaultCounter()
     let fileControl: TestSeams.FileControl = { fd, command, argument in
       if command == F_GETFL {
+        setups.increment()
         let entered = monotonicNow()
         while monotonicNow() < entered + budget + 0.05 { usleep(5_000) }
       }
@@ -395,23 +494,28 @@ struct EventBasedSTUNTests {
       return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
     }
 
+    // Its own executor, so no other sweep holds the admission it needs before setup.
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.stun-setup")
     let outcome = try await measure(within: Self.watchdog) {
-      await TestSeams.$stunServers.withValue({ _ in [healthy.server] }) {
-        await TestSeams.$fileControl.withValue(fileControl) {
-          await TestSeams.$sendSTUNRequest.withValue(send) {
-            do {
-              return Result<PublicIPObservation?, Error>.success(
-                try await publicIPDiscovery(
-                  family: .v4, stunTimeout: Self.longTimeout, interface: nil, sourceIP: nil,
-                  enableLogging: false, budget: budget))
-            } catch {
-              return .failure(error)
+      await TestSeams.$blockingIOExecutor.withValue(executor) {
+        await TestSeams.$stunServers.withValue({ _ in [healthy.server] }) {
+          await TestSeams.$fileControl.withValue(fileControl) {
+            await TestSeams.$sendSTUNRequest.withValue(send) {
+              do {
+                return Result<PublicIPObservation?, Error>.success(
+                  try await publicIPDiscovery(
+                    family: .v4, stunTimeout: Self.longTimeout, interface: nil, sourceIP: nil,
+                    enableLogging: false, budget: budget))
+              } catch {
+                return .failure(error)
+              }
             }
           }
         }
       }
     }.0
     #expect(throws: PublicIPDiscoveryTimeout.self) { try outcome.get() }
+    #expect(setups.value == 1, "the exchange's setup ran \(setups.value) times")
     #expect(sends.value == 0, "a request was sent after the discovery deadline")
   }
 

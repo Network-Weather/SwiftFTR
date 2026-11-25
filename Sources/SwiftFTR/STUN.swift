@@ -55,8 +55,6 @@ enum STUNError: Error, CustomStringConvertible {
   /// The server's host or the network answered the request with an error: `ECONNREFUSED` (nothing
   /// listening), `EHOSTUNREACH`, `ENETUNREACH`, or another receive error.
   case receiveFailed(errno: Int32, details: String?)
-  /// Servers reported different addresses, so none is believed.
-  case serversDisagree(addresses: [String])
   case invalidTimeout(TimeInterval)
   case invalidResponse(String)
   case interfaceBindFailed(interface: String, errno: Int32, details: String?)
@@ -86,8 +84,6 @@ enum STUNError: Error, CustomStringConvertible {
       let errStr = String(cString: strerror(errno))
       let baseMsg = "STUN request failed (errno=\(errno)): \(errStr)"
       return details.map { "\(baseMsg). \($0)" } ?? baseMsg
-    case .serversDisagree(let addresses):
-      return "STUN servers disagree on the public address (\(addresses.count) different answers)"
     case .invalidTimeout(let timeout):
       return "Invalid STUN timeout: \(timeout). Timeout must be finite and greater than zero"
     case .invalidResponse(let reason):
@@ -274,7 +270,8 @@ func isSTUNReply(_ datagram: ArraySlice<UInt8>, to transactionID: [UInt8]) -> Bo
 /// wait goes on to the same deadline, `timeout` seconds from now. One that does carry the
 /// transaction ID but is otherwise invalid fails the exchange with
 /// ``STUNError/invalidResponse(_:)``. A refusal or unreachable report ends it at once. `cutoff`,
-/// when given, is an instant the exchange never runs past, its setup included.
+/// when given, is an instant on `monotonicNow()`'s clock that the exchange never runs past, its
+/// setup included.
 ///
 /// Takes ownership of `fd` and closes it exactly once, whatever the outcome.
 ///
@@ -286,7 +283,7 @@ internal func stunExchange(
   serverLen: socklen_t,
   serverLabel: String,
   timeout: TimeInterval,
-  cutoff: DispatchTime? = nil,
+  cutoff: TimeInterval? = nil,
   send: TestSeams.SendDatagram? = nil
 ) async throws -> STUNPublicIP {
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
@@ -500,13 +497,6 @@ func secondsLeft(until deadline: TimeInterval?) -> TimeInterval? {
   deadline.map { $0.isNaN ? 0 : max($0 - monotonicNow(), 0) }
 }
 
-/// `deadline`, an instant on `monotonicNow()`'s clock, as an instant on Dispatch's clock, read
-/// from both clocks at once. A deadline more than 10^9 s out is clamped there.
-func dispatchInstant(at deadline: TimeInterval) -> DispatchTime {
-  let left = min(secondsLeft(until: deadline) ?? 0, 1e9)
-  return DispatchTime(uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64(left * 1e9))
-}
-
 /// The endpoint for a numeric `host` of `family`, built without the resolver, or `nil` when
 /// `host` is not such a literal.
 private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> (
@@ -600,7 +590,7 @@ private func stunAttempt(
     }
     let found = try await stunExchange(
       fd: fd, family: family, server: endpoint.server, serverLen: endpoint.serverLen,
-      serverLabel: label, timeout: timeout, cutoff: deadline.map(dispatchInstant(at:)), send: send)
+      serverLabel: label, timeout: timeout, cutoff: deadline, send: send)
     if enableLogging { print("[STUN] Success from \(label) (\(famName)) -> \(found.ip)") }
     return .success(found)
   } catch {
@@ -609,49 +599,18 @@ private func stunAttempt(
   }
 }
 
-/// Which answer a sweep believes, from the outcomes of its servers' attempts in any order.
-///
-/// An address is believed as soon as two servers have reported it. Otherwise the outcomes are
-/// compared once every attempt has finished, which is at the sweep's deadline at the latest: one
-/// distinct address is believed, two or more different ones mean none, and with no address the
-/// failure of the last server in list order is reported. So the verdict never depends on which
-/// reply came first.
-struct STUNAgreement {
-  private var outcomes: [Result<STUNPublicIP, Error>?]
-
-  init(servers: Int) { outcomes = Array(repeating: nil, count: servers) }
-
-  /// Records the outcome of the server at `index` and returns the address once two servers have
-  /// reported it.
-  mutating func record(_ index: Int, _ outcome: Result<STUNPublicIP, Error>) -> STUNPublicIP? {
-    outcomes[index] = outcome
-    guard case .success(let found) = outcome else { return nil }
-    let reporting = outcomes.filter {
-      if case .success(let other) = $0 { return other.ip == found.ip }
-      return false
-    }
-    return reporting.count >= 2 ? found : nil
-  }
-
-  /// The verdict once every attempt has finished.
-  func verdict() throws -> STUNPublicIP {
-    var found: [STUNPublicIP] = []
-    var lastFailure: Error?
-    for outcome in outcomes {
-      switch outcome {
-      case .success(let address):
-        if !found.contains(where: { $0.ip == address.ip }) { found.append(address) }
-      case .failure(let error):
-        lastFailure = error
-      case nil:
-        continue
-      }
-    }
-    if found.count == 1 { return found[0] }
-    if found.count > 1 {
-      throw STUNError.serversDisagree(addresses: found.map(\.ip))
-    }
-    throw lastFailure ?? STUNError.recvTimeout
+/// Suspends until `deadline`, an instant on `clock` (`monotonicNow()`'s, which counts system
+/// sleep), has passed, or until the task is cancelled. It sleeps on the continuous clock, which
+/// also counts system sleep, and checks `clock` again on every wake, so it never ends early.
+func sleep(
+  untilMonotonic deadline: TimeInterval,
+  clock: @Sendable () -> TimeInterval = monotonicNow
+) async {
+  while !Task.isCancelled {
+    let left = deadline - clock()
+    // Also a deadline that is not a number: it has passed.
+    guard left > 0 else { return }
+    try? await Task.sleep(until: .now + .seconds(min(left, 1e9)), clock: .continuous)
   }
 }
 
@@ -673,8 +632,7 @@ private func admitSweep(_ admission: _ConcurrencySemaphore, deadline: TimeInterv
       }
     }
     group.addTask {
-      let left = min(secondsLeft(until: deadline) ?? 0, 1e9)
-      try? await Task.sleep(nanoseconds: UInt64(left * 1_000_000_000))
+      await sleep(untilMonotonic: deadline)
       return .deadline
     }
     let first = await group.next() ?? .deadline
@@ -698,11 +656,11 @@ private func admitSweep(_ admission: _ConcurrencySemaphore, deadline: TimeInterv
 /// and looked up no name. The lookups use the system resolver, which is not bound.
 ///
 /// Then each server's attempt starts at once and sends as soon as its name has resolved, holding
-/// no thread while it waits for the reply. Which answer is believed is ``STUNAgreement``'s rule:
-/// two servers reporting one address answer at once; otherwise the sweep decides when every
-/// attempt has finished. Every attempt ends by `deadline`, so the sweep decides there at the
-/// latest, from the replies in hand, with no timer of its own. Cancelling the calling task ends it
-/// at once.
+/// no thread while it waits for the reply. The first valid reply from any server is the answer
+/// (David, 2026-11-24): it ends the sweep at once, and every other attempt is cancelled, its
+/// socket closed. With no answer, the sweep ends when every attempt has failed, which is by
+/// `deadline` at the latest, with no timer of its own. Cancelling the calling task ends it at
+/// once.
 ///
 /// Sweeps are admitted one per executor worker before they open sockets, so at most that many
 /// sweeps hold `servers.count` sockets each.
@@ -715,10 +673,10 @@ private func admitSweep(_ admission: _ConcurrencySemaphore, deadline: TimeInterv
 ///   - enableLogging: Enable debug logging
 ///   - deadline: When the whole sweep gives up, an instant on `monotonicNow()`'s clock, or `nil`
 ///     to leave each attempt only its own bounds.
-/// - Returns: The believed public IP.
-/// - Throws: ``STUNError/serversDisagree(addresses:)`` when servers reported different addresses,
-///   the last server's error in list order when none answered, ``STUNError/recvTimeout`` when the
-///   deadline passed before the sweep could start, or `CancellationError`.
+/// - Returns: The first public IP a server reported.
+/// - Throws: The last server's error in list order when none answered, whatever order they
+///   failed in; ``STUNError/recvTimeout`` when the deadline passed before the sweep could start;
+///   or `CancellationError`.
 internal func stunGetPublicIPWithFallback(
   family: Int32,
   timeout: TimeInterval = 1.0,
@@ -756,8 +714,8 @@ internal func stunGetPublicIPWithFallback(
   if enableLogging {
     print("[STUN] Asking \(servers.count) servers at once (\(famName))...")
   }
-  var agreement = STUNAgreement(servers: servers.count)
-  let agreed = await withTaskGroup(of: (Int, Result<STUNPublicIP, Error>).self) {
+  var failures = [Error?](repeating: nil, count: servers.count)
+  let first = await withTaskGroup(of: (Int, Result<STUNPublicIP, Error>).self) {
     group -> STUNPublicIP? in
     for (index, server) in servers.enumerated() {
       let socket = sockets[index]
@@ -769,15 +727,20 @@ internal func stunGetPublicIPWithFallback(
       }
     }
     for await (index, outcome) in group {
-      if let found = agreement.record(index, outcome) {
+      switch outcome {
+      case .success(let found):
+        // The first answer is decisive: the other attempts are cancelled, not consulted.
         group.cancelAll()
         return found
+      case .failure(let error):
+        failures[index] = error
       }
     }
     return nil
   }
   try Task.checkCancellation()
-  return try agreed ?? agreement.verdict()
+  if let first { return first }
+  throw failures.last(where: { $0 != nil }).flatMap { $0 } ?? STUNError.recvTimeout
 }
 
 // MARK: - Unified Public IP Discovery
@@ -835,10 +798,8 @@ func publicIPDiscoveryOutcome<Found>(
 /// "this network is v6-only" cases.
 ///
 /// Each family asks the library's own resolver, the one a classified trace uses by default: STUN
-/// only, every socket bound before anything is sent, every server asked at once. A family's
-/// address is reported when two servers report it, or when every attempt has ended with one
-/// distinct address; servers that report different addresses leave the family `nil`. Unlike a
-/// trace's question, there is no overall deadline and the address is reported as the STUN servers
+/// only, every socket bound before anything is sent, every server asked at once, and the first
+/// address any server reports is the family's answer. Unlike a trace's question, there is no overall deadline and the address is reported as the STUN servers
 /// gave it, whether or not it is globally routable.
 ///
 /// The two sweeps are child tasks of the caller's. Cancelling the calling task ends both at once,

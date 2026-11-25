@@ -102,10 +102,11 @@ struct FaultInjectionWireTests {
 
     let unwrapped = try #require(result, "STUN never returned from a \(fault) server")
     #expect(throws: STUNError.self) { try unwrapped.get() }
-    // The request can still be on its way when a 0.3 s timeout ends the call.
-    #expect(
-      await eventually(within: 10) { server.requests.value == 1 },
-      "requests: \(server.requests.value)")
+    // Bounded completion only: a 0.3 s exchange may end before its queue first runs and sends.
+    // With long timeouts, `EventBasedSTUNTests.foreignReplyIgnored` and
+    // `invalidReplyFailsItsServerOnly` show each malformed kind of reply read and handled. An
+    // exchange never sends more than one request.
+    #expect(server.requests.value <= 1, "requests: \(server.requests.value)")
   }
 
   @Test("A sub-microsecond STUN timeout is still a timeout, not an unbounded wait")

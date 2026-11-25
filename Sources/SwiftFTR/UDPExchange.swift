@@ -135,16 +135,18 @@ final class UDPExchange: @unchecked Sendable {
   /// call on and closes it exactly once, on every path, a cancellation before setup included.
   ///
   /// - Parameters:
-  ///   - cutoff: An absolute instant the exchange's deadline never passes, however long setup
-  ///     took: nothing is sent at or after it, and a datagram read after it is not taken. `nil`
-  ///     leaves only `timeout`, counted from the end of setup.
+  ///   - cutoff: An instant on `monotonicNow()`'s clock, which counts system sleep, that the
+  ///     exchange never runs past, however long setup took: nothing is sent at or after it, and a
+  ///     datagram read at or after it is not taken. Every such decision reads that same clock, and
+  ///     the wake-up at the cutoff sleeps on the continuous clock. `nil` leaves only `timeout`,
+  ///     counted on Dispatch's clock from the end of setup.
   ///   - send: The datagram send in place of `TestSeams.sendDatagram` and the system call, or
   ///     `nil` for those.
   static func perform(
     adopting fd: Int32,
     request: [UInt8],
     timeout: TimeInterval,
-    cutoff: DispatchTime? = nil,
+    cutoff: TimeInterval? = nil,
     receiveCapacity: Int,
     accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)? = nil,
     send: TestSeams.SendDatagram? = nil,
@@ -156,6 +158,7 @@ final class UDPExchange: @unchecked Sendable {
         Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
       }
     let closeDescriptor = TestSeams.closeDescriptor ?? { fd in close(fd) }
+    let clock = TestSeams.monotonicClock ?? monotonicNow
     let receiveDatagram =
       TestSeams.receiveDatagram ?? { fd, buffer in
         recv(fd, buffer.baseAddress, buffer.count, 0)
@@ -176,7 +179,8 @@ final class UDPExchange: @unchecked Sendable {
     }
 
     let exchange = UDPExchange(
-      fd: fd, request: request, timeout: timeout, cutoff: cutoff, receiveCapacity: receiveCapacity,
+      fd: fd, request: request, timeout: timeout, cutoff: cutoff, clock: clock,
+      receiveCapacity: receiveCapacity,
       accepts: accepts, sendDatagram: sendDatagram, receiveDatagram: receiveDatagram,
       closeDescriptor: closeDescriptor)
     return try await withTaskCancellationHandler {
@@ -190,7 +194,11 @@ final class UDPExchange: @unchecked Sendable {
 
   private let fd: Int32
   private let request: [UInt8]
+  /// The per-exchange timeout, on Dispatch's clock.
   private let deadline: DispatchTime
+  /// The caller's absolute cutoff, on `clock`.
+  private let cutoff: TimeInterval?
+  private let clock: @Sendable () -> TimeInterval
   private let accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)?
   private let sendDatagram: TestSeams.SendDatagram
   private let receiveDatagram: TestSeams.ReceiveDatagram
@@ -210,6 +218,7 @@ final class UDPExchange: @unchecked Sendable {
   private var readSource: DispatchSourceRead?
   private var writeSource: DispatchSourceWrite?
   private var deadlineTimer: DispatchSourceTimer?
+  private var cutoffWake: Task<Void, Never>?
   private var backoffTimer: DispatchSourceTimer?
   /// Sources created on `fd` whose cancel handler has not run yet.
   private var sourcesWatchingDescriptor = 0
@@ -221,7 +230,8 @@ final class UDPExchange: @unchecked Sendable {
     fd: Int32,
     request: [UInt8],
     timeout: TimeInterval,
-    cutoff: DispatchTime?,
+    cutoff: TimeInterval?,
+    clock: @escaping @Sendable () -> TimeInterval,
     receiveCapacity: Int,
     accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)?,
     sendDatagram: @escaping TestSeams.SendDatagram,
@@ -237,10 +247,14 @@ final class UDPExchange: @unchecked Sendable {
     self.closeDescriptor = closeDescriptor
     // Clamped so an extreme timeout cannot overflow the clock; 10^18 ns is about 31 years.
     let nanoseconds = UInt64(min(max(timeout, 0) * 1_000_000_000, 1e18))
-    let relative = DispatchTime(
+    self.deadline = DispatchTime(
       uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + nanoseconds)
-    self.deadline = cutoff.map { min($0, relative) } ?? relative
+    self.cutoff = cutoff
+    self.clock = clock
   }
+
+  /// Whether the cutoff, if any, is still ahead on its own clock.
+  private func beforeCutoff() -> Bool { cutoff.map { clock() < $0 } ?? true }
 
   private func start(_ continuation: CheckedContinuation<UDPExchangeReply, Error>) {
     lock.lock()
@@ -288,6 +302,15 @@ final class UDPExchange: @unchecked Sendable {
     deadlineTimer = timer
     timer.activate()
 
+    if let cutoff {
+      let clock = self.clock
+      cutoffWake = Task {
+        await sleep(untilMonotonic: cutoff, clock: clock)
+        if Task.isCancelled { return }
+        self.queue.async { self.deadlinePassed() }
+      }
+    }
+
     attemptSend()
   }
 
@@ -297,7 +320,7 @@ final class UDPExchange: @unchecked Sendable {
       // the deadline but before the deadline timer runs: a datagram sent then could only report a
       // missing reply, which is not evidence about the peer.
       let attemptStarted = DispatchTime.now()
-      guard attemptStarted < deadline else {
+      guard attemptStarted < deadline, beforeCutoff() else {
         deadlinePassed()
         return
       }
@@ -315,7 +338,7 @@ final class UDPExchange: @unchecked Sendable {
       }
       let code = errno
       lastSendErrno = code
-      guard DispatchTime.now() < deadline else {
+      guard DispatchTime.now() < deadline, beforeCutoff() else {
         finish(.failure(UDPExchangeFailure.sendFailed(errno: code)))
         return
       }
@@ -376,6 +399,7 @@ final class UDPExchange: @unchecked Sendable {
       // the send, this is the event's first read or a retry after EINTR, which took nothing), and
       // a thread descheduled inside `recv` must not add that delay to the round trip.
       let receivedAt = DispatchTime.now()
+      let receivedInTime = beforeCutoff()
       let received = receiveBuffer.withUnsafeMutableBytes { receiveDatagram(fd, $0) }
       let code = received < 0 ? errno : 0
       if received < 0, code == EAGAIN || code == EWOULDBLOCK { return }
@@ -383,7 +407,7 @@ final class UDPExchange: @unchecked Sendable {
 
       // Whatever arrived, it arrived too late if the deadline has passed and the timer simply
       // has not run yet.
-      guard receivedAt <= deadline else {
+      guard receivedAt <= deadline, receivedInTime else {
         deadlinePassed()
         return
       }
@@ -428,6 +452,8 @@ final class UDPExchange: @unchecked Sendable {
 
     deadlineTimer?.cancel()
     deadlineTimer = nil
+    cutoffWake?.cancel()
+    cutoffWake = nil
     backoffTimer?.cancel()
     backoffTimer = nil
 
