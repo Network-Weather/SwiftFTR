@@ -185,54 +185,31 @@ Unreleased
   with `TracerouteError.cancelled` before any flow probes.
 - **Reverse DNS for traces asks the system's DNS daemon directly** (`DNSServiceQueryRecord`)
   instead of calling `getnameinfo` on the blocking-I/O executor. A lookup holds no thread, is
-  stopped (not abandoned) at its deadline, releases a cancelled trace at once, and no longer waits
-  for, or holds, an executor slot. At most 32 are in flight in the process at once. In one
-  comparison on one Mac the two gave the same name for 12 of 13 addresses; the exception,
-  `255.255.255.255`, is named `broadcasthost` in `/etc/hosts`, which `getnameinfo` reads and this
-  query does not. The public `reverseDNS(_:)` still calls `getnameinfo`. A label holding a byte outside printable ASCII is escaped (`\DDD`) where
-  `getnameinfo` returned it raw.
-- **Only hostnames are cached by reverse DNS.** An address with no name, or whose lookup
-  failed, is asked again by the next trace, where 0.18 cached "no hostname" for the whole TTL (a
-  day by default), a timeout included. An address whose question was asked and got no answer by
-  its deadline is not asked again for ten minutes (David, 2026-11-24: "10 minutes is a reasonable in-memory cache of no response for a reverse DNS lookup"); during that holdoff it reports
-  no hostname at once. `networkChanged()`, `clearCaches()` and `invalidateNetworkScopedRDNS()`
-  end every holdoff. So
-  a hop whose PTR query always times out costs one lookup budget per ten minutes, not one per
-  trace. Once the stall breaker has opened, nothing is asked, holdoff or not, until one of those
-  three calls (or a lookup already in flight being answered) closes it. Within one trace each hop address is asked once:
-  a classified trace and a multipath flow no longer ask again, after the probes, about a hop
-  that found no name, and an address seen at several TTLs is asked once.
-- **A link-local hop's reverse lookup gets at most one second.** The daemon asks fe80::/10 and
-  169.254.0.0/16 addresses by multicast on the link, which never answers "no such name", so an
-  unanswered one used to wait out the whole `rdnsLookupTimeout`.
-- **The reverse-DNS stall breaker counts unanswered questions, not slow lookups.** It stops
-  lookups after two in a row that were asked and got no answer by their deadline. A lookup that
-  waited for its turn past the deadline without asking, a link-local lookup, and an error do not
-  count; an answer or "no such record" resets it. One address counts once in a run of stalls
-  (proposed by an agent, not yet confirmed by David, 2026-11-24), so an address asked again in
-  the same run, after its holdoff ended, does not open the breaker by itself. An open breaker stays open until
-  `networkChanged()`, `clearCaches()` or `invalidateNetworkScopedRDNS()`, or until a lookup that
-  was already in flight is answered, as in 0.18; it never closes by time.
-- **Lookups of one address share one query** (David, 2026-11-24: "Build share lookups"). A reverse lookup of an address
-  whose query is already in flight on the same tracer waits for that query instead of asking
-  again, so the flows of a multipath run, which share the tracer's cache and often the same
-  hops, make one daemon query per hop rather than one per flow, and every waiting lookup gets
-  that query's outcome. One address is one PTR question: an IPv4 address and its IPv4-mapped
-  IPv6 spelling, or two spellings of one IPv6 address, share the query, the cached answer and
-  the holdoff, and a link-local zone keeps its interface. A query runs to its outcome even if
-  every caller has gone, since it is bounded by its own timeout, and that outcome is recorded.
-  A caller cancelled before it looks up asks nothing; one cancelled while waiting gets no
-  hostname once the query ends, within the lookup timeout. Traces, classified traces, multipath
-  flows and `discoverPublicIPWithHostname()` are released at once anyway, since they race each
-  reverse-DNS wait against their cancellation. One identity, one write rule (David, 2026-11-24: "Let's go with one identity, one write rule"): the PTR question
-  built once from the caller's string keys every table, decides whether the address is global
-  (with or without a zone), and is what the daemon is asked; a query writes only if it is still
-  the current query for its address when it ends. A global address looked up just before
-  `networkChanged()` or `invalidateNetworkScopedRDNS()` is asked again afterwards, where 0.18 let
-  that lookup finish and cache its answer.
-
-### Bug fixes
-
+  stopped at its deadline, and neither waits for nor holds an executor slot; at most 32 are in
+  flight in the process. Names in `/etc/hosts` only (such as `broadcasthost`) are not found, and
+  a label byte outside printable ASCII is escaped (`\DDD`). The public `reverseDNS(_:)` still
+  calls `getnameinfo`.
+- **Only hostnames are cached by reverse DNS.** An address with no name is asked again by the
+  next trace, where 0.18 cached "no hostname", a timeout included, for the whole TTL. An address
+  whose question got no answer by its deadline is not asked again for ten minutes and reports no
+  hostname at once meanwhile (David, 2026-11-24: "10 minutes is a reasonable in-memory cache of
+  no response for a reverse DNS lookup"). Within one trace each hop address is asked once.
+- **A link-local hop's reverse lookup gets at most one second.** Those addresses are asked by
+  multicast on the link, which never answers "no such name".
+- **The reverse-DNS stall breaker counts unanswered questions, not slow lookups.** It opens after
+  two in a row that were asked and got no answer. A lookup that never got its turn, a link-local
+  lookup and an error do not count; an answer or "no such record" resets it; one address counts
+  once in a run (proposed by an agent, not yet confirmed by David, 2026-11-24). As in 0.18 an
+  open breaker closes only on a reset or an answer to a lookup in flight, never by time.
+- **Lookups of one address share one query** (David, 2026-11-24: "Build share lookups"), so the
+  flows of a multipath run make one daemon query per hop, not one per flow. One address is one
+  PTR question (David, 2026-11-24: "one identity, one write rule"): an IPv4 address and its
+  IPv4-mapped spelling share the query, the answer and the holdoff, and a link-local zone keeps
+  its interface. A query outlives callers that leave, bounded by its own timeout; traces,
+  multipath flows and `discoverPublicIPWithHostname()` are still released at once when cancelled.
+- **A network change stops reverse lookups in flight.** `networkChanged()`, `clearCaches()` and
+  `invalidateNetworkScopedRDNS()` cancel them, end every holdoff, and let none write or send
+  afterwards. A global address being looked up at that moment is asked again by the next trace.
 - **A multipath flow cancelled during its own reverse-DNS wave returns at once.** The flow looked
   up the destination and the public address after its trace without racing the wait against
   its cancellation, as `trace` and `traceClassified` already did, so a lookup that ignored

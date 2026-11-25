@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Actor-based cache for reverse DNS lookups with TTL and size-bounded eviction.
 ///
@@ -111,6 +112,8 @@ actor RDNSCache {
   /// ends, or on a reset, so a lookup after a reset starts a fresh one.
   private var inFlight: [String: InFlight] = [:]
   private var nextQueryID: UInt64 = 0
+  /// Whether queries started since the last reset may still send; closed, then replaced, by it.
+  private var admitting = OSAllocatedUnfairLock(initialState: true)
   private let now: @Sendable () -> ContinuousClock.Instant
 
   /// Initialize a new rDNS cache.
@@ -194,8 +197,11 @@ actor RDNSCache {
     let resolver = self.resolver
     let id = nextQueryID
     nextQueryID &+= 1
+    let admitting = self.admitting
     let task = Task {
-      let outcome = await resolver(question, timeout)
+      let outcome = await ReverseDNSLookup.$admits.withValue({ admitting.withLock { $0 } }) {
+        await resolver(question, timeout)
+      }
       return self.finish(question, id: id, outcome: outcome)
     }
     inFlight[question.key] = InFlight(id: id, task: task)
@@ -255,8 +261,11 @@ actor RDNSCache {
   }
 
   /// Forgets every query in flight and cancels it, so a request from before a reset neither
-  /// goes out afterwards nor keeps a lookup slot from the new network's questions.
+  /// goes out afterwards nor keeps a lookup slot from the new network's questions. Admission is
+  /// closed first: cancelling a query frees its slot, and one still waiting must not take it.
   private func dropInFlight() {
+    admitting.withLock { $0 = false }
+    admitting = OSAllocatedUnfairLock(initialState: true)
     for query in inFlight.values { query.task.cancel() }
     inFlight.removeAll()
   }

@@ -351,13 +351,19 @@ final class ReverseDNSLookup: @unchecked Sendable {
     guard timeout > 0 else { return .timedOutBeforeQuery }
     // Read on the async side: the lookup's queue cannot see task-locals.
     let calls = TestSeams.dnsService ?? .system
-    let lookup = ReverseDNSLookup(question: question, calls: calls, limiter: limiter)
+    let lookup = ReverseDNSLookup(
+      question: question, calls: calls, limiter: limiter, admits: admits)
     return await withTaskCancellationHandler {
       await lookup.run(timeout: timeout)
     } onCancel: {
       lookup.cancel()
     }
   }
+
+  /// Asked once a lookup has its permit: `false` means its owner has dropped it, and it gives the
+  /// permit back without sending. Set for the task by whoever starts lookups it may drop.
+  @TaskLocal static var admits: (@Sendable () -> Bool)?
+  private let admits: (@Sendable () -> Bool)?
 
   let question: ReverseDNSQuestion
   private let calls: DNSServiceCalls
@@ -381,7 +387,11 @@ final class ReverseDNSLookup: @unchecked Sendable {
   private var tornDown = false
   private var holdsPermit = false
 
-  init(question: ReverseDNSQuestion, calls: DNSServiceCalls, limiter: _ConcurrencySemaphore) {
+  init(
+    question: ReverseDNSQuestion, calls: DNSServiceCalls, limiter: _ConcurrencySemaphore,
+    admits: (@Sendable () -> Bool)? = nil
+  ) {
+    self.admits = admits
     self.question = question
     self.calls = calls
     self.limiter = limiter
@@ -534,7 +544,9 @@ final class ReverseDNSLookup: @unchecked Sendable {
   private func permitAcquired() {
     dispatchPrecondition(condition: .onQueue(queue))
     holdsPermit = true
-    if tornDown {
+    let dropped = admits?() == false
+    if dropped { cancel() }
+    if tornDown || dropped {
       // Resolved, and torn down, while the permit was on its way: hand it straight on.
       releasePermit()
     } else {
