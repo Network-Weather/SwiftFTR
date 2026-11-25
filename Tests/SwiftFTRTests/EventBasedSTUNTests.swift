@@ -226,9 +226,9 @@ struct EventBasedSTUNTests {
 
   @Test(
     "The first answer is returned at once, while a different one is still pending",
-    arguments: ReplyOrder.allCases)
-  func firstAnswerDecides(order: ReplyOrder) async throws {
-    for entry in ["sweep", "discovery"] {
+    arguments: ReplyOrder.allCases, ["sweep", "discovery"])
+  func firstAnswerDecides(order: ReplyOrder, entry: String) async throws {
+    do {
       // Both servers hold their replies; only the earlier one is ever released before the call
       // returns, so the later server's different answer is pending and cannot be consulted.
       let gateX = StallGate()
