@@ -355,7 +355,9 @@ if let known = myGatewayReportedWAN {
 ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``, sends to every STUN server at the
 same time, each as soon as its name has resolved; 0.18 tried them one after another. The first
 valid reply from any server is the answer and ends that family's discovery at once; the other
-attempts are cancelled (David, 2026-11-24). A datagram that is not a STUN reply to the request
+attempts are cancelled (David, 2026-11-24). For a trace, a multipath run and
+``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()``, the answer must be a public address of the
+family asked; a private one fails that server and the others go on. A datagram that is not a STUN reply to the request
 (empty, shorter than a STUN header, another magic cookie or another transaction ID) is ignored
 and the wait goes on; in 0.18 it failed that server at once. Each STUN server's name lookup is
 waited for until the earlier of the discovery deadline and 20 s; `getPublicIPs`, which has no

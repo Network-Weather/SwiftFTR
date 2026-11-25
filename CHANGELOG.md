@@ -53,7 +53,9 @@ Unreleased
   be as fast as possible"). Each server's request goes out as soon as its name has resolved, on
   the event-based UDP transport, so a silent, slow or refusing server no longer delays the
   others, and no STUN exchange holds an executor thread. The first valid reply from any server
-  ends the family's discovery at once; the other attempts are cancelled. 0.18 also took the first
+  ends the family's discovery at once; the other attempts are cancelled. For a trace the answer
+  must be a public address of the family asked: a private one fails that server and the others
+  go on. `getPublicIPs` takes the first address as given. 0.18 also took the first
   answer, but asked the servers one after another, so a silent first server cost its whole
   timeout before the second was asked.
 - **A datagram that is not a STUN reply to the request is ignored until the timeout** (empty,
