@@ -36,8 +36,11 @@ struct LibraryPublicIPResolverTests {
     }
   }
 
-  static let mapped4: [UInt8] = [198, 51, 100, 9]
-  static let mapped6: [UInt8] = [0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09]
+  // Public, since the resolver takes only a public address for a trace. Nothing is sent to them.
+  static let mapped4: [UInt8] = [9, 9, 9, 9]
+  static let mapped6: [UInt8] = [
+    0x26, 0x06, 0x47, 0x00, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
+  ]
 
   /// Name lookups the sweep made, each answered from `table` (a name to a loopback port).
   final class NameLookups: @unchecked Sendable {
@@ -61,6 +64,9 @@ struct LibraryPublicIPResolverTests {
   final class STUNSends: @unchecked Sendable {
     private let lock = NSLock()
     private var indices: [UInt32] = []
+    private let onSecondSend: (@Sendable () -> Void)?
+
+    init(onSecondSend: (@Sendable () -> Void)? = nil) { self.onSecondSend = onSecondSend }
 
     var boundInterfaces: [UInt32] { lock.withLock { indices } }
 
@@ -71,8 +77,15 @@ struct LibraryPublicIPResolverTests {
         let level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP
         let option = family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF
         if getsockopt(fd, level, option, &index, &length) != 0 { index = 0 }
-        self.lock.withLock { self.indices.append(index) }
-        return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+        let count = self.lock.withLock {
+          self.indices.append(index)
+          return self.indices.count
+        }
+        let sent = Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+        let code = errno
+        if count == 2 { self.onSecondSend?() }
+        errno = code
+        return sent
       }
     }
   }
@@ -105,10 +118,19 @@ struct LibraryPublicIPResolverTests {
   func everySocketBoundBeforeSend(family: Int32) async throws {
     // The first server refuses at once, so both sockets send; the second answers.
     let refusing = try RefusingUDPPort(family: family)
-    let answer = try Self.answering(family, ip: family == AF_INET6 ? Self.mapped6 : Self.mapped4)
+    // The answer waits until both requests are out, so the first answer cannot cancel the
+    // refusing server's attempt before its send.
+    let bothSent = StallGate()
+    defer { bothSent.open() }
+    let answer = try ScriptedSTUNServer(family: family, gate: bothSent) { request in
+      [
+        AsyncPublicIPDiscoveryTests.stunSuccess(
+          for: request, ip: family == AF_INET6 ? Self.mapped6 : Self.mapped4)!
+      ]
+    }
     defer { answer.stop() }
     let lookups = NameLookups(["stun-a.test": refusing.port, "stun-b.test": answer.port])
-    let sends = STUNSends()
+    let sends = STUNSends(onSecondSend: { bothSent.open() })
     let lo0 = if_nametoindex("lo0")
     try #require(lo0 != 0)
 
@@ -122,7 +144,7 @@ struct LibraryPublicIPResolverTests {
       }
     }
 
-    #expect(found?.address == (family == AF_INET6 ? "2001:db8::9" : "198.51.100.9"))
+    #expect(found?.address == (family == AF_INET6 ? "2606:4700:4700::1111" : "9.9.9.9"))
     #expect(found?.source == .stun)
     #expect(lookups.calls.value == 2)
     #expect(sends.boundInterfaces == [lo0, lo0], "sent from a socket not bound to lo0")
@@ -244,7 +266,7 @@ struct LibraryPublicIPResolverTests {
       v4: [("127.0.0.1", answer4.port)], v6: [("::1", answer6.port)])
 
     let cases: [(source: String, v4: String?, v6: String?)] = [
-      ("127.0.0.1", "198.51.100.9", nil), ("::1", nil, "2001:db8::9"), ("not-an-ip", nil, nil),
+      ("127.0.0.1", "9.9.9.9", nil), ("::1", nil, "2606:4700:4700::1111"), ("not-an-ip", nil, nil),
       ("::1%", nil, nil), ("::1%swiftftr-none0", nil, nil),
     ]
     for (source, v4, v6) in cases {
@@ -321,21 +343,122 @@ struct LibraryPublicIPResolverTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.pip-abandon")
     let occupant = StallGate()
     defer { occupant.open() }
-    Task { try? await executor.run(priority: .userInitiated) { occupant.wait(limit: 60) } }
+    let occupied = FaultCounter()
+    Task {
+      try? await executor.run(priority: .userInitiated) {
+        occupied.increment()
+        occupant.wait(limit: 60)
+      }
+    }
+    try #require(await eventually(within: Self.watchdog) { occupied.value == 1 })
     let refusing = try RefusingUDPPort()
+    // A name, so each discovery's lookup queues behind the occupant until the budget abandons it.
+    let lookups = NameLookups(["stun-a.test": refusing.port])
     let before = Self.lo0UDPSockets()
-    // Each discovery's one attempt queues behind the occupant until the budget abandons it.
-    for _ in 0..<8 {
-      _ = try? await TestSeams.$blockingIOExecutor.withValue(executor) {
-        try await TestSeams.$stunServers.withValue({ _ in [("127.0.0.1", refusing.port)] }) {
-          try await publicIPDiscovery(
-            family: .v4, stunTimeout: 0.2, interface: "lo0", sourceIP: nil, enableLogging: false,
-            budget: 0.3)
+    // Each discovery's lookup queues behind the occupant; once it is seen queued, the deadline is
+    // passed on the test clock, while the occupant still holds the slot.
+    let clock = MovableClock()
+    for round in 0..<8 {
+      let submitted = executor.submissions.value
+      let discovery = Task {
+        await TestSeams.$monotonicClock.withValue(clock.now) {
+          await TestSeams.$blockingIOExecutor.withValue(executor) {
+            await TestSeams.$stunServers.withValue(Self.named(["stun-a.test"])) {
+              await TestSeams.$resolveSTUNServer.withValue(lookups.seam) {
+                await resultOf {
+                  try await publicIPDiscovery(
+                    family: .v4, stunTimeout: Self.longSTUNTimeout, interface: "lo0",
+                    sourceIP: nil, enableLogging: false, budget: 3 * Self.watchdog,
+                    requirePublic: false)
+                }
+              }
+            }
+          }
+        }
+      }
+      defer { discovery.cancel() }
+      let queued = await eventually(within: Self.watchdog) {
+        executor.submissions.value == submitted + 1
+      }
+      try #require(queued, "round \(round): no lookup submitted")
+      clock.jump(by: 6 * Self.watchdog)
+      let outcome = try await measure(within: Self.watchdog) { await discovery.value }.0
+      #expect(throws: PublicIPDiscoveryTimeout.self, "round \(round)") { try outcome.get() }
+    }
+    #expect(lookups.calls.value == 0, "a queued lookup ran although the occupant held the slot")
+    let held = Self.lo0UDPSockets() - before
+    #expect(held == 0, "\(held) sockets held by abandoned attempts")
+  }
+
+  /// How a sweep whose servers never answer is ended.
+  enum SweepEnd: String, CaseIterable, CustomTestStringConvertible, Sendable {
+    /// Cancelled while its name lookups are stalled, so no attempt has taken its socket.
+    case cancelledInLookup
+    /// Cancelled while every exchange waits on a silent server.
+    case cancelledInExchange
+    /// Ended by its deadline while every exchange waits on a silent server.
+    case deadlineInExchange
+    var testDescription: String { rawValue }
+  }
+
+  @Test(
+    "Sweeps ended while every server is silent leave no socket open", arguments: SweepEnd.allCases)
+  func endedSweepsLeaveNoSockets(end: SweepEnd) async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let silent = try HeldUDPServer(family: AF_INET)
+    defer { silent.stop() }
+    let stalled: TestSeams.ResolveSTUNServer = { _, _, _ in
+      gate.wait(limit: 3 * Self.watchdog)
+      return nil
+    }
+    var servers: TestSeams.STUNServers = Self.named(["stun-a.test", "stun-b.test"])
+    if end != .cancelledInLookup {
+      let silentServer = (host: silent.host, port: silent.port)
+      servers = { _ in [silentServer, silentServer] }
+    }
+    // Every case gets a deadline no correct sweep can miss; the deadline case passes it on the test
+    // clock once every request is out.
+    let budget: TimeInterval = 3 * Self.watchdog
+    let clock = MovableClock()
+    let calls = 6
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 8, name: "test.pip-ended")
+    let before = Self.lo0UDPSockets()
+
+    let sweepServers = servers
+    let sweeps = await TestSeams.$monotonicClock.withValue(clock.now) {
+      await TestSeams.$blockingIOExecutor.withValue(executor) {
+        await TestSeams.$stunServers.withValue(sweepServers) {
+          await TestSeams.$resolveSTUNServer.withValue(stalled) {
+            (0..<calls).map { _ in
+              Task {
+                try await publicIPDiscovery(
+                  family: .v4, stunTimeout: Self.longSTUNTimeout, interface: "lo0", sourceIP: nil,
+                  enableLogging: false, budget: budget, requirePublic: false)
+              }
+            }
+          }
         }
       }
     }
+    defer { for sweep in sweeps { sweep.cancel() } }
+    // Every sweep holds both its sockets before it is ended.
+    let opened = await eventually(within: Self.watchdog) {
+      Self.lo0UDPSockets() - before == 2 * calls
+        && (end == .cancelledInLookup || silent.requests.value == 2 * calls)
+    }
+    try #require(opened, "\(Self.lo0UDPSockets() - before) sockets, \(silent.requests.value) sent")
+    if end == .deadlineInExchange {
+      clock.jump(by: 6 * Self.watchdog)
+    } else {
+      for sweep in sweeps { sweep.cancel() }
+    }
+    for sweep in sweeps {
+      let outcome = try await measure(within: Self.watchdog) { await sweep.result }.0
+      #expect(throws: Error.self) { try outcome.get() }
+    }
     let held = Self.lo0UDPSockets() - before
-    #expect(held == 0, "\(held) sockets held by abandoned attempts")
+    #expect(held == 0, "\(held) sockets still open after every sweep returned")
   }
 
   @Test("getPublicIPs cancelled before it starts asks nothing")

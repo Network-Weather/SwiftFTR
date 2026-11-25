@@ -324,7 +324,8 @@ nothing, the lookup included. The lookups use the system resolver, which is not 
 - Where UDP to the STUN servers is blocked, `publicIP` and `clientASN` are `nil` where 0.18 may
   have reported the whoami address (own-network hops are TRANSIT, not ISP), and
   ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` throws (see below). With STUN silent,
-  discovery ends once both servers time out, about 4 s by default.
+  discovery ends once both servers time out, about 2 s by default, since they are asked at once
+  (see below).
 - A tracer bound to an interface or source address it cannot bind sends no STUN name lookups.
 
 **What to change.** Nothing, if STUN reaches its servers. A host app that knows its public
@@ -346,6 +347,32 @@ if let known = myGatewayReportedWAN {
 }
 // or: SwiftFTRConfig(interface: "en0", publicIPResolver: .custom(myResolver))
 ```
+
+## The STUN servers are asked at once, and the first answer decides
+
+**What changed.** The library's resolver, used by a classified trace, a multipath run,
+``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` and
+``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``, sends to every STUN server at the
+same time, each as soon as its name has resolved; 0.18 tried them one after another. The first
+valid reply from any server is the answer and ends that family's discovery at once; the other
+attempts are cancelled (David, 2026-11-24). For a trace, a multipath run and
+``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()``, the answer must be a public address of the
+family asked; a private one fails that server and the others go on. A datagram that is not a STUN reply to the request
+(empty, shorter than a STUN header, another magic cookie or another transaction ID) is ignored
+and the wait goes on; in 0.18 it failed that server at once. Each STUN server's name lookup is
+waited for until the earlier of the discovery deadline and 20 s; `getPublicIPs`, which has no
+deadline, waited as long as `getaddrinfo` took.
+
+**What a caller sees.**
+
+- The answer comes as soon as the fastest server replies. A silent or refusing server no longer
+  delays it: in 0.18 a silent first server cost its whole timeout before the second was asked.
+- A server that sends only malformed datagrams costs its full timeout instead of failing at once,
+  but no longer delays an answer from another server.
+- A stalled resolver ends `getPublicIPs` after about 20 s plus `stunTimeout`, instead of holding it
+  until `getaddrinfo` gave up.
+
+**What to change.** Nothing.
 
 ## discoverPublicIPWithHostname asks the strategy, and PublicIPError has new cases
 
@@ -403,7 +430,7 @@ do {
 library's resolver for each family. Given a `sourceIP`, it runs only the sweep of that address's
 family, bound to it; 0.18 ran the other family's sweep unbound. A `sourceIP` that is not an IP
 address now sends nothing; 0.18 ran both sweeps unbound. `stunTimeout` is still per server, and
-the call still has no overall deadline and reports the address as the STUN server gave it.
+the call still has no overall deadline and reports the address as the STUN servers gave it.
 
 **What a caller sees.** With `sourceIP: "192.0.2.10"`, `v6` is always `nil`; with an IPv6
 `sourceIP`, `v4` is always `nil`; with a malformed one, both are `nil`.

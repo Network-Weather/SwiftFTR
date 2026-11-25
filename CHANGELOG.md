@@ -48,6 +48,23 @@ Unreleased
 
 ### Behavior changes
 
+- **The library's public-IP resolver asks every STUN server at once, and the first answer
+  decides** (David, 2026-11-24: "return as decisive the first public IP we get … The goal is to
+  be as fast as possible"). Each server's request goes out as soon as its name has resolved, on
+  the event-based UDP transport, so a silent, slow or refusing server no longer delays the
+  others, and no STUN exchange holds an executor thread. The first valid reply from any server
+  ends the family's discovery at once; the other attempts are cancelled. For a trace the answer
+  must be a public address of the family asked: a private one fails that server and the others
+  go on. `getPublicIPs` takes the first address as given. 0.18 also took the first
+  answer, but asked the servers one after another, so a silent first server cost its whole
+  timeout before the second was asked.
+- **A datagram that is not a STUN reply to the request is ignored until the timeout** (empty,
+  shorter than a STUN header, another magic cookie, another transaction ID), as DNS ignores a
+  foreign reply; 0.18 failed that server at once. A reply carrying the request's transaction ID
+  that is otherwise invalid still fails that server, and only that server.
+- **`getPublicIPs` waits at most 20 s for each STUN server's name lookup** (it waited as long as
+  `getaddrinfo` took); a classified trace waits until the earlier of that and its discovery
+  deadline. Cancelling the caller ends the wait at once.
 - **The DNS query methods throw `connectionRefused` for a refused port** (they threw
   `sendFailed`): the server's host answered with ICMP port unreachable after the query was sent.
 - **The DNS query methods throw `unreachable` for a host or network unreachable report** (they

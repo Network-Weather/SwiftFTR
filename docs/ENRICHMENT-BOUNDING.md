@@ -10,7 +10,8 @@ Evidence and measurements: [`BUG2-INVESTIGATION.md`](BUG2-INVESTIGATION.md).
 > the count), rather than only for the rest of one batch; and 0.17.1
 > further fixed the executor (a cancellation race that could strand a caller, a timer-release
 > crash, and abandoned queued operations that were never freed). Since 0.18, DNS queries and
-> Team Cymru lookups no longer run on the executor at all. The file and line references in
+> Team Cymru lookups no longer run on the executor at all, and in 0.19 STUN exchanges follow them;
+> only STUN's server-name lookups still use it. The file and line references in
 > "What is broken" describe the 0.14.0 code. Remaining unbounded waits (#84) are in
 > [ROADMAP.md](../ROADMAP.md).
 

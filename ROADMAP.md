@@ -22,10 +22,11 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   deadline whose error names the phase that was running is the requested API; a resolution
   budget is what moving `getaddrinfo` onto the executor needs; a way to read executor pressure
   (queued and running operations) is the companion.
-- **Standalone `getPublicIPs` has no overall bound** (finding 9): each STUN attempt is bounded by
-  `stunTimeout`, but resolving the server names has no deadline, so a stalled resolver holds the
-  call for as long as `getaddrinfo` takes unless the caller cancels. Needs a budget the public
-  signature does not have, for example a new overload.
+- **Standalone `getPublicIPs` has no caller-set bound** (finding 9): each STUN exchange is bounded
+  by `stunTimeout` and each server-name lookup wait by a fixed 20 s, so a stalled resolver holds
+  the call for about 20 s plus `stunTimeout` (longer if more sweeps than executor workers are
+  waiting their turn) unless the caller cancels. A budget the caller chooses needs a parameter the
+  public signature does not have, for example a new overload.
 - **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code
   reading). Decide between failing classification fast and loading in the background, and make
   the SwiftIP2ASN cache directory injectable so a test can stage it without touching the user's.
