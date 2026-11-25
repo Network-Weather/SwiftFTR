@@ -273,7 +273,8 @@ func isSTUNReply(_ datagram: ArraySlice<UInt8>, to transactionID: [UInt8]) -> Bo
 /// A datagram that is not a STUN reply to this request (``isSTUNReply(_:to:)``) is ignored and the
 /// wait goes on to the same deadline, `timeout` seconds from now. One that does carry the
 /// transaction ID but is otherwise invalid fails the exchange with
-/// ``STUNError/invalidResponse(_:)``. A refusal or unreachable report ends it at once.
+/// ``STUNError/invalidResponse(_:)``. A refusal or unreachable report ends it at once. `cutoff`,
+/// when given, is an instant the exchange never runs past, its setup included.
 ///
 /// Takes ownership of `fd` and closes it exactly once, whatever the outcome.
 ///
@@ -285,6 +286,7 @@ internal func stunExchange(
   serverLen: socklen_t,
   serverLabel: String,
   timeout: TimeInterval,
+  cutoff: DispatchTime? = nil,
   send: TestSeams.SendDatagram? = nil
 ) async throws -> STUNPublicIP {
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
@@ -305,7 +307,7 @@ internal func stunExchange(
   let reply: UDPExchangeReply
   do {
     reply = try await UDPExchange.perform(
-      adopting: fd, request: request, timeout: timeout, receiveCapacity: 512,
+      adopting: fd, request: request, timeout: timeout, cutoff: cutoff, receiveCapacity: 512,
       accepts: { isSTUNReply($0, to: transactionID) },
       send: send ?? { fd, bytes in Darwin.send(fd, bytes.baseAddress, bytes.count, 0) },
       configure: connectToServer)
@@ -498,6 +500,13 @@ func secondsLeft(until deadline: TimeInterval?) -> TimeInterval? {
   deadline.map { $0.isNaN ? 0 : max($0 - monotonicNow(), 0) }
 }
 
+/// `deadline`, an instant on `monotonicNow()`'s clock, as an instant on Dispatch's clock, read
+/// from both clocks at once. A deadline more than 10^9 s out is clamped there.
+func dispatchInstant(at deadline: TimeInterval) -> DispatchTime {
+  let left = min(secondsLeft(until: deadline) ?? 0, 1e9)
+  return DispatchTime(uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64(left * 1e9))
+}
+
 /// The endpoint for a numeric `host` of `family`, built without the resolver, or `nil` when
 /// `host` is not such a literal.
 private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> (
@@ -530,7 +539,7 @@ private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> (
 }
 
 /// `server`'s name resolved for `family` on the executor, or `nil` when the lookup failed or its
-/// wait ended first.
+/// wait ended first. With no time left before `deadline`, nothing is submitted.
 ///
 /// - Throws: `CancellationError` when the calling task is cancelled.
 func lookUpSTUNServer(
@@ -538,9 +547,13 @@ func lookUpSTUNServer(
   resolve: @escaping TestSeams.ResolveSTUNServer
 ) async throws -> (server: sockaddr_storage, serverLen: socklen_t)? {
   let wait = min(secondsLeft(until: deadline) ?? stunNameLookupLimit, stunNameLookupLimit)
+  // No time left: nothing is submitted, so no lookup starts after the deadline.
+  guard wait > 0 else { return nil }
   do {
     return try await runDetachedBlockingIO(deadline: wait) {
-      resolve(server.host, server.port, family)
+      // A worker can pick this up as the deadline passes, before its timer has withdrawn it.
+      if let deadline, !(monotonicNow() < deadline) { return nil }
+      return resolve(server.host, server.port, family)
     }
   } catch is BlockingIOTimeout {
     return nil
@@ -580,12 +593,14 @@ private func stunAttempt(
       }
       endpoint = resolved
     }
-    let left = min(timeout, secondsLeft(until: deadline) ?? timeout)
-    guard left > 0, let fd = socket.take() else { throw STUNError.recvTimeout }
     if enableLogging { print("[STUN] Trying \(label) (\(famName))...") }
+    // The deadline goes to the exchange as an instant, so its setup cannot push it later.
+    guard secondsLeft(until: deadline) ?? 1 > 0, let fd = socket.take() else {
+      throw STUNError.recvTimeout
+    }
     let found = try await stunExchange(
       fd: fd, family: family, server: endpoint.server, serverLen: endpoint.serverLen,
-      serverLabel: label, timeout: left, send: send)
+      serverLabel: label, timeout: timeout, cutoff: deadline.map(dispatchInstant(at:)), send: send)
     if enableLogging { print("[STUN] Success from \(label) (\(famName)) -> \(found.ip)") }
     return .success(found)
   } catch {

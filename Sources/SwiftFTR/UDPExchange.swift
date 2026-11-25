@@ -134,12 +134,17 @@ final class UDPExchange: @unchecked Sendable {
   /// the caller made (and may have bound) but has not sent on. The exchange owns `fd` from the
   /// call on and closes it exactly once, on every path, a cancellation before setup included.
   ///
-  /// - Parameter send: The datagram send in place of `TestSeams.sendDatagram` and the system
-  ///   call, or `nil` for those.
+  /// - Parameters:
+  ///   - cutoff: An absolute instant the exchange's deadline never passes, however long setup
+  ///     took: nothing is sent at or after it, and a datagram read after it is not taken. `nil`
+  ///     leaves only `timeout`, counted from the end of setup.
+  ///   - send: The datagram send in place of `TestSeams.sendDatagram` and the system call, or
+  ///     `nil` for those.
   static func perform(
     adopting fd: Int32,
     request: [UInt8],
     timeout: TimeInterval,
+    cutoff: DispatchTime? = nil,
     receiveCapacity: Int,
     accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)? = nil,
     send: TestSeams.SendDatagram? = nil,
@@ -171,7 +176,7 @@ final class UDPExchange: @unchecked Sendable {
     }
 
     let exchange = UDPExchange(
-      fd: fd, request: request, timeout: timeout, receiveCapacity: receiveCapacity,
+      fd: fd, request: request, timeout: timeout, cutoff: cutoff, receiveCapacity: receiveCapacity,
       accepts: accepts, sendDatagram: sendDatagram, receiveDatagram: receiveDatagram,
       closeDescriptor: closeDescriptor)
     return try await withTaskCancellationHandler {
@@ -216,6 +221,7 @@ final class UDPExchange: @unchecked Sendable {
     fd: Int32,
     request: [UInt8],
     timeout: TimeInterval,
+    cutoff: DispatchTime?,
     receiveCapacity: Int,
     accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)?,
     sendDatagram: @escaping TestSeams.SendDatagram,
@@ -231,8 +237,9 @@ final class UDPExchange: @unchecked Sendable {
     self.closeDescriptor = closeDescriptor
     // Clamped so an extreme timeout cannot overflow the clock; 10^18 ns is about 31 years.
     let nanoseconds = UInt64(min(max(timeout, 0) * 1_000_000_000, 1e18))
-    self.deadline = DispatchTime(
+    let relative = DispatchTime(
       uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + nanoseconds)
+    self.deadline = cutoff.map { min($0, relative) } ?? relative
   }
 
   private func start(_ continuation: CheckedContinuation<UDPExchangeReply, Error>) {
