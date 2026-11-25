@@ -57,6 +57,10 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   release that may touch them. Running the suite under `sandbox-exec` with outbound network denied
   catches only leaks whose test then fails: 2 of the 20.
 
+### Stream enrichment to the caller as it is learned
+**Goal**: a caller sees each fact when the library learns it, not when the slowest lookup ends (David, 2026-11-24: "Ideally we are streaming results so the client gets things as we learn them."). ASN numbers, AS names, hostnames and the public address each arrive on their own schedule; today a classified trace returns them together.
+- **What it needs**: a public stream of per-address updates that says whether an entry is partial or complete; one internal publication point per shared lookup that the stream subscribes to, with replay for a late subscriber; a defined end (the caller's deadline, or every lookup finished); and a way for classification to use answers that arrive late.
+
 ### Share the reverse-DNS cache across tracer instances
 **Goal**: Sibling tracers reuse hostname lookups instead of each starting cold, without one
 instance's network change evicting another's entries.

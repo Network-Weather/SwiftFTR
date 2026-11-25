@@ -261,7 +261,7 @@ overlap in time; the "After" column is what must have landed first.
 | ~~Resolver Seam~~ | Async Public-IP Discovery | ~~First part of the stage below: the `PublicIPResolver` protocol and strategy, a per-family cache, the tracer-enforced deadline, one question per classified trace asked after its probes for their family, no discovery in the classifier, every address checked, the source reported on the classified trace, and the source breaks. The library's resolver asks over IPv6 STUN for an IPv6 trace, so IPv6 classification does not go without an address between slices. In this pull request a multipath flow still asks for itself when nothing is cached, as 0.18 did; its inputs are checked before any question.~~ |
 | ~~Multipath Asks Once~~ | Resolver Seam | ~~Second part, its own pull request because the two together pass the review size cap: the multipath contracts of the stage below. The parent asks once after registering its handle and before its first batch, hands the answer or its absence to every flow, caches the answer as a classified trace does, and reports the source on `NetworkTopology`.~~ |
 | ~~Library Resolver~~ | Multipath Asks Once | ~~Third part: the library's STUN-only resolver in its own file, bound before anything is sent (#151), the whoami query through recursive resolvers deleted (#153), `getPublicIPs` and `discoverPublicIPWithHostname()` on it.~~ Landed in #184 and #186, which also closed #151 and removed the STUN share of the budget. |
-| Event-Based STUN | Library Resolver | The stage below: STUN on the event-based transport, servers tried at once, foreign replies ignored, a cancellable, bounded wait on each server-name lookup, and the rule for which answer is believed (decision 16). |
+| ~~Event-Based STUN~~ | Library Resolver | ~~The stage below: STUN on the event-based transport, servers tried at once, foreign replies ignored, a cancellable, bounded wait on each server-name lookup, and the rule for which answer is believed (decision 16).~~ Landed in #188, with the first public answer deciding. |
 | ~~Reverse-DNS Lookup~~ | | ~~The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test, a check that every daemon connection is closed once its lookup is done (the limiter bounds queries, not descriptors; the lowered-limit experiment is opt-in) and the gated live comparison. Unused until the next row; the two are released together. One recorded deadline decides every outcome: the start makes no query once it has passed, and a reply that arrives after it is a timeout, not an answer; neither waits for the timer's handler to run (found in review of the first attempt, which was taken back out of `main` before release).~~ Landed. |
 | Reverse-DNS Cache | Reverse-DNS Lookup | `RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker, and `withTraceCancellation` around the multipath flow's reverse-DNS wait. |
 | Resolution Off The Actor | Event-Based STUN, Reverse-DNS Cache | The stage below, as one change: the resolution seam is one closure shared by trace, streaming trace, ping and the probes, so it becomes async for all of them together. If it outgrows the cap, the second pull request is the forward-resolution budget option (decision 7) and `discoverPaths` resolving once. |
@@ -393,17 +393,20 @@ foreign reply; an invalid reply that does carry the transaction ID fails that se
 resolution for STUN servers gets a bounded, cancellable wait here and moves with Resolution Off
 The Actor.
 
-Which answer is believed is decision 16. Until it is made the rule is the conservative one. An
-address is reported as soon as two servers have reported the same one. Otherwise the answers are
-compared when every attempt has finished or the deadline passes, whichever is first: one
-distinct address is reported, and two different ones yield none. So a single healthy server
-still answers, at the deadline if another is stalled, and a disagreement is never hidden by
-whichever reply came first. That decision at the deadline is the resolver's own and the only
-one: the tracer does not run a second timer against it.
+Which answer is believed: **the first public address any server reports is returned at once**,
+and the other attempts are cancelled (David, 2026-11-24: "we should just return as decisive the
+first public IP we get. We are not trying to build a majority consensus report public IP
+determination system. The goal is to be as fast as possible."). For a trace an answer wins only
+if it passes the tracer's own check (globally routable, right family); one that does not fails
+that server alone. `getPublicIPs` reports the first address as the server gave it. With no
+answer the sweep ends when every attempt has failed, by the discovery deadline at the latest,
+and no second timer runs against it. Every wait and every send, submit or accept decision reads
+the deadline through one primitive on one clock that counts system sleep. `getPublicIPs`, which
+has no deadline, waits at most 20 s for each server-name lookup.
 
-Tests: the STUN fault battery against the new transport; a refused port does not delay the other
-servers; two servers that agree answer at once; a healthy endpoint beside a stalled name yields
-an address at the deadline; two servers that disagree yield none whichever replies first; `getPublicIPs` still returns a partial result when one family answers.
+Tests: the STUN fault battery against the new transport; the first answer returns while another
+is still outstanding, in both orders; a healthy server beside a silent, refusing or stalled-name
+server answers at once; a private answer that arrives first does not win a trace; `getPublicIPs` still returns a partial result when one family answers.
 
 ### Event-Based Reverse DNS
 
@@ -640,7 +643,8 @@ otherwise. Decided ones say so.
 15. **Reporting every method's answer.** Open. Recommended: not in 0.19.0. The observation that
     is believed names its source; a caller who wants every reply supplies a resolver. ROADMAP.
 16. **Which answer the library's resolver believes, and whether it has a DNS echo at all.**
-    Decided: **STUN Only** (David, 2026-11-23). The library's resolver has no DNS echo in
+    Between STUN servers the first public answer decides (David, 2026-11-24; see Event-Based
+    STUN). Decided: **STUN Only** (David, 2026-11-23). The library's resolver has no DNS echo in
     0.19.0. Where STUN is blocked the trace classifies without an address, or the host app
     supplies one through its own resolver. Both reviewers had found "first valid answer wins"
     with a DNS echo beside STUN unsafe: a gateway, captive portal or DNS proxy that intercepts
