@@ -223,6 +223,19 @@ struct EnrichmentLifetimeTests {
     #expect(loads == 1)
   }
 
+  @Test("A caller already cancelled starts no database load")
+  func cancelledCallerStartsNoLoad() async throws {
+    let store = LocalASNDatabaseStore()
+    let resolver = LocalASNResolver(source: .embedded, store: store)
+    let outcome = await Task {
+      withUnsafeCurrentTask { $0?.cancel() }
+      return await resultOf { try await resolver.resolve(ipv4Addrs: ["8.8.8.8"], timeout: 60) }
+    }.value
+    #expect(throws: CancellationError.self) { try outcome.get() }
+    let loads = await store.loadCount
+    #expect(loads == 0)
+  }
+
   // MARK: - Shared work
 
   @Test("Waiters that leave shared work, at a deadline or cancelled, leave nothing registered")

@@ -96,15 +96,7 @@ actor _ASNMemoryCache {
   static let shared = _ASNMemoryCache()
   private var map: [String: ASNInfo] = [:]
   private var order: [String] = []
-  /// A running flight, with the deadline it runs to.
-  private struct Flight {
-    let id: UInt64
-    let work: SharedASNWork<Void>
-    let deadline: TimeInterval
-  }
-
-  private var flights: [LookupKey: Flight] = [:]
-  private var nextFlightID: UInt64 = 0
+  private var flights: [LookupKey: SharedASNWork<Void>] = [:]
   private var joins: [_ASNResolverScope: Int] = [:]
   private var generation: UInt64 = 0
   private let capacity = 2048
@@ -133,9 +125,9 @@ actor _ASNMemoryCache {
 
   /// Returns cached values and coalesces overlapping cache misses into shared flights.
   ///
-  /// A flight reserves each `(address, timeout)` key until it ends or its deadline passes; a call
-  /// whose keys are reserved joins those flights, and starts one flight for the rest, unless
-  /// `deadline` has passed. The result is assembled only from the hits read on entry and one snapshot of each
+  /// A flight reserves each `(address, timeout)` key for as long as it runs; a call whose keys
+  /// are reserved joins those flights, and starts one flight for the rest, unless `deadline` has
+  /// passed. The result is assembled only from the hits read on entry and one snapshot of each
   /// flight, read in a fixed order as its wait ends, so an answer a flight has published (an
   /// origin whose name is still pending included) is returned even when the caller's deadline
   /// ends its wait first. The call throws only when it has no answer and one of its flights
@@ -170,9 +162,9 @@ actor _ASNMemoryCache {
     return resolved
   }
 
-  /// The cache hits for `addresses`, and the flights that answer the rest: those holding a key
-  /// whose deadline has not passed, in address order, then a new one for the other addresses if
-  /// `deadline` has not passed.
+  /// The cache hits for `addresses`, and the flights that answer the rest: those already holding
+  /// a key, in address order, then a new one for the unreserved addresses if `deadline` has not
+  /// passed.
   private func join(
     _ addresses: [String],
     timeout: TimeInterval,
@@ -185,22 +177,19 @@ actor _ASNMemoryCache {
     var joined: [SharedASNWork<Void>] = []
     var seen: Set<ObjectIdentifier> = []
     var unreserved: [String] = []
-    let clock = DiscoveryClock.current
     for address in addresses {
       if let info = map[address] {
         hits[address] = info
-      } else if let flight = flights[LookupKey(scope: scope, address: address, timeout: timeout)],
-        !clock.hasPassed(flight.deadline)
-      {
-        if seen.insert(ObjectIdentifier(flight.work)).inserted {
-          joined.append(flight.work)
+      } else if let flight = flights[LookupKey(scope: scope, address: address, timeout: timeout)] {
+        if seen.insert(ObjectIdentifier(flight)).inserted {
+          joined.append(flight)
           joins[scope, default: 0] += 1
         }
       } else {
         unreserved.append(address)
       }
     }
-    if !unreserved.isEmpty, !clock.hasPassed(deadline) {
+    if !unreserved.isEmpty, !DiscoveryClock.current.hasPassed(deadline) {
       joined.append(
         startFlight(
           unreserved, timeout: timeout, deadline: deadline, using: resolver, scope: scope,
@@ -222,9 +211,7 @@ actor _ASNMemoryCache {
   ) -> SharedASNWork<Void> {
     let keys = addresses.map { LookupKey(scope: scope, address: $0, timeout: timeout) }
     let flightGeneration = generation
-    nextFlightID &+= 1
-    let id = nextFlightID
-    let work = SharedASNWork<Void> { publish in
+    let flight = SharedASNWork<Void> { publish in
       let both: ASNPublish = {
         publish($0)
         starter($0)
@@ -238,25 +225,24 @@ actor _ASNMemoryCache {
           found = try await resolver.resolve(ipv4Addrs: addresses, timeout: timeout)
         }
         both(found)
-        await self.land(id, keys, generation: flightGeneration, found: found)
+        await self.land(keys, generation: flightGeneration, found: found)
       } catch {
-        await self.land(id, keys, generation: flightGeneration, found: [:])
+        await self.land(keys, generation: flightGeneration, found: [:])
         throw error
       }
     }
-    for key in keys { flights[key] = Flight(id: id, work: work, deadline: deadline) }
-    return work
+    for key in keys { flights[key] = flight }
+    return flight
   }
 
-  /// Releases a finished flight's keys that no later flight has taken, and caches its answers
-  /// that carry an AS name. One without a name is not cached, so a later lookup still asks for
-  /// the name. A flight started before ``clear()`` caches nothing.
+  /// Releases a finished flight's keys and caches its answers that carry an AS name. One without
+  /// a name is not cached, so a later lookup still asks for the name. A flight started before
+  /// ``clear()`` changes nothing.
   private func land(
-    _ id: UInt64, _ keys: [LookupKey], generation flightGeneration: UInt64,
-    found: [String: ASNInfo]
+    _ keys: [LookupKey], generation flightGeneration: UInt64, found: [String: ASNInfo]
   ) {
-    for key in keys where flights[key]?.id == id { flights.removeValue(forKey: key) }
     guard flightGeneration == generation else { return }
+    for key in keys { flights.removeValue(forKey: key) }
     setMany(found.filter { !$0.value.name.isEmpty })
   }
 

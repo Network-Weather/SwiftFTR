@@ -59,8 +59,8 @@ public actor LocalASNResolver: ASNResolver, PublishingASNResolver {
   /// until the calling task is cancelled.
   ///
   /// The load is the store's ``SharedASNWork``, asked for by the first caller whose deadline has
-  /// not passed and never stopped by a caller leaving. Only a load that failed is remembered as
-  /// failed.
+  /// not passed and whose task is not cancelled, and never stopped by a caller leaving. Only a
+  /// load that failed is remembered as failed.
   private func database(until deadline: TimeInterval?) async -> UltraCompactDatabase? {
     let load: SharedASNWork<LocalASNDatabaseHandle>
     switch loadState {
@@ -71,7 +71,7 @@ public actor LocalASNResolver: ASNResolver, PublishingASNResolver {
     case .loading(let running):
       load = running
     case .notLoaded:
-      guard !DiscoveryClock.current.hasPassed(deadline) else { return nil }
+      guard !DiscoveryClock.current.hasPassed(deadline), !Task.isCancelled else { return nil }
       // Concurrent resolvers for one source share the store's one load.
       load = await store.load(source)
       loadState = .loading(load)
