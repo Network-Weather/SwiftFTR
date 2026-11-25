@@ -1493,7 +1493,11 @@ public actor SwiftFTR {
     let ip = try await discoverPublicIP()
     let hostname: String?
     if !config.noReverseDNS {
-      hostname = await rdnsCache.lookup(ip)
+      // Raced against the caller's cancellation, as the trace waves are: the shared query runs on
+      // to its own deadline, and its outcome is still recorded.
+      hostname = try await withTraceCancellation(handle: TraceHandle()) {
+        await self.rdnsCache.lookup(ip)
+      }
     } else {
       hostname = nil
     }

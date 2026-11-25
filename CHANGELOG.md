@@ -222,9 +222,9 @@ Unreleased
   the holdoff, and a link-local zone keeps its interface. A query runs to its outcome even if
   every caller has gone, since it is bounded by its own timeout, and that outcome is recorded.
   A caller cancelled before it looks up asks nothing; one cancelled while waiting gets no
-  hostname once the query ends, within the lookup timeout. Traces, classified traces and
-  multipath flows are released at once anyway, since they race each reverse-DNS wave against
-  their cancellation.
+  hostname once the query ends, within the lookup timeout. Traces, classified traces, multipath
+  flows and `discoverPublicIPWithHostname()` are released at once anyway, since they race each
+  reverse-DNS wait against their cancellation.
 
 ### Bug fixes
 

@@ -692,12 +692,13 @@ struct PublicIPResolverTests {
   @Test("discoverPublicIPWithHostname cancelled during its hostname lookup throws, not a nil name")
   func freshDiscoveryCancelledDuringHostname() async throws {
     let entered = FaultCounter()
-    // A reverse lookup that is never answered and ends at its timeout, as the daemon lookup does.
-    // A caller cancelled while it waits is released when the shared query ends, so the timeout is
-    // short against the watchdog.
-    let rdns = RDNSCache(lookupDeadline: 0.5) { _, timeout in
+    let gate = StallGate()
+    defer { gate.open() }
+    // A reverse lookup held behind a gate that outlasts the watchdog and ignores cancellation,
+    // so a call that throws within the watchdog was released while the lookup still ran.
+    let rdns = RDNSCache(lookupDeadline: 3 * Self.watchdog) { _, _ in
       entered.increment()
-      try? await Task.sleep(nanoseconds: UInt64(timeout * 1e9))
+      await gate.waitAsync(limit: 3 * Self.watchdog)
       return .timedOut
     }
     let resolver = ScriptedPublicIPResolver(.answer(Self.observation("8.8.8.8")))
