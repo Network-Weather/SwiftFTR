@@ -80,8 +80,15 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 
 **ASN Resolution** (`Sources/SwiftFTR/ASN.swift`, `HybridASNResolver.swift`, `LocalASNResolver.swift`)
 - Multiple strategies via `ASNResolverStrategy`: `.dns` (Team Cymru), `.embedded` (SwiftIP2ASN local DB), `.remote(bundledPath:url:)`, `.hybrid(source, fallbackTimeout:)`
-- `_ASNMemoryCache`: in-memory cache with 2048 entry capacity
+- `_ASNMemoryCache`: in-memory cache with 2048 entry capacity; caches only entries with an AS name
 - `CymruDNSResolver`: Team Cymru TXT queries over `UDPExchange`, at most 8 in flight per resolve
+- One deadline per `resolve`, taken on entry (`asnDeadline`, on `DiscoveryClock`) and passed down
+  unchanged through the internal `PublishingASNResolver` method, which also publishes answers as
+  they arrive. Shared work (cache flights, the database load) is a `SharedASNWork`
+  (`SharedASNWork.swift`): run once on its own budget, never stopped by a waiter, which waits
+  until it ends, its deadline or its cancellation and then reads a snapshot, forwarding what the
+  work publishes meanwhile to its own publisher (so stacked resolvers hear it). A passed deadline
+  starts nothing but returns what is known without I/O
 
 **Probe Modules** — each in its own file:
 - `Ping.swift`: ICMP echo with statistics (min/avg/max RTT, jitter, packet loss)

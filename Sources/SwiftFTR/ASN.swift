@@ -67,7 +67,10 @@ public protocol ASNResolver: Sendable {
 }
 
 /// Identity shared by copies of one caching resolver.
-private final class _ASNResolverScope: Sendable, Hashable {
+final class _ASNResolverScope: @unchecked Sendable, Hashable {
+  private let lock = NSLock()
+  private var joins = 0
+
   static func == (lhs: _ASNResolverScope, rhs: _ASNResolverScope) -> Bool {
     lhs === rhs
   }
@@ -75,12 +78,15 @@ private final class _ASNResolverScope: Sendable, Hashable {
   func hash(into hasher: inout Hasher) {
     hasher.combine(ObjectIdentifier(self))
   }
+
+  /// How many times a caller joined one of this resolver's running flights. For tests; kept
+  /// here so that counting retains nothing.
+  var joinCount: Int { lock.withLock { joins } }
+  func noteJoin() { lock.withLock { joins += 1 } }
 }
 
 // Simple in-memory cache for ASN lookups with a soft capacity cap.
 actor _ASNMemoryCache {
-  private typealias LoadTask = Task<[String: ASNInfo], Error>
-
   private struct LookupKey: Hashable {
     let scope: _ASNResolverScope
     let address: String
@@ -95,19 +101,10 @@ actor _ASNMemoryCache {
     }
   }
 
-  private struct Flight {
-    let id: UInt64
-    let keys: [LookupKey]
-    let task: LoadTask
-    var joinCount: Int
-  }
-
   static let shared = _ASNMemoryCache()
   private var map: [String: ASNInfo] = [:]
   private var order: [String] = []
-  private var flightIDByKey: [LookupKey: UInt64] = [:]
-  private var flightsByID: [UInt64: Flight] = [:]
-  private var nextFlightID: UInt64 = 1
+  private var flights: [LookupKey: SharedASNWork<Void>] = [:]
   private var generation: UInt64 = 0
   private let capacity = 2048
 
@@ -133,218 +130,185 @@ actor _ASNMemoryCache {
     }
   }
 
-  /// Returns cached values and coalesces overlapping cache misses.
+  /// Returns cached values and coalesces overlapping cache misses into shared flights.
   ///
-  /// A flight reserves each `(address, timeout)` key before its resolver task starts. Calls with
-  /// overlapping keys await that shared task, while calls for disjoint keys start independent
-  /// tasks. The task, rather than its first caller, owns the reservation, so caller cancellation
-  /// cannot cancel or poison work shared with another caller.
-  fileprivate func resolve(
+  /// A flight reserves each `(address, timeout)` key for as long as it runs; a call whose keys
+  /// are reserved joins those flights, and starts one flight for the rest, unless `deadline` has
+  /// passed. The result is assembled only from the hits read on entry and one snapshot of each
+  /// flight, read in a fixed order as its wait ends, so an answer a flight has published (an
+  /// origin whose name is still pending included) is returned even when the caller's deadline
+  /// ends its wait first. The call throws only when it has no answer and one of its flights
+  /// failed (the first such, in that order), or when its task is cancelled. No caller's leaving
+  /// stops a flight.
+  nonisolated fileprivate func resolve(
     _ addresses: [String],
     timeout: TimeInterval,
+    deadline: TimeInterval,
     using resolver: ASNResolver,
-    scope: _ASNResolverScope
+    scope: _ASNResolverScope,
+    publish: @escaping ASNPublish
   ) async throws -> [String: ASNInfo] {
     try Task.checkCancellation()
+    let (hits, flights) = await join(
+      addresses, timeout: timeout, deadline: deadline, using: resolver, scope: scope)
+    if !hits.isEmpty { publish(hits) }
+    let wanted = Set(addresses)
+    let forward: ASNPublish = { publish($0.filter { wanted.contains($0.key) }) }
+    // All flights are waited on at once, so each forwards what it learns while the others run.
+    let snapshots = await withTaskGroup(of: (Int, SharedASNWork<Void>.Snapshot).self) { group in
+      for (index, flight) in flights.enumerated() {
+        group.addTask { (index, await flight.wait(until: deadline, forwardingTo: forward)) }
+      }
+      var byIndex: [Int: SharedASNWork<Void>.Snapshot] = [:]
+      for await (index, snapshot) in group { byIndex[index] = snapshot }
+      return flights.indices.compactMap { byIndex[$0] }
+    }
+    var resolved = hits
+    var failure: Error?
+    for snapshot in snapshots {
+      for (address, info) in snapshot.answers where wanted.contains(address) {
+        resolved[address] = info
+      }
+      if failure == nil, case .failure(let error)? = snapshot.outcome { failure = error }
+    }
+    try Task.checkCancellation()
+    if resolved.isEmpty, let failure { throw failure }
+    return resolved
+  }
 
-    var resolved = getMany(addresses)
-    let missing = addresses.filter { resolved[$0] == nil }
-    guard !missing.isEmpty else { return resolved }
-
-    var tasksByFlightID: [UInt64: LoadTask] = [:]
-    var joinedFlightIDs: Set<UInt64> = []
+  /// The cache hits for `addresses`, and the flights that answer the rest: those already holding
+  /// a key, in address order, then a new one for the unreserved addresses if `deadline` has not
+  /// passed.
+  private func join(
+    _ addresses: [String],
+    timeout: TimeInterval,
+    deadline: TimeInterval,
+    using resolver: ASNResolver,
+    scope: _ASNResolverScope
+  ) -> (hits: [String: ASNInfo], flights: [SharedASNWork<Void>]) {
+    var hits: [String: ASNInfo] = [:]
+    var joined: [SharedASNWork<Void>] = []
+    var seen: Set<ObjectIdentifier> = []
     var unreserved: [String] = []
-
-    for address in missing {
-      let key = LookupKey(scope: scope, address: address, timeout: timeout)
-      if let flightID = flightIDByKey[key], let flight = flightsByID[flightID] {
-        joinedFlightIDs.insert(flightID)
-        tasksByFlightID[flightID] = flight.task
+    for address in addresses {
+      if let info = map[address] {
+        hits[address] = info
+      } else if let flight = flights[LookupKey(scope: scope, address: address, timeout: timeout)] {
+        if seen.insert(ObjectIdentifier(flight)).inserted {
+          joined.append(flight)
+          scope.noteJoin()
+        }
       } else {
         unreserved.append(address)
       }
     }
-
-    for flightID in joinedFlightIDs {
-      flightsByID[flightID]?.joinCount += 1
+    if !unreserved.isEmpty, !DiscoveryClock.current.hasPassed(deadline) {
+      joined.append(
+        startFlight(
+          unreserved, timeout: timeout, using: resolver, scope: scope))
     }
-
-    if !unreserved.isEmpty {
-      let flight = startFlight(
-        addresses: unreserved,
-        timeout: timeout,
-        using: resolver,
-        scope: scope
-      )
-      tasksByFlightID[flight.id] = flight.task
-    }
-
-    for task in tasksByFlightID.values {
-      let loaded = try await Self.waitForLoad(task)
-      for address in addresses {
-        if let info = loaded[address] { resolved[address] = info }
-      }
-    }
-
-    return resolved
+    return (hits, joined)
   }
 
+  /// Starts one flight for `addresses`. It runs on its own budget, `timeout` from now, however
+  /// little time the caller that starts it has left. Its starter hears what it learns as every
+  /// other waiter does, through ``SharedASNWork/wait(until:forwardingTo:)``.
   private func startFlight(
-    addresses: [String],
+    _ addresses: [String],
     timeout: TimeInterval,
     using resolver: ASNResolver,
     scope: _ASNResolverScope
-  ) -> Flight {
-    let flightID = nextFlightID
-    nextFlightID &+= 1
-    let flightGeneration = generation
+  ) -> SharedASNWork<Void> {
     let keys = addresses.map { LookupKey(scope: scope, address: $0, timeout: timeout) }
-    let task = Self.makeLoadTask(
-      resolver: resolver,
-      addresses: addresses,
-      timeout: timeout,
-      cache: self,
-      flightID: flightID,
-      generation: flightGeneration
-    )
-
-    let flight = Flight(
-      id: flightID,
-      keys: keys,
-      task: task,
-      joinCount: 0
-    )
-    flightsByID[flightID] = flight
-    for key in keys {
-      flightIDByKey[key] = flightID
+    let flightGeneration = generation
+    let budget = asnDeadline(timeout)
+    let flight = SharedASNWork<Void> { publish in
+      do {
+        let found: [String: ASNInfo]
+        if let resolver = resolver as? PublishingASNResolver {
+          found = try await resolver.resolve(
+            addresses, timeout: timeout, deadline: budget, publish: publish)
+        } else {
+          found = try await resolver.resolve(ipv4Addrs: addresses, timeout: timeout)
+        }
+        publish(found)
+        await self.land(keys, generation: flightGeneration, found: found)
+      } catch {
+        await self.land(keys, generation: flightGeneration, found: [:])
+        throw error
+      }
     }
+    for key in keys { flights[key] = flight }
     return flight
   }
 
-  /// Creates shared resolver work outside the cache actor.
-  nonisolated private static func makeLoadTask(
-    resolver: ASNResolver,
-    addresses: [String],
-    timeout: TimeInterval,
-    cache: _ASNMemoryCache,
-    flightID: UInt64,
-    generation: UInt64
-  ) -> LoadTask {
-    Task.detached(priority: Task.currentPriority) {
-      do {
-        try Task.checkCancellation()
-        let result = try await resolver.resolve(ipv4Addrs: addresses, timeout: timeout)
-        try Task.checkCancellation()
-        guard await cache.completeFlight(id: flightID, generation: generation, result: result)
-        else {
-          throw CancellationError()
-        }
-        return result
-      } catch {
-        await cache.releaseFlight(id: flightID, generation: generation)
-        throw error
-      }
-    }
+  /// Releases a finished flight's keys and caches its answers that carry an AS name. One without
+  /// a name is not cached, so a later lookup still asks for the name. A flight started before
+  /// ``clear()`` changes nothing.
+  private func land(
+    _ keys: [LookupKey], generation flightGeneration: UInt64, found: [String: ASNInfo]
+  ) {
+    guard flightGeneration == generation else { return }
+    for key in keys { flights.removeValue(forKey: key) }
+    setMany(found.filter { !$0.value.name.isEmpty })
   }
 
-  /// Waits for shared work while allowing this caller to stop waiting independently.
-  nonisolated private static func waitForLoad(_ task: LoadTask) async throws -> [String: ASNInfo] {
-    let pair = AsyncThrowingStream<[String: ASNInfo], Error>.makeStream()
-    _ = Task.detached {
-      do {
-        pair.continuation.yield(try await task.value)
-        pair.continuation.finish()
-      } catch {
-        pair.continuation.finish(throwing: error)
-      }
-    }
-
-    return try await withTaskCancellationHandler {
-      do {
-        var iterator = pair.stream.makeAsyncIterator()
-        guard let result = try await iterator.next() else { throw CancellationError() }
-        try Task.checkCancellation()
-        return result
-      } catch {
-        try Task.checkCancellation()
-        throw error
-      }
-    } onCancel: {
-      pair.continuation.finish(throwing: CancellationError())
-    }
-  }
-
-  private func completeFlight(
-    id: UInt64,
-    generation flightGeneration: UInt64,
-    result: [String: ASNInfo]
-  ) -> Bool {
-    guard flightGeneration == generation, flightsByID[id] != nil else { return false }
-    setMany(result)
-    releaseFlight(id: id, generation: flightGeneration)
-    return true
-  }
-
-  private func releaseFlight(id: UInt64, generation flightGeneration: UInt64) {
-    guard flightGeneration == generation, let flight = flightsByID.removeValue(forKey: id) else {
-      return
-    }
-    for key in flight.keys where flightIDByKey[key] == id {
-      flightIDByKey.removeValue(forKey: key)
-    }
-  }
-
-  /// Clear all cached entries. Internal for testing via @testable import.
+  /// Clear all cached entries and forget running flights, which run on but cache nothing.
+  /// Internal for testing via @testable import.
   func clear() {
-    let tasks = flightsByID.values.map(\.task)
     generation &+= 1
     map.removeAll()
     order.removeAll()
-    flightIDByKey.removeAll()
-    flightsByID.removeAll()
-    for task in tasks {
-      task.cancel()
-    }
+    flights.removeAll()
   }
 
   /// Current cache size. Internal for testing via @testable import.
   var count: Int { map.count }
 
-  /// Number of callers that joined an existing flight. Internal for deterministic tests.
-  var inFlightJoinCount: Int {
-    flightsByID.values.reduce(0) { $0 + $1.joinCount }
-  }
-
   /// Number of keys currently reserved by in-flight work. Internal for deterministic tests.
-  var inFlightReservationCount: Int { flightIDByKey.count }
+  var inFlightReservationCount: Int { flights.count }
 }
 
 /// Decorator that caches results from an underlying ASNResolver in-memory.
 ///
-/// Concurrent misses made through the same resolver instance are coalesced by address and timeout.
-/// Canceling one caller stops that caller's wait without canceling a shared lookup needed by other
-/// callers. The underlying resolver remains responsible for honoring its per-lookup timeout.
-public struct CachingASNResolver: ASNResolver {
+/// Concurrent misses made through the same resolver instance are coalesced by address and timeout
+/// into one shared lookup. Each caller stops waiting at its own timeout, or when its task is
+/// cancelled, and returns every answer it has by then, an AS number whose name is still pending
+/// included; neither stops the shared lookup, which runs on for its other callers and fills the
+/// cache. Only entries with an AS name are cached.
+public struct CachingASNResolver: ASNResolver, PublishingASNResolver {
   private let base: ASNResolver
-  private let scope: _ASNResolverScope
+  /// Internal so a test can check that it is released with the resolver.
+  let scope: _ASNResolverScope
 
   public init(base: ASNResolver) {
     self.base = base
     self.scope = _ASNResolverScope()
   }
+
+  /// - Parameters:
+  ///   - ipv4Addrs: IP addresses to resolve; empty entries are ignored.
+  ///   - timeout: Bounds the whole call, waiting on a shared lookup included.
   #if compiler(>=6.2)
     @concurrent
   #endif
   public func resolve(ipv4Addrs: [String], timeout: TimeInterval) async throws -> [String: ASNInfo]
   {
-    let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
+    try await resolve(
+      ipv4Addrs, timeout: timeout, deadline: asnDeadline(timeout), publish: { _ in })
+  }
+
+  /// How many times a caller of this resolver joined a running flight. For tests.
+  var joinCount: Int { scope.joinCount }
+
+  func resolve(
+    _ addresses: [String], timeout: TimeInterval, deadline: TimeInterval,
+    publish: @escaping ASNPublish
+  ) async throws -> [String: ASNInfo] {
+    let ips = Set(addresses.filter { !$0.isEmpty }).sorted()
     if ips.isEmpty { return [:] }
     return try await _ASNMemoryCache.shared.resolve(
-      ips,
-      timeout: timeout,
-      using: base,
-      scope: scope
-    )
+      ips, timeout: timeout, deadline: deadline, using: base, scope: scope, publish: publish)
   }
 }
 
@@ -413,9 +377,17 @@ private struct _OriginASNResult: Sendable {
   let registry: String?
 }
 
+extension ASNInfo {
+  fileprivate init(_ origin: _OriginASNResult, name: String) {
+    self.init(
+      asn: origin.asn, name: name, prefix: origin.prefix, countryCode: origin.cc,
+      registry: origin.registry)
+  }
+}
+
 // Team Cymru DNS-based resolver using TXT queries.
 /// Team Cymru DNS-based resolver using TXT queries for origin ASN and AS names.
-public struct CymruDNSResolver: ASNResolver {
+public struct CymruDNSResolver: ASNResolver, PublishingASNResolver {
   /// Queries in flight at once for one ``resolve(ipv4Addrs:timeout:)`` call. Each holds one UDP
   /// socket and no thread.
   private static let maxConcurrentQueries = 8
@@ -433,7 +405,9 @@ public struct CymruDNSResolver: ASNResolver {
   /// - Parameters:
   ///   - ipv4Addrs: IP addresses to resolve. IPv4 and IPv6 literals are supported; empty entries
   ///     are ignored.
-  ///   - timeout: The per-query timeout in seconds. It must be finite and greater than zero.
+  ///   - timeout: Bounds the whole call: every origin and AS-name query, on every server, ends by
+  ///     `timeout` seconds after the call starts. It must be finite and greater than zero. An
+  ///     origin whose AS-name query did not answer in time is returned with an empty name.
   /// - Returns: A map from each resolved input address to its ASN metadata.
   /// - Throws: ``DNSError/invalidTimeout(_:)`` if `timeout` is not finite and greater than zero.
   #if compiler(>=6.2)
@@ -442,75 +416,71 @@ public struct CymruDNSResolver: ASNResolver {
   public func resolve(ipv4Addrs: [String], timeout: TimeInterval = 1.0) async throws -> [String:
     ASNInfo]
   {
+    try await resolve(
+      ipv4Addrs, timeout: timeout, deadline: asnDeadline(timeout), publish: { _ in })
+  }
+
+  func resolve(
+    _ addresses: [String], timeout: TimeInterval, deadline: TimeInterval,
+    publish: @escaping ASNPublish
+  ) async throws -> [String: ASNInfo] {
     try _validateDNSTimeout(timeout)
 
-    let ips = Array(Set(ipv4Addrs.filter { !$0.isEmpty }))
-    if ips.isEmpty { return [:] }
-
-    // Cymru only has meaningful origin data for globally routable addresses.
-    // Mapped IPv4 is normalized so it uses origin.asn.cymru.com, not origin6.
-    let lookupIPs = Array(Set(ips.compactMap(asnLookupAddress)))
-    if lookupIPs.isEmpty { return [:] }
+    // Each input presentation, by the address its query uses. Cymru only has meaningful origin
+    // data for globally routable addresses; mapped IPv4 is normalized so it uses
+    // origin.asn.cymru.com, not origin6.
+    var inputsByLookup: [String: [String]] = [:]
+    for ip in Set(addresses.filter { !$0.isEmpty }) {
+      if let lookupIP = asnLookupAddress(for: ip) {
+        inputsByLookup[lookupIP, default: []].append(ip)
+      }
+    }
+    if inputsByLookup.isEmpty { return [:] }
 
     let semaphore = _ConcurrencySemaphore(maxConcurrent: Self.maxConcurrentQueries)
+    // Answers keyed by input presentation, published as each one is learned.
+    var result: [String: ASNInfo] = [:]
+    func learn(_ lookupIP: String, _ info: ASNInfo) {
+      var found: [String: ASNInfo] = [:]
+      for ip in inputsByLookup[lookupIP] ?? [] { found[ip] = info }
+      result.merge(found) { $1 }
+      publish(found)
+    }
 
     // Phase 1: Parallel origin ASN lookups
-    let originResults: [String: _OriginASNResult] = await withTaskGroup(
-      of: (String, _OriginASNResult?).self
-    ) { group in
-      for ip in lookupIPs {
+    var originResults: [String: _OriginASNResult] = [:]
+    await withTaskGroup(of: (String, _OriginASNResult?).self) { group in
+      for ip in inputsByLookup.keys {
         group.addTask {
           guard (try? await semaphore.wait()) != nil else { return (ip, nil) }
           defer { Task { await semaphore.signal() } }
-          return (ip, await self.lookupOriginASN(ip: ip, timeout: timeout))
+          return (ip, await self.lookupOriginASN(ip: ip, timeout: timeout, cutoff: deadline))
         }
       }
-
-      var results: [String: _OriginASNResult] = [:]
-      for await (ip, result) in group {
-        if let r = result { results[ip] = r }
+      for await (ip, origin) in group {
+        guard let origin else { continue }
+        originResults[ip] = origin
+        learn(ip, ASNInfo(origin, name: ""))
       }
-      return results
     }
 
     if originResults.isEmpty { return [:] }
 
     // Phase 2: Parallel AS name lookups for unique ASNs only
-    let uniqueASNs = Array(Set(originResults.values.map { $0.asn }))
-    let asnNames: [Int: String] = await withTaskGroup(of: (Int, String?).self) { group in
-      for asn in uniqueASNs {
+    let originsByASN = Dictionary(grouping: originResults, by: { $0.value.asn })
+    await withTaskGroup(of: (Int, String?).self) { group in
+      for asn in originsByASN.keys {
         group.addTask {
           guard (try? await semaphore.wait()) != nil else { return (asn, nil) }
           defer { Task { await semaphore.signal() } }
-          return (asn, await self.lookupASName(asn: asn, timeout: timeout))
+          return (asn, await self.lookupASName(asn: asn, timeout: timeout, cutoff: deadline))
         }
       }
-
-      var names: [Int: String] = [:]
       for await (asn, name) in group {
-        if let n = name { names[asn] = n }
-      }
-      return names
-    }
-
-    // Combine results
-    var lookupResults: [String: ASNInfo] = [:]
-    for (ip, origin) in originResults {
-      lookupResults[ip] = ASNInfo(
-        asn: origin.asn,
-        name: asnNames[origin.asn] ?? "",
-        prefix: origin.prefix,
-        countryCode: origin.cc,
-        registry: origin.registry
-      )
-    }
-
-    // Preserve the protocol contract that results are keyed by the caller's
-    // input presentation, even when the network query used a normalized key.
-    var result: [String: ASNInfo] = [:]
-    for ip in ips {
-      if let lookupIP = asnLookupAddress(for: ip), let info = lookupResults[lookupIP] {
-        result[ip] = info
+        guard let name else { continue }
+        for (ip, origin) in originsByASN[asn] ?? [] {
+          learn(ip, ASNInfo(origin, name: name))
+        }
       }
     }
     return result
@@ -519,7 +489,9 @@ public struct CymruDNSResolver: ASNResolver {
   /// Look up origin ASN for a single IP address. Dispatches v4 to
   /// `origin.asn.cymru.com` (dotted-quad reverse) and v6 to
   /// `origin6.asn.cymru.com` (full nibble reverse, RFC 1886 §2.5 style).
-  private func lookupOriginASN(ip: String, timeout: TimeInterval) async -> _OriginASNResult? {
+  private func lookupOriginASN(
+    ip: String, timeout: TimeInterval, cutoff: TimeInterval
+  ) async -> _OriginASNResult? {
     let fam = detectAddressFamily(ip)
     let q: String
     if fam == AF_INET6 {
@@ -531,7 +503,8 @@ public struct CymruDNSResolver: ASNResolver {
       q = "\(rev).origin.asn.cymru.com"
     }
 
-    let txts = await DNSClient.queryTXT(name: q, timeout: timeout, servers: servers)
+    let txts = await DNSClient.queryTXT(
+      name: q, timeout: timeout, servers: servers, cutoff: cutoff)
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Format: "AS | BGP Prefix | CC | Registry | Allocated"
@@ -552,10 +525,12 @@ public struct CymruDNSResolver: ASNResolver {
   }
 
   /// Look up AS name for a single ASN.
-  private func lookupASName(asn: Int, timeout: TimeInterval) async -> String? {
+  private func lookupASName(asn: Int, timeout: TimeInterval, cutoff: TimeInterval) async -> String?
+  {
     let qn = "AS\(asn).asn.cymru.com"
 
-    let txts = await DNSClient.queryTXT(name: qn, timeout: timeout, servers: servers)
+    let txts = await DNSClient.queryTXT(
+      name: qn, timeout: timeout, servers: servers, cutoff: cutoff)
     guard let txts = txts, let first = txts.first else { return nil }
 
     // Typical format: "AS | AS Name | CC | Registry | Allocated"

@@ -122,6 +122,7 @@ private func exchangeDNSQuery(
   query: String,
   queryType: UInt16,
   timeout: TimeInterval,
+  cutoff: TimeInterval? = nil,
   interface: String?,
   sourceIP: String?,
   serverPort: UInt16? = nil
@@ -135,7 +136,8 @@ private func exchangeDNSQuery(
   let port = serverPort ?? TestSeams.dnsServerPort ?? 53
   let (request, id) = makeDNSQueryMessage(encodedQuery: encodedQuery, queryType: queryType)
   let reply = try await UDPExchange.perform(
-    family: family, request: request, timeout: timeout, receiveCapacity: dnsReceiveCapacity,
+    family: family, request: request, timeout: timeout, cutoff: cutoff,
+    receiveCapacity: dnsReceiveCapacity,
     accepts: { DNSClient.isAddressed(to: request, $0) },
     configure: { fd in
       try bindDNSSocket(fd, family: family, interface: interface, sourceIP: sourceIP)
@@ -177,6 +179,7 @@ private func runDNSQuery(
   query: String,
   queryType: UInt16,
   timeout: TimeInterval,
+  cutoff: TimeInterval? = nil,
   interface: String?,
   sourceIP: String?,
   serverPort: UInt16? = nil
@@ -184,7 +187,7 @@ private func runDNSQuery(
   let reply: DNSReply
   do {
     reply = try await exchangeDNSQuery(
-      server: server, query: query, queryType: queryType, timeout: timeout,
+      server: server, query: query, queryType: queryType, timeout: timeout, cutoff: cutoff,
       interface: interface, sourceIP: sourceIP, serverPort: serverPort)
   } catch let failure as UDPExchangeFailure {
     throw dnsError(for: failure)
@@ -1977,16 +1980,19 @@ struct DNSClient {
 
   /// TXT strings for `name` from the first of `servers` that answers, or `nil`.
   ///
-  /// Each server gets `timeout` seconds. The wait holds no thread, and cancelling the calling
-  /// task ends it at once.
+  /// Each server gets `timeout` seconds, and none runs past `cutoff` (an instant on
+  /// `DiscoveryClock.current`; `nil` is none): no server is tried once it has passed. The wait
+  /// holds no thread, and cancelling the calling task ends it at once.
   static func queryTXT(
-    name: String, timeout: TimeInterval = 1.0, servers: [String] = defaultTXTServers
+    name: String, timeout: TimeInterval = 1.0, servers: [String] = defaultTXTServers,
+    cutoff: TimeInterval? = nil
   ) async -> [String]? {
     for server in servers {
+      if DiscoveryClock.current.hasPassed(cutoff) { return nil }
       // After cancellation each remaining attempt throws before it opens a socket.
       let answers = try? await runDNSQuery(
         server: server, query: name, queryType: DNSRecordType.txt.rawValue, timeout: timeout,
-        interface: nil, sourceIP: nil
+        cutoff: cutoff, interface: nil, sourceIP: nil
       ).answers
       if let answers, let strings = txtStrings(from: answers) { return strings }
     }

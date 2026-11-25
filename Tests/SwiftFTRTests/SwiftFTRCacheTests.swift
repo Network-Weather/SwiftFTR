@@ -108,12 +108,13 @@ final class SwiftFTRCacheTests: XCTestCase {
     return await resolver.callCount() >= expectedCount
   }
 
-  private func waitForJoinCount(_ expectedCount: Int) async -> Bool {
+  private func waitForJoinCount(_ expectedCount: Int, on caching: CachingASNResolver) async -> Bool
+  {
     for _ in 0..<2_000 {
-      if await _ASNMemoryCache.shared.inFlightJoinCount >= expectedCount { return true }
+      if caching.joinCount >= expectedCount { return true }
       try? await Task.sleep(for: .milliseconds(1))
     }
-    return await _ASNMemoryCache.shared.inFlightJoinCount >= expectedCount
+    return caching.joinCount >= expectedCount
   }
 
   func testCachingResolverHitsCache() async throws {
@@ -274,15 +275,15 @@ final class SwiftFTRCacheTests: XCTestCase {
     let addresses = ["203.0.113.10", "203.0.113.11"]
 
     let first = Task {
-      try await caching.resolve(ipv4Addrs: addresses, timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: addresses, timeout: 60)
     }
     let firstStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(firstStarted)
 
     let second = Task {
-      try await caching.resolve(ipv4Addrs: addresses, timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: addresses, timeout: 60)
     }
-    let secondJoined = await waitForJoinCount(1)
+    let secondJoined = await waitForJoinCount(1, on: caching)
     let callsWhileSuspended = await base.callCount()
 
     await base.succeedAll()
@@ -302,7 +303,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let first = Task {
       try await caching.resolve(
         ipv4Addrs: ["203.0.113.1", "203.0.113.2"],
-        timeout: 1.0
+        timeout: 60
       )
     }
     let firstStarted = await waitForCallCount(1, from: base)
@@ -311,7 +312,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let second = Task {
       try await caching.resolve(
         ipv4Addrs: ["203.0.113.2", "203.0.113.3"],
-        timeout: 1.0
+        timeout: 60
       )
     }
     let secondStarted = await waitForCallCount(2, from: base)
@@ -334,7 +335,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.4"
 
     let lookup = Task {
-      try await outer.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await outer.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let baseStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(baseStarted, "Nested caching decorators must not await their own outer flight")
@@ -354,12 +355,12 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.5"
 
     let first = Task {
-      try await firstCache.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await firstCache.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let firstStarted = await waitForCallCount(1, from: firstBase)
     XCTAssertTrue(firstStarted)
     let second = Task {
-      try await secondCache.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await secondCache.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let secondStarted = await waitForCallCount(1, from: secondBase)
     XCTAssertTrue(
@@ -382,7 +383,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let firstStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(firstStarted)
     let long = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let secondStarted = await waitForCallCount(2, from: base)
     XCTAssertTrue(secondStarted, "A short-timeout caller must not join a longer flight")
@@ -394,20 +395,18 @@ final class SwiftFTRCacheTests: XCTestCase {
     XCTAssertEqual(callCount, 2)
   }
 
-  func testRejectedNaNTimeoutReleasesFlightReservation() async {
-    let caching = CachingASNResolver(base: ImmediateFailureResolver())
+  /// A NaN timeout has already passed: nothing is asked and nothing is reserved.
+  func testNaNTimeoutAsksNothing() async throws {
+    let base = CountingResolver()
+    let caching = CachingASNResolver(base: base)
 
-    do {
-      _ = try await caching.resolve(ipv4Addrs: ["203.0.113.7"], timeout: .nan)
-      XCTFail("The base resolver should reject the lookup")
-    } catch ControlledResolverError.requestedFailure {
-      // Expected.
-    } catch {
-      XCTFail("Unexpected error: \(error)")
-    }
+    let result = try await caching.resolve(ipv4Addrs: ["203.0.113.7"], timeout: .nan)
 
+    XCTAssertTrue(result.isEmpty)
+    let calls = await base.calls()
+    XCTAssertEqual(calls, 0, "No lookup may start once the deadline has passed")
     let reservationCount = await _ASNMemoryCache.shared.inFlightReservationCount
-    XCTAssertEqual(reservationCount, 0, "A rejected timeout must not leak its flight key")
+    XCTAssertEqual(reservationCount, 0, "A passed deadline must not leak a flight key")
   }
 
   func testCachingResolverReleasesFailedFlightsForRetry() async throws {
@@ -416,14 +415,14 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.20"
 
     let first = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let firstStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(firstStarted)
     let joined = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
-    let secondJoined = await waitForJoinCount(1)
+    let secondJoined = await waitForJoinCount(1, on: caching)
     let callsWhileSuspended = await base.callCount()
 
     await base.failAll()
@@ -439,7 +438,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     }
 
     let retry = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let retryStarted = await waitForCallCount(2, from: base)
     XCTAssertTrue(retryStarted)
@@ -459,14 +458,14 @@ final class SwiftFTRCacheTests: XCTestCase {
     let address = "203.0.113.40"
 
     let owner = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let ownerStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(ownerStarted)
     let joined = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
-    let secondJoined = await waitForJoinCount(1)
+    let secondJoined = await waitForJoinCount(1, on: caching)
 
     let cancellationObserved = expectation(description: "Canceled caller stops waiting")
     let canceledResult = Task {
@@ -481,7 +480,7 @@ final class SwiftFTRCacheTests: XCTestCase {
       }
     }
     joined.cancel()
-    await fulfillment(of: [cancellationObserved], timeout: 1.0)
+    await fulfillment(of: [cancellationObserved], timeout: 60)
     await base.succeedAll()
     let ownerResult = try await owner.value
     let canceledPromptly = await canceledResult.value
@@ -493,33 +492,28 @@ final class SwiftFTRCacheTests: XCTestCase {
     XCTAssertNotNil(ownerResult[address])
   }
 
-  func testClearingCacheCancelsFlightsAndPreventsStalePopulation() async throws {
+  /// Clearing the cache forgets running flights: they answer their callers but cache nothing.
+  func testClearingCacheForgetsFlightsAndPreventsStalePopulation() async throws {
     let base = ControlledResolver()
     let caching = CachingASNResolver(base: base)
     let address = "203.0.113.50"
 
     let first = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let firstStarted = await waitForCallCount(1, from: base)
     XCTAssertTrue(firstStarted)
 
     await _ASNMemoryCache.shared.clear()
     await base.succeedAll()
-    do {
-      _ = try await first.value
-      XCTFail("Clearing the cache should cancel its shared flights")
-    } catch is CancellationError {
-      // Expected.
-    } catch {
-      XCTFail("Unexpected error: \(error)")
-    }
+    let firstResult = try await first.value
+    XCTAssertNotNil(firstResult[address], "The flight still answers the caller that started it")
 
     let cacheCount = await _ASNMemoryCache.shared.count
     XCTAssertEqual(cacheCount, 0)
 
     let retry = Task {
-      try await caching.resolve(ipv4Addrs: [address], timeout: 1.0)
+      try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
     let retryStarted = await waitForCallCount(2, from: base)
     XCTAssertTrue(retryStarted)
@@ -618,7 +612,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     // A different address must not wait for the held one: it returns while the gate is still
     // closed, or trips the watchdog. (Qualified: XCTestCase's own `measure` hides the helper.)
     let (fast, _) = try await SwiftFTRTests.measure(within: 20) {
-      try await caching.resolve(ipv4Addrs: ["203.0.113.2"], timeout: 2.0)
+      try await caching.resolve(ipv4Addrs: ["203.0.113.2"], timeout: 60)
     }
     XCTAssertEqual(fast["203.0.113.2"]?.asn, 65000)
 
