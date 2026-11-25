@@ -200,8 +200,14 @@ Unreleased
   whose query is already in flight on the same tracer waits for that query instead of asking
   again, so the flows of a multipath run, which share the tracer's cache and often the same
   hops, make one daemon query per hop rather than one per flow, and every waiting lookup gets
-  that query's outcome. A lookup whose task is cancelled stops waiting at once without stopping
-  the query for the others; the query is stopped when no one is waiting for it.
+  that query's outcome. One address is one PTR question: an IPv4 address and its IPv4-mapped
+  IPv6 spelling, or two spellings of one IPv6 address, share the query, the cached answer and
+  the holdoff, and a link-local zone keeps its interface. A query runs to its outcome even if
+  every caller has gone, since it is bounded by its own timeout, and that outcome is recorded.
+  A caller cancelled before it looks up asks nothing; one cancelled while waiting gets no
+  hostname once the query ends, within the lookup timeout. Traces, classified traces and
+  multipath flows are released at once anyway, since they race each reverse-DNS wave against
+  their cancellation.
 
 ### Bug fixes
 

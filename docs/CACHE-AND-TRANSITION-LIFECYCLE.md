@@ -64,8 +64,9 @@ As of 0.18.0, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
   2026-11-24). An open breaker never closes by time, holdoffs expired or not. Lookups of one
   address share one query (David, 2026-11-24: "Build share lookups"): a lookup that arrives while a query for its address is
   in flight waits for it, so each address has at most one query at a time and its one outcome
-  is applied once. A waiter that is cancelled leaves without stopping the query; the query is
-  cancelled, and recorded nowhere, when its last waiter leaves. `clear()` and
+  is applied once, whoever is still waiting. A query is never cancelled because a caller left;
+  it is bounded by its own timeout. Every table is keyed by the PTR question (name and
+  interface index), so the spellings of one address are one entry. `clear()` and
   `invalidateNetworkScoped()` drop the queries in flight, so a lookup after them starts fresh,
   and a query from before them cannot change the breaker or the holdoffs. A lookup that never got to ask in time and
   a link-local lookup (asked by multicast) do not count. `clear()` and
