@@ -30,6 +30,10 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
 - **A `.remote` ASN download is bounded only by URLSession's 60 s default** (finding 7, from code
   reading). Decide between failing classification fast and loading in the background, and make
   the SwiftIP2ASN cache directory injectable so a test can stage it without touching the user's.
+- **A very large ASN batch's preparation is not interrupted by its deadline**: the deadline is
+  checked before each lookup, flight and fallback starts, not inside the loops that deduplicate
+  and normalise the input, so a batch of tens of thousands of addresses with a sub-millisecond
+  timeout can overrun it by the milliseconds those loops take. A trace has a few dozen addresses.
 - **Report an HTTP status as soon as the headers arrive** (#122, finding 27): URLSession withholds
   the response until body bytes follow it, so a server that stalls after its headers is reported
   only at the timeout, and without its status if no body byte came. Fixing it means reading the

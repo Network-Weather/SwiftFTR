@@ -42,7 +42,7 @@ struct UDPExchangeReply: Sendable {
 /// carries the query's transaction ID and does not echo another question); the caller validates
 /// the rest of what comes back.
 ///
-/// Descriptor ownership: ``perform(family:request:timeout:receiveCapacity:accepts:configure:)`` owns the
+/// Descriptor ownership: ``perform(family:request:timeout:cutoff:receiveCapacity:accepts:configure:)`` owns the
 /// socket until the read source exists and closes it itself if setup fails. From then on the
 /// descriptor is closed exactly once, by the cancel handler of the last source watching it, and
 /// the caller is resumed only after that close. Every source is activated as soon as it is
@@ -106,6 +106,7 @@ final class UDPExchange: @unchecked Sendable {
   ///   - request: One datagram, sent whole or not at all.
   ///   - timeout: Seconds from the start of the exchange until it gives up. Validated by the
   ///     caller: finite and greater than zero.
+  ///   - cutoff: As for ``perform(adopting:request:timeout:cutoff:receiveCapacity:accepts:send:configure:)``.
   ///   - receiveCapacity: Bytes read from the reply; a longer datagram is truncated to this.
   ///   - accepts: Whether a datagram read after the send is addressed to this request. One it
   ///     rejects is consumed and ignored, and the wait goes on to the same deadline. `nil` accepts
@@ -118,6 +119,7 @@ final class UDPExchange: @unchecked Sendable {
     family: Int32,
     request: [UInt8],
     timeout: TimeInterval,
+    cutoff: TimeInterval? = nil,
     receiveCapacity: Int,
     accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)? = nil,
     configure: (Int32) throws -> Void
@@ -126,11 +128,11 @@ final class UDPExchange: @unchecked Sendable {
     let fd = socket(family, SOCK_DGRAM, IPPROTO_UDP)
     guard fd >= 0 else { throw UDPExchangeFailure.socketCreationFailed(errno: errno) }
     return try await perform(
-      adopting: fd, request: request, timeout: timeout, receiveCapacity: receiveCapacity,
-      accepts: accepts, configure: configure)
+      adopting: fd, request: request, timeout: timeout, cutoff: cutoff,
+      receiveCapacity: receiveCapacity, accepts: accepts, configure: configure)
   }
 
-  /// ``perform(family:request:timeout:receiveCapacity:accepts:configure:)`` on `fd`, a UDP socket
+  /// ``perform(family:request:timeout:cutoff:receiveCapacity:accepts:configure:)`` on `fd`, a UDP socket
   /// the caller made (and may have bound) but has not sent on. The exchange owns `fd` from the
   /// call on and closes it exactly once, on every path, a cancellation before setup included.
   ///

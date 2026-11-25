@@ -153,8 +153,9 @@ Not covered, and why:
   `EHOSTUNREACH` or `ENETUNREACH`, so `DNSProbeOutcomeTests.unreachable` injects them through the
   receive seam; no test shows the kernel reporting them on a connected UDP socket.
 - **The `.dns` and `.hybrid` strategies end to end**: their fallback is Team Cymru over the real
-  resolver. `CymruEventBasedTests` runs `CymruDNSResolver` against a loopback responder; the
-  battery passes a stub resolver to every classified trace so no test reaches it.
+  resolver. `CymruEventBasedTests` and `EnrichmentLifetimeTests` run `CymruDNSResolver`, behind
+  the cache and the hybrid, against a loopback responder; the battery passes a stub resolver to
+  every classified trace so no classified trace reaches it.
 - **A TCP port that drops SYNs (filtered).** Producing one needs a firewall rule.
 - **Which of two simultaneous events of a reverse lookup wins.** The fake daemon forces each
   order of a reply against a cancellation and against the wake-up by holding the lookup's queue,
@@ -699,3 +700,42 @@ Observations that are not defects of the library:
   `lookupWithNoTimeLeftNotSubmitted`, `replyAfterCutoffNotTaken`, `noSendAfterCutoff`). Tests:
   `EventBasedSTUNTests`, `LibraryPublicIPResolverTests.endedSweepsLeaveNoSockets` and
   `abandonedAttemptsHoldNoSockets`.
+- **An ASN lookup's timeout did not bound the call.** Confirmed by test and fixed (Enrichment
+  Lifetimes). `HybridASNResolver` ignored its timeout: it waited for a loading database however
+  long the load took, and gave its DNS fallback `fallbackTimeout` whatever the caller allowed.
+  `CymruDNSResolver` gave each query, server and wave the full timeout again, and
+  `CachingASNResolver` waited on a shared lookup for as long as it ran. Now one deadline, taken
+  on entry, ends every phase, and the caller returns what it has. Tests, each failing at its
+  watchdog on the old code with only the test seams added: `cymruPhasesEndAtTheDeadline`,
+  `cachedLookupReturnsTheOriginThenTheName`, `hybridFallbackEndsAtTheDeadline`,
+  `localLoadWaitEnds`, `outcomeIndependentOfFlightOrder`.
+- **A caller leaving a shared database load could not cancel it or latch the resolver as failed
+  in 0.18**, contrary to the plan's premise: no caller could leave at all, since the wait ignored
+  both its timeout and cancellation, and a cancelled caller was answered once the load finished.
+  The defect was the unbounded wait above. Now that a caller can leave, `localLoadWaitEnds` checks
+  that leaving by deadline or by cancellation leaves the one load running and the resolver able
+  to answer from it, and `waitersLeaveNothingRegistered` that a waiter that leaves shared work
+  leaves no registration behind.
+- **`testDatabaseReleasedAfterLastResolverGoesAway` failed intermittently in CI** (#189).
+  Confirmed as a wrong test premise, not a leak. The test read the store's weak slot the instant
+  the resolver's scope ended, but a finished task that touched the database can be released by
+  the runtime just after its caller resumes: on 0.18, the load task's own result. Under CPU load
+  (16 busy processes, one Mac), 7 of 300 repetitions found the database still resident at that
+  instant and none with that result held elsewhere; on this branch 9 of 300 did, all released
+  within 1.3 ms; with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, none. The test now waits for the
+  release under a watchdog.
+- **Shared ASN work inherited its starter's time, and a passed deadline hid what was known.**
+  Found by the first review of Enrichment Lifetimes' second attempt and fixed. A hybrid fallback
+  flight ran to the deadline of the caller that started it, so a caller with little time left cut
+  off another that joined with a full budget; a flight now runs for its own `timeout`. A passed
+  deadline skipped the hybrid's cache read and the store's resident database; it now starts
+  nothing and returns what is known. A per-resolver join counter kept every resolver's scope in a
+  process-wide dictionary; the count now lives on the scope. Tests:
+  `sharedFallbackOutlivesItsStarter`, `passedDeadlineReturnsWhatIsKnown`,
+  `discardedResolverIsReleased`.
+- **A resolver that joined running shared work passed on none of what it published.** Found by
+  the second review of Enrichment Lifetimes' second attempt and fixed. Only a flight's starter
+  received its answers, so a cache in front of a hybrid whose DNS fallback was already running
+  returned nothing at its deadline although the origin was known. Every waiter on shared work now
+  receives what it has published and publishes while they wait, and passes it on. Test:
+  `joinerForwardsWhatItsFlightPublished` (origin known before the join, and learned during it).
