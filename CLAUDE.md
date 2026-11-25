@@ -106,7 +106,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 3. **Dependency Injection**: Resolvers (ASN, DNS) are injectable via `SwiftFTRConfig` for testing
 4. **Per-Operation Interface Binding**: Override global interface on individual operations (ping, trace, etc.)
 5. **Resource Management**: Single socket per trace, buffer reuse, minimal allocations
-6. **Blocking I/O**: `BlockingIOExecutor` (`Utils.swift`, eight workers) carries STUN server-name resolution (`getaddrinfo`, one request per name) and each STUN exchange (one request per attempt, for classified traces and standalone `getPublicIPs` alike). Public-IP discovery itself is async and holds no slot between those requests; DNS queries, DNS probes, Team Cymru lookups and reverse DNS do not use it
+6. **Blocking I/O**: `BlockingIOExecutor` (`Utils.swift`, eight workers) carries STUN server-name resolution (`getaddrinfo`, one request per name, its wait bounded by the discovery deadline and 20 s). STUN exchanges run on `UDPExchange`, every server at once, and hold no slot; DNS queries, DNS probes, Team Cymru lookups and reverse DNS do not use it either
 
 ## Environment Variables
 

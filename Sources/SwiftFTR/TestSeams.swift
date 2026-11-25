@@ -24,7 +24,8 @@ enum TestSeams {
   /// which has none).
   typealias DiscoverPublicIP = @Sendable (_ request: PublicIPRequest) async throws -> STUNPublicIP
 
-  /// The STUN servers to try, in order, for one address family.
+  /// The STUN servers a sweep asks, all at once, for one address family. Their order decides
+  /// only which failure a sweep with no answer reports: the last one's.
   typealias STUNServers = @Sendable (_ family: Int32) -> [(host: String, port: UInt16)]
 
   /// Resolution of a STUN server's name for `family`, in place of `getaddrinfo`. Runs in an
@@ -86,6 +87,21 @@ enum TestSeams {
 
   @TaskLocal static var connectSocket: ConnectSocket?
 
+  /// `monotonicNow()` in place of the real clock for every public-IP discovery deadline (the
+  /// budget, admission, name lookups and each exchange's cutoff), so a test can move the clock past
+  /// a deadline, as a system sleep does, without waiting for it.
+  @TaskLocal static var monotonicClock: (@Sendable () -> TimeInterval)?
+
+  /// A ``UDPExchange`` arms no wake-up at its cutoff, so only its send and read decisions can act
+  /// on it: for a test of those decisions.
+  @TaskLocal static var skipCutoffWake = false
+
+  /// The longest a STUN name lookup is waited for, in place of `stunNameLookupLimit`.
+  @TaskLocal static var stunNameLookupLimit: TimeInterval?
+
+  /// Called with a server's index when a STUN sweep records that server's failure.
+  @TaskLocal static var observeSTUNOutcome: (@Sendable (_ index: Int) -> Void)?
+
   /// UDP port every event-based DNS query sends to, in place of 53, so a query to a loopback
   /// literal reaches a test responder on an ephemeral port.
   @TaskLocal static var dnsServerPort: UInt16?
@@ -112,7 +128,7 @@ enum TestSeams {
 
   /// `send(2)` of a STUN sweep's binding request, in place of the system call, called with the
   /// request's own socket. Returns what `send` would and sets `errno` the same way. Captured by the
-  /// sweep, since each exchange runs in an executor slot.
+  /// sweep on the async side; ``sendDatagram`` does not apply to STUN.
   @TaskLocal static var sendSTUNRequest: SendDatagram?
 
   /// Arms the wake-up at a caller's public-IP resolver's deadline in place of a sleeping task, and

@@ -43,25 +43,38 @@ struct FaultInjectionWireTests {
   }
 
   enum STUNFault: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    case silent, garbage, wrongTransaction, slow
+    case silent, empty, garbage, wrongCookie, wrongTransaction, slow
+    /// Carries the request's transaction ID, so it fails the exchange rather than being ignored.
+    case wrongMessageType
     var testDescription: String { rawValue }
   }
 
-  /// The outcome of a STUN call, or `nil` if it was still running after ``watchdog``.
-  static func runSTUN(server: LoopbackUDPResponder, timeout: TimeInterval) async
-    -> Result<STUNPublicIP, Error>?
-  {
-    let box = ResultBox<STUNPublicIP>()
+  /// The outcome of a STUN exchange with `server`, or `nil` if it was still running after
+  /// ``watchdog``.
+  static func runSTUN(
+    server: LoopbackUDPResponder, timeout: TimeInterval, setups: FaultCounter = FaultCounter()
+  ) async -> Result<STUNPublicIP, Error>? {
     let (address, length) = server.address
-    let returned = await returnsWithin(watchdog) {
-      box.set(
-        Result {
-          try stunGetPublicIP(
-            family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
-            timeout: timeout)
-        })
+    let fileControl: TestSeams.FileControl = { fd, command, argument in
+      if command == F_GETFL { setups.increment() }
+      return fcntl(fd, command, argument)
     }
-    return returned ? box.value : nil
+    do {
+      return try await measure(within: watchdog) {
+        try await TestSeams.$fileControl.withValue(fileControl) {
+          do {
+            return Result<STUNPublicIP, Error>.success(
+              try await stunGetPublicIP(
+                family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
+                timeout: timeout))
+          } catch {
+            return .failure(error)
+          }
+        }
+      }.0
+    } catch {
+      return nil
+    }
   }
 
   @Test("STUN accepts a well-formed binding response from the fixture")
@@ -77,27 +90,31 @@ struct FaultInjectionWireTests {
   @Test("STUN gives up within its timeout on a faulty server", arguments: STUNFault.allCases)
   func stunFaults(fault: STUNFault) async throws {
     let server = try LoopbackUDPResponder(accepts: .stunBindingRequest) { request in
+      var reply = Self.stunSuccess(for: request, ip: [198, 51, 100, 7])!
       switch fault {
       case .silent: return nil
+      case .empty: return ([], 0)
       case .garbage: return ([0xDE, 0xAD, 0xBE, 0xEF], 0)
-      case .wrongTransaction:
-        var reply = Self.stunSuccess(for: request, ip: [198, 51, 100, 7])!
-        reply[8] ^= 0xFF
-        return (reply, 0)
-      case .slow:
-        return Self.stunSuccess(for: request, ip: [198, 51, 100, 7]).map { ($0, Self.lateAnswer) }
+      case .wrongCookie: reply[4] ^= 0xFF
+      case .wrongTransaction: reply[8] ^= 0xFF
+      case .slow: return (reply, Self.lateAnswer)
+      case .wrongMessageType: reply[1] = 0x11
       }
+      return (reply, 0)
     }
     defer { server.stop() }
     let timeout: TimeInterval = 0.3
-    let result = await Self.runSTUN(server: server, timeout: timeout)
+    let setups = FaultCounter()
+    let result = await Self.runSTUN(server: server, timeout: timeout, setups: setups)
 
     let unwrapped = try #require(result, "STUN never returned from a \(fault) server")
     #expect(throws: STUNError.self) { try unwrapped.get() }
-    // The request can still be on its way when a 0.3 s timeout ends the call.
-    #expect(
-      await eventually(within: 10) { server.requests.value == 1 },
-      "requests: \(server.requests.value)")
+    // Bounded completion only: a 0.3 s exchange may end before its queue first runs and sends.
+    // With long timeouts, `EventBasedSTUNTests.foreignReplyIgnored` and
+    // `invalidReplyFailsItsServerOnly` show each malformed kind of reply read and handled. An
+    // exchange never sends more than one request.
+    #expect(server.requests.value <= 1, "requests: \(server.requests.value)")
+    #expect(setups.value == 1, "the exchange was set up \(setups.value) times")
   }
 
   @Test("A sub-microsecond STUN timeout is still a timeout, not an unbounded wait")
@@ -106,12 +123,12 @@ struct FaultInjectionWireTests {
     defer { server.stop() }
     // The failure is a wait with no end, so any finite watchdog tells them apart.
     let (address, length) = server.address
-    let returned = await returnsWithin(5) {
-      _ = try? stunGetPublicIP(
+    let outcome = try await measure(within: 5) {
+      try? await stunGetPublicIP(
         family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
         timeout: 0.000_000_5)
-    }
-    #expect(returned, "STUN with a 0.5 µs timeout was still waiting after 5 s")
+    }.0
+    #expect(outcome == nil)
   }
 
   // MARK: DNS

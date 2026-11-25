@@ -52,6 +52,9 @@ enum STUNError: Error, CustomStringConvertible {
   case connectFailed(errno: Int32, details: String?)
   case sendFailed(errno: Int32, details: String?)
   case recvTimeout
+  /// The server's host or the network answered the request with an error: `ECONNREFUSED` (nothing
+  /// listening), `EHOSTUNREACH`, `ENETUNREACH`, or another receive error.
+  case receiveFailed(errno: Int32, details: String?)
   case invalidTimeout(TimeInterval)
   case invalidResponse(String)
   case interfaceBindFailed(interface: String, errno: Int32, details: String?)
@@ -77,6 +80,10 @@ enum STUNError: Error, CustomStringConvertible {
       return details.map { "\(baseMsg). \($0)" } ?? baseMsg
     case .recvTimeout:
       return "STUN request timed out"
+    case .receiveFailed(let errno, let details):
+      let errStr = String(cString: strerror(errno))
+      let baseMsg = "STUN request failed (errno=\(errno)): \(errStr)"
+      return details.map { "\(baseMsg). \($0)" } ?? baseMsg
     case .invalidTimeout(let timeout):
       return "Invalid STUN timeout: \(timeout). Timeout must be finite and greater than zero"
     case .invalidResponse(let reason):
@@ -189,9 +196,10 @@ private func bindSTUNSocket(
 }
 
 /// A bound STUN socket made before its server's name is resolved, handed to the one attempt that
-/// uses it. Whichever of that attempt and the last reference to this object comes first closes
-/// the descriptor: an attempt that takes it closes it when done, and an attempt that never runs
-/// (abandoned while queued, or never started because the sweep ended) leaves it to `deinit`.
+/// uses it. Whichever of that attempt and the end of the sweep comes first closes the descriptor:
+/// an attempt that takes it hands it to its exchange, which closes it, and a socket no attempt
+/// took (its lookup failed or was abandoned, or the sweep ended first) is closed by the sweep on
+/// its way out, or by `deinit`.
 final class BoundSTUNSocket: @unchecked Sendable {
   private let lock = NSLock()
   private var descriptor: Int32
@@ -215,8 +223,8 @@ final class BoundSTUNSocket: @unchecked Sendable {
   }
 }
 
-/// Family-parameterized STUN core with pre-resolved endpoint. Builds the binding request,
-/// sends it, and parses the XOR-MAPPED-ADDRESS attribute. Supports both AF_INET and AF_INET6.
+/// Queries one STUN server at an already-resolved endpoint, from a new socket bound to
+/// `interface` and `sourceIP` where given.
 internal func stunGetPublicIP(
   family: Int32,
   server: sockaddr_storage,
@@ -226,21 +234,48 @@ internal func stunGetPublicIP(
   interface: String? = nil,
   sourceIP: String? = nil,
   enableLogging: Bool = false
-) throws -> STUNPublicIP {
+) async throws -> STUNPublicIP {
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
     throw STUNError.invalidTimeout(timeout)
   }
+  try Task.checkCancellation()
   let fd = try makeBoundSTUNSocket(
     family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
-  defer { close(fd) }
-  return try stunExchange(
+  return try await stunExchange(
     fd: fd, family: family, server: server, serverLen: serverLen, serverLabel: serverLabel,
     timeout: timeout)
 }
 
-/// One STUN Binding exchange on `fd`, a socket already bound by ``makeBoundSTUNSocket(family:interface:sourceIP:enableLogging:)``:
-/// connect to `server`, send the request with `send` (the system call by default), and parse the
-/// reply. Blocks for up to `timeout` on each of the send and the receive. Does not close `fd`.
+/// A STUN Binding Request (RFC 5389 §6) with a fresh random transaction ID, and that ID.
+func makeSTUNBindingRequest() -> (request: [UInt8], transactionID: [UInt8]) {
+  let transactionID = (0..<12).map { _ in UInt8.random(in: 0...255) }
+  // Type 0x0001 (Binding Request), length 0, then the magic cookie 0x2112A442.
+  return ([0x00, 0x01, 0x00, 0x00, 0x21, 0x12, 0xA4, 0x42] + transactionID, transactionID)
+}
+
+/// Whether `datagram` is a STUN message answering the request that carried `transactionID`: a
+/// whole 20-byte header with the magic cookie and that transaction ID. Anything else (empty, too
+/// short, another cookie, another ID) is not addressed to this request.
+func isSTUNReply(_ datagram: ArraySlice<UInt8>, to transactionID: [UInt8]) -> Bool {
+  let bytes = Array(datagram)
+  return bytes.count >= 20 && bytes[4..<8] == [0x21, 0x12, 0xA4, 0x42]
+    && Array(bytes[8..<20]) == transactionID
+}
+
+/// One STUN Binding exchange on `fd`, a socket already bound by ``makeBoundSTUNSocket(family:interface:sourceIP:enableLogging:)``
+/// and not yet sent on: connect it to `server`, send the request with `send` (the system call by
+/// default), and parse the reply. Holds no thread: the exchange is a ``UDPExchange``.
+///
+/// A datagram that is not a STUN reply to this request (``isSTUNReply(_:to:)``) is ignored and the
+/// wait goes on to the same deadline, `timeout` seconds from now. One that does carry the
+/// transaction ID but is otherwise invalid fails the exchange with
+/// ``STUNError/invalidResponse(_:)``. A refusal or unreachable report ends it at once. `cutoff`,
+/// when given, is an instant on `monotonicNow()`'s clock that the exchange never runs past, its
+/// setup included.
+///
+/// Takes ownership of `fd` and closes it exactly once, whatever the outcome.
+///
+/// - Throws: ``STUNError``, or `CancellationError` when the calling task is cancelled.
 internal func stunExchange(
   fd: Int32,
   family: Int32,
@@ -248,84 +283,57 @@ internal func stunExchange(
   serverLen: socklen_t,
   serverLabel: String,
   timeout: TimeInterval,
+  cutoff: TimeInterval? = nil,
   send: TestSeams.SendDatagram? = nil
-) throws -> STUNPublicIP {
+) async throws -> STUNPublicIP {
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
+    close(fd)
     throw STUNError.invalidTimeout(timeout)
   }
-  var server = server
-
-  // Connect the datagram socket before sending. Besides simplifying I/O, this
-  // makes the kernel discard datagrams from peers other than the resolved STUN
-  // server, so an unrelated packet cannot win the response race.
-  let connectResult = withUnsafePointer(to: &server) { aptr in
-    aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
-      connect(fd, saptr, serverLen)
+  let (request, transactionID) = makeSTUNBindingRequest()
+  // Connected, so the kernel delivers only the server's datagrams to this socket.
+  let connectToServer: (Int32) throws -> Void = { fd in
+    var server = server
+    let connected = withUnsafePointer(to: &server) {
+      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, serverLen) }
+    }
+    guard connected == 0 else {
+      throw STUNError.connectFailed(errno: errno, details: "Failed to connect to \(serverLabel)")
     }
   }
-  guard connectResult == 0 else {
-    let error = errno
-    throw STUNError.connectFailed(
-      errno: error, details: "Failed to connect to \(serverLabel)")
+  let reply: UDPExchangeReply
+  do {
+    reply = try await UDPExchange.perform(
+      adopting: fd, request: request, timeout: timeout, cutoff: cutoff, receiveCapacity: 512,
+      accepts: { isSTUNReply($0, to: transactionID) },
+      send: send ?? { fd, bytes in Darwin.send(fd, bytes.baseAddress, bytes.count, 0) },
+      configure: connectToServer)
+  } catch let failure as UDPExchangeFailure {
+    throw STUNError(failure, serverLabel: serverLabel)
   }
-
-  // Set timeouts. A zero timeval disables SO_RCVTIMEO, so invalid values are
-  // rejected above and option failures are surfaced rather than ignored.
-  // A positive timeout that rounds down to zero microseconds must still be a timeout.
-  var tv = timeval(
-    tv_sec: Int(timeout), tv_usec: __darwin_suseconds_t((timeout - floor(timeout)) * 1_000_000))
-  if tv.tv_sec == 0, tv.tv_usec == 0 { tv.tv_usec = 1 }
-  let receiveTimeoutResult = withUnsafePointer(to: &tv) { p in
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
-  }
-  guard receiveTimeoutResult == 0 else {
-    let error = errno
-    throw STUNError.socketFailed(errno: error, details: "Failed to configure receive timeout")
-  }
-  let sendTimeoutResult = withUnsafePointer(to: &tv) { p in
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, p, socklen_t(MemoryLayout<timeval>.size))
-  }
-  guard sendTimeoutResult == 0 else {
-    let error = errno
-    throw STUNError.socketFailed(errno: error, details: "Failed to configure send timeout")
-  }
-
-  // Build STUN Binding Request (RFC 5389 §6).
-  var req = [UInt8](repeating: 0, count: 20)
-  // Type 0x0001 (Binding Request), Length 0x0000.
-  req[0] = 0x00
-  req[1] = 0x01
-  req[2] = 0x00
-  req[3] = 0x00
-  // Magic cookie 0x2112A442.
-  req[4] = 0x21
-  req[5] = 0x12
-  req[6] = 0xA4
-  req[7] = 0x42
-  // Transaction ID — 12 random bytes. We keep a copy because the IPv6
-  // XOR-MAPPED-ADDRESS parse needs them to un-XOR bytes 4..15 of the address.
-  var transactionID = [UInt8](repeating: 0, count: 12)
-  for i in 0..<12 {
-    transactionID[i] = UInt8.random(in: 0...255)
-    req[8 + i] = transactionID[i]
-  }
-
-  let sent = req.withUnsafeBytes { raw in
-    send?(fd, raw) ?? Darwin.send(fd, raw.baseAddress!, raw.count, 0)
-  }
-  if sent < 0 {
-    let error = errno
-    throw STUNError.sendFailed(
-      errno: error, details: "Failed to send STUN request to \(serverLabel)")
-  }
-
-  // The connected UDP socket accepts responses only from the selected server.
-  var buf = [UInt8](repeating: 0, count: 512)
-  let n = recv(fd, &buf, buf.count, 0)
-  if n <= 0 { throw STUNError.recvTimeout }
-
   return try parseSTUNBindingResponse(
-    Array(buf.prefix(Int(n))), transactionID: transactionID, expectedFamily: family)
+    reply.bytes, transactionID: transactionID, expectedFamily: family)
+}
+
+extension STUNError {
+  /// The STUN meaning of a transport failure in an exchange with `serverLabel`.
+  init(_ failure: UDPExchangeFailure, serverLabel: String) {
+    switch failure {
+    case .socketCreationFailed(let code):
+      self = .socketFailed(errno: code, details: nil)
+    case .nonBlockingFailed(let code):
+      self = .socketFailed(errno: code, details: "Failed to make the STUN socket non-blocking")
+    case .sendFailed(let code):
+      self = .sendFailed(
+        errno: code ?? 0, details: "Failed to send STUN request to \(serverLabel)")
+    case .refused:
+      self = .receiveFailed(errno: ECONNREFUSED, details: "\(serverLabel) refused the request")
+    case .unreachable(let code, _), .receiveFailed(let code):
+      self = .receiveFailed(errno: code, details: "No reply from \(serverLabel)")
+    case .timedOut:
+      self = .recvTimeout
+    }
+  }
 }
 
 /// Validates and parses a STUN Binding Success Response (RFC 5389).
@@ -429,7 +437,8 @@ internal func parseSTUNBindingResponse(
 }
 
 /// Queries a STUN server by hostname and port. The socket is bound before the name is resolved,
-/// so a failed bind sends nothing, the lookup included.
+/// so a failed bind sends nothing, the lookup included. The lookup is waited for as a sweep's is
+/// (``stunNameLookupLimit``).
 internal func stunGetPublicIP(
   family: Int32,
   host: String,
@@ -438,32 +447,27 @@ internal func stunGetPublicIP(
   interface: String? = nil,
   sourceIP: String? = nil,
   enableLogging: Bool = false
-) throws -> STUNPublicIP {
+) async throws -> STUNPublicIP {
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
     throw STUNError.invalidTimeout(timeout)
   }
-  let fd = try makeBoundSTUNSocket(
+  try Task.checkCancellation()
+  let socket = try BoundSTUNSocket(
     family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
-  defer { close(fd) }
-  guard let (server, serverLen) = resolveSTUNServer(host: host, port: port, family: family) else {
-    let error = errno
-    let famName = family == AF_INET6 ? "v6" : "v4"
-    throw STUNError.resolveFailed(
-      errno: error,
-      details: "Failed to resolve STUN server '\(host):\(port)' (\(famName))")
-  }
-  return try stunExchange(
-    fd: fd, family: family, server: server, serverLen: serverLen,
-    serverLabel: "\(host):\(port)", timeout: timeout)
+  return try await stunAttempt(
+    (host, port), socket: socket, family: family, timeout: timeout, deadline: nil,
+    resolve: TestSeams.resolveSTUNServer ?? resolveSTUNServer, send: TestSeams.sendSTUNRequest,
+    enableLogging: enableLogging
+  ).get()
 }
 
-/// Back-compat wrapper for v4-only callers. Same signature/behavior as before
-/// Stage 4; delegates to the family-parameterized `stunGetPublicIP`.
+/// Back-compat wrapper for v4-only callers; delegates to the family-parameterized
+/// `stunGetPublicIP`.
 func stunGetPublicIPv4(
   host: String = "stun.l.google.com", port: UInt16 = 19302, timeout: TimeInterval = 1.0,
   interface: String? = nil, sourceIP: String? = nil, enableLogging: Bool = false
-) throws -> STUNPublicIP {
-  return try stunGetPublicIP(
+) async throws -> STUNPublicIP {
+  try await stunGetPublicIP(
     family: AF_INET, host: host, port: port, timeout: timeout,
     interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
 }
@@ -472,40 +476,65 @@ func stunGetPublicIPv4(
 func stunGetPublicIPv6(
   host: String = "stun.cloudflare.com", port: UInt16 = 3478, timeout: TimeInterval = 1.0,
   interface: String? = nil, sourceIP: String? = nil, enableLogging: Bool = false
-) throws -> STUNPublicIP {
-  return try stunGetPublicIP(
+) async throws -> STUNPublicIP {
+  try await stunGetPublicIP(
     family: AF_INET6, host: host, port: port, timeout: timeout,
     interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
 }
 
-// MARK: - Multi-Server STUN Fallback
+// MARK: - Concurrent STUN sweep
 
-/// A STUN server whose name has been resolved for one address family.
-private struct STUNEndpoint: Sendable {
-  let host: String
-  let port: UInt16
-  let server: sockaddr_storage
-  let serverLen: socklen_t
-}
+/// The longest a STUN server's name lookup is waited for (on the deadline's clock) when the sweep
+/// has no deadline of its own, as in ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``: the forward-
+/// resolution budget a trace gets by default (docs/BLOCKING-IO.md, decision 7). A sweep with a
+/// deadline waits for the earlier of the two. The `getaddrinfo` itself runs on in its executor
+/// slot when the wait ends.
+let stunNameLookupLimit: TimeInterval = 20
 
-/// How long the executor waits for one STUN attempt with per-server `timeout`, counted from
-/// submission: twice `timeout`.
-///
-/// A running attempt is bounded by its socket's own send and receive timeouts, each `timeout`.
-/// This deadline is the backstop for both together, and it also bounds the wait for a free
-/// executor slot. A stalled attempt keeps its slot until its `recv` returns, but the sweep moves
-/// on at this deadline.
-func stunAttemptDeadline(_ timeout: TimeInterval) -> TimeInterval { 2 * timeout }
+/// The clock every public-IP discovery deadline is on, and the only two things done with one.
+/// A deadline is an absolute instant on `now`; `nil` is none. Every decision to send, submit or
+/// accept calls ``hasPassed(_:)`` immediately before it, and every blocking step calls it again
+/// as it returns; every wait for a deadline is ``sleep(until:)``.
+struct DiscoveryClock: Sendable {
+  /// `monotonicNow()`, which counts system sleep, or a test's.
+  let now: @Sendable () -> TimeInterval
+  /// The longest one wait lasts before reading `now` again.
+  let slice: TimeInterval
+  /// The continuous-clock wait itself, replaceable so a test can see where a wait was anchored.
+  var sleepUntil: @Sendable (ContinuousClock.Instant) async -> Void = {
+    try? await Task.sleep(until: $0, clock: .continuous)
+  }
 
-/// Seconds from now until `deadline`, an instant on `monotonicNow()`'s clock, and never less than
-/// zero; `nil` when there is no deadline.
-func secondsLeft(until deadline: TimeInterval?) -> TimeInterval? {
-  deadline.map { max($0 - monotonicNow(), 0) }
+  /// The clock for the calling task: `TestSeams.monotonicClock` when bound, with short waits a
+  /// moved test clock is noticed in, else `monotonicNow()`. Read in the task; capture it for any
+  /// queue or worker, which cannot see task-locals.
+  static var current: DiscoveryClock {
+    TestSeams.monotonicClock.map { DiscoveryClock(now: $0, slice: 0.01) }
+      ?? DiscoveryClock(now: monotonicNow, slice: 1e9)
+  }
+
+  /// Whether `deadline` has passed: always false for `nil`, always true for a value that is not a
+  /// number.
+  func hasPassed(_ deadline: TimeInterval?) -> Bool { deadline.map { !(now() < $0) } ?? false }
+
+  /// Suspends until `deadline` has passed, or the task is cancelled. Each wait is anchored on the
+  /// continuous clock before `now` is read, so time that passes between the two (a system sleep
+  /// included) shortens the wait rather than lengthening it; `now` is read again on every wake.
+  func sleep(until deadline: TimeInterval) async {
+    while !Task.isCancelled {
+      let anchor = ContinuousClock.now
+      let left = deadline - now()
+      guard left > 0 else { return }
+      await sleepUntil(anchor + .seconds(min(left, slice, 1e9)))
+    }
+  }
 }
 
 /// The endpoint for a numeric `host` of `family`, built without the resolver, or `nil` when
 /// `host` is not such a literal.
-private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> STUNEndpoint? {
+private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> (
+  server: sockaddr_storage, serverLen: socklen_t
+)? {
   var storage = sockaddr_storage()
   let length: socklen_t
   if family == AF_INET6 {
@@ -529,161 +558,240 @@ private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> S
     }
     length = socklen_t(MemoryLayout<sockaddr_in>.size)
   }
-  return STUNEndpoint(host: host, port: port, server: storage, serverLen: length)
+  return (storage, length)
 }
 
-/// Resolves every server in `servers` for `family` at once, each name as its own executor
-/// request, and returns the endpoints in list order once every lookup has ended, `nil` where
-/// resolution failed. A numeric address needs no resolver and no executor slot.
-///
-/// Each lookup is abandoned at `deadline`, an instant on `monotonicNow()`'s clock, and counts as
-/// failed; its `getaddrinfo` runs on in its executor slot. With no deadline a lookup is waited for
-/// as long as it takes, but cancelling the calling task still ends the wait at once.
+/// `server`'s name resolved for `family` on the executor, or `nil` when the lookup failed or its
+/// wait ended first. With no time left before `deadline`, nothing is submitted.
 ///
 /// - Throws: `CancellationError` when the calling task is cancelled.
-private func resolveSTUNEndpoints(
-  _ servers: [(host: String, port: UInt16)], family: Int32, deadline: TimeInterval?
-) async throws -> [STUNEndpoint?] {
-  try await withThrowingTaskGroup(of: (Int, STUNEndpoint?).self) { group in
-    for (index, server) in servers.enumerated() {
-      group.addTask {
-        if let literal = literalSTUNEndpoint(host: server.host, port: server.port, family: family) {
-          return (index, literal)
-        }
-        let resolve = TestSeams.resolveSTUNServer ?? resolveSTUNServer
-        do {
-          let resolved = try await runDetachedBlockingIO(deadline: secondsLeft(until: deadline)) {
-            resolve(server.host, server.port, family).map {
-              STUNEndpoint(
-                host: server.host, port: server.port, server: $0.server, serverLen: $0.serverLen)
-            }
-          }
-          return (index, resolved)
-        } catch is BlockingIOTimeout {
-          return (index, nil)
-        }
+func lookUpSTUNServer(
+  _ server: (host: String, port: UInt16), family: Int32, deadline: TimeInterval?,
+  resolve: @escaping TestSeams.ResolveSTUNServer
+) async throws -> (server: sockaddr_storage, serverLen: socklen_t)? {
+  let clock = DiscoveryClock.current
+  let limit = min(
+    deadline ?? .infinity, clock.now() + (TestSeams.stunNameLookupLimit ?? stunNameLookupLimit))
+  // No time left: nothing is submitted, so no lookup starts after the deadline.
+  guard !clock.hasPassed(limit) else { return nil }
+  typealias Endpoint = (server: sockaddr_storage, serverLen: socklen_t)
+  // The wait ends at `limit` on the deadline's own clock, raced here rather than handed to the
+  // executor, whose timer is on Dispatch's uptime clock and stands still while the Mac sleeps.
+  let found = try await withThrowingTaskGroup(of: Endpoint?.self) { group -> Endpoint? in
+    group.addTask {
+      try await runDetachedBlockingIO {
+        guard !clock.hasPassed(limit) else { return nil }
+        let endpoint = resolve(server.host, server.port, family)
+        // A lookup that returns after its limit is not used, whichever side of the race wins.
+        return clock.hasPassed(limit) ? nil : endpoint
       }
     }
-    var endpoints = [STUNEndpoint?](repeating: nil, count: servers.count)
-    for try await (index, endpoint) in group { endpoints[index] = endpoint }
-    return endpoints
+    group.addTask {
+      await clock.sleep(until: limit)
+      return nil
+    }
+    // The first to finish decides; the other is cancelled, which withdraws a queued lookup.
+    defer { group.cancelAll() }
+    return try await group.next() ?? nil
+  }
+  try Task.checkCancellation()
+  return found
+}
+
+/// One server's attempt in a sweep: its name resolved (a numeric address needs no lookup), then
+/// one exchange from `socket`. Never throws; the outcome is returned.
+///
+/// The wait on the lookup ends at the earlier of `deadline` and ``stunNameLookupLimit``, and at
+/// once when the calling task is cancelled; `getaddrinfo` runs on in its executor slot. The
+/// exchange ends at the earlier of `timeout` and `deadline`, and an attempt with no time left
+/// sends nothing.
+private func stunAttempt(
+  _ server: (host: String, port: UInt16),
+  socket: BoundSTUNSocket,
+  family: Int32,
+  timeout: TimeInterval,
+  deadline: TimeInterval?,
+  resolve: @escaping TestSeams.ResolveSTUNServer,
+  send: TestSeams.SendDatagram?,
+  enableLogging: Bool
+) async -> Result<STUNPublicIP, Error> {
+  let label = "\(server.host):\(server.port)"
+  let famName = family == AF_INET6 ? "v6" : "v4"
+  do {
+    try Task.checkCancellation()
+    let endpoint: (server: sockaddr_storage, serverLen: socklen_t)
+    if let literal = literalSTUNEndpoint(host: server.host, port: server.port, family: family) {
+      endpoint = literal
+    } else {
+      let resolved = try await lookUpSTUNServer(
+        server, family: family, deadline: deadline, resolve: resolve)
+      guard let resolved else {
+        throw STUNError.resolveFailed(
+          errno: 0, details: "Failed to resolve STUN server '\(label)' (\(famName))")
+      }
+      endpoint = resolved
+    }
+    if enableLogging { print("[STUN] Trying \(label) (\(famName))...") }
+    // The deadline goes to the exchange as an instant, so its setup cannot push it later.
+    guard !DiscoveryClock.current.hasPassed(deadline), let fd = socket.take() else {
+      throw STUNError.recvTimeout
+    }
+    let found = try await stunExchange(
+      fd: fd, family: family, server: endpoint.server, serverLen: endpoint.serverLen,
+      serverLabel: label, timeout: timeout, cutoff: deadline, send: send)
+    if enableLogging { print("[STUN] Success from \(label) (\(famName)) -> \(found.ip)") }
+    return .success(found)
+  } catch {
+    if enableLogging { print("[STUN] Failed \(label) (\(famName)): \(error)") }
+    return .failure(error)
   }
 }
 
-/// Attempts to discover the public IP of a given family by trying multiple STUN servers in
-/// sequence, after resolving all their names at once. Falls back through the server list until
-/// one succeeds.
+/// Waits for a permit from `admission`, giving up at `deadline` (an instant on `monotonicNow()`'s
+/// clock; `nil` waits for as long as it takes). A permit taken is the caller's to signal.
+///
+/// - Throws: ``STUNError/recvTimeout`` when the deadline passes first, `CancellationError` when
+///   the calling task is cancelled. Neither leaves a permit taken.
+private func admitSweep(
+  _ admission: _ConcurrencySemaphore, deadline: TimeInterval?, clock: DiscoveryClock
+) async throws {
+  guard let deadline else { return try await admission.wait() }
+  enum Event { case admitted, gaveUp, deadline }
+  let first = await withTaskGroup(of: Event.self) { group -> Event in
+    group.addTask {
+      do {
+        try await admission.wait()
+        return .admitted
+      } catch {
+        return .gaveUp
+      }
+    }
+    group.addTask {
+      await clock.sleep(until: deadline)
+      return .deadline
+    }
+    let first = await group.next() ?? .deadline
+    group.cancelAll()
+    // A permit the waiter took after the other child finished first is given back.
+    for await other in group where other == .admitted && first != .admitted {
+      await admission.signal()
+    }
+    return first
+  }
+  if first == .admitted, !Task.isCancelled { return }
+  if first == .admitted { await admission.signal() }
+  try Task.checkCancellation()
+  throw STUNError.recvTimeout
+}
+
+/// Discovers the public IP of `family` by asking every STUN server at the same time.
 ///
 /// One socket per server is created and bound to `interface` and `sourceIP` first, before any
 /// name is resolved. If a bind fails the sweep throws that failure at once, having sent nothing
 /// and looked up no name. The lookups use the system resolver, which is not bound.
 ///
-/// Each attempt is a blocking exchange submitted to the executor on its own, under
-/// ``stunAttemptDeadline(_:)``, so the sweep waits on no thread, and cancelling the calling task
-/// ends it at once.
+/// Then each server's attempt starts at once and sends as soon as its name has resolved, holding
+/// no thread while it waits for the reply. The first valid reply from any server is the answer
+/// (David, 2026-11-24): it ends the sweep at once, and every other attempt is cancelled, its
+/// socket closed. With no answer, the sweep ends when every attempt has failed, which is by
+/// `deadline` at the latest, with no timer of its own. Cancelling the calling task ends it at
+/// once.
 ///
-/// `deadline`, an instant on `monotonicNow()`'s clock, bounds the whole sweep: name lookups and
-/// every attempt are abandoned when it passes, and no attempt starts after it. `nil` leaves only
-/// the per-server bound.
+/// Sweeps are admitted one per executor worker before they open sockets, so at most that many
+/// sweeps hold `servers.count` sockets each.
 ///
 /// - Parameters:
 ///   - family: `AF_INET` for v4 or `AF_INET6` for v6.
-///   - timeout: Timeout per server attempt (default 1.0s)
+///   - timeout: Timeout for each server's exchange (default 1.0s), counted from its send.
 ///   - interface: Network interface to bind to (optional)
 ///   - sourceIP: Source IP address to bind to (optional)
 ///   - enableLogging: Enable debug logging
-///   - deadline: When the whole sweep gives up, or `nil`
-/// - Returns: Public IP if any server responds
-/// - Throws: The last attempt's error if all servers fail (`STUNError.recvTimeout` for an attempt
-///   that outlived its deadline), or `CancellationError`.
+///   - deadline: When the whole sweep gives up, an instant on `monotonicNow()`'s clock, or `nil`
+///     to leave each attempt only its own bounds.
+///   - requirePublic: Whether only a globally routable address of `family` can be the answer, as a
+///     trace requires; another fails its server alone. `getPublicIPs` takes the first as given.
+/// - Returns: The first public IP a server reported.
+/// - Throws: The last server's error in list order when none answered, whatever order they
+///   failed in; ``STUNError/recvTimeout`` when the deadline passed before the sweep could start;
+///   or `CancellationError`.
 internal func stunGetPublicIPWithFallback(
   family: Int32,
   timeout: TimeInterval = 1.0,
   interface: String? = nil,
   sourceIP: String? = nil,
   enableLogging: Bool = false,
-  deadline: TimeInterval? = nil
+  deadline: TimeInterval? = nil,
+  requirePublic: Bool = false
 ) async throws -> STUNPublicIP {
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
     throw STUNError.invalidTimeout(timeout)
   }
 
   let servers = TestSeams.stunServers?(family) ?? stunServers
-  var lastError: Error = STUNError.recvTimeout
   let famName = family == AF_INET6 ? "v6" : "v4"
 
   // Admitted first, one sweep per executor worker, so a sweep waiting its turn holds no socket;
-  // the wait ends with the caller's cancellation (a discovery's deadline cancels it too).
+  // the wait ends at the deadline or with the caller's cancellation.
   try Task.checkCancellation()
+  let clock = DiscoveryClock.current
+  if clock.hasPassed(deadline) { throw STUNError.recvTimeout }
   let admission = (TestSeams.blockingIOExecutor ?? blockingIOExecutor).stunSweepAdmission
-  try await admission.wait()
+  try await admitSweep(admission, deadline: deadline, clock: clock)
   defer { Task { await admission.signal() } }
   // Bound first: nothing is resolved or sent unless every socket could be bound.
   let sockets = try servers.map { _ in
     try BoundSTUNSocket(
       family: family, interface: interface, sourceIP: sourceIP, enableLogging: enableLogging)
   }
-  // On the way out, close what no running attempt took, so an attempt abandoned in the queue
-  // holds no socket while it waits for a worker to discard it.
+  // On the way out, close what no attempt took.
   defer { for socket in sockets { socket.take().map { _ = close($0) } } }
-  if let left = secondsLeft(until: deadline), left <= 0 { throw STUNError.recvTimeout }
+  if clock.hasPassed(deadline) { throw STUNError.recvTimeout }
+  // Read on the async side, where the task-local seams are visible.
   let send = TestSeams.sendSTUNRequest
+  let resolve = TestSeams.resolveSTUNServer ?? resolveSTUNServer
+  let observeOutcome = TestSeams.observeSTUNOutcome
 
   if enableLogging {
-    print("[STUN] Resolving \(servers.count) servers concurrently (\(famName))...")
+    print("[STUN] Asking \(servers.count) servers at once (\(famName))...")
   }
-  let endpoints = try await resolveSTUNEndpoints(servers, family: family, deadline: deadline)
-
-  for (index, resolved) in endpoints.enumerated() {
-    try Task.checkCancellation()
-    var attemptDeadline = stunAttemptDeadline(timeout)
-    if let left = secondsLeft(until: deadline) {
-      guard left > 0 else {
-        if enableLogging { print("[STUN] Discovery deadline passed (\(famName))") }
-        lastError = STUNError.recvTimeout
-        break
-      }
-      attemptDeadline = min(attemptDeadline, left)
+  // For a trace, only a public address of the family asked can be the answer (the check the
+  // tracer applies to every source); any other fails that server alone.
+  let usable: (STUNPublicIP) -> Result<STUNPublicIP, Error> = { found in
+    let ipFamily: IPAddressFamily = family == AF_INET6 ? .v6 : .v4
+    let observation = PublicIPObservation(address: found.ip, family: ipFamily, source: .stun)
+    guard requirePublic, validatedPublicIP(observation, for: ipFamily) == nil else {
+      return .success(found)
     }
-    guard let endpoint = resolved else {
-      let (host, port) = servers[index]
-      if enableLogging {
-        print("[STUN] Resolution failed for \(host):\(port) (\(famName))")
-      }
-      lastError = STUNError.resolveFailed(
-        errno: 0,
-        details: "Failed to resolve STUN server '\(host):\(port)' (\(famName))")
-      continue
-    }
-
-    let label = "\(endpoint.host):\(endpoint.port)"
-    if enableLogging {
-      print("[STUN] Trying \(label) (\(famName))...")
-    }
-    do {
+    return .failure(STUNError.invalidResponse("mapped address is not a public \(ipFamily) address"))
+  }
+  var failures = [Error?](repeating: nil, count: servers.count)
+  let first = await withTaskGroup(of: (Int, Result<STUNPublicIP, Error>).self) {
+    group -> STUNPublicIP? in
+    for (index, server) in servers.enumerated() {
       let socket = sockets[index]
-      let result = try await runDetachedBlockingIO(deadline: attemptDeadline) {
-        guard let fd = socket.take() else { throw STUNError.recvTimeout }
-        defer { close(fd) }
-        return try stunExchange(
-          fd: fd, family: family, server: endpoint.server, serverLen: endpoint.serverLen,
-          serverLabel: label, timeout: timeout, send: send)
+      group.addTask {
+        let outcome = await stunAttempt(
+          server, socket: socket, family: family, timeout: timeout, deadline: deadline,
+          resolve: resolve, send: send, enableLogging: enableLogging)
+        return (index, outcome)
       }
-      if enableLogging {
-        print("[STUN] Success from \(label) (\(famName)) -> \(result.ip)")
-      }
-      return result
-    } catch is CancellationError {
-      throw CancellationError()
-    } catch {
-      if enableLogging {
-        print("[STUN] Failed \(label) (\(famName)): \(error)")
-      }
-      lastError = error is BlockingIOTimeout ? STUNError.recvTimeout : error
     }
+    for await (index, outcome) in group {
+      switch outcome.flatMap({ usable($0) }) {
+      case .success(let found):
+        // The first usable answer is decisive: the other attempts are cancelled, not consulted.
+        group.cancelAll()
+        return found
+      case .failure(let error):
+        failures[index] = error
+        observeOutcome?(index)
+      }
+    }
+    return nil
   }
-
-  throw lastError
+  try Task.checkCancellation()
+  if let first { return first }
+  throw failures.last(where: { $0 != nil }).flatMap { $0 } ?? STUNError.recvTimeout
 }
 
 // MARK: - Unified Public IP Discovery
@@ -741,13 +849,13 @@ func publicIPDiscoveryOutcome<Found>(
 /// "this network is v6-only" cases.
 ///
 /// Each family asks the library's own resolver, the one a classified trace uses by default: STUN
-/// only, every socket bound before anything is sent. Unlike a trace's question, there is no
-/// overall deadline and the address is reported as the STUN server gave it, whether or not it is
-/// globally routable.
+/// only, every socket bound before anything is sent, every server asked at once, and the first
+/// address any server reports is the family's answer. Unlike a trace's question, there is no overall deadline and the address is reported as the STUN servers
+/// gave it, whether or not it is globally routable.
 ///
 /// The two sweeps are child tasks of the caller's. Cancelling the calling task ends both at once,
-/// and the call returns what had been found by then. Each server attempt is bounded by
-/// `stunTimeout`; resolving the server names has no deadline of its own.
+/// and the call returns what had been found by then. Each server's exchange is bounded by
+/// `stunTimeout`, and the wait on each server's name lookup by 20 s.
 ///
 /// - Parameters:
 ///   - stunTimeout: Per-server timeout (default 0.8s).
@@ -781,7 +889,7 @@ private func stunSweepAddress(
   do {
     return try await publicIPDiscovery(
       family: family == AF_INET6 ? .v6 : .v4, stunTimeout: timeout, interface: interface,
-      sourceIP: sourceIP, enableLogging: enableLogging, budget: .infinity
+      sourceIP: sourceIP, enableLogging: enableLogging, budget: .infinity, requirePublic: false
     )?.address
   } catch {
     if enableLogging {

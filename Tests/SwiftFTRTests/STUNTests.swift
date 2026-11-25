@@ -211,9 +211,9 @@ struct STUNTests {
   }
 
   @Test("STUN rejects invalid timeouts before network I/O", arguments: [0.0, -1.0, .infinity])
-  func testInvalidTimeout(timeout: TimeInterval) {
-    #expect {
-      try stunGetPublicIP(
+  func testInvalidTimeout(timeout: TimeInterval) async {
+    await #expect {
+      try await stunGetPublicIP(
         family: AF_INET, host: "unused.invalid", port: 3478, timeout: timeout)
     } throws: { error in
       guard case STUNError.invalidTimeout = error else { return false }
@@ -273,10 +273,10 @@ struct STUNTests {
     "STUN call to Google STUN server",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS"))
   )
-  func testSTUNRealCall() throws {
+  func testSTUNRealCall() async throws {
     // Test actual STUN call to Google's public STUN server
     // This exercises the full network code path
-    let result = try stunGetPublicIPv4(
+    let result = try await stunGetPublicIPv4(
       host: "stun.l.google.com",
       port: 19302,
       timeout: 2.0
@@ -296,12 +296,12 @@ struct STUNTests {
     "STUN timeout on invalid server",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS"))
   )
-  func testSTUNTimeout() throws {
+  func testSTUNTimeout() async throws {
     // Use a valid IP that won't respond to STUN (reserved documentation IP)
-    #expect(
+    await #expect(
       throws: STUNError.self,
       performing: {
-        _ = try stunGetPublicIPv4(
+        _ = try await stunGetPublicIPv4(
           host: "192.0.2.1",  // Reserved TEST-NET-1
           port: 19302,
           timeout: 0.5  // Short timeout
@@ -313,12 +313,12 @@ struct STUNTests {
     "STUN with invalid hostname",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS"))
   )
-  func testSTUNInvalidHostname() throws {
+  func testSTUNInvalidHostname() async throws {
     // Non-existent hostname should fail to resolve
-    #expect(
+    await #expect(
       throws: STUNError.self,
       performing: {
-        _ = try stunGetPublicIPv4(
+        _ = try await stunGetPublicIPv4(
           host: "this-host-definitely-does-not-exist-12345.invalid",
           port: 19302,
           timeout: 1.0
@@ -330,9 +330,9 @@ struct STUNTests {
     "STUN with logging enabled",
     .enabled(if: !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS"))
   )
-  func testSTUNWithLogging() throws {
+  func testSTUNWithLogging() async throws {
     // Test that logging parameter doesn't break anything
-    let result = try stunGetPublicIPv4(
+    let result = try await stunGetPublicIPv4(
       host: "stun.l.google.com",
       port: 19302,
       timeout: 2.0,
@@ -436,8 +436,8 @@ struct STUNTests {
       if: ProcessInfo.processInfo.environment["PTR_SKIP_STUN"] == nil
         && !ProcessInfo.processInfo.environment.keys.contains("SKIP_NETWORK_TESTS")
         && IPv6Reachability.isAvailable()))
-  func testSTUNv6Cloudflare() throws {
-    let result = try stunGetPublicIPv6(host: "stun.cloudflare.com", port: 3478, timeout: 2.0)
+  func testSTUNv6Cloudflare() async throws {
+    let result = try await stunGetPublicIPv6(host: "stun.cloudflare.com", port: 3478, timeout: 2.0)
     #expect(result.family == AF_INET6, "v6 STUN should return AF_INET6")
     #expect(result.ip.contains(":"), "v6 address should contain colons (\(result.ip))")
     // Sanity: v6 should not be link-local or loopback.
