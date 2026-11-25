@@ -79,6 +79,10 @@ actor RDNSCache {
   private var stalledInStreak: Set<String> = []
   /// When each held-off address timed out. Bounded by `maxSize`, oldest inserted evicted first.
   private var holdoffs: [String: ContinuousClock.Instant] = [:]
+  /// When the resolver last responded (an answer or "no such record") about each address, so a
+  /// timeout for a question asked before then is recognised as contradicted. Bounded like
+  /// `holdoffs`.
+  private var lastResponse: [String: ContinuousClock.Instant] = [:]
   private let now: @Sendable () -> ContinuousClock.Instant
 
   /// Initialize a new rDNS cache.
@@ -156,14 +160,27 @@ actor RDNSCache {
     // reset the breaker on the new network. A multicast question is no evidence about the
     // resolver either way, but an unanswered one is held off like any other.
     if lookupBreakerGeneration == breakerGeneration {
-      if outcome == .timedOut {
+      // A timeout for a question asked before the resolver last responded about this address
+      // (another lookup of it, in flight at the same time) is contradicted: the resolver did
+      // respond, so it neither holds the address off nor counts as a stall.
+      let contradicted =
+        outcome == .timedOut && lastResponse[ip].map { $0 >= now } == true
+      switch outcome {
+      case .timedOut where !contradicted:
         holdOff(ip, since: self.now())
+      case .answer, .noSuchRecord:
+        // A response ends any holdoff a concurrent lookup's timeout set, and contradicts a
+        // timeout still to come for a question asked before it.
+        holdoffs.removeValue(forKey: ip)
+        recordResponse(ip, at: self.now())
+      default:
+        break
       }
       if !isMulticast {
         switch outcome {
         case .timedOut:
           // Asked and unanswered: the resolver is stalled. Once per address per run of stalls.
-          if stalledInStreak.insert(ip).inserted { consecutiveStalls += 1 }
+          if !contradicted, stalledInStreak.insert(ip).inserted { consecutiveStalls += 1 }
         case .answer, .noSuchRecord:
           // The resolver answered.
           resetStalls()
@@ -220,6 +237,7 @@ actor RDNSCache {
     breakerGeneration &+= 1
     cache.removeAll()
     holdoffs.removeAll()
+    lastResponse.removeAll()
     resetStalls()
   }
 
@@ -235,15 +253,26 @@ actor RDNSCache {
     breakerGeneration &+= 1
     cache = cache.filter { ip, _ in ipAddressScope(of: ip) == .global }
     holdoffs.removeAll()
+    lastResponse.removeAll()
     resetStalls()
   }
 
   /// Addresses currently held off, expired or not, for tests.
   var holdoffCount: Int { holdoffs.count }
 
+  /// Addresses with a recorded response, for tests.
+  var responseRecordCount: Int { lastResponse.count }
+
   private func resetStalls() {
     consecutiveStalls = 0
     stalledInStreak.removeAll()
+  }
+
+  private func recordResponse(_ ip: String, at instant: ContinuousClock.Instant) {
+    lastResponse[ip] = instant
+    if lastResponse.count > maxSize, let oldest = lastResponse.min(by: { $0.value < $1.value }) {
+      lastResponse.removeValue(forKey: oldest.key)
+    }
   }
 
   private func holdOff(_ ip: String, since: ContinuousClock.Instant) {

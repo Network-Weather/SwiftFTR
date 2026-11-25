@@ -211,6 +211,17 @@ struct RDNSHoldoffTests {
     #expect(await cache.holdoffCount == 2)
   }
 
+  @Test("The record of responses is bounded by the cache size")
+  func responseRecordBounded() async {
+    let clock = TestClock()
+    let cache = Self.cache(Daemon { _ in .noSuchRecord }, clock: clock, maxSize: 2)
+    for octet in 1...5 {
+      _ = await cache.lookup("192.0.2.\(octet)")
+      clock.advance(.seconds(1))
+    }
+    #expect(await cache.responseRecordCount == 2)
+  }
+
   @Test("One address counts once per run of stalls, however many lookups of it time out together")
   func oneAddressCountsOncePerStreak() async throws {
     let flows = 5

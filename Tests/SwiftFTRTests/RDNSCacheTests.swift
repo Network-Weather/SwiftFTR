@@ -272,8 +272,10 @@ struct RDNSCacheTests {
     // is the destination, or one address at two TTLs. Its PTR query times out. The public address, which is no hop,
     // fails with an outcome that neither counts toward the breaker nor resets it, so the count
     // after the call is exactly the stalls the hop address caused. Each ask of the hop is one
-    // more lookup budget spent.
-    let rdns = RDNSCache { address, _ in
+    // more lookup budget spent. A size of zero keeps no holdoff (nor any answer), so a second ask
+    // of the hop reaches the resolver and is counted here rather than hidden by the holdoff its
+    // first timeout would set; stalls are still counted.
+    let rdns = RDNSCache(maxSize: 0) { address, _ in
       log.record(address)
       return address == publicIP
         ? .error(.daemon(DNSServiceStatus.serviceNotRunning)) : .timedOut
