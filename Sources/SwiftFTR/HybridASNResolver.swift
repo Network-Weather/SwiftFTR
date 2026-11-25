@@ -21,6 +21,12 @@ public struct HybridASNResolver: ASNResolver, Sendable {
     self.fallbackTimeout = fallbackTimeout
   }
 
+  init(local: LocalASNResolver, dns: CachingASNResolver, fallbackTimeout: TimeInterval) {
+    self.localResolver = local
+    self.dnsResolver = dns
+    self.fallbackTimeout = fallbackTimeout
+  }
+
   /// Preload the local database for faster first lookups.
   public func preload() async {
     await localResolver.preload()

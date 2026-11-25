@@ -162,7 +162,11 @@ actor LocalASNDatabaseStore {
   /// Number of loads this store has started. Tests read it to prove that resolvers share.
   private(set) var loadCount = 0
 
-  init() {}
+  typealias Loader = @Sendable (LocalASNSource) async throws -> UltraCompactDatabase
+  private let loader: Loader
+  init(loader: @escaping Loader = { try await LocalASNDatabaseStore.load($0) }) {
+    self.loader = loader
+  }
 
   /// Returns the shared handle for `source`, loading it if no live resolver already holds one.
   func handle(for source: LocalASNSource) async throws -> LocalASNDatabaseHandle {
@@ -175,8 +179,9 @@ actor LocalASNDatabaseStore {
     }
 
     loadCount += 1
+    let loader = self.loader
     let task = Task<LocalASNDatabaseHandle, any Error> {
-      LocalASNDatabaseHandle(try await Self.load(source))
+      LocalASNDatabaseHandle(try await loader(source))
     }
     inFlight[key] = task
     defer { inFlight[key] = nil }
@@ -195,7 +200,7 @@ actor LocalASNDatabaseStore {
   #if compiler(>=6.2)
     @concurrent
   #endif
-  private static func load(_ source: LocalASNSource) async throws -> UltraCompactDatabase {
+  static func load(_ source: LocalASNSource) async throws -> UltraCompactDatabase {
     switch source {
     case .embedded:
       return try EmbeddedDatabase.loadUltraCompact()
