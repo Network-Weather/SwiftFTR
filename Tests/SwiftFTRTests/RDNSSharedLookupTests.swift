@@ -143,6 +143,27 @@ struct RDNSSharedLookupTests {
     #expect(await cache.inFlightCount == 0)
   }
 
+  @Test(
+    "An answer from before a reset reaches neither the lookup that asked nor the cache",
+    arguments: Reset.allCases)
+  func answerFromBeforeReset(reset: Reset) async throws {
+    let resolver = GatedResolver { _ in .answer("router.old") }
+    defer { resolver.openAll() }
+    let cache = RDNSCache { address, _ in await resolver.resolve(address) }
+
+    let old = Task { await cache.lookup("192.168.1.1") }
+    #expect(await Self.awaiting(cache, 1))
+    switch reset {
+    case .clear: await cache.clear()
+    case .invalidateNetworkScoped: await cache.invalidateNetworkScoped()
+    }
+    resolver.open(1)
+    let hostname = try await measure(within: Self.watchdog) { await old.value }.0
+    #expect(hostname == nil, "an answer from the old network reached its caller")
+    #expect(await eventually(within: Self.watchdog) { await cache.inFlightCount == 0 })
+    #expect(await cache.count == 0, "an answer from the old network was cached")
+  }
+
   @Test("A shared query takes one permit from the limiter, however many lookups wait on it")
   func onePermitPerQuery() async throws {
     let limiter = _ConcurrencySemaphore(maxConcurrent: 1)
