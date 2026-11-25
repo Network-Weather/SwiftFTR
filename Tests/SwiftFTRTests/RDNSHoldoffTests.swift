@@ -389,4 +389,45 @@ struct RDNSHoldoffTests {
     _ = await cache.lookup(address)
     #expect(calls.value == 3, "the address was not asked again after its response")
   }
+
+  @Test(
+    "A response whose own caller cancelled still ends the holdoff a concurrent timeout would set")
+  func responseToCancelledCallerStillCounts() async throws {
+    let timeoutGate = StallGate()
+    let responseGate = StallGate()
+    defer {
+      timeoutGate.open()
+      responseGate.open()
+    }
+    let calls = FaultCounter()
+    // Each ask ignores cancellation, as a resolver that has already been answered does.
+    let cache = RDNSCache(ttl: 0) { _, _ in
+      calls.increment()
+      switch calls.value {
+      case 1:
+        await timeoutGate.waitAsync(limit: 2 * Self.watchdog)
+        return .timedOut
+      case 2:
+        await responseGate.waitAsync(limit: 2 * Self.watchdog)
+        return .answer("router.example")
+      default:
+        return .answer("router.example")
+      }
+    }
+    let timingOut = Task { await cache.lookup("192.0.2.1") }
+    #expect(await eventually(within: Self.watchdog) { calls.value == 1 })
+    let responding = Task { await cache.lookup("192.0.2.1") }
+    #expect(await eventually(within: Self.watchdog) { calls.value == 2 })
+    responding.cancel()
+    responseGate.open()
+    let answered = try await measure(within: Self.watchdog) { await responding.value }.0
+    #expect(answered == nil, "a cancelled caller was handed a hostname")
+    timeoutGate.open()
+    _ = try await measure(within: Self.watchdog) { await timingOut.value }
+
+    #expect(
+      await cache.holdoffCount == 0, "a timeout the resolver contradicted held the address off")
+    _ = await cache.lookup("192.0.2.1")
+    #expect(calls.value == 3)
+  }
 }
