@@ -155,7 +155,7 @@ struct RDNSHoldoffTests {
     let cache = RDNSCache { _, _ in
       asked.increment()
       guard asked.value == 1 else { return .timedOut }
-      // The first ask waits until its caller cancels, then reports a timeout anyway.
+      // The first ask waits until its query is cancelled, then reports a timeout anyway.
       try? await Task.sleep(nanoseconds: 120_000_000_000)
       return .timedOut
     }
@@ -165,7 +165,10 @@ struct RDNSHoldoffTests {
       lookup.cancel()
       return await lookup.value
     }
+    // The abandoned query has ended, and its timeout was handled, once it is no longer tracked.
+    #expect(await eventually(within: Self.watchdog) { await cache.inFlightCount == 0 })
     #expect(await cache.holdoffCount == 0)
+    #expect(await cache.stallCount == 0)
     _ = await cache.lookup("192.0.2.1")
     #expect(asked.value == 2, "a cancelled lookup held the address off")
   }
@@ -212,40 +215,23 @@ struct RDNSHoldoffTests {
     #expect(await cache.holdoffCount == 2)
   }
 
-  @Test("The record of responses is bounded by the cache size")
-  func responseRecordBounded() async {
+  @Test("One address counts once per run of stalls when asked again after its holdoff ends")
+  func oneAddressCountsOncePerStreak() async {
+    // Concurrent lookups of one address share one query and so one outcome; what this rule still
+    // covers is the same address asked again in the same run of stalls once its holdoff has
+    // ended (or been evicted), with nothing answered in between.
     let clock = TestClock()
-    let cache = Self.cache(Daemon { _ in .noSuchRecord }, clock: clock, maxSize: 2)
-    for octet in 1...5 {
-      _ = await cache.lookup("192.0.2.\(octet)")
-      clock.advance(.seconds(1))
-    }
-    #expect(await cache.responseRecordCount == 2)
-  }
+    let daemon = Daemon { _ in .timedOut }
+    let cache = Self.cache(daemon, clock: clock)
 
-  @Test("One address counts once per run of stalls, however many lookups of it time out together")
-  func oneAddressCountsOncePerStreak() async throws {
-    let flows = 5
-    let allIn = StallGate()
-    defer { allIn.open() }
-    let entered = FaultCounter()
-    let cache = RDNSCache { _, _ in
-      entered.increment()
-      if entered.value >= flows { allIn.open() }
-      await allIn.waitAsync(limit: 2 * Self.watchdog)
-      return .timedOut
-    }
-    // Five flows of one multipath batch asking about the same hop at once.
-    _ = try await measure(within: Self.watchdog) {
-      await withTaskGroup(of: Void.self) { group in
-        for _ in 0..<flows { group.addTask { _ = await cache.lookup("192.0.2.1") } }
-      }
-    }
-    #expect(entered.value == flows)
+    _ = await cache.lookup("192.0.2.1")
+    clock.advance(RDNSCache.stalledAddressHoldoff)
+    _ = await cache.lookup("192.0.2.1")
+    #expect(daemon.asks("192.0.2.1") == 2)
     let stalls = await cache.stallCount
     #expect(stalls == 1, "one address counted \(stalls) stalls")
     let suppressing = await cache.isSuppressingLookups
-    #expect(!suppressing, "one hop opened the breaker by itself")
+    #expect(!suppressing, "one address opened the breaker by itself")
 
     // A second address that stalls is still the second stall.
     _ = await cache.lookup("192.0.2.2")
@@ -321,113 +307,5 @@ struct RDNSHoldoffTests {
       _ = await cache.lookup("203.0.113.1")
       #expect(daemon.asks("203.0.113.1") == 0)
     }
-  }
-
-  /// Two lookups of one address in flight together: the first ask times out, the second gets
-  /// `response`. `responseFirst` says which of the two the cache handles first.
-  static let raceCases: [(String, ReverseDNSLookupOutcome, Bool)] = [
-    ("192.0.2.1", .answer("router.example"), false),
-    ("192.0.2.1", .answer("router.example"), true),
-    ("192.0.2.1", .noSuchRecord, false),
-    ("192.0.2.1", .noSuchRecord, true),
-    ("fe80::1%lo0", .answer("peer.local"), false),
-    ("fe80::1%lo0", .answer("peer.local"), true),
-    ("fe80::1%lo0", .noSuchRecord, false),
-    ("fe80::1%lo0", .noSuchRecord, true),
-  ]
-
-  @Test(
-    "A response to a concurrent lookup of the same address leaves no holdoff and no stall, in either order",
-    arguments: raceCases)
-  func responseBeatsConcurrentTimeout(
-    address: String, response: ReverseDNSLookupOutcome, responseFirst: Bool
-  ) async throws {
-    let timeoutGate = StallGate()
-    let responseGate = StallGate()
-    defer {
-      timeoutGate.open()
-      responseGate.open()
-    }
-    let calls = FaultCounter()
-    // A TTL of zero, so an answer is never served from the answer cache: only a holdoff, or its
-    // absence, decides whether the next lookup asks. The test starts the second lookup only once
-    // the first has been asked, so the count says which call this is.
-    let cache = RDNSCache(ttl: 0) { _, _ in
-      calls.increment()
-      let number = calls.value
-      switch number {
-      case 1:
-        await timeoutGate.waitAsync(limit: 2 * Self.watchdog)
-        return .timedOut
-      case 2:
-        await responseGate.waitAsync(limit: 2 * Self.watchdog)
-        return response
-      default:
-        return response
-      }
-    }
-    let timingOut = Task { await cache.lookup(address) }
-    #expect(await eventually(within: Self.watchdog) { calls.value == 1 })
-    let responding = Task { await cache.lookup(address) }
-    #expect(await eventually(within: Self.watchdog) { calls.value == 2 })
-
-    if responseFirst {
-      responseGate.open()
-      _ = try await measure(within: Self.watchdog) { await responding.value }
-      timeoutGate.open()
-      _ = try await measure(within: Self.watchdog) { await timingOut.value }
-    } else {
-      timeoutGate.open()
-      _ = try await measure(within: Self.watchdog) { await timingOut.value }
-      responseGate.open()
-      _ = try await measure(within: Self.watchdog) { await responding.value }
-    }
-
-    #expect(await cache.holdoffCount == 0, "a holdoff outlived a response")
-    let stalls = await cache.stallCount
-    #expect(stalls == 0, "a timeout the resolver contradicted left \(stalls) stalls")
-    _ = await cache.lookup(address)
-    #expect(calls.value == 3, "the address was not asked again after its response")
-  }
-
-  @Test(
-    "A response whose own caller cancelled still ends the holdoff a concurrent timeout would set")
-  func responseToCancelledCallerStillCounts() async throws {
-    let timeoutGate = StallGate()
-    let responseGate = StallGate()
-    defer {
-      timeoutGate.open()
-      responseGate.open()
-    }
-    let calls = FaultCounter()
-    // Each ask ignores cancellation, as a resolver that has already been answered does.
-    let cache = RDNSCache(ttl: 0) { _, _ in
-      calls.increment()
-      switch calls.value {
-      case 1:
-        await timeoutGate.waitAsync(limit: 2 * Self.watchdog)
-        return .timedOut
-      case 2:
-        await responseGate.waitAsync(limit: 2 * Self.watchdog)
-        return .answer("router.example")
-      default:
-        return .answer("router.example")
-      }
-    }
-    let timingOut = Task { await cache.lookup("192.0.2.1") }
-    #expect(await eventually(within: Self.watchdog) { calls.value == 1 })
-    let responding = Task { await cache.lookup("192.0.2.1") }
-    #expect(await eventually(within: Self.watchdog) { calls.value == 2 })
-    responding.cancel()
-    responseGate.open()
-    let answered = try await measure(within: Self.watchdog) { await responding.value }.0
-    #expect(answered == nil, "a cancelled caller was handed a hostname")
-    timeoutGate.open()
-    _ = try await measure(within: Self.watchdog) { await timingOut.value }
-
-    #expect(
-      await cache.holdoffCount == 0, "a timeout the resolver contradicted held the address off")
-    _ = await cache.lookup("192.0.2.1")
-    #expect(calls.value == 3)
   }
 }
