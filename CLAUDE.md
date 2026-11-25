@@ -94,7 +94,7 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
 - `Multipath.swift`: Dublin Traceroute-style ECMP path enumeration
 
 **Caching Infrastructure**
-- `RDNSCache` (`RDNSCache.swift`): Reverse DNS with 86400s TTL, through `ReverseDNSLookup`; caches answers only; an address whose question timed out is held off for ten minutes (David, 2026-11-24) or until an answer for it; a stall breaker counts unicast questions asked and unanswered, each address once per run (proposed, not yet confirmed by David) and stays open until a reset; link-local lookups capped at one second
+- `RDNSCache` (`RDNSCache.swift`): Reverse DNS with 86400s TTL, through `ReverseDNSLookup`; caches answers only; an address whose question timed out is held off for ten minutes (David, 2026-11-24); concurrent lookups of one address share one query (David, 2026-11-24); a stall breaker counts unicast questions asked and unanswered, each address once per run (proposed, not yet confirmed by David) and stays open until a reset; link-local lookups capped at one second
 - `ReverseDNSLookup` (`ReverseDNSLookup.swift`): one PTR query through `DNSServiceQueryRecord`, holding no thread, with typed outcomes and a process-wide cap on lookups in flight
 - `SwiftFTR.publicIPCache`: One `PublicIPObservation` per address family, with its source, for classified trace/multipath; invalidated on network change
 - `_ASNMemoryCache` (in `ASN.swift`): LRU-style IP-to-ASN cache

@@ -624,7 +624,8 @@ holds no thread and is stopped at ``SwiftFTRConfig/rdnsLookupTimeout`` or when t
 cancelled. Only hostnames are cached. A link-local address (fe80::/10, 169.254.0.0/16), which the
 daemon asks by multicast on the link, gets at most one second. The stall breaker, which stops
 reverse DNS until a network change after two stalls, now counts only lookups that were asked and
-got no answer, not every lookup that took nearly its deadline.
+got no answer, not every lookup that took nearly its deadline. Lookups of one address that
+overlap share one query (David, 2026-11-24: "Build share lookups").
 
 **What a caller sees.** No signature changes. Results differ in these cases:
 
@@ -646,6 +647,8 @@ got no answer, not every lookup that took nearly its deadline.
   no hostname for that address.
 - A trace whose first hop is an unnamed link-local address spends at most one second on it in
   the reverse-DNS phase, rather than the whole lookup timeout.
+- A multipath run makes one reverse query per hop address at a time, however many of its flows
+  share the hop, and they all get its answer.
 - Reverse DNS no longer waits for a blocking-I/O worker, so other work holding the workers does
   not delay hostnames, and reverse DNS no longer delays public-IP discovery.
 
