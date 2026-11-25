@@ -620,8 +620,8 @@ await tracer.invalidatePublicIP()  // 0.19 caches the run's answer
 **What changed.** The hostnames on trace, classified-trace and multipath hops, and from
 ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()``, come from a PTR query to the system's DNS
 daemon (`DNSServiceQueryRecord`) instead of `getnameinfo` on the blocking-I/O executor. The query
-holds no thread and is stopped at ``SwiftFTRConfig/rdnsLookupTimeout`` or when the trace is
-cancelled. Only hostnames are cached. A link-local address (fe80::/10, 169.254.0.0/16), which the
+holds no thread and is stopped at ``SwiftFTRConfig/rdnsLookupTimeout``; a cancelled trace stops
+waiting for it at once. Only hostnames are cached. A link-local address (fe80::/10, 169.254.0.0/16), which the
 daemon asks by multicast on the link, gets at most one second. The stall breaker, which stops
 reverse DNS until a network change after two stalls, now counts only lookups that were asked and
 got no answer, not every lookup that took nearly its deadline. Lookups of one address that

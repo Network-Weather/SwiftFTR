@@ -168,7 +168,7 @@ Unreleased
   with `TracerouteError.cancelled` before any flow probes.
 - **Reverse DNS for traces asks the system's DNS daemon directly** (`DNSServiceQueryRecord`)
   instead of calling `getnameinfo` on the blocking-I/O executor. A lookup holds no thread, is
-  stopped (not abandoned) at its deadline or when its trace is cancelled, and no longer waits
+  stopped (not abandoned) at its deadline, releases a cancelled trace at once, and no longer waits
   for, or holds, an executor slot. At most 32 are in flight in the process at once. In one
   comparison on one Mac the two gave the same name for 12 of 13 addresses; the exception,
   `255.255.255.255`, is named `broadcasthost` in `/etc/hosts`, which `getnameinfo` reads and this
