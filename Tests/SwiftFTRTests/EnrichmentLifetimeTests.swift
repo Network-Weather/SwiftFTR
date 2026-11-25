@@ -169,7 +169,15 @@ struct EnrichmentLifetimeTests {
     let hybrid = HybridASNResolver(
       local: Self.failingLocalResolver(), dns: CachingASNResolver(base: base),
       fallbackTimeout: fallback)
-    _ = try await hybrid.resolve(ipv4Addrs: ["203.0.114.30"], timeout: Self.timeout)
+    // Every clock read is a millisecond later, so time left is never the configured value.
+    let ticks = Locked(0.0)
+    let ticking: @Sendable () -> TimeInterval = {
+      ticks.set(ticks.value + 0.001)
+      return ticks.value
+    }
+    _ = try await TestSeams.$monotonicClock.withValue(ticking) {
+      try await hybrid.resolve(ipv4Addrs: ["203.0.114.30"], timeout: Self.timeout)
+    }
     let timeouts = await base.timeouts
     // Exactly the configured value, never the time left, so every caller's key is the same.
     #expect(timeouts == [fallback])

@@ -35,10 +35,12 @@ public struct HybridASNResolver: ASNResolver, PublishingASNResolver, Sendable {
 
   /// Resolves from the local database, then asks DNS for the addresses it lacks.
   ///
-  /// - Parameter timeout: Bounds the whole call: the wait for a database that is still loading,
-  ///   then the DNS fallback, which also ends `fallbackTimeout` seconds after it starts and is
-  ///   not started once `timeout` has run out. Each answer is returned as soon as it is known; an
-  ///   AS number whose name the fallback had not learned in time has an empty name.
+  /// - Parameters:
+  ///   - ipv4Addrs: IP addresses to resolve; only globally routable ones are looked up.
+  ///   - timeout: Bounds the whole call: the wait for a database that is still loading, then the
+  ///     DNS fallback, which also ends `fallbackTimeout` seconds after it starts and is not
+  ///     started once `timeout` has run out. An AS number whose name the fallback had not
+  ///     learned in time has an empty name.
   #if compiler(>=6.2)
     @concurrent
   #endif

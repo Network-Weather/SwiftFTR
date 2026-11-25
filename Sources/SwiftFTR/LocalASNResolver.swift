@@ -87,9 +87,11 @@ public actor LocalASNResolver: ASNResolver, PublishingASNResolver {
     return try? outcome?.get().database
   }
 
-  /// - Parameter timeout: Bounds the wait for a database that is still loading. A lookup in a
-  ///   loaded database answers whatever the timeout. One that runs out of time, or whose task is
-  ///   cancelled, while the database loads leaves the load running for every other caller.
+  /// - Parameters:
+  ///   - ipv4Addrs: IP addresses to resolve; only globally routable ones are looked up.
+  ///   - timeout: Bounds the wait for a database that is still loading. A lookup in a loaded
+  ///     database answers whatever the timeout. One that runs out of time, or whose task is
+  ///     cancelled, while the database loads leaves the load running for every other caller.
   /// - Throws: `CancellationError` when the calling task is cancelled while the database loads.
   #if compiler(>=6.2)
     @concurrent

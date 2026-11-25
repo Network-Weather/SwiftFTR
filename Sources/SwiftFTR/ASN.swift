@@ -287,7 +287,9 @@ public struct CachingASNResolver: ASNResolver, PublishingASNResolver {
     self.scope = _ASNResolverScope()
   }
 
-  /// - Parameter timeout: Bounds the whole call, waiting on a shared lookup included.
+  /// - Parameters:
+  ///   - ipv4Addrs: IP addresses to resolve; empty entries are ignored.
+  ///   - timeout: Bounds the whole call, waiting on a shared lookup included.
   #if compiler(>=6.2)
     @concurrent
   #endif
