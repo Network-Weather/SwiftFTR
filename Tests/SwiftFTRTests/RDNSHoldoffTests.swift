@@ -310,4 +310,71 @@ struct RDNSHoldoffTests {
       #expect(daemon.asks("203.0.113.1") == 0)
     }
   }
+
+  /// Two lookups of one address in flight together: the first ask times out, the second gets
+  /// `response`. `responseFirst` says which of the two the cache handles first.
+  static let raceCases: [(String, ReverseDNSLookupOutcome, Bool)] = [
+    ("192.0.2.1", .answer("router.example"), false),
+    ("192.0.2.1", .answer("router.example"), true),
+    ("192.0.2.1", .noSuchRecord, false),
+    ("192.0.2.1", .noSuchRecord, true),
+    ("fe80::1%lo0", .answer("peer.local"), false),
+    ("fe80::1%lo0", .answer("peer.local"), true),
+    ("fe80::1%lo0", .noSuchRecord, false),
+    ("fe80::1%lo0", .noSuchRecord, true),
+  ]
+
+  @Test(
+    "A response to a concurrent lookup of the same address leaves no holdoff and no stall, in either order",
+    arguments: raceCases)
+  func responseBeatsConcurrentTimeout(
+    address: String, response: ReverseDNSLookupOutcome, responseFirst: Bool
+  ) async throws {
+    let timeoutGate = StallGate()
+    let responseGate = StallGate()
+    defer {
+      timeoutGate.open()
+      responseGate.open()
+    }
+    let calls = FaultCounter()
+    // A TTL of zero, so an answer is never served from the answer cache: only a holdoff, or its
+    // absence, decides whether the next lookup asks. The test starts the second lookup only once
+    // the first has been asked, so the count says which call this is.
+    let cache = RDNSCache(ttl: 0) { _, _ in
+      calls.increment()
+      let number = calls.value
+      switch number {
+      case 1:
+        await timeoutGate.waitAsync(limit: 2 * Self.watchdog)
+        return .timedOut
+      case 2:
+        await responseGate.waitAsync(limit: 2 * Self.watchdog)
+        return response
+      default:
+        return response
+      }
+    }
+    let timingOut = Task { await cache.lookup(address) }
+    #expect(await eventually(within: Self.watchdog) { calls.value == 1 })
+    let responding = Task { await cache.lookup(address) }
+    #expect(await eventually(within: Self.watchdog) { calls.value == 2 })
+
+    if responseFirst {
+      responseGate.open()
+      _ = try await measure(within: Self.watchdog) { await responding.value }
+      timeoutGate.open()
+      _ = try await measure(within: Self.watchdog) { await timingOut.value }
+    } else {
+      timeoutGate.open()
+      _ = try await measure(within: Self.watchdog) { await timingOut.value }
+      responseGate.open()
+      _ = try await measure(within: Self.watchdog) { await responding.value }
+    }
+
+    #expect(await cache.holdoffCount == 0, "a holdoff outlived a response")
+    let stalls = await cache.stallCount
+    #expect(stalls == 0, "a timeout the resolver contradicted left \(stalls) stalls")
+    _ = await cache.lookup(address)
+    #expect(calls.value == 3, "the address was not asked again after its response")
+  }
 }
