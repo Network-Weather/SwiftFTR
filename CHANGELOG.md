@@ -177,10 +177,12 @@ Unreleased
 - **Only hostnames are cached by reverse DNS.** An address with no name, or whose lookup
   failed, is asked again by the next trace, where 0.18 cached "no hostname" for the whole TTL (a
   day by default), a timeout included. An address whose question was asked and got no answer by
-  its deadline is not asked again for ten minutes (proposed by an agent, not yet confirmed by David, 2026-11-24); during that holdoff it reports no
-  hostname at once. `networkChanged()`, `clearCaches()` and `invalidateNetworkScopedRDNS()` end
-  every holdoff. So a hop whose PTR query always times out costs one lookup budget per ten
-  minutes, not one per trace. Within one trace each hop address is asked once:
+  its deadline is not asked again for ten minutes (David, 2026-11-24: "10 minutes is a reasonable in-memory cache of no response for a reverse DNS lookup"); during that holdoff it reports
+  no hostname at once. An answer or "no such record" for the address ends its holdoff, and
+  `networkChanged()`, `clearCaches()` and `invalidateNetworkScopedRDNS()` end every holdoff. So
+  a hop whose PTR query always times out costs one lookup budget per ten minutes, not one per
+  trace. Once the stall breaker has opened, nothing is asked, holdoff or not, until one of those
+  three calls (or a lookup already in flight being answered) closes it. Within one trace each hop address is asked once:
   a classified trace and a multipath flow no longer ask again, after the probes, about a hop
   that found no name, and an address seen at several TTLs is asked once.
 - **A link-local hop's reverse lookup gets at most one second.** The daemon asks fe80::/10 and
@@ -190,8 +192,10 @@ Unreleased
   lookups after two in a row that were asked and got no answer by their deadline. A lookup that
   waited for its turn past the deadline without asking, a link-local lookup, and an error do not
   count; an answer or "no such record" resets it. One address counts once in a run of stalls
-  (proposed by an agent, not yet confirmed by David, 2026-11-24), so several lookups of one hop timing out together, as a multipath batch's flows
-  make, do not open the breaker by themselves.
+  (proposed by an agent, not yet confirmed by David, 2026-11-24), so several lookups of one hop timing out together, as a multipath
+  batch's flows make, do not open the breaker by themselves. An open breaker stays open until
+  `networkChanged()`, `clearCaches()` or `invalidateNetworkScopedRDNS()`, or until a lookup that
+  was already in flight is answered, as in 0.18; it never closes by time.
 
 ### Bug fixes
 

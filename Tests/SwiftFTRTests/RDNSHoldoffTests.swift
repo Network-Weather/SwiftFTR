@@ -5,9 +5,10 @@ import Testing
 
 /// The stalled-address holdoff and the once-per-streak stall count of `RDNSCache`.
 ///
-/// Proposed by an agent, not yet confirmed by David (2026-11-24): an address whose question was
-/// asked and timed out is not asked again for `RDNSCache.stalledAddressHoldoff`, and one address
-/// counts at most once toward the stall breaker in a run of stalls.
+/// The holdoff is David's decision (2026-11-24): an address whose question was asked and timed
+/// out is not asked again for `RDNSCache.stalledAddressHoldoff`. That one address counts at most
+/// once toward the stall breaker in a run of stalls is proposed by an agent, not yet confirmed
+/// by David (2026-11-24).
 @Suite
 struct RDNSHoldoffTests {
   static let watchdog: TimeInterval = 60

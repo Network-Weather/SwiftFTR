@@ -55,13 +55,15 @@ actor RDNSCache {
   /// How long an address whose question was asked and got no answer by its deadline
   /// (``ReverseDNSLookupOutcome/timedOut``, unicast or link-local) is not asked again.
   ///
-  /// Proposed by an agent, not yet confirmed by David (2026-11-24). Only answers are cached, so
+  /// David, 2026-11-24: "10 minutes is a reasonable in-memory cache of no response for a reverse DNS lookup". Only answers are cached, so
   /// without it a hop whose PTR query always times out costs the whole lookup budget on every
   /// trace: a hop that answers "no such record" in the same wave resets the stall count each
   /// time, so the breaker never opens. During the holdoff a lookup of the address returns `nil`
   /// at once, asks nothing, and neither counts toward nor resets the breaker. A holdoff is not a
-  /// cached answer, and ``clear()`` and ``invalidateNetworkScoped()`` drop every one, since a
-  /// network change may have fixed the resolver.
+  /// cached answer. An answer or "no such record" for the address ends it, and a timeout for a
+  /// question asked before such a response sets none. ``clear()`` and ``invalidateNetworkScoped()``
+  /// drop every one, since a network change may have fixed the resolver. Once the holdoff ends
+  /// the address is asked again, unless the breaker is open: that stays open until a reset.
   static let stalledAddressHoldoff: Duration = .seconds(600)
 
   private var cache: [String: CacheEntry] = [:]

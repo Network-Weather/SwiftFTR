@@ -39,6 +39,15 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   judge whether the reply came after its request, but still times the reply when the read handler
   takes it, so a busy queue or a long read batch adds to the RTT. Using the stamp would remove that,
   and it is the same clock as the send stamp.
+- **An open reverse-DNS stall breaker never closes on its own**: after lookups of two different
+  addresses time out in a row, `RDNSCache` asks nothing for any address until
+  `networkChanged()`, `clearCaches()` or `invalidateNetworkScopedRDNS()`, or until a lookup that
+  was already in flight is answered. 0.18 behaved the same. A host app that never calls one of
+  them loses hostnames for the life of the tracer after a transient resolver outage. A
+  time-based half-open retry would need: an instant recorded when the breaker opens; after an
+  interval, one probe lookup let through (one at a time, with others still suppressed while it
+  is in flight); an answer or "no such record" from it closing the breaker, and a timeout
+  re-arming the interval, perhaps with backoff; and tests on an injected clock for each.
 - **A tripwire that keeps the offline selection offline**: nothing stops a new test from reaching
   the network with `SKIP_NETWORK_TESTS=1` set (the #92 sweep found 20 that did). A test-only flag
   in `TestSeams`, set when that variable is, would make the real forward resolver, ICMP socket,

@@ -635,10 +635,13 @@ got no answer, not every lookup that took nearly its deadline.
   a label as `\\`); `getnameinfo` returned those bytes raw.
 - An address with no name is asked again by every trace, where 0.18 remembered "no hostname"
   for the cache TTL (a day by default). An address whose lookup timed out is held off for ten
-  minutes (proposed by an agent, not yet confirmed by David, 2026-11-24): it reports no hostname without asking, then is asked again. On a link
-  whose resolver times out, a hostname now appears within ten minutes of the resolver
-  recovering, or at once after ``SwiftFTR/SwiftFTR/networkChanged()``,
-  ``SwiftFTR/SwiftFTR/clearCaches()`` or ``SwiftFTR/SwiftFTR/invalidateNetworkScopedRDNS()``.
+  minutes (David, 2026-11-24: "10 minutes is a reasonable in-memory cache of no response for a reverse DNS lookup"): it reports no hostname without asking, then is asked again.
+  If only one address timed out, a hostname appears within ten minutes of its resolver
+  recovering. If lookups of two different addresses timed out in a row, the stall breaker is
+  open and asks nothing for any address, after the holdoffs too, until
+  ``SwiftFTR/SwiftFTR/networkChanged()``, ``SwiftFTR/SwiftFTR/clearCaches()`` or
+  ``SwiftFTR/SwiftFTR/invalidateNetworkScopedRDNS()``, as in 0.18. Call one of them when the
+  network changes or the resolver is known to have recovered.
   ``SwiftFTR/SwiftFTR/discoverPublicIPWithHostname()`` called again within the holdoff returns
   no hostname for that address.
 - A trace whose first hop is an unnamed link-local address spends at most one second on it in

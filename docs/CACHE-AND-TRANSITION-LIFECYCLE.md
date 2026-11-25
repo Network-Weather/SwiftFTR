@@ -54,13 +54,15 @@ As of 0.18.0, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
 - `RDNSCache` holds entries for 86400 s, evicting the oldest-inserted entry at 1000 entries
   (both configurable through `SwiftFTRConfig`). It caches answers only: no such record, an
   error and a cancellation are asked again next time. An address whose question was asked and
-  timed out (unicast or link-local) is held off for ten minutes (proposed by an agent, not yet confirmed by David, 2026-11-24): its lookup
-  returns nil at once without asking and without touching the breaker. Holdoffs are bounded by
+  timed out (unicast or link-local) is held off for ten minutes (David, 2026-11-24: "10 minutes is a reasonable in-memory cache of no response for a reverse DNS lookup"): its lookup
+  returns nil at once without asking and without touching the breaker. An answer or "no such
+  record" for the address ends its holdoff, and a timeout for a question asked before such a
+  response sets none. Holdoffs are bounded by
   the cache size (oldest inserted evicted), expire by the monotonic clock, and `clear()` and
   `invalidateNetworkScoped()` drop every one, global addresses included. It has a stall breaker:
   after two consecutive unicast lookups of different addresses that were asked and got no answer
   by their deadline, further lookups are suppressed while that count stays at two or more (one
-  address counts once per run of stalls, (proposed by an agent, not yet confirmed by David, 2026-11-24)). A lookup that never got to ask in time and
+  address counts once per run of stalls, proposed by an agent, not yet confirmed by David, 2026-11-24). An open breaker never closes by time, holdoffs expired or not. A lookup that never got to ask in time and
   a link-local lookup (asked by multicast) do not count. `clear()` and
   `invalidateNetworkScoped()` reset it, and so does a lookup that was already in flight being
   answered, or told there is no such record. `clear()` also generation-guards against
