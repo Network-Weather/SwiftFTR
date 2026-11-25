@@ -356,6 +356,71 @@ struct EventBasedSTUNTests {
     #expect(lookups.value == 2, "looked up \(lookups.value) names")
   }
 
+  @Test("An exchange whose setup outlasts the discovery deadline sends nothing")
+  func setupPastDeadlineSendsNothing() async throws {
+    let healthy = try Self.answering(Self.mappedX)
+    defer { healthy.stop() }
+    let budget: TimeInterval = 0.2
+    // Making the socket non-blocking is the exchange's first setup step. Held from its own entry
+    // until a budget has passed, it ends after the deadline, which was set before it was entered.
+    let fileControl: TestSeams.FileControl = { fd, command, argument in
+      if command == F_GETFL {
+        let entered = monotonicNow()
+        while monotonicNow() < entered + budget + 0.05 { usleep(5_000) }
+      }
+      return fcntl(fd, command, argument)
+    }
+    let sends = FaultCounter()
+    let send: TestSeams.SendDatagram = { fd, bytes in
+      sends.increment()
+      return Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
+    }
+
+    let outcome = try await measure(within: Self.watchdog) {
+      await TestSeams.$stunServers.withValue({ _ in [healthy.server] }) {
+        await TestSeams.$fileControl.withValue(fileControl) {
+          await TestSeams.$sendSTUNRequest.withValue(send) {
+            do {
+              return Result<PublicIPObservation?, Error>.success(
+                try await publicIPDiscovery(
+                  family: .v4, stunTimeout: Self.longTimeout, interface: nil, sourceIP: nil,
+                  enableLogging: false, budget: budget))
+            } catch {
+              return .failure(error)
+            }
+          }
+        }
+      }
+    }.0
+    #expect(throws: PublicIPDiscoveryTimeout.self) { try outcome.get() }
+    #expect(sends.value == 0, "a request was sent after the discovery deadline")
+  }
+
+  @Test("A name lookup with no time left is not submitted to the executor")
+  func lookupWithNoTimeLeftNotSubmitted() async throws {
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.stun-expired")
+    let lookups = FaultCounter()
+    let resolve: TestSeams.ResolveSTUNServer = { _, port, family in
+      lookups.increment()
+      return loopbackAddress(family: family, port: port)
+    }
+    try await TestSeams.$blockingIOExecutor.withValue(executor) {
+      for deadline in [monotonicNow() - 1, monotonicNow(), -TimeInterval.infinity, .nan] {
+        let found = try await lookUpSTUNServer(
+          ("named.test", 3478), family: AF_INET, deadline: deadline, resolve: resolve)
+        #expect(found == nil, "deadline \(deadline)")
+      }
+      #expect(executor.submissions.value == 0, "\(executor.submissions.value) lookups submitted")
+      // Positive control: with time left the lookup is submitted and answers.
+      let found = try await lookUpSTUNServer(
+        ("named.test", 3478), family: AF_INET, deadline: monotonicNow() + Self.watchdog,
+        resolve: resolve)
+      #expect(found != nil)
+      #expect(executor.submissions.value == 1)
+    }
+    #expect(lookups.value == 1, "\(lookups.value) lookups ran")
+  }
+
   // MARK: The executor's slots
 
   @Test("With every executor slot held, discovery from servers given by address still answers")

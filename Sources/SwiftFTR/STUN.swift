@@ -529,6 +529,24 @@ private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> (
   return (storage, length)
 }
 
+/// `server`'s name resolved for `family` on the executor, or `nil` when the lookup failed or its
+/// wait ended first.
+///
+/// - Throws: `CancellationError` when the calling task is cancelled.
+func lookUpSTUNServer(
+  _ server: (host: String, port: UInt16), family: Int32, deadline: TimeInterval?,
+  resolve: @escaping TestSeams.ResolveSTUNServer
+) async throws -> (server: sockaddr_storage, serverLen: socklen_t)? {
+  let wait = min(secondsLeft(until: deadline) ?? stunNameLookupLimit, stunNameLookupLimit)
+  do {
+    return try await runDetachedBlockingIO(deadline: wait) {
+      resolve(server.host, server.port, family)
+    }
+  } catch is BlockingIOTimeout {
+    return nil
+  }
+}
+
 /// One server's attempt in a sweep: its name resolved (a numeric address needs no lookup), then
 /// one exchange from `socket`. Never throws; the outcome is returned.
 ///
@@ -554,15 +572,8 @@ private func stunAttempt(
     if let literal = literalSTUNEndpoint(host: server.host, port: server.port, family: family) {
       endpoint = literal
     } else {
-      let wait = min(secondsLeft(until: deadline) ?? stunNameLookupLimit, stunNameLookupLimit)
-      let resolved: (server: sockaddr_storage, serverLen: socklen_t)?
-      do {
-        resolved = try await runDetachedBlockingIO(deadline: wait) {
-          resolve(server.host, server.port, family)
-        }
-      } catch is BlockingIOTimeout {
-        resolved = nil
-      }
+      let resolved = try await lookUpSTUNServer(
+        server, family: family, deadline: deadline, resolve: resolve)
       guard let resolved else {
         throw STUNError.resolveFailed(
           errno: 0, details: "Failed to resolve STUN server '\(label)' (\(famName))")

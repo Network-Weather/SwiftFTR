@@ -613,6 +613,16 @@ final class BlockingIOExecutor: Sendable {
   /// One permit per worker for STUN sweeps, taken before a sweep opens its sockets, so sweeps
   /// queued behind this executor hold none.
   let stunSweepAdmission: _ConcurrencySemaphore
+  /// Operations handed to the queue so far, for tests that check nothing was submitted.
+  let submissions = SubmissionCounter()
+
+  /// A count behind a lock.
+  final class SubmissionCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    var value: Int { lock.withLock { count } }
+    func increment() { lock.withLock { count += 1 } }
+  }
 
   init(maximumConcurrentOperations: Int, name: String) {
     precondition(maximumConcurrentOperations > 0)
@@ -684,6 +694,7 @@ final class BlockingIOExecutor: Sendable {
           deadlineTimer.cancel()
           return
         }
+        submissions.increment()
         operationQueue.addOperation(queuedOperation)
       }
     } onCancel: {
