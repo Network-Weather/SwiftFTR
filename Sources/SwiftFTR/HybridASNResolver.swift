@@ -64,13 +64,12 @@ public struct HybridASNResolver: ASNResolver, PublishingASNResolver, Sendable {
         Array(publicIPs), timeout: timeout, deadline: deadline, publish: publish)) ?? [:]
     let missingIPs = publicIPs.subtracting(merged.keys)
 
-    // Fall back to DNS for missing IPs, keyed by `fallbackTimeout` so that concurrent fallbacks
-    // share one flight, and ending at the earlier of the caller's deadline and its own.
-    let clock = DiscoveryClock.current
-    guard !missingIPs.isEmpty, !clock.hasPassed(deadline) else { return merged }
-    let fallbackDeadline = min(deadline, clock.now() + fallbackTimeout)
+    // Fall back to DNS for missing IPs. The cache answers what it holds even past the deadline;
+    // a new flight, keyed by `fallbackTimeout` so that concurrent fallbacks share it, runs for
+    // `fallbackTimeout` whoever starts it, and this caller waits for it until its own deadline.
+    guard !missingIPs.isEmpty else { return merged }
     let dnsResults = try? await dnsResolver.resolve(
-      Array(missingIPs), timeout: fallbackTimeout, deadline: fallbackDeadline, publish: publish)
+      Array(missingIPs), timeout: fallbackTimeout, deadline: deadline, publish: publish)
 
     // Merge results (local takes precedence)
     for (k, v) in dnsResults ?? [:] where merged[k] == nil {

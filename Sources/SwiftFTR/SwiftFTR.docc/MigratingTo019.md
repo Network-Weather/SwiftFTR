@@ -650,8 +650,9 @@ for the whole call in every built-in resolver, taken on entry and passed down un
 - ``CymruDNSResolver`` (`.dns`) ends every origin and AS-name query on every server by it. 0.18
   gave each query the full timeout again, per server and per wave of eight.
 - ``HybridASNResolver`` (the default, `.hybrid(.embedded)`) ignored it. It now waits for a
-  database still loading only until it, and its DNS fallback ends at the earlier of it and
-  `fallbackTimeout`, and is not started once it has passed.
+  database still loading only until it, and waits for its DNS fallback only until it. The
+  fallback lookup itself runs for `fallbackTimeout`, so a caller with little time left does not
+  cut it short for another caller sharing it.
 - ``LocalASNResolver`` waits for its database only until it; a loaded database answers whatever
   the timeout.
 - ``CachingASNResolver`` stops each caller at it, even when the resolver behind it overruns.
@@ -666,8 +667,9 @@ next lookup uses the same work.
 - A classified trace's ASN phase ends within its timeout (1.5 s in ``TraceClassifier``). One
   started before the embedded database has loaded can come back without ASN data, where 0.18
   waited for the load; with `.dns`, AS names can be empty when the names answer late.
-- A `timeout` of zero, below zero or NaN starts no lookup: only cached answers, or a database
-  already loaded, answer. Infinity, or a very large value, waits as long as the work takes.
+- A `timeout` of zero, below zero or NaN starts no lookup, but returns what is known without
+  I/O: cached answers, a database any resolver already holds, and what a running lookup has
+  learned. Infinity, or a very large value, waits as long as the work takes.
 - A cancelled `LocalASNResolver.resolve` throws `CancellationError` while the database loads; a
   cancelled `preload()` returns while the load continues.
 

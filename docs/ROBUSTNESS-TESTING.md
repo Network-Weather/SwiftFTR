@@ -724,3 +724,12 @@ Observations that are not defects of the library:
   instant and none with that result held elsewhere; on this branch 9 of 300 did, all released
   within 1.3 ms; with `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1`, none. The test now waits for the
   release under a watchdog.
+- **Shared ASN work inherited its starter's time, and a passed deadline hid what was known.**
+  Found by the first review of Enrichment Lifetimes' second attempt and fixed. A hybrid fallback
+  flight ran to the deadline of the caller that started it, so a caller with little time left cut
+  off another that joined with a full budget; a flight now runs for its own `timeout`. A passed
+  deadline skipped the hybrid's cache read and the store's resident database; it now starts
+  nothing and returns what is known. A per-resolver join counter kept every resolver's scope in a
+  process-wide dictionary; the count now lives on the scope. Tests:
+  `sharedFallbackOutlivesItsStarter`, `passedDeadlineReturnsWhatIsKnown`,
+  `discardedResolverIsReleased`.

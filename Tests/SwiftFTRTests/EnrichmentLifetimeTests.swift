@@ -67,7 +67,7 @@ struct EnrichmentLifetimeTests {
         try await caching.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
       }
     }
-    let joined = await eventually(within: Self.watchdog) { await caching.joinCount == 1 }
+    let joined = await eventually(within: Self.watchdog) { caching.joinCount == 1 }
     #expect(joined)
     joinerClock.jump(by: 2 * Self.timeout)
 
@@ -160,6 +160,8 @@ struct EnrichmentLifetimeTests {
     let (found, _) = try await measure(within: Self.watchdog) { try await lookup.value }
     #expect(found[CymruTXTFixture.address]?.asn == CymruTXTFixture.asn)
     #expect(found[CymruTXTFixture.address]?.name == "")
+    // A flight that outlived the caller ends at its own budget, so it holds no socket after this.
+    clock.jump(by: 2 * max(caller, fallback))
   }
 
   @Test("Concurrent hybrid fallbacks are keyed by fallbackTimeout, so they share one flight")
@@ -277,6 +279,131 @@ struct EnrichmentLifetimeTests {
     #expect(ended.outcome != nil)
   }
 
+  // MARK: - Shared work runs on its own budget
+
+  @Test("A shared fallback runs on its own budget: the caller that started it cannot cut it short")
+  func sharedFallbackOutlivesItsStarter() async throws {
+    let nameGate = StallGate()
+    defer { nameGate.open() }
+    let fixture = try CymruTXTFixture(answersOrigin: true, name: .answerAfter(nameGate))
+    defer { fixture.stop() }
+    let caching = CachingASNResolver(base: CymruDNSResolver(servers: ["127.0.0.1"]))
+    let hybrid = HybridASNResolver(
+      local: Self.failingLocalResolver(), dns: caching, fallbackTimeout: 10 * Self.timeout)
+    let (starterClock, joinerClock) = (MovableClock(), MovableClock())
+    // The starter has 60 s; the fallback it starts has 600 s.
+    let starter = Task {
+      try await fixture.bind(starterClock) {
+        try await hybrid.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+      }
+    }
+    let waiting = await eventually(within: Self.watchdog) { fixture.nameQueries.value > 0 }
+    #expect(waiting)
+    let joiner = Task {
+      try await fixture.bind(joinerClock) {
+        try await hybrid.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: 10 * Self.timeout)
+      }
+    }
+    let joined = await eventually(within: Self.watchdog) { caching.joinCount == 1 }
+    #expect(joined)
+
+    // The starter's deadline passes; it leaves with the origin, and the flight goes on.
+    starterClock.jump(by: 2 * Self.timeout)
+    let (partial, _) = try await measure(within: Self.watchdog) { try await starter.value }
+    #expect(partial[CymruTXTFixture.address]?.name == "")
+
+    nameGate.open()
+    let (named, _) = try await measure(within: Self.watchdog) { try await joiner.value }
+    #expect(named[CymruTXTFixture.address]?.name == CymruTXTFixture.name)
+    #expect(fixture.nameQueries.value == 1)
+  }
+
+  // MARK: - A passed deadline returns what is known
+
+  @Test("A passed deadline starts nothing, and returns what each source already holds")
+  func passedDeadlineReturnsWhatIsKnown() async throws {
+    // A cache hit.
+    let base = ScriptedASNResolver(failsAtOnce: [], answersAtOnce: true)
+    let caching = CachingASNResolver(base: base)
+    _ = try await caching.resolve(ipv4Addrs: ["203.0.117.1"], timeout: Self.timeout)
+    let hit = try await caching.resolve(ipv4Addrs: ["203.0.117.1"], timeout: 0)
+    let baseCalls = await base.calls("203.0.117.1")
+    #expect(hit["203.0.117.1"] != nil)
+    #expect(baseCalls == 1)
+
+    // The hybrid's cached DNS answer.
+    let dns = ScriptedASNResolver(failsAtOnce: [], answersAtOnce: true)
+    let hybrid = HybridASNResolver(
+      local: Self.failingLocalResolver(), dns: CachingASNResolver(base: dns), fallbackTimeout: 1)
+    _ = try await hybrid.resolve(ipv4Addrs: ["203.0.117.2"], timeout: Self.timeout)
+    let fromCache = try await hybrid.resolve(ipv4Addrs: ["203.0.117.2"], timeout: 0)
+    let dnsCalls = await dns.calls("203.0.117.2")
+    #expect(fromCache["203.0.117.2"] != nil)
+    #expect(dnsCalls == 1)
+
+    // What a running shared flight has published: the origin, before its name.
+    let nameGate = StallGate()
+    defer { nameGate.open() }
+    let fixture = try CymruTXTFixture(answersOrigin: true, name: .refuse(after: nameGate))
+    defer { fixture.stop() }
+    let running = HybridASNResolver(
+      local: Self.failingLocalResolver(),
+      dns: CachingASNResolver(base: CymruDNSResolver(servers: ["127.0.0.1"])),
+      fallbackTimeout: Self.timeout)
+    let clock = MovableClock()
+    let owner = Task {
+      try await fixture.bind(clock) {
+        try await running.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+      }
+    }
+    let waiting = await eventually(within: Self.watchdog) { fixture.nameQueries.value > 0 }
+    #expect(waiting)
+    let published = try await fixture.bind(clock) {
+      try await running.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: 0)
+    }
+    #expect(published[CymruTXTFixture.address]?.asn == CymruTXTFixture.asn)
+    #expect(fixture.originQueries.value == 1)
+    nameGate.open()
+    _ = try await measure(within: Self.watchdog) { try await owner.value }
+
+    // A database another resolver already holds.
+    let store = LocalASNDatabaseStore()
+    let holder = LocalASNResolver(source: .embedded, store: store)
+    await holder.preload()
+    let late = try await LocalASNResolver(source: .embedded, store: store)
+      .resolve(ipv4Addrs: ["8.8.8.8"], timeout: 0)
+    let loads = await store.loadCount
+    #expect(late["8.8.8.8"]?.asn == 15169)
+    #expect(loads == 1)
+    withExtendedLifetime(holder) {}
+  }
+
+  @Test("A caching resolver that is gone leaves nothing of its own in the shared cache")
+  func discardedResolverIsReleased() async throws {
+    final class WeakScope: @unchecked Sendable { weak var scope: _ASNResolverScope? }
+    let released = WeakScope()
+    do {
+      let base = ScriptedASNResolver(failsAtOnce: [])
+      let caching = CachingASNResolver(base: base)
+      released.scope = caching.scope
+      let first = Task {
+        try await caching.resolve(ipv4Addrs: ["203.0.117.9"], timeout: Self.timeout)
+      }
+      let started = await eventually(within: Self.watchdog) { await base.calls("203.0.117.9") == 1 }
+      #expect(started)
+      let second = Task {
+        try await caching.resolve(ipv4Addrs: ["203.0.117.9"], timeout: Self.timeout)
+      }
+      let joined = await eventually(within: Self.watchdog) { caching.joinCount == 1 }
+      #expect(joined)
+      await base.succeed("203.0.117.9")
+      _ = try await measure(within: Self.watchdog) { try await first.value }
+      _ = try await measure(within: Self.watchdog) { try await second.value }
+    }
+    let gone = await eventually(within: Self.watchdog) { released.scope == nil }
+    #expect(gone)
+  }
+
   // MARK: - Extremes
 
   @Test("Extreme timeouts do not crash; a passed deadline starts nothing, an endless one waits")
@@ -340,6 +467,8 @@ final class CymruTXTFixture: @unchecked Sendable {
     case silent
     /// The serve thread waits for the gate, then refuses the query.
     case refuse(after: StallGate)
+    /// The serve thread waits for the gate, then answers.
+    case answerAfter(StallGate)
     case answer
   }
 
@@ -369,6 +498,9 @@ final class CymruTXTFixture: @unchecked Sendable {
           return (
             FaultInjectionWireTests.dnsResponse(to: query, rcode: 5, answerCount: 0, answers: []), 0
           )
+        case .answerAfter(let gate):
+          gate.wait(limit: 60)
+          text = "64496 | ZZ | arin | 2026-01-01 | \(CymruTXTFixture.name)"
         case .answer:
           text = "64496 | ZZ | arin | 2026-01-01 | \(CymruTXTFixture.name)"
         }

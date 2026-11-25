@@ -190,11 +190,14 @@ Unreleased
   every server, by it; it no longer gives each query, server and wave of eight the full timeout
   again, so a silent first server can use up the budget before the second is asked.
   `HybridASNResolver` (the default `.hybrid(.embedded)`), which ignored its timeout, waits for a
-  database still loading only until it, and its DNS fallback ends at the earlier of it and
-  `fallbackTimeout` and is not started once it has passed. `LocalASNResolver` waits for its
-  database only until it. `CachingASNResolver` stops each caller at it, even when the resolver
-  behind it overruns. A timeout of zero, below zero or NaN has passed on entry, so only cached
-  or already loaded answers come back; infinity never passes.
+  database still loading only until it, and waits for its DNS fallback only until it.
+  `LocalASNResolver` waits for its database only until it. `CachingASNResolver` stops each caller
+  at it, even when the resolver behind it overruns. Shared work keeps its own budget: a cached
+  lookup runs for its own `timeout` (a hybrid fallback for `fallbackTimeout`) from when it
+  starts, so a caller with little time left cannot cut it short for another. A passed deadline
+  starts nothing but still returns what is known without I/O: cached answers, a database another
+  resolver already holds, and what a running lookup has learned. A timeout of zero, below zero or
+  NaN has passed on entry; infinity never passes.
 - **A lookup returns every answer it has when its time runs out**, an AS number whose name has
   not arrived included, with an empty `name` (David, 2026-11-24: "yes on partials"). Team Cymru's
   origin answers are published as they arrive, so a caller of the cache, the hybrid or `.dns`

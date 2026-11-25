@@ -67,7 +67,10 @@ public protocol ASNResolver: Sendable {
 }
 
 /// Identity shared by copies of one caching resolver.
-private final class _ASNResolverScope: Sendable, Hashable {
+final class _ASNResolverScope: @unchecked Sendable, Hashable {
+  private let lock = NSLock()
+  private var joins = 0
+
   static func == (lhs: _ASNResolverScope, rhs: _ASNResolverScope) -> Bool {
     lhs === rhs
   }
@@ -75,6 +78,11 @@ private final class _ASNResolverScope: Sendable, Hashable {
   func hash(into hasher: inout Hasher) {
     hasher.combine(ObjectIdentifier(self))
   }
+
+  /// How many times a caller joined one of this resolver's running flights. For tests; kept
+  /// here so that counting retains nothing.
+  var joinCount: Int { lock.withLock { joins } }
+  func noteJoin() { lock.withLock { joins += 1 } }
 }
 
 // Simple in-memory cache for ASN lookups with a soft capacity cap.
@@ -97,7 +105,6 @@ actor _ASNMemoryCache {
   private var map: [String: ASNInfo] = [:]
   private var order: [String] = []
   private var flights: [LookupKey: SharedASNWork<Void>] = [:]
-  private var joins: [_ASNResolverScope: Int] = [:]
   private var generation: UInt64 = 0
   private let capacity = 2048
 
@@ -183,7 +190,7 @@ actor _ASNMemoryCache {
       } else if let flight = flights[LookupKey(scope: scope, address: address, timeout: timeout)] {
         if seen.insert(ObjectIdentifier(flight)).inserted {
           joined.append(flight)
-          joins[scope, default: 0] += 1
+          scope.noteJoin()
         }
       } else {
         unreserved.append(address)
@@ -198,7 +205,8 @@ actor _ASNMemoryCache {
     return (hits, joined)
   }
 
-  /// Starts one flight for `addresses`, bounded by the deadline of the caller that starts it.
+  /// Starts one flight for `addresses`. It runs on its own budget, `timeout` from now, however
+  /// little time the caller that starts it has left (`deadline` only decides whether it starts).
   /// It publishes to its own record and to that caller, so a caller that is itself a flight
   /// (a cache in front of this one) sees each answer as it arrives.
   private func startFlight(
@@ -211,6 +219,7 @@ actor _ASNMemoryCache {
   ) -> SharedASNWork<Void> {
     let keys = addresses.map { LookupKey(scope: scope, address: $0, timeout: timeout) }
     let flightGeneration = generation
+    let budget = asnDeadline(timeout)
     let flight = SharedASNWork<Void> { publish in
       let both: ASNPublish = {
         publish($0)
@@ -220,7 +229,7 @@ actor _ASNMemoryCache {
         let found: [String: ASNInfo]
         if let resolver = resolver as? PublishingASNResolver {
           found = try await resolver.resolve(
-            addresses, timeout: timeout, deadline: deadline, publish: both)
+            addresses, timeout: timeout, deadline: budget, publish: both)
         } else {
           found = try await resolver.resolve(ipv4Addrs: addresses, timeout: timeout)
         }
@@ -253,19 +262,10 @@ actor _ASNMemoryCache {
     map.removeAll()
     order.removeAll()
     flights.removeAll()
-    joins.removeAll()
   }
 
   /// Current cache size. Internal for testing via @testable import.
   var count: Int { map.count }
-
-  /// Number of times a caller joined a running flight since the last ``clear()``. Internal for
-  /// deterministic tests.
-  var joinCount: Int { joins.values.reduce(0, +) }
-
-  /// Number of times a caller of one caching resolver joined a running flight since the last
-  /// ``clear()``. Internal for deterministic tests.
-  fileprivate func joinCount(_ scope: _ASNResolverScope) -> Int { joins[scope] ?? 0 }
 
   /// Number of keys currently reserved by in-flight work. Internal for deterministic tests.
   var inFlightReservationCount: Int { flights.count }
@@ -280,7 +280,8 @@ actor _ASNMemoryCache {
 /// cache. Only entries with an AS name are cached.
 public struct CachingASNResolver: ASNResolver, PublishingASNResolver {
   private let base: ASNResolver
-  private let scope: _ASNResolverScope
+  /// Internal so a test can check that it is released with the resolver.
+  let scope: _ASNResolverScope
 
   public init(base: ASNResolver) {
     self.base = base
@@ -300,9 +301,7 @@ public struct CachingASNResolver: ASNResolver, PublishingASNResolver {
   }
 
   /// How many times a caller of this resolver joined a running flight. For tests.
-  var joinCount: Int {
-    get async { await _ASNMemoryCache.shared.joinCount(scope) }
-  }
+  var joinCount: Int { scope.joinCount }
 
   func resolve(
     _ addresses: [String], timeout: TimeInterval, deadline: TimeInterval,

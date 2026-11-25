@@ -108,12 +108,13 @@ final class SwiftFTRCacheTests: XCTestCase {
     return await resolver.callCount() >= expectedCount
   }
 
-  private func waitForJoinCount(_ expectedCount: Int) async -> Bool {
+  private func waitForJoinCount(_ expectedCount: Int, on caching: CachingASNResolver) async -> Bool
+  {
     for _ in 0..<2_000 {
-      if await _ASNMemoryCache.shared.joinCount >= expectedCount { return true }
+      if caching.joinCount >= expectedCount { return true }
       try? await Task.sleep(for: .milliseconds(1))
     }
-    return await _ASNMemoryCache.shared.joinCount >= expectedCount
+    return caching.joinCount >= expectedCount
   }
 
   func testCachingResolverHitsCache() async throws {
@@ -282,7 +283,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let second = Task {
       try await caching.resolve(ipv4Addrs: addresses, timeout: 60)
     }
-    let secondJoined = await waitForJoinCount(1)
+    let secondJoined = await waitForJoinCount(1, on: caching)
     let callsWhileSuspended = await base.callCount()
 
     await base.succeedAll()
@@ -421,7 +422,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let joined = Task {
       try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
-    let secondJoined = await waitForJoinCount(1)
+    let secondJoined = await waitForJoinCount(1, on: caching)
     let callsWhileSuspended = await base.callCount()
 
     await base.failAll()
@@ -464,7 +465,7 @@ final class SwiftFTRCacheTests: XCTestCase {
     let joined = Task {
       try await caching.resolve(ipv4Addrs: [address], timeout: 60)
     }
-    let secondJoined = await waitForJoinCount(1)
+    let secondJoined = await waitForJoinCount(1, on: caching)
 
     let cancellationObserved = expectation(description: "Canceled caller stops waiting")
     let canceledResult = Task {

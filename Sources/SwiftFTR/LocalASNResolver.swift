@@ -58,9 +58,9 @@ public actor LocalASNResolver: ASNResolver, PublishingASNResolver {
   /// The database, waiting for its load until `deadline` (`nil` waits as long as it takes) or
   /// until the calling task is cancelled.
   ///
-  /// The load is the store's ``SharedASNWork``, asked for by the first caller whose deadline has
-  /// not passed and whose task is not cancelled, and never stopped by a caller leaving. Only a
-  /// load that failed is remembered as failed.
+  /// The load is the store's ``SharedASNWork``, started only by a caller whose deadline has not
+  /// passed and whose task is not cancelled, and never stopped by a caller leaving. Only a load
+  /// that failed is remembered as failed.
   private func database(until deadline: TimeInterval?) async -> UltraCompactDatabase? {
     let load: SharedASNWork<LocalASNDatabaseHandle>
     switch loadState {
@@ -71,9 +71,11 @@ public actor LocalASNResolver: ASNResolver, PublishingASNResolver {
     case .loading(let running):
       load = running
     case .notLoaded:
-      guard !DiscoveryClock.current.hasPassed(deadline), !Task.isCancelled else { return nil }
-      // Concurrent resolvers for one source share the store's one load.
-      load = await store.load(source)
+      // Concurrent resolvers for one source share the store's one load. Past the deadline, or
+      // cancelled, only a database already resident or loading may be taken.
+      let mayStart = !DiscoveryClock.current.hasPassed(deadline) && !Task.isCancelled
+      guard let shared = await store.load(source, mayStart: mayStart) else { return nil }
+      load = shared
       loadState = .loading(load)
     }
     let outcome = await load.wait(until: deadline).outcome
@@ -201,8 +203,11 @@ actor LocalASNDatabaseStore {
   }
 
   /// The shared load of `source`: one already finished when a live resolver holds its database,
-  /// else the load in flight, else a new one. Nothing a caller does stops it.
-  func load(_ source: LocalASNSource) -> SharedASNWork<LocalASNDatabaseHandle> {
+  /// else the load in flight, else a new one if `mayStart`, else `nil`. Nothing a caller does
+  /// stops it.
+  func load(_ source: LocalASNSource, mayStart: Bool = true) -> SharedASNWork<
+    LocalASNDatabaseHandle
+  >? {
     let key = LocalASNSourceKey(source)
     if let handle = resident[key]?.handle {
       return SharedASNWork(finished: handle)
@@ -210,6 +215,7 @@ actor LocalASNDatabaseStore {
     if let running = inFlight[key] {
       return running
     }
+    guard mayStart else { return nil }
 
     loadCount += 1
     let loader = self.loader

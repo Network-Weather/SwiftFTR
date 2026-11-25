@@ -441,11 +441,12 @@ the database should stay resident. A
 `resolver:` passed to `traceClassified` overrides the configured strategy for that call.
 
 `timeout` bounds the whole `resolve` call in every built-in resolver: Cymru's origin and AS-name
-queries on every server, the wait for a database still loading, the hybrid's DNS fallback (which
-also ends `fallbackTimeout` after it starts) and the wait on a shared cached lookup. At the
-deadline the call returns every answer it has; an AS number whose name had not arrived has
-`name == ""` and is not cached. Zero, a negative value or NaN starts nothing; infinity waits for
-the work. A caller that leaves at its deadline or is cancelled stops no shared lookup or database
+queries on every server, the wait for a database still loading, and the wait on the hybrid's DNS
+fallback or another shared cached lookup. Shared lookups run on their own budget (their own
+`timeout`, `fallbackTimeout` for the hybrid's), whoever started them. At the deadline the call
+returns every answer it has; an AS number whose name had not arrived has `name == ""` and is not
+cached. Zero, a negative value or NaN starts nothing but still returns cached answers, a database
+already resident and what a running lookup has learned; infinity waits for the work. A caller that leaves at its deadline or is cancelled stops no shared lookup or database
 load. A caller's own `ASNResolver` behind `CachingASNResolver` is not interrupted: the caller
 stops waiting and the lookup runs on.
 

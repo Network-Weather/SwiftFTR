@@ -6,6 +6,15 @@ typealias ASNPublish = @Sendable ([String: ASNInfo]) -> Void
 
 /// A built-in resolver: it is bounded by one absolute deadline, passed down unchanged from the
 /// public call that took it, and it publishes answers as it learns them.
+///
+/// Two rules hold at every step of every built-in resolver:
+///
+/// - **A passed deadline starts nothing, and still returns everything already available without
+///   I/O**: cache hits, a database another resolver already holds, and whatever running or
+///   finished shared work has published.
+/// - **Shared work runs on its own budget; a waiter's deadline bounds only the waiter.** A cache
+///   flight runs for its own `timeout` (part of its identity) from when it starts, and the
+///   database load runs to its end, whichever caller started them.
 protocol PublishingASNResolver: ASNResolver {
   /// Resolves `addresses` until `deadline`, publishing each answer as it is learned and
   /// returning every answer it has.
@@ -13,7 +22,7 @@ protocol PublishingASNResolver: ASNResolver {
   /// - Parameters:
   ///   - timeout: The public call's `timeout`, unchanged. It identifies a shared cache flight and
   ///     is what the DNS resolver validates; it is never a measure of time left.
-  ///   - deadline: An instant on `DiscoveryClock.current`. Nothing starts once it has passed.
+  ///   - deadline: An instant on `DiscoveryClock.current` that bounds this caller's waits.
   ///   - publish: Receives answers as they are learned.
   func resolve(
     _ addresses: [String], timeout: TimeInterval, deadline: TimeInterval,
