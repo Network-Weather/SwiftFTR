@@ -69,7 +69,8 @@ func publicIPDiscovery(
   // `!(budget > 0)` also refuses NaN.
   guard budget > 0 else { throw PublicIPDiscoveryTimeout() }
   let bounded = budget.isFinite && budget < 1e9
-  let deadline = bounded ? monotonicNow() + budget : nil
+  let clock = discoveryClock()
+  let deadline = bounded ? clock() + budget : nil
 
   guard let substitute = TestSeams.discoverPublicIP else {
     let outcome: Result<STUNPublicIP, Error>
@@ -82,7 +83,7 @@ func publicIPDiscovery(
       outcome = .failure(error)
     }
     let found = try publicIPDiscoveryOutcome(
-      outcome, now: monotonicNow(), deadline: deadline ?? .infinity, cancelled: Task.isCancelled)
+      outcome, now: clock(), deadline: deadline ?? .infinity, cancelled: Task.isCancelled)
     return PublicIPObservation(address: found.ip, family: family, source: .stun)
   }
 
@@ -111,6 +112,6 @@ func publicIPDiscovery(
       first = .failure(error)
     }
     return try publicIPDiscoveryOutcome(
-      first, now: monotonicNow(), deadline: deadline, cancelled: Task.isCancelled)
+      first, now: clock(), deadline: deadline, cancelled: Task.isCancelled)
   }
 }

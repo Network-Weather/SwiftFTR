@@ -335,28 +335,29 @@ struct AsyncPublicIPDiscoveryTests {
     let servers = Self.servers(v4: [(first.host, first.port), (second.host, second.port)])
 
     // Each attempt could run past the watchdog on its own; only the budget can end discovery
-    // inside it. The budget is the one real duration here, and the first attempt must be sent
-    // inside it: on a three-core CI runner with the rest of the suite running, a one-second budget
-    // ended before the first attempt was sent.
-    let outcome = try await measure(within: Self.watchdog) {
-      await Self.withFixtures(servers: servers, executor: executor) {
-        do {
-          return Result<PublicIPObservation?, Error>.success(
+    // inside it. The budget is generous in real time and is passed on the test clock once both
+    // servers have been asked, so a slow start cannot spend it.
+    let clock = MovableClock()
+    let discovery = Task {
+      await TestSeams.$monotonicClock.withValue(clock.now) {
+        await Self.withFixtures(servers: servers, executor: executor) {
+          await resultOf {
             try await publicIPDiscovery(
               family: .v4, stunTimeout: Self.longSTUNTimeout, interface: nil, sourceIP: nil,
-              enableLogging: false, budget: 4))
-        } catch {
-          return .failure(error)
+              enableLogging: false, budget: 3 * Self.watchdog)
+          }
         }
       }
-    }.0
-    #expect(throws: PublicIPDiscoveryTimeout.self) { try outcome.get() }
-    #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
-    // Both servers are asked at once, each once. Each fixture counts on its own thread.
-    let bothAsked = await eventually(within: 10) {
+    }
+    defer { discovery.cancel() }
+    let bothAsked = await eventually(within: Self.watchdog) {
       first.requests.value == 1 && second.requests.value == 1
     }
-    #expect(bothAsked, "asked \(first.requests.value) and \(second.requests.value) times")
+    try #require(bothAsked, "asked \(first.requests.value) and \(second.requests.value) times")
+    clock.jump(by: 6 * Self.watchdog)
+    let outcome = try await measure(within: Self.watchdog) { await discovery.value }.0
+    #expect(throws: PublicIPDiscoveryTimeout.self) { try outcome.get() }
+    #expect(first.releaseTime == nil, "discovery returned only once its first server answered")
 
     // The discovery itself ended, not only the wait for it: nothing more is sent.
     first.release()

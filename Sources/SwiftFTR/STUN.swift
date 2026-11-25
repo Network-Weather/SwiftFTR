@@ -484,17 +484,28 @@ func stunGetPublicIPv6(
 
 // MARK: - Concurrent STUN sweep
 
-/// The longest a STUN server's name lookup is waited for when the sweep has no deadline of its
-/// own, as in ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``: the forward-
+/// The longest a STUN server's name lookup is waited for (on the deadline's clock) when the sweep
+/// has no deadline of its own, as in ``getPublicIPs(stunTimeout:interface:sourceIP:enableLogging:)``: the forward-
 /// resolution budget a trace gets by default (docs/BLOCKING-IO.md, decision 7). A sweep with a
 /// deadline waits for the earlier of the two. The `getaddrinfo` itself runs on in its executor
 /// slot when the wait ends.
 let stunNameLookupLimit: TimeInterval = 20
 
-/// Seconds from now until `deadline`, an instant on `monotonicNow()`'s clock, and never less than
+/// The clock every public-IP discovery deadline is on: `monotonicNow()`, which counts system
+/// sleep, or the test's `TestSeams.monotonicClock`. Read it in the task, then capture it for any
+/// queue or worker, which cannot see task-locals.
+func discoveryClock() -> @Sendable () -> TimeInterval { TestSeams.monotonicClock ?? monotonicNow }
+
+/// How long one wait on ``sleep(untilMonotonic:clock:slice:)`` may last before it reads the clock
+/// again: unbounded on the real clock, which the continuous sleep follows, and short on a test
+/// clock, which a test moves without real time passing.
+func discoverySleepSlice() -> TimeInterval { TestSeams.monotonicClock == nil ? 1e9 : 0.01 }
+
+/// Seconds from now until `deadline`, an instant on ``discoveryClock()``, and never less than
 /// zero (a deadline that is not a number has passed); `nil` when there is no deadline.
 func secondsLeft(until deadline: TimeInterval?) -> TimeInterval? {
-  deadline.map { $0.isNaN ? 0 : max($0 - monotonicNow(), 0) }
+  let now = discoveryClock()
+  return deadline.map { $0.isNaN ? 0 : max($0 - now(), 0) }
 }
 
 /// The endpoint for a numeric `host` of `family`, built without the resolver, or `nil` when
@@ -536,18 +547,33 @@ func lookUpSTUNServer(
   _ server: (host: String, port: UInt16), family: Int32, deadline: TimeInterval?,
   resolve: @escaping TestSeams.ResolveSTUNServer
 ) async throws -> (server: sockaddr_storage, serverLen: socklen_t)? {
-  let wait = min(secondsLeft(until: deadline) ?? stunNameLookupLimit, stunNameLookupLimit)
+  let clock = discoveryClock()
+  let slice = discoverySleepSlice()
+  let limit = min(
+    deadline ?? .infinity, clock() + (TestSeams.stunNameLookupLimit ?? stunNameLookupLimit))
   // No time left: nothing is submitted, so no lookup starts after the deadline.
-  guard wait > 0 else { return nil }
-  do {
-    return try await runDetachedBlockingIO(deadline: wait) {
-      // A worker can pick this up as the deadline passes, before its timer has withdrawn it.
-      if let deadline, !(monotonicNow() < deadline) { return nil }
-      return resolve(server.host, server.port, family)
+  guard clock() < limit else { return nil }
+  typealias Endpoint = (server: sockaddr_storage, serverLen: socklen_t)
+  // The wait ends at `limit` on the deadline's own clock, raced here rather than handed to the
+  // executor, whose timer is on Dispatch's uptime clock and stands still while the Mac sleeps.
+  let found = try await withThrowingTaskGroup(of: Endpoint?.self) { group -> Endpoint? in
+    group.addTask {
+      try await runDetachedBlockingIO {
+        // A worker can pick this up as the limit passes, before the race has withdrawn it.
+        guard clock() < limit else { return nil }
+        return resolve(server.host, server.port, family)
+      }
     }
-  } catch is BlockingIOTimeout {
-    return nil
+    group.addTask {
+      await sleep(untilMonotonic: limit, clock: clock, slice: slice)
+      return nil
+    }
+    // The first to finish decides; the other is cancelled, which withdraws a queued lookup.
+    defer { group.cancelAll() }
+    return try await group.next() ?? nil
   }
+  try Task.checkCancellation()
+  return found
 }
 
 /// One server's attempt in a sweep: its name resolved (a numeric address needs no lookup), then
@@ -601,16 +627,18 @@ private func stunAttempt(
 
 /// Suspends until `deadline`, an instant on `clock` (`monotonicNow()`'s, which counts system
 /// sleep), has passed, or until the task is cancelled. It sleeps on the continuous clock, which
-/// also counts system sleep, and checks `clock` again on every wake, so it never ends early.
+/// also counts system sleep, at most `slice` seconds at a time, and checks `clock` again on every
+/// wake, so it never ends early.
 func sleep(
   untilMonotonic deadline: TimeInterval,
-  clock: @Sendable () -> TimeInterval = monotonicNow
+  clock: @Sendable () -> TimeInterval = monotonicNow,
+  slice: TimeInterval = 1e9
 ) async {
   while !Task.isCancelled {
     let left = deadline - clock()
     // Also a deadline that is not a number: it has passed.
     guard left > 0 else { return }
-    try? await Task.sleep(until: .now + .seconds(min(left, 1e9)), clock: .continuous)
+    try? await Task.sleep(until: .now + .seconds(min(left, slice, 1e9)), clock: .continuous)
   }
 }
 
@@ -631,8 +659,10 @@ private func admitSweep(_ admission: _ConcurrencySemaphore, deadline: TimeInterv
         return .gaveUp
       }
     }
+    let clock = discoveryClock()
+    let slice = discoverySleepSlice()
     group.addTask {
-      await sleep(untilMonotonic: deadline)
+      await sleep(untilMonotonic: deadline, clock: clock, slice: slice)
       return .deadline
     }
     let first = await group.next() ?? .deadline
@@ -710,6 +740,7 @@ internal func stunGetPublicIPWithFallback(
   // Read on the async side, where the task-local seams are visible.
   let send = TestSeams.sendSTUNRequest
   let resolve = TestSeams.resolveSTUNServer ?? resolveSTUNServer
+  let observeOutcome = TestSeams.observeSTUNOutcome
 
   if enableLogging {
     print("[STUN] Asking \(servers.count) servers at once (\(famName))...")
@@ -734,6 +765,7 @@ internal func stunGetPublicIPWithFallback(
         return found
       case .failure(let error):
         failures[index] = error
+        observeOutcome?(index)
       }
     }
     return nil

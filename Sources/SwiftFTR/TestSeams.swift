@@ -87,9 +87,16 @@ enum TestSeams {
 
   @TaskLocal static var connectSocket: ConnectSocket?
 
-  /// `monotonicNow()` in place of the real clock, for a ``UDPExchange``'s decisions against its
-  /// cutoff, so a test can move the clock past the cutoff (as a system sleep does) without sleeping.
+  /// `monotonicNow()` in place of the real clock for every public-IP discovery deadline (the
+  /// budget, admission, name lookups and each exchange's cutoff), so a test can move the clock past
+  /// a deadline, as a system sleep does, without waiting for it.
   @TaskLocal static var monotonicClock: (@Sendable () -> TimeInterval)?
+
+  /// The longest a STUN name lookup is waited for, in place of `stunNameLookupLimit`.
+  @TaskLocal static var stunNameLookupLimit: TimeInterval?
+
+  /// Called with a server's index when a STUN sweep records that server's failure.
+  @TaskLocal static var observeSTUNOutcome: (@Sendable (_ index: Int) -> Void)?
 
   /// UDP port every event-based DNS query sends to, in place of 53, so a query to a loopback
   /// literal reaches a test responder on an ephemeral port.

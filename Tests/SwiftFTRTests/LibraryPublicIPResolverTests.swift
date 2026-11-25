@@ -352,23 +352,34 @@ struct LibraryPublicIPResolverTests {
     // A name, so each discovery's lookup queues behind the occupant until the budget abandons it.
     let lookups = NameLookups(["stun-a.test": refusing.port])
     let before = Self.lo0UDPSockets()
+    // Each discovery's lookup queues behind the occupant; once it is seen queued, the deadline is
+    // passed on the test clock, while the occupant still holds the slot.
+    let clock = MovableClock()
     for round in 0..<8 {
       let submitted = executor.submissions.value
-      let outcome = try await measure(within: Self.watchdog) {
-        await TestSeams.$blockingIOExecutor.withValue(executor) {
-          await TestSeams.$stunServers.withValue(Self.named(["stun-a.test"])) {
-            await TestSeams.$resolveSTUNServer.withValue(lookups.seam) {
-              await Result {
-                try await publicIPDiscovery(
-                  family: .v4, stunTimeout: 0.2, interface: "lo0", sourceIP: nil,
-                  enableLogging: false, budget: 0.3)
+      let discovery = Task {
+        await TestSeams.$monotonicClock.withValue(clock.now) {
+          await TestSeams.$blockingIOExecutor.withValue(executor) {
+            await TestSeams.$stunServers.withValue(Self.named(["stun-a.test"])) {
+              await TestSeams.$resolveSTUNServer.withValue(lookups.seam) {
+                await resultOf {
+                  try await publicIPDiscovery(
+                    family: .v4, stunTimeout: Self.longSTUNTimeout, interface: "lo0",
+                    sourceIP: nil, enableLogging: false, budget: 3 * Self.watchdog)
+                }
               }
             }
           }
         }
-      }.0
+      }
+      defer { discovery.cancel() }
+      let queued = await eventually(within: Self.watchdog) {
+        executor.submissions.value == submitted + 1
+      }
+      try #require(queued, "round \(round): no lookup submitted")
+      clock.jump(by: 6 * Self.watchdog)
+      let outcome = try await measure(within: Self.watchdog) { await discovery.value }.0
       #expect(throws: PublicIPDiscoveryTimeout.self, "round \(round)") { try outcome.get() }
-      #expect(executor.submissions.value == submitted + 1, "round \(round): no lookup submitted")
     }
     #expect(lookups.calls.value == 0, "a queued lookup ran although the occupant held the slot")
     let held = Self.lo0UDPSockets() - before
@@ -402,20 +413,25 @@ struct LibraryPublicIPResolverTests {
       let silentServer = (host: silent.host, port: silent.port)
       servers = { _ in [silentServer, silentServer] }
     }
-    let budget: TimeInterval = end == .deadlineInExchange ? 5 : 3 * Self.watchdog
+    // Every case gets a deadline no correct sweep can miss; the deadline case passes it on the test
+    // clock once every request is out.
+    let budget: TimeInterval = 3 * Self.watchdog
+    let clock = MovableClock()
     let calls = 6
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 8, name: "test.pip-ended")
     let before = Self.lo0UDPSockets()
 
     let sweepServers = servers
-    let sweeps = await TestSeams.$blockingIOExecutor.withValue(executor) {
-      await TestSeams.$stunServers.withValue(sweepServers) {
-        await TestSeams.$resolveSTUNServer.withValue(stalled) {
-          (0..<calls).map { _ in
-            Task {
-              try await publicIPDiscovery(
-                family: .v4, stunTimeout: Self.longSTUNTimeout, interface: "lo0", sourceIP: nil,
-                enableLogging: false, budget: budget)
+    let sweeps = await TestSeams.$monotonicClock.withValue(clock.now) {
+      await TestSeams.$blockingIOExecutor.withValue(executor) {
+        await TestSeams.$stunServers.withValue(sweepServers) {
+          await TestSeams.$resolveSTUNServer.withValue(stalled) {
+            (0..<calls).map { _ in
+              Task {
+                try await publicIPDiscovery(
+                  family: .v4, stunTimeout: Self.longSTUNTimeout, interface: "lo0", sourceIP: nil,
+                  enableLogging: false, budget: budget)
+              }
             }
           }
         }
@@ -428,7 +444,11 @@ struct LibraryPublicIPResolverTests {
         && (end == .cancelledInLookup || silent.requests.value == 2 * calls)
     }
     try #require(opened, "\(Self.lo0UDPSockets() - before) sockets, \(silent.requests.value) sent")
-    if end != .deadlineInExchange { for sweep in sweeps { sweep.cancel() } }
+    if end == .deadlineInExchange {
+      clock.jump(by: 6 * Self.watchdog)
+    } else {
+      for sweep in sweeps { sweep.cancel() }
+    }
     for sweep in sweeps {
       let outcome = try await measure(within: Self.watchdog) { await sweep.result }.0
       #expect(throws: Error.self) { try outcome.get() }

@@ -7,6 +7,23 @@ import Testing
   import Darwin
 #endif
 
+/// A clock that reads `monotonicNow()` plus an offset a test can move, as a system sleep moves the
+/// real one while Dispatch's uptime clock stands still. Bound to `TestSeams.monotonicClock`, it
+/// lets a test pass a discovery deadline at the moment of its choosing.
+final class MovableClock: @unchecked Sendable {
+  private let lock = NSLock()
+  private var offset: TimeInterval = 0
+  func jump(by seconds: TimeInterval) { lock.withLock { offset += seconds } }
+  var now: @Sendable () -> TimeInterval {
+    { monotonicNow() + self.lock.withLock { self.offset } }
+  }
+}
+
+/// The outcome of `body`, its error included. (Swift 6.1 has no async `Result` initializer.)
+func resultOf<T: Sendable>(_ body: () async throws -> T) async -> Result<T, Error> {
+  do { return .success(try await body()) } catch { return .failure(error) }
+}
+
 /// A loopback STUN server that answers each binding request with the datagrams `replies` builds
 /// from it, sent in order, once `gate` (when given) has opened. Anything that is not a binding
 /// request is a stray (``DatagramFilter``) and is never answered.
@@ -169,28 +186,17 @@ struct EventBasedSTUNTests {
       reply[1] = 0x11
       return [reply]
     }
-    // The healthy server answers only once the sweep has read the invalid reply, so that failure
-    // comes first and must not end the sweep.
-    let invalidRead = StallGate()
-    defer { invalidRead.open() }
-    let healthy = try Self.answering(Self.mappedX, gate: invalidRead)
+    // The healthy server answers only once the sweep has recorded the invalid server's failure,
+    // so that failure comes first and must not end the sweep.
+    let invalidFailed = StallGate()
+    defer { invalidFailed.open() }
+    let healthy = try Self.answering(Self.mappedX, gate: invalidFailed)
     defer {
       invalid.stop()
       healthy.stop()
     }
-    let invalidPort = invalid.port
-    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
-      let n = recv(fd, buffer.baseAddress, buffer.count, 0)
-      let code = errno
-      var peer = sockaddr_in()
-      var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-      let named = withUnsafeMutablePointer(to: &peer) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fd, $0, &length) }
-      }
-      if n >= 20, named == 0, UInt16(bigEndian: peer.sin_port) == invalidPort { invalidRead.open() }
-      errno = code
-      return n
-    }
+    // The sweep records the invalid server's failure (index 0) before the healthy one may answer.
+    let failed: @Sendable (Int) -> Void = { index in if index == 0 { invalidFailed.open() } }
 
     let alone = try await Self.sweep([invalid.server])
     #expect {
@@ -199,7 +205,7 @@ struct EventBasedSTUNTests {
       guard case STUNError.invalidResponse = error else { return false }
       return true
     }
-    let beside = try await TestSeams.$receiveDatagram.withValue(receive) {
+    let beside = try await TestSeams.$observeSTUNOutcome.withValue(failed) {
       try await Self.sweep([invalid.server, healthy.server])
     }
     #expect(try beside.get().ip == "198.51.100.7")
@@ -318,7 +324,10 @@ struct EventBasedSTUNTests {
       await TestSeams.$blockingIOExecutor.withValue(executor) {
         await TestSeams.$resolveSTUNServer.withValue(resolve) {
           await TestSeams.$receiveDatagram.withValue(receive) {
-            await Self.ask("discovery", [other, healthy.server])
+            // Past the watchdog, so only abandoning the stalled lookup can return in time.
+            await TestSeams.$stunNameLookupLimit.withValue(3 * Self.watchdog) {
+              await Self.ask("discovery", [other, healthy.server])
+            }
           }
         }
       }
@@ -342,17 +351,6 @@ struct EventBasedSTUNTests {
 
   // MARK: One clock for the deadline
 
-  /// A clock that reads `monotonicNow()` plus an offset a test can move, as a system sleep moves
-  /// the real one while Dispatch's uptime clock stands still.
-  final class MovableClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var offset: TimeInterval = 0
-    func jump(by seconds: TimeInterval) { lock.withLock { offset += seconds } }
-    var now: @Sendable () -> TimeInterval {
-      { monotonicNow() + self.lock.withLock { self.offset } }
-    }
-  }
-
   @Test("A reply read once the cutoff has passed on its own clock is not taken")
   func replyAfterCutoffNotTaken() async throws {
     let release = StallGate()
@@ -373,7 +371,7 @@ struct EventBasedSTUNTests {
     let exchange = Task {
       await TestSeams.$monotonicClock.withValue(clock.now) {
         await TestSeams.$receiveDatagram.withValue(receive) {
-          await Result {
+          await resultOf {
             try await stunExchange(
               fd: fd, family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
               timeout: 3 * Self.watchdog, cutoff: cutoff)
@@ -408,7 +406,7 @@ struct EventBasedSTUNTests {
     let cutoff = monotonicNow() + 3 * Self.watchdog
     let outcome = try await measure(within: Self.watchdog) {
       await TestSeams.$monotonicClock.withValue(clock.now) {
-        await Result {
+        await resultOf {
           try await stunExchange(
             fd: fd, family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
             timeout: 3 * Self.watchdog, cutoff: cutoff, send: send)
@@ -485,15 +483,15 @@ struct EventBasedSTUNTests {
   func setupPastDeadlineSendsNothing() async throws {
     let healthy = try Self.answering(Self.mappedX)
     defer { healthy.stop() }
-    let budget: TimeInterval = 0.2
-    // Making the socket non-blocking is the exchange's first setup step. Held from its own entry
-    // until a budget has passed, it ends after the deadline, which was set before it was entered.
+    // A deadline no correct sweep can miss in real time, passed on the test clock from inside the
+    // exchange's first setup step, after the attempt has started.
+    let budget: TimeInterval = 3 * Self.watchdog
+    let clock = MovableClock()
     let setups = FaultCounter()
     let fileControl: TestSeams.FileControl = { fd, command, argument in
       if command == F_GETFL {
         setups.increment()
-        let entered = monotonicNow()
-        while monotonicNow() < entered + budget + 0.05 { usleep(5_000) }
+        clock.jump(by: 2 * budget)
       }
       return fcntl(fd, command, argument)
     }
@@ -507,16 +505,18 @@ struct EventBasedSTUNTests {
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 2, name: "test.stun-setup")
     let outcome = try await measure(within: Self.watchdog) {
       await TestSeams.$blockingIOExecutor.withValue(executor) {
-        await TestSeams.$stunServers.withValue({ _ in [healthy.server] }) {
-          await TestSeams.$fileControl.withValue(fileControl) {
-            await TestSeams.$sendSTUNRequest.withValue(send) {
-              do {
-                return Result<PublicIPObservation?, Error>.success(
-                  try await publicIPDiscovery(
-                    family: .v4, stunTimeout: Self.longTimeout, interface: nil, sourceIP: nil,
-                    enableLogging: false, budget: budget))
-              } catch {
-                return .failure(error)
+        await TestSeams.$monotonicClock.withValue(clock.now) {
+          await TestSeams.$stunServers.withValue({ _ in [healthy.server] }) {
+            await TestSeams.$fileControl.withValue(fileControl) {
+              await TestSeams.$sendSTUNRequest.withValue(send) {
+                do {
+                  return Result<PublicIPObservation?, Error>.success(
+                    try await publicIPDiscovery(
+                      family: .v4, stunTimeout: Self.longTimeout, interface: nil, sourceIP: nil,
+                      enableLogging: false, budget: budget))
+                } catch {
+                  return .failure(error)
+                }
               }
             }
           }
