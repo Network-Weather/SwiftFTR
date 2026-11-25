@@ -325,6 +325,69 @@ struct EnrichmentLifetimeTests {
     #expect(fixture.nameQueries.value == 1)
   }
 
+  @Test(
+    "A cache in front of a hybrid that joined a running fallback hears what it published",
+    arguments: [true, false])
+  func joinerForwardsWhatItsFlightPublished(originBeforeJoin: Bool) async throws {
+    let (originGate, nameGate) = (StallGate(), StallGate())
+    defer {
+      originGate.open()
+      nameGate.open()
+    }
+    if originBeforeJoin { originGate.open() }
+    let fixture = try CymruTXTFixture(
+      answersOrigin: true, originGate: originGate, name: .refuse(after: nameGate))
+    defer { fixture.stop() }
+    let dns = CachingASNResolver(base: CymruDNSResolver(servers: ["127.0.0.1"]))
+    let hybrid = HybridASNResolver(
+      local: Self.failingLocalResolver(), dns: dns, fallbackTimeout: 10 * Self.timeout)
+    let outer = CachingASNResolver(base: hybrid)
+    let (fallbackClock, outerClock, joinerClock) = (MovableClock(), MovableClock(), MovableClock())
+    // A hybrid lookup starts the DNS fallback, which learns the origin and waits for the name.
+    let fallbackOwner = Task {
+      try await fixture.bind(fallbackClock) {
+        try await hybrid.resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
+      }
+    }
+    // Either the origin is already known when the hybrid below the outer cache joins, or it
+    // arrives while that hybrid waits.
+    let waiting = await eventually(within: Self.watchdog) {
+      originBeforeJoin ? fixture.nameQueries.value > 0 : fixture.originQueries.value > 0
+    }
+    #expect(waiting)
+    // The outer cache's flight runs the hybrid, which joins that fallback rather than starting it.
+    let outerOwner = Task {
+      try await fixture.bind(outerClock) {
+        try await outer.resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
+      }
+    }
+    let innerJoined = await eventually(within: Self.watchdog) { dns.joinCount == 1 }
+    #expect(innerJoined)
+    // A second outer caller joins the outer flight and leaves at its deadline, while every
+    // flight below it is still waiting for the name.
+    let joiner = Task {
+      try await fixture.bind(joinerClock) {
+        try await outer.resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
+      }
+    }
+    let outerJoined = await eventually(within: Self.watchdog) { outer.joinCount == 1 }
+    #expect(outerJoined)
+    if !originBeforeJoin {
+      // The origin is learned, and published, before its AS-name query goes out.
+      originGate.open()
+      let named = await eventually(within: Self.watchdog) { fixture.nameQueries.value > 0 }
+      #expect(named)
+    }
+    joinerClock.jump(by: 2 * Self.timeout)
+    let (found, _) = try await measure(within: Self.watchdog) { try await joiner.value }
+    #expect(found[fixture.address]?.asn == CymruTXTFixture.asn)
+    #expect(fixture.originQueries.value == 1)
+
+    nameGate.open()
+    _ = try await measure(within: Self.watchdog) { try await fallbackOwner.value }
+    _ = try await measure(within: Self.watchdog) { try await outerOwner.value }
+  }
+
   // MARK: - A passed deadline returns what is known
 
   @Test("A passed deadline starts nothing, and returns what each source already holds")
@@ -486,7 +549,8 @@ final class CymruTXTFixture: @unchecked Sendable {
   let nameQueries = FaultCounter()
   private let responder: LoopbackUDPResponder
 
-  init(answersOrigin: Bool, name nameReply: NameReply) throws {
+  /// - Parameter originGate: When given, the origin reply waits for it.
+  init(answersOrigin: Bool, originGate: StallGate? = nil, name nameReply: NameReply) throws {
     let name = Locked(nameReply)
     self.name = name
     let (origins, names) = (originQueries, nameQueries)
@@ -499,6 +563,7 @@ final class CymruTXTFixture: @unchecked Sendable {
       case originQuery:
         origins.increment()
         guard answersOrigin else { return nil }
+        originGate?.wait(limit: 60)
         text = "64496 | 203.0.114.0/24 | ZZ | arin | 2026-01-01"
       case "as64496.asn.cymru.com":
         names.increment()

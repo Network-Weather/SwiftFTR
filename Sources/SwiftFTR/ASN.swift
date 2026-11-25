@@ -150,14 +150,22 @@ actor _ASNMemoryCache {
   ) async throws -> [String: ASNInfo] {
     try Task.checkCancellation()
     let (hits, flights) = await join(
-      addresses, timeout: timeout, deadline: deadline, using: resolver, scope: scope,
-      publish: publish)
+      addresses, timeout: timeout, deadline: deadline, using: resolver, scope: scope)
     if !hits.isEmpty { publish(hits) }
     let wanted = Set(addresses)
+    let forward: ASNPublish = { publish($0.filter { wanted.contains($0.key) }) }
+    // All flights are waited on at once, so each forwards what it learns while the others run.
+    let snapshots = await withTaskGroup(of: (Int, SharedASNWork<Void>.Snapshot).self) { group in
+      for (index, flight) in flights.enumerated() {
+        group.addTask { (index, await flight.wait(until: deadline, forwardingTo: forward)) }
+      }
+      var byIndex: [Int: SharedASNWork<Void>.Snapshot] = [:]
+      for await (index, snapshot) in group { byIndex[index] = snapshot }
+      return flights.indices.compactMap { byIndex[$0] }
+    }
     var resolved = hits
     var failure: Error?
-    for flight in flights {
-      let snapshot = await flight.wait(until: deadline)
+    for snapshot in snapshots {
       for (address, info) in snapshot.answers where wanted.contains(address) {
         resolved[address] = info
       }
@@ -165,7 +173,6 @@ actor _ASNMemoryCache {
     }
     try Task.checkCancellation()
     if resolved.isEmpty, let failure { throw failure }
-    publish(resolved)
     return resolved
   }
 
@@ -177,8 +184,7 @@ actor _ASNMemoryCache {
     timeout: TimeInterval,
     deadline: TimeInterval,
     using resolver: ASNResolver,
-    scope: _ASNResolverScope,
-    publish: @escaping ASNPublish
+    scope: _ASNResolverScope
   ) -> (hits: [String: ASNInfo], flights: [SharedASNWork<Void>]) {
     var hits: [String: ASNInfo] = [:]
     var joined: [SharedASNWork<Void>] = []
@@ -199,41 +205,33 @@ actor _ASNMemoryCache {
     if !unreserved.isEmpty, !DiscoveryClock.current.hasPassed(deadline) {
       joined.append(
         startFlight(
-          unreserved, timeout: timeout, deadline: deadline, using: resolver, scope: scope,
-          publish: publish))
+          unreserved, timeout: timeout, using: resolver, scope: scope))
     }
     return (hits, joined)
   }
 
   /// Starts one flight for `addresses`. It runs on its own budget, `timeout` from now, however
-  /// little time the caller that starts it has left (`deadline` only decides whether it starts).
-  /// It publishes to its own record and to that caller, so a caller that is itself a flight
-  /// (a cache in front of this one) sees each answer as it arrives.
+  /// little time the caller that starts it has left. Its starter hears what it learns as every
+  /// other waiter does, through ``SharedASNWork/wait(until:forwardingTo:)``.
   private func startFlight(
     _ addresses: [String],
     timeout: TimeInterval,
-    deadline: TimeInterval,
     using resolver: ASNResolver,
-    scope: _ASNResolverScope,
-    publish starter: @escaping ASNPublish
+    scope: _ASNResolverScope
   ) -> SharedASNWork<Void> {
     let keys = addresses.map { LookupKey(scope: scope, address: $0, timeout: timeout) }
     let flightGeneration = generation
     let budget = asnDeadline(timeout)
     let flight = SharedASNWork<Void> { publish in
-      let both: ASNPublish = {
-        publish($0)
-        starter($0)
-      }
       do {
         let found: [String: ASNInfo]
         if let resolver = resolver as? PublishingASNResolver {
           found = try await resolver.resolve(
-            addresses, timeout: timeout, deadline: budget, publish: both)
+            addresses, timeout: timeout, deadline: budget, publish: publish)
         } else {
           found = try await resolver.resolve(ipv4Addrs: addresses, timeout: timeout)
         }
-        both(found)
+        publish(found)
         await self.land(keys, generation: flightGeneration, found: found)
       } catch {
         await self.land(keys, generation: flightGeneration, found: [:])
@@ -469,9 +467,9 @@ public struct CymruDNSResolver: ASNResolver, PublishingASNResolver {
     if originResults.isEmpty { return [:] }
 
     // Phase 2: Parallel AS name lookups for unique ASNs only
-    let uniqueASNs = Set(originResults.values.map { $0.asn })
+    let originsByASN = Dictionary(grouping: originResults, by: { $0.value.asn })
     await withTaskGroup(of: (Int, String?).self) { group in
-      for asn in uniqueASNs {
+      for asn in originsByASN.keys {
         group.addTask {
           guard (try? await semaphore.wait()) != nil else { return (asn, nil) }
           defer { Task { await semaphore.signal() } }
@@ -480,7 +478,7 @@ public struct CymruDNSResolver: ASNResolver, PublishingASNResolver {
       }
       for await (asn, name) in group {
         guard let name else { continue }
-        for (ip, origin) in originResults where origin.asn == asn {
+        for (ip, origin) in originsByASN[asn] ?? [] {
           learn(ip, ASNInfo(origin, name: name))
         }
       }
