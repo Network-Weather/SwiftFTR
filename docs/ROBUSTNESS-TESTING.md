@@ -492,7 +492,7 @@ numbers are as of the commit that added this section.
   order.** Found in the second review. Through the cache, the hybrid fallback and the `.dns`
   strategy, an answered Team Cymru origin was dropped at the deadline while its AS name was
   pending (a direct call returned it); a caller with one failed and one unfinished lookup threw
-  in 5 of 20 runs and returned nothing in the rest, and one with a failed lookup beside an
+  in only 5 or 6 of 20 runs and returned nothing in the rest, and one with a failed lookup beside an
   answered one always threw. A lookup now publishes each answer as it arrives, a caller out of
   time takes those, and a caller throws only when it has no answer at all, with the earliest
   failed lookup's error. The deadline was also taken only after the addresses were prepared:
