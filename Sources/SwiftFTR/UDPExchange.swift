@@ -158,8 +158,8 @@ final class UDPExchange: @unchecked Sendable {
         Darwin.send(fd, bytes.baseAddress, bytes.count, 0)
       }
     let closeDescriptor = TestSeams.closeDescriptor ?? { fd in close(fd) }
-    let clock = discoveryClock()
-    let slice = discoverySleepSlice()
+    let clock = DiscoveryClock.current
+    let wakeAtCutoff = !TestSeams.skipCutoffWake
     let receiveDatagram =
       TestSeams.receiveDatagram ?? { fd, buffer in
         recv(fd, buffer.baseAddress, buffer.count, 0)
@@ -180,7 +180,8 @@ final class UDPExchange: @unchecked Sendable {
     }
 
     let exchange = UDPExchange(
-      fd: fd, request: request, timeout: timeout, cutoff: cutoff, clock: clock, slice: slice,
+      fd: fd, request: request, timeout: timeout, cutoff: cutoff, clock: clock,
+      wakeAtCutoff: wakeAtCutoff,
       receiveCapacity: receiveCapacity,
       accepts: accepts, sendDatagram: sendDatagram, receiveDatagram: receiveDatagram,
       closeDescriptor: closeDescriptor)
@@ -199,8 +200,8 @@ final class UDPExchange: @unchecked Sendable {
   private let deadline: DispatchTime
   /// The caller's absolute cutoff, on `clock`.
   private let cutoff: TimeInterval?
-  private let clock: @Sendable () -> TimeInterval
-  private let slice: TimeInterval
+  private let clock: DiscoveryClock
+  private let wakeAtCutoff: Bool
   private let accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)?
   private let sendDatagram: TestSeams.SendDatagram
   private let receiveDatagram: TestSeams.ReceiveDatagram
@@ -233,8 +234,8 @@ final class UDPExchange: @unchecked Sendable {
     request: [UInt8],
     timeout: TimeInterval,
     cutoff: TimeInterval?,
-    clock: @escaping @Sendable () -> TimeInterval,
-    slice: TimeInterval,
+    clock: DiscoveryClock,
+    wakeAtCutoff: Bool,
     receiveCapacity: Int,
     accepts: (@Sendable (ArraySlice<UInt8>) -> Bool)?,
     sendDatagram: @escaping TestSeams.SendDatagram,
@@ -254,11 +255,11 @@ final class UDPExchange: @unchecked Sendable {
       uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + nanoseconds)
     self.cutoff = cutoff
     self.clock = clock
-    self.slice = slice
+    self.wakeAtCutoff = wakeAtCutoff
   }
 
   /// Whether the cutoff, if any, is still ahead on its own clock.
-  private func beforeCutoff() -> Bool { cutoff.map { clock() < $0 } ?? true }
+  private func beforeCutoff() -> Bool { !clock.hasPassed(cutoff) }
 
   private func start(_ continuation: CheckedContinuation<UDPExchangeReply, Error>) {
     lock.lock()
@@ -306,11 +307,10 @@ final class UDPExchange: @unchecked Sendable {
     deadlineTimer = timer
     timer.activate()
 
-    if let cutoff {
+    if let cutoff, wakeAtCutoff {
       let clock = self.clock
-      let slice = self.slice
       cutoffWake = Task {
-        await sleep(untilMonotonic: cutoff, clock: clock, slice: slice)
+        await clock.sleep(until: cutoff)
         if Task.isCancelled { return }
         self.queue.async { self.deadlinePassed() }
       }

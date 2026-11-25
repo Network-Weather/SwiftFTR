@@ -36,8 +36,11 @@ struct LibraryPublicIPResolverTests {
     }
   }
 
-  static let mapped4: [UInt8] = [198, 51, 100, 9]
-  static let mapped6: [UInt8] = [0x20, 0x01, 0x0D, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x09]
+  // Public, since the resolver takes only a public address for a trace. Nothing is sent to them.
+  static let mapped4: [UInt8] = [9, 9, 9, 9]
+  static let mapped6: [UInt8] = [
+    0x26, 0x06, 0x47, 0x00, 0x47, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11, 0x11,
+  ]
 
   /// Name lookups the sweep made, each answered from `table` (a name to a loopback port).
   final class NameLookups: @unchecked Sendable {
@@ -141,7 +144,7 @@ struct LibraryPublicIPResolverTests {
       }
     }
 
-    #expect(found?.address == (family == AF_INET6 ? "2001:db8::9" : "198.51.100.9"))
+    #expect(found?.address == (family == AF_INET6 ? "2606:4700:4700::1111" : "9.9.9.9"))
     #expect(found?.source == .stun)
     #expect(lookups.calls.value == 2)
     #expect(sends.boundInterfaces == [lo0, lo0], "sent from a socket not bound to lo0")
@@ -263,7 +266,7 @@ struct LibraryPublicIPResolverTests {
       v4: [("127.0.0.1", answer4.port)], v6: [("::1", answer6.port)])
 
     let cases: [(source: String, v4: String?, v6: String?)] = [
-      ("127.0.0.1", "198.51.100.9", nil), ("::1", nil, "2001:db8::9"), ("not-an-ip", nil, nil),
+      ("127.0.0.1", "9.9.9.9", nil), ("::1", nil, "2606:4700:4700::1111"), ("not-an-ip", nil, nil),
       ("::1%", nil, nil), ("::1%swiftftr-none0", nil, nil),
     ]
     for (source, v4, v6) in cases {
@@ -365,7 +368,8 @@ struct LibraryPublicIPResolverTests {
                 await resultOf {
                   try await publicIPDiscovery(
                     family: .v4, stunTimeout: Self.longSTUNTimeout, interface: "lo0",
-                    sourceIP: nil, enableLogging: false, budget: 3 * Self.watchdog)
+                    sourceIP: nil, enableLogging: false, budget: 3 * Self.watchdog,
+                    requirePublic: false)
                 }
               }
             }
@@ -430,7 +434,7 @@ struct LibraryPublicIPResolverTests {
               Task {
                 try await publicIPDiscovery(
                   family: .v4, stunTimeout: Self.longSTUNTimeout, interface: "lo0", sourceIP: nil,
-                  enableLogging: false, budget: budget)
+                  enableLogging: false, budget: budget, requirePublic: false)
               }
             }
           }

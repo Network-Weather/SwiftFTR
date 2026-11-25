@@ -232,7 +232,7 @@ struct EventBasedSTUNTests {
         return .success(
           try await publicIPDiscovery(
             family: .v4, stunTimeout: longTimeout, interface: nil, sourceIP: nil,
-            enableLogging: false, budget: 3 * watchdog)?.address ?? "none")
+            enableLogging: false, budget: 3 * watchdog, requirePublic: false)?.address ?? "none")
       } catch {
         return .failure(error)
       }
@@ -349,6 +349,101 @@ struct EventBasedSTUNTests {
     #expect(stallEnded.value == 0, "the stalled lookup ended before the answer was returned")
   }
 
+  // MARK: A trace takes only a public address
+
+  @Test(
+    "A private answer that comes first fails its server for a trace; getPublicIPs reports it",
+    arguments: ["trace", "standalone"])
+  func privateAnswerFirst(entry: String) async throws {
+    // The public server answers only once the sweep has recorded the private one's failure, which
+    // happens only for a trace; for getPublicIPs it stays held while the private answer returns.
+    let privateRecorded = StallGate()
+    defer { privateRecorded.open() }
+    let publicServer = try Self.answering([9, 9, 9, 9], gate: privateRecorded)
+    let privateServer = try Self.answering([192, 168, 1, 1])
+    defer {
+      publicServer.stop()
+      privateServer.stop()
+    }
+    let failed: @Sendable (Int) -> Void = { index in if index == 1 { privateRecorded.open() } }
+    let servers = AsyncPublicIPDiscoveryTests.servers(v4: [
+      publicServer.server, privateServer.server,
+    ])
+
+    let found = try await measure(within: Self.watchdog) {
+      await TestSeams.$stunServers.withValue(servers) {
+        await TestSeams.$observeSTUNOutcome.withValue(failed) {
+          if entry == "trace" {
+            let request = PublicIPRequest(
+              family: .v4, interface: nil, sourceIP: nil,
+              deadline: .now + .seconds(3 * Self.watchdog))
+            return try? await LibraryPublicIPResolver(
+              stunTimeout: Self.longTimeout, enableLogging: false
+            )
+            .publicIP(for: request)?.address
+          }
+          return await getPublicIPs(stunTimeout: Self.longTimeout).v4
+        }
+      }
+    }.0
+    #expect(found == (entry == "trace" ? "9.9.9.9" : "192.168.1.1"), "\(entry): \(found ?? "nil")")
+    #expect(privateServer.requests.value == 1)
+  }
+
+  // MARK: The deadline primitive
+
+  @Test("A name lookup that returns after its limit is not used")
+  func lookupReturningLateNotUsed() async throws {
+    let clock = MovableClock()
+    let resolved = FaultCounter()
+    let resolve: TestSeams.ResolveSTUNServer = { _, port, family in
+      clock.jump(by: 3 * stunNameLookupLimit)
+      resolved.increment()
+      return loopbackAddress(family: family, port: port)
+    }
+    let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.stun-late-lookup")
+    let found = try await measure(within: Self.watchdog) {
+      try await TestSeams.$monotonicClock.withValue(clock.now) {
+        try await TestSeams.$blockingIOExecutor.withValue(executor) {
+          try await lookUpSTUNServer(
+            ("named.test", 3478), family: AF_INET, deadline: nil, resolve: resolve)
+        }
+      }
+    }.0
+    #expect(resolved.value == 1, "the lookup never ran")
+    #expect(found == nil, "a lookup that returned after its limit was used")
+  }
+
+  @Test("A wait for a deadline is anchored before the clock is read")
+  func sleepAnchoredBeforeClockRead() async throws {
+    // The first read says ten seconds are left and records when it was taken; later reads say the
+    // deadline has passed. The wait asked for must end no later than ten seconds after that read.
+    final class Reads: @unchecked Sendable {
+      let lock = NSLock()
+      var instants: [ContinuousClock.Instant] = []
+      var requested: [ContinuousClock.Instant] = []
+    }
+    let reads = Reads()
+    let now: @Sendable () -> TimeInterval = {
+      let at = ContinuousClock.now
+      let first = reads.lock.withLock {
+        reads.instants.append(at)
+        return reads.instants.count == 1
+      }
+      // So that an anchor taken after this read is strictly later than it.
+      while ContinuousClock.now == at {}
+      return first ? 90 : 100
+    }
+    var clock = DiscoveryClock(now: now, slice: 1e9)
+    clock.sleepUntil = { instant in reads.lock.withLock { reads.requested.append(instant) } }
+    await clock.sleep(until: 100)
+    let (read, requested) = reads.lock.withLock { (reads.instants.first, reads.requested.first) }
+    let firstRead = try #require(read)
+    let wake = try #require(requested)
+    let anchoredBeforeRead = wake - .seconds(10) <= firstRead
+    #expect(anchoredBeforeRead, "the wait was anchored after the clock was read")
+  }
+
   // MARK: One clock for the deadline
 
   @Test("A reply read once the cutoff has passed on its own clock is not taken")
@@ -369,8 +464,8 @@ struct EventBasedSTUNTests {
     let (address, length) = loopbackAddress(family: AF_INET, port: server.port)
     let cutoff = monotonicNow() + 3 * Self.watchdog
     let exchange = Task {
-      // The wake-up at the cutoff sleeps on real time here, so only the read can decide.
-      await TestSeams.$deadlineSleepSlice.withValue(1e9) {
+      // No wake-up at the cutoff, so only the read can decide.
+      await TestSeams.$skipCutoffWake.withValue(true) {
         await TestSeams.$monotonicClock.withValue(clock.now) {
           await TestSeams.$receiveDatagram.withValue(receive) {
             await resultOf {
@@ -452,7 +547,7 @@ struct EventBasedSTUNTests {
               await #expect(throws: PublicIPDiscoveryTimeout.self, "budget \(budget)") {
                 try await publicIPDiscovery(
                   family: .v4, stunTimeout: 1, interface: nil, sourceIP: nil, enableLogging: false,
-                  budget: budget)
+                  budget: budget, requirePublic: false)
               }
             }
             for deadline in [monotonicNow() - 1, -TimeInterval.infinity, .nan] {
@@ -516,7 +611,7 @@ struct EventBasedSTUNTests {
                   return Result<PublicIPObservation?, Error>.success(
                     try await publicIPDiscovery(
                       family: .v4, stunTimeout: Self.longTimeout, interface: nil, sourceIP: nil,
-                      enableLogging: false, budget: budget))
+                      enableLogging: false, budget: budget, requirePublic: false))
                 } catch {
                   return .failure(error)
                 }

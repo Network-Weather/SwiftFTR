@@ -344,7 +344,7 @@ struct AsyncPublicIPDiscoveryTests {
           await resultOf {
             try await publicIPDiscovery(
               family: .v4, stunTimeout: Self.longSTUNTimeout, interface: nil, sourceIP: nil,
-              enableLogging: false, budget: 3 * Self.watchdog)
+              enableLogging: false, budget: 3 * Self.watchdog, requirePublic: false)
           }
         }
       }

@@ -491,23 +491,43 @@ func stunGetPublicIPv6(
 /// slot when the wait ends.
 let stunNameLookupLimit: TimeInterval = 20
 
-/// The clock every public-IP discovery deadline is on: `monotonicNow()`, which counts system
-/// sleep, or the test's `TestSeams.monotonicClock`. Read it in the task, then capture it for any
-/// queue or worker, which cannot see task-locals.
-func discoveryClock() -> @Sendable () -> TimeInterval { TestSeams.monotonicClock ?? monotonicNow }
+/// The clock every public-IP discovery deadline is on, and the only two things done with one.
+/// A deadline is an absolute instant on `now`; `nil` is none. Every decision to send, submit or
+/// accept calls ``hasPassed(_:)`` immediately before it, and every blocking step calls it again
+/// as it returns; every wait for a deadline is ``sleep(until:)``.
+struct DiscoveryClock: Sendable {
+  /// `monotonicNow()`, which counts system sleep, or a test's.
+  let now: @Sendable () -> TimeInterval
+  /// The longest one wait lasts before reading `now` again.
+  let slice: TimeInterval
+  /// The continuous-clock wait itself, replaceable so a test can see where a wait was anchored.
+  var sleepUntil: @Sendable (ContinuousClock.Instant) async -> Void = {
+    try? await Task.sleep(until: $0, clock: .continuous)
+  }
 
-/// How long one wait on ``sleep(untilMonotonic:clock:slice:)`` may last before it reads the clock
-/// again: unbounded on the real clock, which the continuous sleep follows, and short on a test
-/// clock, which a test moves without real time passing.
-func discoverySleepSlice() -> TimeInterval {
-  TestSeams.deadlineSleepSlice ?? (TestSeams.monotonicClock == nil ? 1e9 : 0.01)
-}
+  /// The clock for the calling task: `TestSeams.monotonicClock` when bound, with short waits a
+  /// moved test clock is noticed in, else `monotonicNow()`. Read in the task; capture it for any
+  /// queue or worker, which cannot see task-locals.
+  static var current: DiscoveryClock {
+    TestSeams.monotonicClock.map { DiscoveryClock(now: $0, slice: 0.01) }
+      ?? DiscoveryClock(now: monotonicNow, slice: 1e9)
+  }
 
-/// Seconds from now until `deadline`, an instant on ``discoveryClock()``, and never less than
-/// zero (a deadline that is not a number has passed); `nil` when there is no deadline.
-func secondsLeft(until deadline: TimeInterval?) -> TimeInterval? {
-  let now = discoveryClock()
-  return deadline.map { $0.isNaN ? 0 : max($0 - now(), 0) }
+  /// Whether `deadline` has passed: always false for `nil`, always true for a value that is not a
+  /// number.
+  func hasPassed(_ deadline: TimeInterval?) -> Bool { deadline.map { !(now() < $0) } ?? false }
+
+  /// Suspends until `deadline` has passed, or the task is cancelled. Each wait is anchored on the
+  /// continuous clock before `now` is read, so time that passes between the two (a system sleep
+  /// included) shortens the wait rather than lengthening it; `now` is read again on every wake.
+  func sleep(until deadline: TimeInterval) async {
+    while !Task.isCancelled {
+      let anchor = ContinuousClock.now
+      let left = deadline - now()
+      guard left > 0 else { return }
+      await sleepUntil(anchor + .seconds(min(left, slice, 1e9)))
+    }
+  }
 }
 
 /// The endpoint for a numeric `host` of `family`, built without the resolver, or `nil` when
@@ -549,25 +569,25 @@ func lookUpSTUNServer(
   _ server: (host: String, port: UInt16), family: Int32, deadline: TimeInterval?,
   resolve: @escaping TestSeams.ResolveSTUNServer
 ) async throws -> (server: sockaddr_storage, serverLen: socklen_t)? {
-  let clock = discoveryClock()
-  let slice = discoverySleepSlice()
+  let clock = DiscoveryClock.current
   let limit = min(
-    deadline ?? .infinity, clock() + (TestSeams.stunNameLookupLimit ?? stunNameLookupLimit))
+    deadline ?? .infinity, clock.now() + (TestSeams.stunNameLookupLimit ?? stunNameLookupLimit))
   // No time left: nothing is submitted, so no lookup starts after the deadline.
-  guard clock() < limit else { return nil }
+  guard !clock.hasPassed(limit) else { return nil }
   typealias Endpoint = (server: sockaddr_storage, serverLen: socklen_t)
   // The wait ends at `limit` on the deadline's own clock, raced here rather than handed to the
   // executor, whose timer is on Dispatch's uptime clock and stands still while the Mac sleeps.
   let found = try await withThrowingTaskGroup(of: Endpoint?.self) { group -> Endpoint? in
     group.addTask {
       try await runDetachedBlockingIO {
-        // A worker can pick this up as the limit passes, before the race has withdrawn it.
-        guard clock() < limit else { return nil }
-        return resolve(server.host, server.port, family)
+        guard !clock.hasPassed(limit) else { return nil }
+        let endpoint = resolve(server.host, server.port, family)
+        // A lookup that returns after its limit is not used, whichever side of the race wins.
+        return clock.hasPassed(limit) ? nil : endpoint
       }
     }
     group.addTask {
-      await sleep(untilMonotonic: limit, clock: clock, slice: slice)
+      await clock.sleep(until: limit)
       return nil
     }
     // The first to finish decides; the other is cancelled, which withdraws a queued lookup.
@@ -613,7 +633,7 @@ private func stunAttempt(
     }
     if enableLogging { print("[STUN] Trying \(label) (\(famName))...") }
     // The deadline goes to the exchange as an instant, so its setup cannot push it later.
-    guard secondsLeft(until: deadline) ?? 1 > 0, let fd = socket.take() else {
+    guard !DiscoveryClock.current.hasPassed(deadline), let fd = socket.take() else {
       throw STUNError.recvTimeout
     }
     let found = try await stunExchange(
@@ -627,29 +647,14 @@ private func stunAttempt(
   }
 }
 
-/// Suspends until `deadline`, an instant on `clock` (`monotonicNow()`'s, which counts system
-/// sleep), has passed, or until the task is cancelled. It sleeps on the continuous clock, which
-/// also counts system sleep, at most `slice` seconds at a time, and checks `clock` again on every
-/// wake, so it never ends early.
-func sleep(
-  untilMonotonic deadline: TimeInterval,
-  clock: @Sendable () -> TimeInterval = monotonicNow,
-  slice: TimeInterval = 1e9
-) async {
-  while !Task.isCancelled {
-    let left = deadline - clock()
-    // Also a deadline that is not a number: it has passed.
-    guard left > 0 else { return }
-    try? await Task.sleep(until: .now + .seconds(min(left, slice, 1e9)), clock: .continuous)
-  }
-}
-
 /// Waits for a permit from `admission`, giving up at `deadline` (an instant on `monotonicNow()`'s
 /// clock; `nil` waits for as long as it takes). A permit taken is the caller's to signal.
 ///
 /// - Throws: ``STUNError/recvTimeout`` when the deadline passes first, `CancellationError` when
 ///   the calling task is cancelled. Neither leaves a permit taken.
-private func admitSweep(_ admission: _ConcurrencySemaphore, deadline: TimeInterval?) async throws {
+private func admitSweep(
+  _ admission: _ConcurrencySemaphore, deadline: TimeInterval?, clock: DiscoveryClock
+) async throws {
   guard let deadline else { return try await admission.wait() }
   enum Event { case admitted, gaveUp, deadline }
   let first = await withTaskGroup(of: Event.self) { group -> Event in
@@ -661,10 +666,8 @@ private func admitSweep(_ admission: _ConcurrencySemaphore, deadline: TimeInterv
         return .gaveUp
       }
     }
-    let clock = discoveryClock()
-    let slice = discoverySleepSlice()
     group.addTask {
-      await sleep(untilMonotonic: deadline, clock: clock, slice: slice)
+      await clock.sleep(until: deadline)
       return .deadline
     }
     let first = await group.next() ?? .deadline
@@ -705,6 +708,8 @@ private func admitSweep(_ admission: _ConcurrencySemaphore, deadline: TimeInterv
 ///   - enableLogging: Enable debug logging
 ///   - deadline: When the whole sweep gives up, an instant on `monotonicNow()`'s clock, or `nil`
 ///     to leave each attempt only its own bounds.
+///   - requirePublic: Whether only a globally routable address of `family` can be the answer, as a
+///     trace requires; another fails its server alone. `getPublicIPs` takes the first as given.
 /// - Returns: The first public IP a server reported.
 /// - Throws: The last server's error in list order when none answered, whatever order they
 ///   failed in; ``STUNError/recvTimeout`` when the deadline passed before the sweep could start;
@@ -715,7 +720,8 @@ internal func stunGetPublicIPWithFallback(
   interface: String? = nil,
   sourceIP: String? = nil,
   enableLogging: Bool = false,
-  deadline: TimeInterval? = nil
+  deadline: TimeInterval? = nil,
+  requirePublic: Bool = false
 ) async throws -> STUNPublicIP {
   guard timeout.isFinite, timeout > 0, timeout <= TimeInterval(Int32.max) else {
     throw STUNError.invalidTimeout(timeout)
@@ -727,9 +733,10 @@ internal func stunGetPublicIPWithFallback(
   // Admitted first, one sweep per executor worker, so a sweep waiting its turn holds no socket;
   // the wait ends at the deadline or with the caller's cancellation.
   try Task.checkCancellation()
-  if let left = secondsLeft(until: deadline), left <= 0 { throw STUNError.recvTimeout }
+  let clock = DiscoveryClock.current
+  if clock.hasPassed(deadline) { throw STUNError.recvTimeout }
   let admission = (TestSeams.blockingIOExecutor ?? blockingIOExecutor).stunSweepAdmission
-  try await admitSweep(admission, deadline: deadline)
+  try await admitSweep(admission, deadline: deadline, clock: clock)
   defer { Task { await admission.signal() } }
   // Bound first: nothing is resolved or sent unless every socket could be bound.
   let sockets = try servers.map { _ in
@@ -738,7 +745,7 @@ internal func stunGetPublicIPWithFallback(
   }
   // On the way out, close what no attempt took.
   defer { for socket in sockets { socket.take().map { _ = close($0) } } }
-  if let left = secondsLeft(until: deadline), left <= 0 { throw STUNError.recvTimeout }
+  if clock.hasPassed(deadline) { throw STUNError.recvTimeout }
   // Read on the async side, where the task-local seams are visible.
   let send = TestSeams.sendSTUNRequest
   let resolve = TestSeams.resolveSTUNServer ?? resolveSTUNServer
@@ -746,6 +753,16 @@ internal func stunGetPublicIPWithFallback(
 
   if enableLogging {
     print("[STUN] Asking \(servers.count) servers at once (\(famName))...")
+  }
+  // For a trace, only a public address of the family asked can be the answer (the check the
+  // tracer applies to every source); any other fails that server alone.
+  let usable: (STUNPublicIP) -> Result<STUNPublicIP, Error> = { found in
+    let ipFamily: IPAddressFamily = family == AF_INET6 ? .v6 : .v4
+    let observation = PublicIPObservation(address: found.ip, family: ipFamily, source: .stun)
+    guard requirePublic, validatedPublicIP(observation, for: ipFamily) == nil else {
+      return .success(found)
+    }
+    return .failure(STUNError.invalidResponse("mapped address is not a public \(ipFamily) address"))
   }
   var failures = [Error?](repeating: nil, count: servers.count)
   let first = await withTaskGroup(of: (Int, Result<STUNPublicIP, Error>).self) {
@@ -760,9 +777,9 @@ internal func stunGetPublicIPWithFallback(
       }
     }
     for await (index, outcome) in group {
-      switch outcome {
+      switch outcome.flatMap({ usable($0) }) {
       case .success(let found):
-        // The first answer is decisive: the other attempts are cancelled, not consulted.
+        // The first usable answer is decisive: the other attempts are cancelled, not consulted.
         group.cancelAll()
         return found
       case .failure(let error):
@@ -872,7 +889,7 @@ private func stunSweepAddress(
   do {
     return try await publicIPDiscovery(
       family: family == AF_INET6 ? .v6 : .v4, stunTimeout: timeout, interface: interface,
-      sourceIP: sourceIP, enableLogging: enableLogging, budget: .infinity
+      sourceIP: sourceIP, enableLogging: enableLogging, budget: .infinity, requirePublic: false
     )?.address
   } catch {
     if enableLogging {

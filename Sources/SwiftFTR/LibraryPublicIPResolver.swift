@@ -24,7 +24,7 @@ struct LibraryPublicIPResolver: PublicIPResolver {
     try await publicIPDiscovery(
       family: request.family, stunTimeout: stunTimeout, interface: request.interface,
       sourceIP: request.sourceIP, enableLogging: enableLogging,
-      budget: secondsUntil(request.deadline))
+      budget: secondsUntil(request.deadline), requirePublic: true)
   }
 }
 
@@ -43,7 +43,9 @@ struct LibraryPublicIPResolver: PublicIPResolver {
 /// beyond 10^9 seconds is no bound; one that is not positive, or not a number, ends discovery
 /// before it starts.
 ///
-/// The answer's source is ``PublicIPObservationSource/stun``, a test substitute's included.
+/// With `requirePublic`, as the tracer asks, only a globally routable address of `family` can be
+/// the sweep's answer. The answer's source is ``PublicIPObservationSource/stun``, a test
+/// substitute's included.
 ///
 /// - Throws: ``PublicIPDiscoveryTimeout`` when the budget passes with no address,
 ///   `CancellationError` when the calling task is cancelled, or the sweep's own error.
@@ -53,7 +55,8 @@ func publicIPDiscovery(
   interface: String?,
   sourceIP: String?,
   enableLogging: Bool,
-  budget: TimeInterval
+  budget: TimeInterval,
+  requirePublic: Bool
 ) async throws -> PublicIPObservation? {
   try Task.checkCancellation()
   // A zone that names no interface (`::1%`, `fe80::1%nope`) would bind with no scope at all.
@@ -69,8 +72,8 @@ func publicIPDiscovery(
   // `!(budget > 0)` also refuses NaN.
   guard budget > 0 else { throw PublicIPDiscoveryTimeout() }
   let bounded = budget.isFinite && budget < 1e9
-  let clock = discoveryClock()
-  let deadline = bounded ? clock() + budget : nil
+  let clock = DiscoveryClock.current
+  let deadline = bounded ? clock.now() + budget : nil
 
   guard let substitute = TestSeams.discoverPublicIP else {
     let outcome: Result<STUNPublicIP, Error>
@@ -78,12 +81,13 @@ func publicIPDiscovery(
       outcome = .success(
         try await stunGetPublicIPWithFallback(
           family: family.socketFamily, timeout: stunTimeout, interface: interface,
-          sourceIP: sourceIP, enableLogging: enableLogging, deadline: deadline))
+          sourceIP: sourceIP, enableLogging: enableLogging, deadline: deadline,
+          requirePublic: requirePublic))
     } catch {
       outcome = .failure(error)
     }
     let found = try publicIPDiscoveryOutcome(
-      outcome, now: clock(), deadline: deadline ?? .infinity, cancelled: Task.isCancelled)
+      outcome, now: clock.now(), deadline: deadline ?? .infinity, cancelled: Task.isCancelled)
     return PublicIPObservation(address: found.ip, family: family, source: .stun)
   }
 
@@ -98,8 +102,7 @@ func publicIPDiscovery(
   return try await withThrowingTaskGroup(of: PublicIPObservation.self) { group in
     group.addTask { try await discover() }
     group.addTask {
-      let left = secondsLeft(until: deadline) ?? 0
-      try await Task.sleep(nanoseconds: UInt64(left * 1_000_000_000))
+      await clock.sleep(until: deadline)
       throw PublicIPDiscoveryTimeout()
     }
     // The first child to finish is the outcome; the other is cancelled and awaited.
@@ -112,6 +115,6 @@ func publicIPDiscovery(
       first = .failure(error)
     }
     return try publicIPDiscoveryOutcome(
-      first, now: clock(), deadline: deadline, cancelled: Task.isCancelled)
+      first, now: clock.now(), deadline: deadline, cancelled: Task.isCancelled)
   }
 }
