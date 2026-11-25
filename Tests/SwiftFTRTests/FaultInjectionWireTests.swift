@@ -51,19 +51,25 @@ struct FaultInjectionWireTests {
 
   /// The outcome of a STUN exchange with `server`, or `nil` if it was still running after
   /// ``watchdog``.
-  static func runSTUN(server: LoopbackUDPResponder, timeout: TimeInterval) async
-    -> Result<STUNPublicIP, Error>?
-  {
+  static func runSTUN(
+    server: LoopbackUDPResponder, timeout: TimeInterval, setups: FaultCounter = FaultCounter()
+  ) async -> Result<STUNPublicIP, Error>? {
     let (address, length) = server.address
+    let fileControl: TestSeams.FileControl = { fd, command, argument in
+      if command == F_GETFL { setups.increment() }
+      return fcntl(fd, command, argument)
+    }
     do {
       return try await measure(within: watchdog) {
-        do {
-          return Result<STUNPublicIP, Error>.success(
-            try await stunGetPublicIP(
-              family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
-              timeout: timeout))
-        } catch {
-          return .failure(error)
+        try await TestSeams.$fileControl.withValue(fileControl) {
+          do {
+            return Result<STUNPublicIP, Error>.success(
+              try await stunGetPublicIP(
+                family: AF_INET, server: address, serverLen: length, serverLabel: "fixture",
+                timeout: timeout))
+          } catch {
+            return .failure(error)
+          }
         }
       }.0
     } catch {
@@ -98,7 +104,8 @@ struct FaultInjectionWireTests {
     }
     defer { server.stop() }
     let timeout: TimeInterval = 0.3
-    let result = await Self.runSTUN(server: server, timeout: timeout)
+    let setups = FaultCounter()
+    let result = await Self.runSTUN(server: server, timeout: timeout, setups: setups)
 
     let unwrapped = try #require(result, "STUN never returned from a \(fault) server")
     #expect(throws: STUNError.self) { try unwrapped.get() }
@@ -107,6 +114,7 @@ struct FaultInjectionWireTests {
     // `invalidReplyFailsItsServerOnly` show each malformed kind of reply read and handled. An
     // exchange never sends more than one request.
     #expect(server.requests.value <= 1, "requests: \(server.requests.value)")
+    #expect(setups.value == 1, "the exchange was set up \(setups.value) times")
   }
 
   @Test("A sub-microsecond STUN timeout is still a timeout, not an unbounded wait")

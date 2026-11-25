@@ -477,6 +477,12 @@ struct AsyncPublicIPDiscoveryTests {
     #expect(await eventually(within: Self.watchdog) { occupied.value > 0 })
     let silent = try HeldUDPServer(family: AF_INET)
     defer { silent.stop() }
+    // Each exchange's setup, which runs before its queue does: proof both attempts were made.
+    let setups = FaultCounter()
+    let fileControl: TestSeams.FileControl = { fd, command, argument in
+      if command == F_GETFL { setups.increment() }
+      return fcntl(fd, command, argument)
+    }
 
     // getPublicIPs has no budget, so only each attempt's own 0.2 s timeout can end it inside the
     // watchdog; the occupant holds the only slot past it.
@@ -484,11 +490,14 @@ struct AsyncPublicIPDiscoveryTests {
       await Self.withFixtures(
         servers: Self.servers(v4: [(silent.host, silent.port), (silent.host, silent.port)]),
         executor: executor
-      ) { await getPublicIPs(stunTimeout: 0.2) }
+      ) {
+        await TestSeams.$fileControl.withValue(fileControl) { await getPublicIPs(stunTimeout: 0.2) }
+      }
     }
     #expect(ips.v4 == nil)
     // Completion only: whether a 0.2 s exchange sends before its timeout depends on when its
     // queue first runs. `answersWithEveryExecutorSlotHeld` shows sends and replies without a slot.
     #expect(released.value == 0, "an attempt waited for the occupant to free its slot")
+    #expect(setups.value == 2, "\(setups.value) of 2 attempts started their exchange")
   }
 }

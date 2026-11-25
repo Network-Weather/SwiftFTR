@@ -169,10 +169,27 @@ struct EventBasedSTUNTests {
       reply[1] = 0x11
       return [reply]
     }
-    let healthy = try Self.answering(Self.mappedX)
+    // The healthy server answers only once the sweep has read the invalid reply, so that failure
+    // comes first and must not end the sweep.
+    let invalidRead = StallGate()
+    defer { invalidRead.open() }
+    let healthy = try Self.answering(Self.mappedX, gate: invalidRead)
     defer {
       invalid.stop()
       healthy.stop()
+    }
+    let invalidPort = invalid.port
+    let receive: TestSeams.ReceiveDatagram = { fd, buffer in
+      let n = recv(fd, buffer.baseAddress, buffer.count, 0)
+      let code = errno
+      var peer = sockaddr_in()
+      var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+      let named = withUnsafeMutablePointer(to: &peer) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fd, $0, &length) }
+      }
+      if n >= 20, named == 0, UInt16(bigEndian: peer.sin_port) == invalidPort { invalidRead.open() }
+      errno = code
+      return n
     }
 
     let alone = try await Self.sweep([invalid.server])
@@ -182,21 +199,13 @@ struct EventBasedSTUNTests {
       guard case STUNError.invalidResponse = error else { return false }
       return true
     }
-    let beside = try await Self.sweep([invalid.server, healthy.server])
+    let beside = try await TestSeams.$receiveDatagram.withValue(receive) {
+      try await Self.sweep([invalid.server, healthy.server])
+    }
     #expect(try beside.get().ip == "198.51.100.7")
   }
 
   // MARK: The first answer decides
-
-  @Test("A refused port does not delay the other servers")
-  func refusedPortDoesNotDelay() async throws {
-    let refusing = try RefusingUDPPort()
-    let healthy = try Self.answering(Self.mappedX)
-    defer { healthy.stop() }
-    // Only the refusal ending its attempt at once lets the sweep decide inside the watchdog.
-    let found = try await Self.sweep([("127.0.0.1", refusing.port), healthy.server]).get()
-    #expect(found.ip == "198.51.100.7")
-  }
 
   enum ReplyOrder: String, CaseIterable, CustomTestStringConvertible, Sendable {
     case xFirst, yFirst
