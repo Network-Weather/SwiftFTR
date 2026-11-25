@@ -200,8 +200,9 @@ Unreleased
   NaN has passed on entry; infinity never passes.
 - **A lookup returns every answer it has when its time runs out**, an AS number whose name has
   not arrived included, with an empty `name` (David, 2026-11-24: "yes on partials"). Team Cymru's
-  origin answers are published as they arrive, so a caller of the cache, the hybrid or `.dns`
-  gets them at its deadline. An entry without a name is not cached, so the next lookup asks for
+  origin answers are published as they arrive and passed up through every resolver waiting on
+  them, however the resolvers are stacked, so a caller of the cache, the hybrid or `.dns` gets
+  them at its deadline. An entry without a name is not cached, so the next lookup asks for
   the name again. A lookup throws only when it has no answer and a lookup it waited on failed.
 - **A caller that stops waiting stops nothing shared.** A cached lookup, the database load and a
   hybrid's DNS fallback run on for every other caller when one reaches its deadline or is

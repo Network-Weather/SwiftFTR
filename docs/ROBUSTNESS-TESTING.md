@@ -733,3 +733,9 @@ Observations that are not defects of the library:
   process-wide dictionary; the count now lives on the scope. Tests:
   `sharedFallbackOutlivesItsStarter`, `passedDeadlineReturnsWhatIsKnown`,
   `discardedResolverIsReleased`.
+- **A resolver that joined running shared work passed on none of what it published.** Found by
+  the second review of Enrichment Lifetimes' second attempt and fixed. Only a flight's starter
+  received its answers, so a cache in front of a hybrid whose DNS fallback was already running
+  returned nothing at its deadline although the origin was known. Every waiter on shared work now
+  receives what it has published and publishes while they wait, and passes it on. Test:
+  `joinerForwardsWhatItsFlightPublished` (origin known before the join, and learned during it).

@@ -86,7 +86,8 @@ SwiftFTR is a fast, parallel traceroute library for macOS using ICMP datagram so
   unchanged through the internal `PublishingASNResolver` method, which also publishes answers as
   they arrive. Shared work (cache flights, the database load) is a `SharedASNWork`
   (`SharedASNWork.swift`): run once on its own budget, never stopped by a waiter, which waits
-  until it ends, its deadline or its cancellation and then reads a snapshot. A passed deadline
+  until it ends, its deadline or its cancellation and then reads a snapshot, forwarding what the
+  work publishes meanwhile to its own publisher (so stacked resolvers hear it). A passed deadline
   starts nothing but returns what is known without I/O
 
 **Probe Modules** — each in its own file:
