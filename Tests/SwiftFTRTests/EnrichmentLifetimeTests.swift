@@ -24,7 +24,7 @@ struct EnrichmentLifetimeTests {
     let lookup = Task {
       try await fixture.bind(clock) {
         try await CymruDNSResolver(servers: ["127.0.0.1"])
-          .resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+          .resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
       }
     }
     // The query of the silent phase has reached the server, so the call is waiting on it.
@@ -37,8 +37,8 @@ struct EnrichmentLifetimeTests {
     let (found, _) = try await measure(within: Self.watchdog) { try await lookup.value }
     if originAnswers {
       // An origin whose name had not arrived is still an answer.
-      #expect(found[CymruTXTFixture.address]?.asn == CymruTXTFixture.asn)
-      #expect(found[CymruTXTFixture.address]?.name == "")
+      #expect(found[fixture.address]?.asn == CymruTXTFixture.asn)
+      #expect(found[fixture.address]?.name == "")
     } else {
       #expect(found.isEmpty)
     }
@@ -57,14 +57,14 @@ struct EnrichmentLifetimeTests {
     let (ownerClock, joinerClock) = (MovableClock(), MovableClock())
     let owner = Task {
       try await fixture.bind(ownerClock) {
-        try await caching.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+        try await caching.resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
       }
     }
     let waiting = await eventually(within: Self.watchdog) { fixture.nameQueries.value > 0 }
     #expect(waiting)
     let joiner = Task {
       try await fixture.bind(joinerClock) {
-        try await caching.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+        try await caching.resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
       }
     }
     let joined = await eventually(within: Self.watchdog) { caching.joinCount == 1 }
@@ -73,50 +73,59 @@ struct EnrichmentLifetimeTests {
 
     // The flight is still waiting for its name; what it published is returned.
     let (partial, _) = try await measure(within: Self.watchdog) { try await joiner.value }
-    #expect(partial[CymruTXTFixture.address]?.asn == CymruTXTFixture.asn)
-    #expect(partial[CymruTXTFixture.address]?.name == "")
+    #expect(partial[fixture.address]?.asn == CymruTXTFixture.asn)
+    #expect(partial[fixture.address]?.name == "")
 
     // The flight ran on after the joiner left, and ends without the name.
     nameGate.open()
     let (owned, _) = try await measure(within: Self.watchdog) { try await owner.value }
-    #expect(owned[CymruTXTFixture.address]?.name == "")
+    #expect(owned[fixture.address]?.name == "")
 
     // The entry without its name was not cached as complete: the next lookup asks again.
     fixture.name.set(.answer)
     let (named, _) = try await measure(within: Self.watchdog) {
       try await fixture.bind(joinerClock) {
-        try await caching.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+        try await caching.resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
       }
     }
-    #expect(named[CymruTXTFixture.address]?.name == CymruTXTFixture.name)
+    #expect(named[fixture.address]?.name == CymruTXTFixture.name)
   }
 
   @Test(
     "A caller's outcome does not depend on which of its flights ends first",
     arguments: [false, true])
   func outcomeIndependentOfFlightOrder(joinedFlightFails: Bool) async throws {
-    let held = "203.0.114.20"
-    let other = "203.0.114.21"
-    let base = ScriptedASNResolver(failsAtOnce: joinedFlightFails ? [] : [other])
+    let (held, other) = (uniqueASNTestAddress(), uniqueASNTestAddress())
+    let base = ScriptedASNResolver(failsAtOnce: [])
     defer { Task { await base.releaseAll() } }
     let caching = CachingASNResolver(base: base)
 
-    // The first caller's flight holds `held`; the second joins it and starts one for `other`.
-    let owner = Task {
-      await resultOf { try await caching.resolve(ipv4Addrs: [held], timeout: Self.timeout) }
+    // One owner's flight holds `held`, another's `other`; a third caller joins both.
+    let owners = [held, other].map { address in
+      Task {
+        await resultOf { try await caching.resolve(ipv4Addrs: [address], timeout: Self.timeout) }
+      }
     }
-    let ownerStarted = await eventually(within: Self.watchdog) { await base.calls(held) == 1 }
-    #expect(ownerStarted)
+    let started = await eventually(within: Self.watchdog) {
+      let (a, b) = (await base.calls(held), await base.calls(other))
+      return a == 1 && b == 1
+    }
+    #expect(started)
     let clock = MovableClock()
     let joiner = Task {
       try await TestSeams.$monotonicClock.withValue(clock.now) {
         try await caching.resolve(ipv4Addrs: [held, other], timeout: Self.timeout)
       }
     }
-    let joinerStarted = await eventually(within: Self.watchdog) { await base.calls(other) == 1 }
-    #expect(joinerStarted)
-    // Either the joined flight fails while the caller's own is held, or the reverse.
-    if joinedFlightFails { await base.fail(held) }
+    let joined = await eventually(within: Self.watchdog) { caching.joinCount == 2 }
+    #expect(joined)
+
+    // The first flight in the joiner's order fails and the second is held, or the reverse. The
+    // failed flight's owner has its outcome before the joiner's deadline passes.
+    let (failing, heldOwner) = joinedFlightFails ? (0, 1) : (1, 0)
+    await base.fail([held, other][failing])
+    let (failedOwner, _) = try await measure(within: Self.watchdog) { await owners[failing].value }
+    #expect(throws: ScriptedASNResolver.Failure.self) { try failedOwner.get() }
     clock.jump(by: 2 * Self.timeout)
 
     let (outcome, _) = try await measure(within: Self.watchdog) {
@@ -124,14 +133,12 @@ struct EnrichmentLifetimeTests {
     }
     #expect(throws: ScriptedASNResolver.Failure.self) { try outcome.get() }
 
-    // The shared flight ran on after the joiner left: its owner gets what it found.
-    await base.succeed(held)
-    let (ownerOutcome, _) = try await measure(within: Self.watchdog) { await owner.value }
-    if joinedFlightFails {
-      #expect(throws: ScriptedASNResolver.Failure.self) { try ownerOutcome.get() }
-    } else {
-      #expect((try? ownerOutcome.get())?[held] != nil)
+    // The held flight ran on after the joiner left: its owner gets what it found.
+    await base.succeed([held, other][heldOwner])
+    let (ownerOutcome, _) = try await measure(within: Self.watchdog) {
+      await owners[heldOwner].value
     }
+    #expect((try? ownerOutcome.get())?[[held, other][heldOwner]] != nil)
   }
 
   // MARK: - Hybrid resolver
@@ -149,7 +156,7 @@ struct EnrichmentLifetimeTests {
     let clock = MovableClock()
     let lookup = Task {
       try await fixture.bind(clock) {
-        try await hybrid.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: caller)
+        try await hybrid.resolve(ipv4Addrs: [fixture.address], timeout: caller)
       }
     }
     let waiting = await eventually(within: Self.watchdog) { fixture.nameQueries.value > 0 }
@@ -158,8 +165,8 @@ struct EnrichmentLifetimeTests {
     clock.jump(by: 2 * min(caller, fallback))
 
     let (found, _) = try await measure(within: Self.watchdog) { try await lookup.value }
-    #expect(found[CymruTXTFixture.address]?.asn == CymruTXTFixture.asn)
-    #expect(found[CymruTXTFixture.address]?.name == "")
+    #expect(found[fixture.address]?.asn == CymruTXTFixture.asn)
+    #expect(found[fixture.address]?.name == "")
     // A flight that outlived the caller ends at its own budget, so it holds no socket after this.
     clock.jump(by: 2 * max(caller, fallback))
   }
@@ -178,7 +185,7 @@ struct EnrichmentLifetimeTests {
       return ticks.value
     }
     _ = try await TestSeams.$monotonicClock.withValue(ticking) {
-      try await hybrid.resolve(ipv4Addrs: ["203.0.114.30"], timeout: Self.timeout)
+      try await hybrid.resolve(ipv4Addrs: [uniqueASNTestAddress()], timeout: Self.timeout)
     }
     let timeouts = await base.timeouts
     // Exactly the configured value, never the time left, so every caller's key is the same.
@@ -294,14 +301,14 @@ struct EnrichmentLifetimeTests {
     // The starter has 60 s; the fallback it starts has 600 s.
     let starter = Task {
       try await fixture.bind(starterClock) {
-        try await hybrid.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+        try await hybrid.resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
       }
     }
     let waiting = await eventually(within: Self.watchdog) { fixture.nameQueries.value > 0 }
     #expect(waiting)
     let joiner = Task {
       try await fixture.bind(joinerClock) {
-        try await hybrid.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: 10 * Self.timeout)
+        try await hybrid.resolve(ipv4Addrs: [fixture.address], timeout: 10 * Self.timeout)
       }
     }
     let joined = await eventually(within: Self.watchdog) { caching.joinCount == 1 }
@@ -310,11 +317,11 @@ struct EnrichmentLifetimeTests {
     // The starter's deadline passes; it leaves with the origin, and the flight goes on.
     starterClock.jump(by: 2 * Self.timeout)
     let (partial, _) = try await measure(within: Self.watchdog) { try await starter.value }
-    #expect(partial[CymruTXTFixture.address]?.name == "")
+    #expect(partial[fixture.address]?.name == "")
 
     nameGate.open()
     let (named, _) = try await measure(within: Self.watchdog) { try await joiner.value }
-    #expect(named[CymruTXTFixture.address]?.name == CymruTXTFixture.name)
+    #expect(named[fixture.address]?.name == CymruTXTFixture.name)
     #expect(fixture.nameQueries.value == 1)
   }
 
@@ -323,22 +330,23 @@ struct EnrichmentLifetimeTests {
   @Test("A passed deadline starts nothing, and returns what each source already holds")
   func passedDeadlineReturnsWhatIsKnown() async throws {
     // A cache hit.
+    let (cachedAddress, fallbackAddress) = (uniqueASNTestAddress(), uniqueASNTestAddress())
     let base = ScriptedASNResolver(failsAtOnce: [], answersAtOnce: true)
     let caching = CachingASNResolver(base: base)
-    _ = try await caching.resolve(ipv4Addrs: ["203.0.117.1"], timeout: Self.timeout)
-    let hit = try await caching.resolve(ipv4Addrs: ["203.0.117.1"], timeout: 0)
-    let baseCalls = await base.calls("203.0.117.1")
-    #expect(hit["203.0.117.1"] != nil)
+    _ = try await caching.resolve(ipv4Addrs: [cachedAddress], timeout: Self.timeout)
+    let hit = try await caching.resolve(ipv4Addrs: [cachedAddress], timeout: 0)
+    let baseCalls = await base.calls(cachedAddress)
+    #expect(hit[cachedAddress] != nil)
     #expect(baseCalls == 1)
 
     // The hybrid's cached DNS answer.
     let dns = ScriptedASNResolver(failsAtOnce: [], answersAtOnce: true)
     let hybrid = HybridASNResolver(
       local: Self.failingLocalResolver(), dns: CachingASNResolver(base: dns), fallbackTimeout: 1)
-    _ = try await hybrid.resolve(ipv4Addrs: ["203.0.117.2"], timeout: Self.timeout)
-    let fromCache = try await hybrid.resolve(ipv4Addrs: ["203.0.117.2"], timeout: 0)
-    let dnsCalls = await dns.calls("203.0.117.2")
-    #expect(fromCache["203.0.117.2"] != nil)
+    _ = try await hybrid.resolve(ipv4Addrs: [fallbackAddress], timeout: Self.timeout)
+    let fromCache = try await hybrid.resolve(ipv4Addrs: [fallbackAddress], timeout: 0)
+    let dnsCalls = await dns.calls(fallbackAddress)
+    #expect(fromCache[fallbackAddress] != nil)
     #expect(dnsCalls == 1)
 
     // What a running shared flight has published: the origin, before its name.
@@ -353,15 +361,15 @@ struct EnrichmentLifetimeTests {
     let clock = MovableClock()
     let owner = Task {
       try await fixture.bind(clock) {
-        try await running.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+        try await running.resolve(ipv4Addrs: [fixture.address], timeout: Self.timeout)
       }
     }
     let waiting = await eventually(within: Self.watchdog) { fixture.nameQueries.value > 0 }
     #expect(waiting)
     let published = try await fixture.bind(clock) {
-      try await running.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: 0)
+      try await running.resolve(ipv4Addrs: [fixture.address], timeout: 0)
     }
-    #expect(published[CymruTXTFixture.address]?.asn == CymruTXTFixture.asn)
+    #expect(published[fixture.address]?.asn == CymruTXTFixture.asn)
     #expect(fixture.originQueries.value == 1)
     nameGate.open()
     _ = try await measure(within: Self.watchdog) { try await owner.value }
@@ -382,21 +390,22 @@ struct EnrichmentLifetimeTests {
   func discardedResolverIsReleased() async throws {
     final class WeakScope: @unchecked Sendable { weak var scope: _ASNResolverScope? }
     let released = WeakScope()
+    let address = uniqueASNTestAddress()
     do {
       let base = ScriptedASNResolver(failsAtOnce: [])
       let caching = CachingASNResolver(base: base)
       released.scope = caching.scope
       let first = Task {
-        try await caching.resolve(ipv4Addrs: ["203.0.117.9"], timeout: Self.timeout)
+        try await caching.resolve(ipv4Addrs: [address], timeout: Self.timeout)
       }
-      let started = await eventually(within: Self.watchdog) { await base.calls("203.0.117.9") == 1 }
+      let started = await eventually(within: Self.watchdog) { await base.calls(address) == 1 }
       #expect(started)
       let second = Task {
-        try await caching.resolve(ipv4Addrs: ["203.0.117.9"], timeout: Self.timeout)
+        try await caching.resolve(ipv4Addrs: [address], timeout: Self.timeout)
       }
       let joined = await eventually(within: Self.watchdog) { caching.joinCount == 1 }
       #expect(joined)
-      await base.succeed("203.0.117.9")
+      await base.succeed(address)
       _ = try await measure(within: Self.watchdog) { try await first.value }
       _ = try await measure(within: Self.watchdog) { try await second.value }
     }
@@ -412,11 +421,9 @@ struct EnrichmentLifetimeTests {
     let endless: [TimeInterval] = [
       .infinity, .greatestFiniteMagnitude, 1e300, Double(Int.max).nextDown,
     ]
-    for (index, timeout) in (passed + endless).enumerated() {
+    for timeout in passed + endless {
       let expectAnswer = endless.contains(where: { $0.bitPattern == timeout.bitPattern })
-      // A distinct address per resolver: the cache's answers are shared by address.
-      let address = "203.0.115.\(index + 1)"
-      let fallbackAddress = "203.0.116.\(index + 1)"
+      let (address, fallbackAddress) = (uniqueASNTestAddress(), uniqueASNTestAddress())
 
       let base = ScriptedASNResolver(failsAtOnce: [], answersAtOnce: true)
       let (cached, _) = try await measure(within: Self.watchdog) {
@@ -459,7 +466,6 @@ struct EnrichmentLifetimeTests {
 /// Team Cymru's two TXT answers for one address, from a loopback responder whose AS-name answer
 /// can be withheld, or held and then refused.
 final class CymruTXTFixture: @unchecked Sendable {
-  static let address = "203.0.114.7"
   static let asn = 64496
   static let name = "EXAMPLE-NET, ZZ"
 
@@ -472,6 +478,9 @@ final class CymruTXTFixture: @unchecked Sendable {
     case answer
   }
 
+  /// The address this fixture answers for, distinct per fixture, since the cache's answers are
+  /// shared by address across resolvers and repetitions.
+  let address = uniqueASNTestAddress()
   let name: Locked<NameReply>
   let originQueries = FaultCounter()
   let nameQueries = FaultCounter()
@@ -481,10 +490,13 @@ final class CymruTXTFixture: @unchecked Sendable {
     let name = Locked(nameReply)
     self.name = name
     let (origins, names) = (originQueries, nameQueries)
+    let originQuery =
+      address.split(separator: ".").reversed().joined(separator: ".")
+      + ".origin.asn.cymru.com"
     responder = try LoopbackUDPResponder(accepts: .dnsQuery()) { query in
       let text: String
       switch CymruFixture.queryName(query)?.lowercased() {
-      case "7.114.0.203.origin.asn.cymru.com":
+      case originQuery:
         origins.increment()
         guard answersOrigin else { return nil }
         text = "64496 | 203.0.114.0/24 | ZZ | arin | 2026-01-01"
@@ -526,12 +538,24 @@ final class CymruTXTFixture: @unchecked Sendable {
   }
 }
 
+/// A globally routable address no other test in this process uses. The cache keeps answers by
+/// address across resolvers, so each lookup that must miss needs its own.
+func uniqueASNTestAddress() -> String {
+  let n = uniqueAddressCounter.mutate { count in
+    defer { count += 1 }
+    return count
+  }
+  return "45.\(1 + n / 250 % 250).\(1 + n % 250).7"
+}
+private let uniqueAddressCounter = Locked(0)
+
 final class Locked<Value: Sendable>: @unchecked Sendable {
   private let lock = NSLock()
   private var stored: Value
   init(_ value: Value) { stored = value }
   var value: Value { lock.withLock { stored } }
   func set(_ value: Value) { lock.withLock { stored = value } }
+  func mutate<T>(_ body: (inout Value) -> T) -> T { lock.withLock { body(&stored) } }
 }
 
 /// An ASN resolver that answers or fails each address as the test says: at once, or when
