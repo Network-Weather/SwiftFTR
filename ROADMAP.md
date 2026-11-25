@@ -30,6 +30,10 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   reading). A lookup no longer waits for it past its timeout, but the download runs on, and is not
   stopped when every caller has left. Make the SwiftIP2ASN cache directory injectable so a test can
   stage a real download without touching the user's.
+- **Stream ASN answers to the caller as they arrive** (David, 2026-11-24: "Ideally we are
+  streaming results so the client gets things as we learn them"). Shared lookups already record
+  each answer as it arrives in one place; a public stream, how a caller's own resolver would
+  publish, and how classification would use answers that come in late are still to design.
 - **A local ASN database that failed to load is never retried by its resolver**: a `.remote`
   source first used offline leaves that resolver, and so its tracer, without local ASN data for
   its lifetime, though a new resolver would load it. Retry after a backoff instead of remembering

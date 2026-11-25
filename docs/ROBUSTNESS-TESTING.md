@@ -488,6 +488,22 @@ numbers are as of the commit that added this section.
   `ConfigurationLimits.maximumTimeout` now sets no bound. Tests:
   `LocalASNResolverTests.testWarmLookupStopsAtItsDeadline`,
   `testLookupIsNotQueuedBehindAnotherBatch` and `testHugeTimeoutWaitsForTheLoad`.
+- **A cached lookup that ran out of time dropped answers it had, and its outcome depended on
+  order.** Found in the second review. Through the cache, the hybrid fallback and the `.dns`
+  strategy, an answered Team Cymru origin was dropped at the deadline while its AS name was
+  pending (a direct call returned it); a caller with one failed and one unfinished lookup threw
+  in 5 of 20 runs and returned nothing in the rest, and one with a failed lookup beside an
+  answered one always threw. A lookup now publishes each answer as it arrives, a caller out of
+  time takes those, and a caller throws only when it has no answer at all, with the earliest
+  failed lookup's error. The deadline was also taken only after the addresses were prepared:
+  65,536 addresses with a 1 ms budget took 12 to 23 ms in release before and about 1.1 ms after.
+  Tests: `SwiftFTRCacheTests.testCachedCymruLookupReturnsAnsweredOriginsAtItsTimeout`,
+  `testHybridFallbackReturnsAnsweredOriginsAtItsTimeout`,
+  `testFailedFlightOutcomeDoesNotDependOnOrder`, `testDeadlineCoversPreparingTheAddresses`,
+  `testCallerOutOfTimeWhileSortingKeepsJoinedAnswers` and
+  `LocalASNResolverTests.testPreparingABatchStopsAtTheDeadline`. Unanswered lookups skipped after
+  the deadline have no test of their own: the saving is time only (16,000 held flights, 50 ms
+  timeout: 62 ms in release after, 125 ms measured by the reviewer before).
 - **A large Team Cymru lookup woke every queued address after its deadline.** Found in the same
   review: a task per address waited for one of eight slots, and each went on to find the time
   gone (4,096 addresses made over 8,000 attempts after a 50 ms deadline). At most eight now run,

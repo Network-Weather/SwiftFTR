@@ -191,6 +191,14 @@ Unreleased
 - **A `CachingASNResolver` caller stops waiting at its own `timeout`** with what is cached or has
   arrived, even when the resolver behind it overruns. The shared lookup runs on and fills the
   cache, so the next caller is answered without another upstream call.
+- **A caller whose time runs out gets every answer already received** (David, 2026-11-24): a
+  Team Cymru origin that has answered is returned with an empty AS name while the name is still
+  pending, through `CachingASNResolver`, the `.dns` strategy and the hybrid fallback alike, as a
+  direct `CymruDNSResolver` call already did. A caller's own `ASNResolver` behind a
+  `CachingASNResolver` contributes its answers only when its call returns.
+- **A `CachingASNResolver` caller throws only when it has no answer at all** and one of its
+  shared lookups failed. 0.18 threw whenever one of them failed, discarding answers the others
+  had; the error thrown is that of the earliest failed lookup, whatever order they ended in.
 
 ### Bug fixes
 

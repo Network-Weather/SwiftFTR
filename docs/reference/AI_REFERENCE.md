@@ -446,8 +446,11 @@ leaving, by timeout or cancellation, never stops it or marks the resolver failed
 resolver waits for its DNS fallback only until the timeout (the query keeps `fallbackTimeout`,
 so concurrent lookups share it); a local lookup's batch runs off the resolver; and a
 `CachingASNResolver` caller stops waiting at its own timeout while the shared lookup fills the
-cache. A classified trace passes 1.5 s. A cancelled caller of `LocalASNResolver.resolve` gets
-`CancellationError`.
+cache. A caller whose time runs out gets every answer already received, a Team Cymru origin whose
+AS name is still pending included (with an empty name), and the deadline also covers preparing
+the addresses. A `CachingASNResolver` caller throws only when it has no answer and one of its
+shared lookups failed. A classified trace passes 1.5 s. A cancelled caller of
+`LocalASNResolver.resolve` gets `CancellationError`.
 
 ### 12. StreamingTraceConfig and StreamingHop
 

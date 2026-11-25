@@ -626,7 +626,7 @@ has when it runs out:
 | ``CymruDNSResolver`` (`.dns`) | each query, each server and each wave of eight queries got the full timeout | every query and the fallback to the second server share one deadline; each server still to try gets an equal share of the time left, and no query starts once it has passed |
 | ``LocalASNResolver`` (`.embedded`, `.remote`) | waited for a database still loading however long it took, and ran each batch on the resolver | waits for the load until the timeout, and the load runs on and answers the next lookup; batches run off the resolver and stop at the timeout |
 | ``HybridASNResolver`` (the default `.hybrid(.embedded)`) | the same database wait, then DNS with `fallbackTimeout` | the same bounded wait, then a wait for DNS until the timeout, or no DNS when none is left; the DNS query keeps `fallbackTimeout`, so concurrent lookups share it |
-| ``CachingASNResolver`` | waited for the resolver behind it | stops waiting at its own timeout; the shared lookup runs on and fills the cache |
+| ``CachingASNResolver`` | waited for the resolver behind it; threw when any shared lookup failed | stops waiting at its own timeout with every answer received, a Team Cymru origin whose AS name is still pending included; the shared lookup runs on and fills the cache; throws only when it has no answer and a shared lookup failed |
 
 A caller that stops waiting, at its timeout or because it was cancelled, stops nothing shared: a
 database load and a cached lookup run on for the other callers, and a resolver whose caller left
@@ -645,6 +645,10 @@ a database, as in 0.18.
   ``LocalASNResolver/preload()`` returns, leaving the load running.
 - A direct call with a timeout shorter than a cold database load returns an empty map for
   addresses the database would have answered.
+- A cached lookup that runs out of time returns the Team Cymru origins already answered, with
+  ``ASNInfo/name`` empty where the AS name had not arrived, and a call through
+  ``CachingASNResolver`` whose shared lookups partly failed returns the answers it has instead of
+  throwing.
 
 **What to change.** Load the database before the first classified trace if that trace should
 carry ASN data, and give direct lookups a timeout that covers what they wait for:
