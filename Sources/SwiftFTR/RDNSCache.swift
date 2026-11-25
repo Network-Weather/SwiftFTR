@@ -152,8 +152,18 @@ actor RDNSCache {
     let lookupGeneration = isScoped ? scopedGeneration : globalGeneration
     let lookupBreakerGeneration = breakerGeneration
     let outcome = await resolver(ip, timeout)
+    let isResponse = outcome.isResolverResponse
 
-    // A lookup whose caller cancelled says nothing about the name or the resolver, whatever
+    // A response from the current breaker generation is evidence whoever is still waiting for
+    // it, so it ends the address's holdoff, contradicts a concurrent timeout still to come, and
+    // resets the breaker even when this lookup's caller has cancelled.
+    if isResponse && lookupBreakerGeneration == breakerGeneration {
+      holdoffs.removeValue(forKey: ip)
+      recordResponse(ip, at: self.now())
+      if !isMulticast { resetStalls() }
+    }
+
+    // A lookup whose caller cancelled says nothing else about the name or the resolver, whatever
     // outcome it reports: recording it could trip the breaker on lookups nobody waited for.
     guard !Task.isCancelled else { return nil }
 
@@ -167,29 +177,12 @@ actor RDNSCache {
       // respond, so it neither holds the address off nor counts as a stall.
       let contradicted =
         outcome == .timedOut && lastResponse[ip].map { $0 >= now } == true
-      switch outcome {
-      case .timedOut where !contradicted:
+      // A response was applied above. Anything but a timeout is no evidence either way:
+      // never asked, or failed without waiting on the resolver.
+      if outcome == .timedOut && !contradicted {
         holdOff(ip, since: self.now())
-      case .answer, .noSuchRecord:
-        // A response ends any holdoff a concurrent lookup's timeout set, and contradicts a
-        // timeout still to come for a question asked before it.
-        holdoffs.removeValue(forKey: ip)
-        recordResponse(ip, at: self.now())
-      default:
-        break
-      }
-      if !isMulticast {
-        switch outcome {
-        case .timedOut:
-          // Asked and unanswered: the resolver is stalled. Once per address per run of stalls.
-          if !contradicted, stalledInStreak.insert(ip).inserted { consecutiveStalls += 1 }
-        case .answer, .noSuchRecord:
-          // The resolver answered.
-          resetStalls()
-        case .timedOutBeforeQuery, .error, .cancelled:
-          // Never asked, or failed without waiting on the resolver.
-          break
-        }
+        // Asked and unanswered: the resolver is stalled. Once per address per run of stalls.
+        if !isMulticast, stalledInStreak.insert(ip).inserted { consecutiveStalls += 1 }
       }
     }
 
@@ -301,6 +294,16 @@ actor RDNSCache {
   private func evictOldest() {
     if let oldest = cache.min(by: { $0.value.timestamp < $1.value.timestamp }) {
       cache.removeValue(forKey: oldest.key)
+    }
+  }
+}
+
+extension ReverseDNSLookupOutcome {
+  /// Whether the resolver responded about the name: an answer, or "no such record".
+  fileprivate var isResolverResponse: Bool {
+    switch self {
+    case .answer, .noSuchRecord: true
+    case .timedOut, .timedOutBeforeQuery, .error, .cancelled: false
     }
   }
 }
