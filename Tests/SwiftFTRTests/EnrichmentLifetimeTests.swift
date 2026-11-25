@@ -18,7 +18,7 @@ struct EnrichmentLifetimeTests {
 
   @Test("Both Cymru query phases end at the caller's deadline", arguments: [false, true])
   func cymruPhasesEndAtTheDeadline(originAnswers: Bool) async throws {
-    let fixture = try CymruTXTFixture(answersOrigin: originAnswers, answersName: false)
+    let fixture = try CymruTXTFixture(answersOrigin: originAnswers, name: .silent)
     defer { fixture.stop() }
     let clock = MovableClock()
     let lookup = Task {
@@ -46,28 +46,45 @@ struct EnrichmentLifetimeTests {
 
   // MARK: - Caching resolver
 
-  @Test("A cached lookup returns the origin at its deadline, and a later one gets the name")
+  @Test("A caller leaving a cached lookup at its deadline gets the origin; a later one, the name")
   func cachedLookupReturnsTheOriginThenTheName() async throws {
-    let fixture = try CymruTXTFixture(answersOrigin: true, answersName: false)
+    // The AS-name reply is held, then refused, so the shared flight outlives the second caller.
+    let nameGate = StallGate()
+    defer { nameGate.open() }
+    let fixture = try CymruTXTFixture(answersOrigin: true, name: .refuse(after: nameGate))
     defer { fixture.stop() }
     let caching = CachingASNResolver(base: CymruDNSResolver(servers: ["127.0.0.1"]))
-    let clock = MovableClock()
-    let first = Task {
-      try await fixture.bind(clock) {
+    let (ownerClock, joinerClock) = (MovableClock(), MovableClock())
+    let owner = Task {
+      try await fixture.bind(ownerClock) {
         try await caching.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
       }
     }
     let waiting = await eventually(within: Self.watchdog) { fixture.nameQueries.value > 0 }
     #expect(waiting)
-    clock.jump(by: 2 * Self.timeout)
-    let (partial, _) = try await measure(within: Self.watchdog) { try await first.value }
+    let joiner = Task {
+      try await fixture.bind(joinerClock) {
+        try await caching.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
+      }
+    }
+    let joined = await eventually(within: Self.watchdog) { await caching.joinCount == 1 }
+    #expect(joined)
+    joinerClock.jump(by: 2 * Self.timeout)
+
+    // The flight is still waiting for its name; what it published is returned.
+    let (partial, _) = try await measure(within: Self.watchdog) { try await joiner.value }
     #expect(partial[CymruTXTFixture.address]?.asn == CymruTXTFixture.asn)
     #expect(partial[CymruTXTFixture.address]?.name == "")
 
+    // The flight ran on after the joiner left, and ends without the name.
+    nameGate.open()
+    let (owned, _) = try await measure(within: Self.watchdog) { try await owner.value }
+    #expect(owned[CymruTXTFixture.address]?.name == "")
+
     // The entry without its name was not cached as complete: the next lookup asks again.
-    fixture.answersName.set(true)
+    fixture.name.set(.answer)
     let (named, _) = try await measure(within: Self.watchdog) {
-      try await fixture.bind(clock) {
+      try await fixture.bind(joinerClock) {
         try await caching.resolve(ipv4Addrs: [CymruTXTFixture.address], timeout: Self.timeout)
       }
     }
@@ -123,7 +140,7 @@ struct EnrichmentLifetimeTests {
     "The hybrid's DNS fallback ends at the earlier of the caller's deadline and its own, with the origin",
     arguments: [(timeout, 10 * timeout), (10 * timeout, timeout)])
   func hybridFallbackEndsAtTheDeadline(caller: TimeInterval, fallback: TimeInterval) async throws {
-    let fixture = try CymruTXTFixture(answersOrigin: true, answersName: false)
+    let fixture = try CymruTXTFixture(answersOrigin: true, name: .silent)
     defer { fixture.stop() }
     let hybrid = HybridASNResolver(
       local: Self.failingLocalResolver(),
@@ -291,21 +308,28 @@ struct EnrichmentLifetimeTests {
   }
 }
 
-/// Team Cymru's two TXT answers for one address, from a loopback responder whose origin and
-/// AS-name answers can each be withheld.
+/// Team Cymru's two TXT answers for one address, from a loopback responder whose AS-name answer
+/// can be withheld, or held and then refused.
 final class CymruTXTFixture: @unchecked Sendable {
   static let address = "203.0.114.7"
   static let asn = 64496
   static let name = "EXAMPLE-NET, ZZ"
 
-  let answersName: LockedFlag
+  enum NameReply: Sendable {
+    case silent
+    /// The serve thread waits for the gate, then refuses the query.
+    case refuse(after: StallGate)
+    case answer
+  }
+
+  let name: Locked<NameReply>
   let originQueries = FaultCounter()
   let nameQueries = FaultCounter()
   private let responder: LoopbackUDPResponder
 
-  init(answersOrigin: Bool, answersName: Bool) throws {
-    let nameFlag = LockedFlag(answersName)
-    self.answersName = nameFlag
+  init(answersOrigin: Bool, name nameReply: NameReply) throws {
+    let name = Locked(nameReply)
+    self.name = name
     let (origins, names) = (originQueries, nameQueries)
     responder = try LoopbackUDPResponder(accepts: .dnsQuery()) { query in
       let text: String
@@ -316,8 +340,17 @@ final class CymruTXTFixture: @unchecked Sendable {
         text = "64496 | 203.0.114.0/24 | ZZ | arin | 2026-01-01"
       case "as64496.asn.cymru.com":
         names.increment()
-        guard nameFlag.value else { return nil }
-        text = "64496 | ZZ | arin | 2026-01-01 | \(CymruTXTFixture.name)"
+        switch name.value {
+        case .silent:
+          return nil
+        case .refuse(let gate):
+          gate.wait(limit: 60)
+          return (
+            FaultInjectionWireTests.dnsResponse(to: query, rcode: 5, answerCount: 0, answers: []), 0
+          )
+        case .answer:
+          text = "64496 | ZZ | arin | 2026-01-01 | \(CymruTXTFixture.name)"
+        }
       default:
         return nil
       }
@@ -340,12 +373,12 @@ final class CymruTXTFixture: @unchecked Sendable {
   }
 }
 
-final class LockedFlag: @unchecked Sendable {
+final class Locked<Value: Sendable>: @unchecked Sendable {
   private let lock = NSLock()
-  private var flag: Bool
-  init(_ value: Bool) { flag = value }
-  var value: Bool { lock.withLock { flag } }
-  func set(_ value: Bool) { lock.withLock { flag = value } }
+  private var stored: Value
+  init(_ value: Value) { stored = value }
+  var value: Value { lock.withLock { stored } }
+  func set(_ value: Value) { lock.withLock { stored = value } }
 }
 
 /// An ASN resolver that answers or fails each address as the test says: at once, or when

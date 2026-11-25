@@ -105,7 +105,7 @@ actor _ASNMemoryCache {
 
   private var flights: [LookupKey: Flight] = [:]
   private var nextFlightID: UInt64 = 0
-  private var joins = 0
+  private var joins: [_ASNResolverScope: Int] = [:]
   private var generation: UInt64 = 0
   private let capacity = 2048
 
@@ -194,7 +194,7 @@ actor _ASNMemoryCache {
       {
         if seen.insert(ObjectIdentifier(flight.work)).inserted {
           joined.append(flight.work)
-          joins += 1
+          joins[scope, default: 0] += 1
         }
       } else {
         unreserved.append(address)
@@ -267,7 +267,7 @@ actor _ASNMemoryCache {
     map.removeAll()
     order.removeAll()
     flights.removeAll()
-    joins = 0
+    joins.removeAll()
   }
 
   /// Current cache size. Internal for testing via @testable import.
@@ -275,7 +275,11 @@ actor _ASNMemoryCache {
 
   /// Number of times a caller joined a running flight since the last ``clear()``. Internal for
   /// deterministic tests.
-  var joinCount: Int { joins }
+  var joinCount: Int { joins.values.reduce(0, +) }
+
+  /// Number of times a caller of one caching resolver joined a running flight since the last
+  /// ``clear()``. Internal for deterministic tests.
+  fileprivate func joinCount(_ scope: _ASNResolverScope) -> Int { joins[scope] ?? 0 }
 
   /// Number of keys currently reserved by in-flight work. Internal for deterministic tests.
   var inFlightReservationCount: Int { flights.count }
@@ -305,6 +309,11 @@ public struct CachingASNResolver: ASNResolver, PublishingASNResolver {
   {
     try await resolve(
       ipv4Addrs, timeout: timeout, deadline: asnDeadline(timeout), publish: { _ in })
+  }
+
+  /// How many times a caller of this resolver joined a running flight. For tests.
+  var joinCount: Int {
+    get async { await _ASNMemoryCache.shared.joinCount(scope) }
   }
 
   func resolve(
