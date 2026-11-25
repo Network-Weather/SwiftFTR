@@ -44,7 +44,7 @@ struct RDNSCacheTests {
   @Test("Only an answer is cached; every other outcome is asked again", arguments: uncachedOutcomes)
   func onlyAnswersAreCached(outcome: ReverseDNSLookupOutcome) async {
     let resolver = RecordingResolver { _ in outcome }
-    let cache = RDNSCache { address, timeout in resolver.resolve(address, timeout) }
+    let cache = RDNSCache { question, timeout in resolver.resolve(question.key, timeout) }
 
     #expect(await cache.lookup("192.0.2.1") == nil)
     #expect(await cache.lookup("192.0.2.1") == nil)
@@ -55,7 +55,7 @@ struct RDNSCacheTests {
   @Test("An answer is cached and served without asking again")
   func answerIsCached() async {
     let resolver = RecordingResolver { _ in .answer("router.example") }
-    let cache = RDNSCache { address, timeout in resolver.resolve(address, timeout) }
+    let cache = RDNSCache { question, timeout in resolver.resolve(question.key, timeout) }
 
     #expect(await cache.lookup("192.0.2.1") == "router.example")
     #expect(await cache.lookup("192.0.2.1") == "router.example")
@@ -103,8 +103,10 @@ struct RDNSCacheTests {
       ("fe80::2%lo0", .timedOut),
     ]
     let outcomes: [String: ReverseDNSLookupOutcome] = Dictionary(
-      uniqueKeysWithValues: neutral + [("192.0.2.1", .timedOut), ("192.0.2.9", .timedOut)])
-    let cache = RDNSCache { address, _ in outcomes[address] ?? .noSuchRecord }
+      uniqueKeysWithValues: (neutral + [("192.0.2.1", .timedOut), ("192.0.2.9", .timedOut)]).map {
+        (ptrKey($0.0), $0.1)
+      })
+    let cache = RDNSCache { question, _ in outcomes[question.key] ?? .noSuchRecord }
 
     _ = await cache.lookup("192.0.2.1")
     for (address, _) in neutral {
@@ -120,27 +122,29 @@ struct RDNSCacheTests {
   @Test("A link-local lookup gets the shorter link-local cap; every other lookup the full deadline")
   func linkLocalCap() async {
     let resolver = RecordingResolver { _ in .noSuchRecord }
-    let cache = RDNSCache(lookupDeadline: 7) { address, timeout in
-      resolver.resolve(address, timeout)
+    let cache = RDNSCache(lookupDeadline: 7) { question, timeout in
+      resolver.resolve(question.key, timeout)
     }
     let linkLocal = ["fe80::1%lo0", "fe80::1", "169.254.1.1", "::ffff:169.254.1.1"]
     let unicast = ["192.0.2.1", "2001:db8::1", "10.0.0.1", "fc00::1", "127.0.0.1"]
     for address in linkLocal + unicast {
       _ = await cache.lookup(address)
     }
-    let timeouts = Dictionary(uniqueKeysWithValues: resolver.calls.map { ($0.address, $0.timeout) })
+    // An address and its mapped spelling are one key, asked once each lookup with one timeout.
+    let timeouts = Dictionary(
+      resolver.calls.map { ($0.address, $0.timeout) }, uniquingKeysWith: { first, _ in first })
     for address in linkLocal {
-      #expect(timeouts[address] == RDNSCache.linkLocalLookupDeadline, "\(address)")
+      #expect(timeouts[ptrKey(address)] == RDNSCache.linkLocalLookupDeadline, "\(address)")
     }
     for address in unicast {
-      #expect(timeouts[address] == 7, "\(address)")
+      #expect(timeouts[ptrKey(address)] == 7, "\(address)")
     }
     #expect(RDNSCache.linkLocalLookupDeadline < SwiftFTRConfig.defaultRDNSLookupTimeout)
 
     // A deadline shorter than the link-local cap applies to link-local lookups too.
     let short = RecordingResolver { _ in .noSuchRecord }
-    let shortCache = RDNSCache(lookupDeadline: 0.25) { address, timeout in
-      short.resolve(address, timeout)
+    let shortCache = RDNSCache(lookupDeadline: 0.25) { question, timeout in
+      short.resolve(question.key, timeout)
     }
     _ = await shortCache.lookup("fe80::1%lo0")
     #expect(short.calls.first?.timeout == 0.25)
@@ -275,9 +279,9 @@ struct RDNSCacheTests {
     // more lookup budget spent. A size of zero keeps no holdoff (nor any answer), so a second ask
     // of the hop reaches the resolver and is counted here rather than hidden by the holdoff its
     // first timeout would set; stalls are still counted.
-    let rdns = RDNSCache(maxSize: 0) { address, _ in
-      log.record(address)
-      return address == publicIP
+    let rdns = RDNSCache(maxSize: 0) { question, _ in
+      log.record(question.key)
+      return question.key == ptrKey(publicIP)
         ? .error(.daemon(DNSServiceStatus.serviceNotRunning)) : .timedOut
     }
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: destinationTTL))
@@ -298,12 +302,13 @@ struct RDNSCacheTests {
         }
       }
     }
-    let hopAsks = log.count(of: "127.0.0.1")
+    let hopAsks = log.count(of: ptrKey("127.0.0.1"))
     #expect(hopAsks == 1, "the hop address was asked \(hopAsks) times in one \(operation)")
     let stalls = await rdns.stallCount
     #expect(stalls == 1, "one unanswered hop counted \(stalls) stalls")
     if operation != .trace {
-      #expect(log.count(of: publicIP) == 1, "the public address, no hop, was not asked once")
+      #expect(
+        log.count(of: ptrKey(publicIP)) == 1, "the public address, no hop, was not asked once")
     }
   }
 }

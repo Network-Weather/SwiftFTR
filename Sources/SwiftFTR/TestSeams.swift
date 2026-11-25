@@ -111,6 +111,10 @@ enum TestSeams {
   /// The system DNS daemon calls a ``ReverseDNSLookup`` makes, in place of `dns_sd`.
   @TaskLocal static var dnsService: DNSServiceCalls?
 
+  /// The interface index a ``ReverseDNSQuestion`` finds for a zone name, in place of
+  /// `if_nametoindex`; 0 means no such interface.
+  @TaskLocal static var interfaceIndex: (@Sendable (_ name: String) -> UInt32)?
+
   @TaskLocal static var makeICMPSocket: MakeICMPSocket?
 
   @TaskLocal static var sendProbe: SendProbe?

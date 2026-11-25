@@ -42,14 +42,18 @@ struct RDNSHoldoffTests {
       self.outcome = outcome
     }
 
-    func resolve(_ address: String) -> ReverseDNSLookupOutcome {
+    /// Records `question` by its key; `outcome` is given the key, which `ptrKey(_:)` makes from
+    /// an address.
+    func resolve(_ question: ReverseDNSQuestion) -> ReverseDNSLookupOutcome {
+      let address = question.key
       lock.lock()
       asked[address, default: 0] += 1
       lock.unlock()
       return outcome(address)
     }
 
-    func asks(_ address: String) -> Int {
+    func asks(_ literal: String) -> Int {
+      let address = ptrKey(literal)
       lock.lock()
       defer { lock.unlock() }
       return asked[address] ?? 0
@@ -60,7 +64,7 @@ struct RDNSHoldoffTests {
     _ daemon: Daemon, clock: TestClock = TestClock(), maxSize: Int = 1000
   ) -> RDNSCache {
     RDNSCache(
-      maxSize: maxSize, resolver: { address, _ in daemon.resolve(address) },
+      maxSize: maxSize, resolver: { question, _ in daemon.resolve(question) },
       now: { clock.now() })
   }
 
@@ -270,8 +274,8 @@ struct RDNSHoldoffTests {
     // holdoff expires within the ten traces.
     let daemon = Daemon { address in
       switch address {
-      case Path.named where path != .wholeResolverStalled: .answer("router.example")
-      case Path.noRecord where path != .wholeResolverStalled: .noSuchRecord
+      case ptrKey(Path.named) where path != .wholeResolverStalled: .answer("router.example")
+      case ptrKey(Path.noRecord) where path != .wholeResolverStalled: .noSuchRecord
       default: .timedOut
       }
     }

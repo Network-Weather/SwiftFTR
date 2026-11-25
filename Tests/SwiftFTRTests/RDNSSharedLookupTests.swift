@@ -26,14 +26,17 @@ struct RDNSSharedLookupTests {
     }
 
     var calls: Int { locked { issued } }
-    func calls(for address: String) -> Int { locked { asked.filter { $0 == address }.count } }
+    func calls(for address: String) -> Int {
+      let key = ptrKey(address)
+      return locked { asked.filter { $0 == key }.count }
+    }
     func open(_ call: Int) { gates[call - 1].open() }
     func openAll() { for gate in gates { gate.open() } }
 
-    func resolve(_ address: String) async -> ReverseDNSLookupOutcome {
+    func resolve(_ question: ReverseDNSQuestion) async -> ReverseDNSLookupOutcome {
       let call = locked {
         issued += 1
-        asked.append(address)
+        asked.append(question.key)
         return issued
       }
       let gate = gates[min(call, gates.count) - 1]
@@ -67,7 +70,7 @@ struct RDNSSharedLookupTests {
     let resolver = GatedResolver { _ in answered ? .answer("router.example") : .timedOut }
     defer { resolver.openAll() }
     // A TTL of zero, so a late lookup could not be answered from the cache instead of joining.
-    let cache = RDNSCache(ttl: 0) { address, _ in await resolver.resolve(address) }
+    let cache = RDNSCache(ttl: 0) { question, _ in await resolver.resolve(question) }
 
     let tasks = Self.lookups(cache, Array(repeating: "192.0.2.1", count: 5))
     #expect(await Self.awaiting(cache, 5), "the five lookups never all waited")
@@ -88,7 +91,7 @@ struct RDNSSharedLookupTests {
   func cancelledJoinerGetsNil() async throws {
     let resolver = GatedResolver { _ in .answer("router.example") }
     defer { resolver.openAll() }
-    let cache = RDNSCache(ttl: 0) { address, _ in await resolver.resolve(address) }
+    let cache = RDNSCache(ttl: 0) { question, _ in await resolver.resolve(question) }
 
     let tasks = Self.lookups(cache, Array(repeating: "192.0.2.1", count: 3))
     #expect(await Self.awaiting(cache, 3))
@@ -115,7 +118,7 @@ struct RDNSSharedLookupTests {
     // timeout could hold the address off or count a stall.
     let resolver = GatedResolver { call in call == 1 ? .timedOut : .answer("router.example") }
     defer { resolver.openAll() }
-    let cache = RDNSCache { address, _ in await resolver.resolve(address) }
+    let cache = RDNSCache { question, _ in await resolver.resolve(question) }
     let ip = "192.168.1.1"
 
     let old = Task { await cache.lookup(ip) }
@@ -149,7 +152,7 @@ struct RDNSSharedLookupTests {
   func answerFromBeforeReset(reset: Reset) async throws {
     let resolver = GatedResolver { _ in .answer("router.old") }
     defer { resolver.openAll() }
-    let cache = RDNSCache { address, _ in await resolver.resolve(address) }
+    let cache = RDNSCache { question, _ in await resolver.resolve(question) }
 
     let old = Task { await cache.lookup("192.168.1.1") }
     #expect(await Self.awaiting(cache, 1))
@@ -197,8 +200,8 @@ struct RDNSSharedLookupTests {
     // separate answer for A that a timeout could contradict.
     let resolverA = GatedResolver { _ in answered ? .answer("a.example") : .timedOut }
     defer { resolverA.openAll() }
-    let cache = RDNSCache(maxSize: 1) { address, _ in
-      address == "192.0.2.1" ? await resolverA.resolve(address) : .answer("b.example")
+    let cache = RDNSCache(maxSize: 1) { question, _ in
+      question == .of("192.0.2.1") ? await resolverA.resolve(question) : .answer("b.example")
     }
 
     let tasks = Self.lookups(cache, ["192.0.2.1", "192.0.2.1"])
@@ -220,8 +223,8 @@ struct RDNSSharedLookupTests {
   func joinsWhileBreakerOpen() async throws {
     let held = GatedResolver { _ in .answer("one.example") }
     defer { held.openAll() }
-    let cache = RDNSCache(ttl: 0) { address, _ in
-      address == "1.1.1.1" ? await held.resolve(address) : .timedOut
+    let cache = RDNSCache(ttl: 0) { question, _ in
+      question == .of("1.1.1.1") ? await held.resolve(question) : .timedOut
     }
 
     let first = Task { await cache.lookup("1.1.1.1") }
@@ -244,7 +247,7 @@ struct RDNSSharedLookupTests {
   func spellingsOfOneAddress() async throws {
     let resolver = GatedResolver { call in call == 1 ? .timedOut : .answer("host.example") }
     defer { resolver.openAll() }
-    let cache = RDNSCache(ttl: 3600) { address, _ in await resolver.resolve(address) }
+    let cache = RDNSCache(ttl: 3600) { question, _ in await resolver.resolve(question) }
 
     // An IPv4 address and its IPv4-mapped IPv6 spelling ask one question.
     resolver.open(1)
@@ -271,7 +274,7 @@ struct RDNSSharedLookupTests {
   func linkLocalZoneIsPartOfTheAddress() async throws {
     let resolver = GatedResolver { _ in .answer("peer.local") }
     defer { resolver.openAll() }
-    let cache = RDNSCache { address, _ in await resolver.resolve(address) }
+    let cache = RDNSCache { question, _ in await resolver.resolve(question) }
     let index = if_nametoindex("lo0")
     #expect(index != 0)
 
@@ -286,5 +289,94 @@ struct RDNSSharedLookupTests {
     _ = await cache.lookup("fe80::1")
     #expect(resolver.calls == 2, "an unscoped link-local address shared the zoned one's entry")
     #expect(resolver.calls(for: "fe80::1") == 1)
+  }
+
+  @Test(
+    "A global query superseded by a reset writes nothing; later lookups see the fresh query's outcome"
+  )
+  func supersededGlobalQueryWritesNothing() async throws {
+    let resolver = GatedResolver { call in
+      switch call {
+      case 1: .answer("old.example")
+      case 2: .noSuchRecord
+      default: .answer("new.example")
+      }
+    }
+    defer { resolver.openAll() }
+    let cache = RDNSCache { question, _ in await resolver.resolve(question) }
+    let ip = "1.1.1.1"
+
+    let old = Task { await cache.lookup(ip) }
+    #expect(await eventually(within: Self.watchdog) { resolver.calls == 1 })
+    await cache.invalidateNetworkScoped()
+    let fresh = Task { await cache.lookup(ip) }
+    #expect(await eventually(within: Self.watchdog) { resolver.calls == 2 })
+
+    resolver.open(1)
+    let oldHostname = try await measure(within: Self.watchdog) { await old.value }.0
+    #expect(oldHostname == nil, "an answer from before the reset reached its caller")
+    #expect(await cache.count == 0, "a superseded query wrote its answer")
+    // A third lookup, while the fresh query runs, waits on the fresh query.
+    let third = Task { await cache.lookup(ip) }
+    #expect(await Self.awaiting(cache, 2))
+    resolver.open(2)
+    let freshHostname = try await measure(within: Self.watchdog) { await fresh.value }.0
+    let thirdHostname = try await measure(within: Self.watchdog) { await third.value }.0
+    #expect(freshHostname == nil)
+    #expect(thirdHostname == nil)
+    #expect(resolver.calls == 2)
+
+    // Nothing stale was cached, so the next lookup asks again.
+    resolver.open(3)
+    let next = try await measure(within: Self.watchdog) { await cache.lookup(ip) }.0
+    #expect(next == "new.example")
+    #expect(resolver.calls == 3)
+  }
+
+  @Test(
+    "A global address is global with or without a zone suffix, whichever spelling comes first",
+    arguments: [true, false])
+  func zonedGlobalSpellingIsGlobal(zonedFirst: Bool) async {
+    let calls = FaultCounter()
+    let cache = RDNSCache { _, _ in
+      calls.increment()
+      return .answer("one.one.one.one")
+    }
+    let zoned = "2606:4700:4700::1111%lo0"
+    let bare = "2606:4700:4700::1111"
+    for spelling in zonedFirst ? [zoned, bare] : [bare, zoned] {
+      _ = await cache.lookup(spelling)
+    }
+    await cache.invalidateNetworkScoped()
+    #expect(await cache.count == 1, "the global answer was evicted as network-scoped")
+    let hostname = await cache.lookup(bare)
+    #expect(hostname == "one.one.one.one")
+    #expect(calls.value == 1)
+  }
+
+  @Test("The daemon is asked on the interface the lookup was keyed with, not one found again")
+  func askedWithCapturedInterfaceIndex() async throws {
+    // The zone name maps to interface 7 the first time it is looked up and to 9 after that, as
+    // when a tunnel is recreated between keying a lookup and asking the daemon.
+    let mapped = FaultCounter()
+    let mapper: @Sendable (String) -> UInt32 = { name in
+      guard name == "zz9" else { return if_nametoindex(name) }
+      mapped.increment()
+      return mapped.value == 1 ? 7 : 9
+    }
+    let daemon = FakeDNSService()
+    let cache = RDNSCache(lookupDeadline: 120, limiter: _ConcurrencySemaphore(maxConcurrent: 4))
+
+    try await TestSeams.$interfaceIndex.withValue(mapper) {
+      try await daemon.install {
+        let lookup = Task { await cache.lookup("fe80::1%zz9") }
+        #expect(await eventually(within: Self.watchdog) { daemon.scheduledCount == 1 })
+        let interfaceIndex = daemon.question(0)?.interfaceIndex
+        #expect(interfaceIndex == 7, "asked on interface \(String(describing: interfaceIndex))")
+        daemon.expireDeadlines()
+        _ = try await measure(within: Self.watchdog) { await lookup.value }
+      }
+    }
+    #expect(await eventually(within: Self.watchdog) { daemon.liveCount == 0 })
   }
 }

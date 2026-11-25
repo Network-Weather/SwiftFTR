@@ -1255,8 +1255,8 @@ struct EmptyASNResolver: ASNResolver {
 func stallingRDNSCache(
   gate: StallGate, limit: TimeInterval, entered: FaultCounter? = nil, only: Set<String>? = nil
 ) -> RDNSCache {
-  RDNSCache(lookupDeadline: 30) { address, _ in
-    if let only, !only.contains(address) { return .noSuchRecord }
+  RDNSCache(lookupDeadline: 30) { question, _ in
+    if let only, !only.contains(where: { ptrKey($0) == question.key }) { return .noSuchRecord }
     return await withCheckedContinuation { continuation in
       DispatchQueue.global().async {
         entered?.increment()

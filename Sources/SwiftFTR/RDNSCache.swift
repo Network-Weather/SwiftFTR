@@ -18,18 +18,26 @@ import Foundation
 /// joins nothing; one cancelled while it waits gets `nil` when the query ends, so a caller that
 /// must be released at once races the wait itself, as the traces do with `withTraceCancellation`.
 ///
-/// Every table is keyed by the PTR question an address asks (``ReverseDNSQuestion``: its name and
-/// interface index), so an IPv4 address and its IPv4-mapped IPv6 spelling, or two spellings of
-/// one IPv6 address, are one address, and a link-local address keeps its zone's interface.
+/// One identity, one write rule (David, 2026-11-24: "Let's go with one identity, one write
+/// rule"). A lookup's identity is the ``ReverseDNSQuestion`` built once from the caller's string:
+/// it keys the sharing, the answer cache, the holdoffs and the stall run, says whether the address
+/// is global, and is the question the resolver is asked, on the interface it captured. So an IPv4
+/// address and its IPv4-mapped spelling, or two spellings of one IPv6 address, are one address,
+/// and a link-local address keeps its zone's interface. A string that is not an address literal
+/// has no question: its lookup returns `nil` at once, asks nothing and records nothing. A query
+/// writes (an answer, a holdoff, a stall, a reset of the count) only if it is still the current
+/// query for its key when it ends; ``clear()`` and ``invalidateNetworkScoped()`` drop every query
+/// in flight, so one from before a reset writes nothing, and its waiters get `nil`.
 ///
 /// When an insertion takes the cache past `maxSize`, the entry stored longest ago is evicted; a
 /// cache hit does not refresh an entry, so this is insertion-order eviction, not
 /// least-recently-used.
 actor RDNSCache {
-  /// One lookup of `address`, allowed `timeout` seconds from the call, including any wait for a
+  /// One lookup of `question`, allowed `timeout` seconds from the call, including any wait for a
   /// permit. It must return by then: the cache does not race it against a timer of its own.
   typealias Resolver =
-    @Sendable (_ address: String, _ timeout: TimeInterval) async -> ReverseDNSLookupOutcome
+    @Sendable (_ question: ReverseDNSQuestion, _ timeout: TimeInterval) async ->
+    ReverseDNSLookupOutcome
 
   private struct CacheEntry {
     let hostname: String
@@ -38,10 +46,10 @@ actor RDNSCache {
     let isGlobal: Bool
   }
 
-  /// The query in flight for one address key.
+  /// The query in flight for one address key. Its task returns the hostname it wrote, if any.
   private struct InFlight {
     let id: UInt64
-    let task: Task<ReverseDNSLookupOutcome, Never>
+    let task: Task<String?, Never>
   }
 
   /// How long a single reverse lookup may take before the caller stops waiting for it.
@@ -92,9 +100,6 @@ actor RDNSCache {
   private let resolver: Resolver
   private let lookupDeadline: TimeInterval
   private let linkLocalLookupDeadline: TimeInterval
-  private var scopedGeneration: UInt64 = 0
-  private var globalGeneration: UInt64 = 0
-  private var breakerGeneration: UInt64 = 0
   private var consecutiveStalls = 0
   /// The addresses counted in the current run of stalls: each counts once, so an address asked
   /// again in the same run, after its holdoff ended or was evicted, cannot open the breaker by
@@ -134,8 +139,8 @@ actor RDNSCache {
     self.linkLocalLookupDeadline = linkLocalLookupDeadline
     self.resolver =
       resolver
-      ?? { address, timeout in
-        await ReverseDNSLookup.lookup(address, timeout: timeout, limiter: limiter)
+      ?? { question, timeout in
+        await ReverseDNSLookup.lookup(question, timeout: timeout, limiter: limiter)
       }
   }
 
@@ -152,18 +157,15 @@ actor RDNSCache {
   /// - Returns: The hostname if one was found, nil otherwise, and nil for a cancelled caller.
   func lookup(_ ip: String) async -> String? {
     // A caller cancelled already starts nothing and joins nothing.
-    guard !Task.isCancelled else { return nil }
-    let question = ReverseDNSQuestion(address: ip)
-    let key = question.map { "\($0.name)%\($0.interfaceIndex)" } ?? ip
+    guard !Task.isCancelled, let question = ReverseDNSQuestion(address: ip) else { return nil }
+    let key = question.key
     let now = self.now()
 
     if let entry = cache[key], now < entry.timestamp + ttl {
       return entry.hostname
     }
 
-    let isScoped = ipAddressScope(of: ip) != .global
-    let generation = isScoped ? scopedGeneration : globalGeneration
-    let task: Task<ReverseDNSLookupOutcome, Never>
+    let task: Task<String?, Never>
     if let running = inFlight[key] {
       // The breaker and the holdoff stop a query from starting, not a lookup from joining one.
       task = running.task
@@ -175,76 +177,59 @@ actor RDNSCache {
       }
       // Lookups keep stalling, so skip the wait and report numerically until the breaker resets.
       guard !isSuppressingLookups else { return nil }
-      task = startQuery(
-        ip, key: key, isMulticast: question?.isMulticast ?? false, isScoped: isScoped,
-        generation: generation)
+      task = startQuery(question)
     }
 
     awaiting += 1
-    let outcome = await task.value
+    let hostname = await task.value
     awaiting -= 1
-    // A result from an invalidated network generation must not reach a caller that asked before
-    // it. Network-scoped invalidation rejects scoped lookups in flight; clear() rejects both.
-    guard !Task.isCancelled, case .answer(let hostname) = outcome,
-      generation == (isScoped ? scopedGeneration : globalGeneration)
-    else { return nil }
-    return hostname
+    return Task.isCancelled ? nil : hostname
   }
 
-  /// Starts the one query for `key`. Its timeout depends only on the address and this cache's
-  /// settings, so it is the timeout any lookup awaiting it would have had.
-  private func startQuery(
-    _ ip: String, key: String, isMulticast: Bool, isScoped: Bool, generation: UInt64
-  ) -> Task<ReverseDNSLookupOutcome, Never> {
-    let timeout = isMulticast ? min(linkLocalLookupDeadline, lookupDeadline) : lookupDeadline
-    let breakerGeneration = self.breakerGeneration
+  /// Starts the one query for `question`. Its timeout depends only on the question and this
+  /// cache's settings, so it is the timeout any lookup awaiting it would have had.
+  private func startQuery(_ question: ReverseDNSQuestion) -> Task<String?, Never> {
+    let timeout =
+      question.isMulticast ? min(linkLocalLookupDeadline, lookupDeadline) : lookupDeadline
     let resolver = self.resolver
     let id = nextQueryID
     nextQueryID &+= 1
     let task = Task {
-      let outcome = await resolver(ip, timeout)
-      self.finish(
-        key, id: id, outcome: outcome, isMulticast: isMulticast, isScoped: isScoped,
-        generation: generation, breakerGeneration: breakerGeneration)
-      return outcome
+      let outcome = await resolver(question, timeout)
+      return self.finish(question, id: id, outcome: outcome)
     }
-    inFlight[key] = InFlight(id: id, task: task)
+    inFlight[question.key] = InFlight(id: id, task: task)
     return task
   }
 
-  /// Applies a query's one outcome, once.
-  private func finish(
-    _ key: String, id: UInt64, outcome: ReverseDNSLookupOutcome, isMulticast: Bool,
-    isScoped: Bool, generation: UInt64, breakerGeneration: UInt64
-  ) {
-    if inFlight[key]?.id == id { inFlight.removeValue(forKey: key) }
+  /// Applies a query's one outcome, if it is still the current query for its key, and returns
+  /// the hostname it wrote. One that a reset dropped writes nothing and returns `nil`.
+  private func finish(_ question: ReverseDNSQuestion, id: UInt64, outcome: ReverseDNSLookupOutcome)
+    -> String?
+  {
+    let key = question.key
+    guard inFlight[key]?.id == id else { return nil }
+    inFlight.removeValue(forKey: key)
 
-    // Only a query started under the current breaker generation may update breaker state or hold
-    // an address off: one from before a network change must not re-trip or reset the breaker on
-    // the new network. A multicast question is no evidence about the resolver either way, but an
-    // unanswered one is held off like any other.
-    if breakerGeneration == self.breakerGeneration {
-      switch outcome {
-      case .timedOut:
-        holdOff(key, since: now())
-        // Asked and unanswered: the resolver is stalled.
-        if !isMulticast, stalledInStreak.insert(key).inserted { consecutiveStalls += 1 }
-      case .answer, .noSuchRecord:
-        // The resolver answered.
-        if !isMulticast { resetStalls() }
-      case .timedOutBeforeQuery, .error, .cancelled:
-        // Never asked, or failed without waiting on the resolver.
-        break
-      }
+    // A multicast question is no evidence about the resolver either way, but an unanswered one
+    // is held off like any other.
+    switch outcome {
+    case .timedOut:
+      holdOff(key, since: now())
+      // Asked and unanswered: the resolver is stalled.
+      if !question.isMulticast, stalledInStreak.insert(key).inserted { consecutiveStalls += 1 }
+    case .answer, .noSuchRecord:
+      // The resolver answered.
+      if !question.isMulticast { resetStalls() }
+    case .timedOutBeforeQuery, .error, .cancelled:
+      // Never asked, or failed without waiting on the resolver.
+      break
     }
 
-    // An answer from an invalidated generation must not repopulate the newly invalidated cache.
-    if case .answer(let name) = outcome,
-      generation == (isScoped ? scopedGeneration : globalGeneration)
-    {
-      cache[key] = CacheEntry(hostname: name, timestamp: now(), isGlobal: !isScoped)
-      if cache.count > maxSize { evictOldest() }
-    }
+    guard case .answer(let name) = outcome else { return nil }
+    cache[key] = CacheEntry(hostname: name, timestamp: now(), isGlobal: question.isGlobal)
+    if cache.count > maxSize { evictOldest() }
+    return name
   }
 
   /// Batch lookup multiple IP addresses concurrently, each distinct address once.
@@ -271,9 +256,6 @@ actor RDNSCache {
 
   /// Clear all cached entries.
   func clear() {
-    scopedGeneration &+= 1
-    globalGeneration &+= 1
-    breakerGeneration &+= 1
     cache.removeAll()
     holdoffs.removeAll()
     inFlight.removeAll()
@@ -283,13 +265,11 @@ actor RDNSCache {
   /// Invalidate network-scoped (non-global) rDNS cache entries and reset the stall breaker.
   ///
   /// Evicts cached rDNS entries whose address is not globally routable (RFC 1918 private, CGNAT,
-  /// link-local, loopback, ULA). Preserves globally routable entries and their TTLs. In-flight
-  /// lookups for scoped addresses are discarded, while in-flight global lookups continue to
-  /// complete and cache normally. Every holdoff is dropped, global ones included: a timeout says
-  /// something about the path to a resolver, which the network change may have fixed.
+  /// link-local, loopback, ULA). Preserves globally routable entries and their TTLs. Every query
+  /// in flight is dropped, global ones included, so none writes and their waiters get `nil`; a
+  /// global address looked up just before is asked again afterwards. Every holdoff is dropped
+  /// too: a timeout says something about the path to a resolver, which the change may have fixed.
   func invalidateNetworkScoped() {
-    scopedGeneration &+= 1
-    breakerGeneration &+= 1
     cache = cache.filter { _, entry in entry.isGlobal }
     holdoffs.removeAll()
     inFlight.removeAll()
