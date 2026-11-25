@@ -676,6 +676,10 @@ overlap share one query (David, 2026-11-24: "Build share lookups").
   the reverse-DNS phase, rather than the whole lookup timeout.
 - A multipath run makes one reverse query per hop address at a time, however many of its flows
   share the hop, and they all get its answer.
+- A reverse lookup in flight when ``SwiftFTR/SwiftFTR/networkChanged()`` or
+  ``SwiftFTR/SwiftFTR/invalidateNetworkScopedRDNS()`` runs gives its caller no hostname and caches
+  nothing, for a global address too, which the next trace asks again (David, 2026-11-24: "Let's
+  go with one identity, one write rule"). 0.18 let a global lookup finish and cache its answer.
 - Reverse DNS no longer waits for a blocking-I/O worker, so other work holding the workers does
   not delay hostnames, and reverse DNS no longer delays public-IP discovery.
 

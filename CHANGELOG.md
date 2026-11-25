@@ -224,7 +224,12 @@ Unreleased
   A caller cancelled before it looks up asks nothing; one cancelled while waiting gets no
   hostname once the query ends, within the lookup timeout. Traces, classified traces, multipath
   flows and `discoverPublicIPWithHostname()` are released at once anyway, since they race each
-  reverse-DNS wait against their cancellation.
+  reverse-DNS wait against their cancellation. One identity, one write rule (David, 2026-11-24: "Let's go with one identity, one write rule"): the PTR question
+  built once from the caller's string keys every table, decides whether the address is global
+  (with or without a zone), and is what the daemon is asked; a query writes only if it is still
+  the current query for its address when it ends. A global address looked up just before
+  `networkChanged()` or `invalidateNetworkScopedRDNS()` is asked again afterwards, where 0.18 let
+  that lookup finish and cache its answer.
 
 ### Bug fixes
 

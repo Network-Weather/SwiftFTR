@@ -65,14 +65,17 @@ As of 0.18.0, in `Traceroute.swift`, `RDNSCache.swift`, `ASN.swift` and
   address share one query (David, 2026-11-24: "Build share lookups"): a lookup that arrives while a query for its address is
   in flight waits for it, so each address has at most one query at a time and its one outcome
   is applied once, whoever is still waiting. A query is never cancelled because a caller left;
-  it is bounded by its own timeout. Every table is keyed by the PTR question (name and
-  interface index), so the spellings of one address are one entry. `clear()` and
-  `invalidateNetworkScoped()` drop the queries in flight, so a lookup after them starts fresh,
-  and a query from before them cannot change the breaker or the holdoffs. A lookup that never got to ask in time and
+  it is bounded by its own timeout. One identity, one write rule (David, 2026-11-24: "Let's go with one identity, one write rule"): a lookup's
+  identity is the PTR question built once from the caller's string (name and interface index),
+  which keys every table, says whether the address is global with or without a zone, and is
+  what the daemon is asked; and a query writes (answer, holdoff, stall, reset of the count) only
+  if it is still the current query for its key when it ends. `clear()` and
+  `invalidateNetworkScoped()` drop every query in flight, so a lookup after them starts fresh
+  and a query from before them writes nothing and gives its waiters `nil`; a global address
+  looked up just before is asked again afterwards. A lookup that never got to ask in time and
   a link-local lookup (asked by multicast) do not count. `clear()` and
   `invalidateNetworkScoped()` reset it, and so does a lookup that was already in flight being
-  answered, or told there is no such record. `clear()` also generation-guards against
-  in-flight lookups repopulating the cache.
+  answered, or told there is no such record.
 - The ASN cache is capacity-bounded (2048 entries) with **no TTL**; entries
   live until evicted or the cache is reset.
 - The address-scope classifier (`IPAddressScope` in `Utils.swift`)
@@ -162,11 +165,9 @@ association changed.
 
 Two semantics the implementation holds to:
 
-- **In-flight lookups.** The current generation guard is cache-wide: `clear()`
-  rejects every in-flight result. Selective eviction needs a scope-aware
-  equivalent — an in-flight lookup for a scoped address must not repopulate
-  the cache after eviction, while an in-flight global lookup should complete
-  and cache normally.
+- **In-flight lookups.** Every lookup in flight is dropped, global ones included,
+  so none repopulates the cache after eviction and their callers get no hostname;
+  a global address looked up just before is asked again afterwards.
 - **Stall breaker.** This call resets the stall breaker. The breaker exists
   because the resolver on the current network path was stalling, and a
   network transition is precisely the event most likely to have fixed it —
@@ -254,8 +255,7 @@ it see no behavior change. Beyond that, library-level tests demonstrate:
   later-registered traces tracked, and leaves every cache intact.
 - `invalidateNetworkScopedRDNS()` evicts private/CGNAT/link-local/ULA/loopback
   entries (positive and negative), preserves global entries and their TTLs,
-  rejects in-flight scoped results, allows in-flight global results, and
-  resets the stall breaker.
+  drops every lookup in flight, and resets the stall breaker.
 - `seedPublicIP` rejects non-global addresses (including CGNAT), rejects
   malformed input, and a rejected seed leaves discovery behavior unchanged.
 - A seed made before an invalidation does not survive it.
