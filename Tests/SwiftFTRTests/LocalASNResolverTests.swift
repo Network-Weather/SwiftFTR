@@ -224,6 +224,11 @@ final class LocalASNResolverTests: XCTestCase {
   }
 
   /// The store holds databases weakly: once the last resolver goes away, the next one reloads.
+  ///
+  /// The release is not synchronous with the scope's end: a task that touched the database (the
+  /// one that loaded it, or a finished wait) can still be released by the runtime on another
+  /// thread just after its caller resumed. Under CPU load that took up to about 1 ms (#189), so
+  /// the test waits for the release, under a watchdog far longer than that.
   func testDatabaseReleasedAfterLastResolverGoesAway() async throws {
     let store = LocalASNDatabaseStore()
 
@@ -235,8 +240,8 @@ final class LocalASNResolverTests: XCTestCase {
       withExtendedLifetime(resolver) {}
     }
 
-    let residentAfterRelease = await store.isResident(.embedded)
-    XCTAssertFalse(residentAfterRelease, "Database should be released with its last resolver")
+    let released = await eventually(within: 20) { await !store.isResident(.embedded) }
+    XCTAssertTrue(released, "Database should be released with its last resolver")
 
     let again = LocalASNResolver(source: .embedded, store: store)
     await again.preload()

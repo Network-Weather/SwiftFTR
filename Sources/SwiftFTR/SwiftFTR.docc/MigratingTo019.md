@@ -1,6 +1,6 @@
 # Migrating to SwiftFTR 0.19
 
-Handle the two new DNSError cases, the public-IP resolver, and the DNS, address-validation, ping, bufferbloat, public-IP discovery and CLI changes introduced in SwiftFTR 0.19.
+Handle the two new DNSError cases, the public-IP resolver, and the DNS, address-validation, ping, bufferbloat, public-IP discovery, ASN lookup and CLI changes introduced in SwiftFTR 0.19.
 
 ## Overview
 
@@ -17,8 +17,9 @@ To find the call sites to review, search the consumer for `switch` over `DNSErro
 `.classify(`, `.publicIP` read from a `SwiftFTR` tracer, `SwiftFTRConfig(` calls that pass `publicIP:`,
 `traceClassified(` results whose `publicIP` or `clientASN` is read for an IPv6 destination,
 `discoverPaths(` followed by a read of the public-IP cache, `PublicIPError`,
-`discoverPublicIPWithHostname(`, `STUNPublicIP`, `getPublicIPs(` calls that pass `sourceIP:`, and any
-script that reads the output of `swift-ftr probe dns`.
+`discoverPublicIPWithHostname(`, `STUNPublicIP`, `getPublicIPs(` calls that pass `sourceIP:`,
+`resolve(ipv4Addrs:` calls on an ASN resolver, and any script that reads the output of
+`swift-ftr probe dns`.
 
 ## Update the package
 
@@ -639,4 +640,50 @@ After, to keep the cache as it was:
 ```swift
 let topology = try await tracer.discoverPaths(to: host)
 await tracer.invalidatePublicIP()  // 0.19 caches the run's answer
+```
+
+## An ASN lookup's timeout bounds the whole call
+
+**What changed.** The `timeout` of ``ASNResolver/resolve(ipv4Addrs:timeout:)`` is one deadline
+for the whole call in every built-in resolver, taken on entry and passed down unchanged:
+
+- ``CymruDNSResolver`` (`.dns`) ends every origin and AS-name query on every server by it. 0.18
+  gave each query the full timeout again, per server and per wave of eight.
+- ``HybridASNResolver`` (the default, `.hybrid(.embedded)`) ignored it. It now waits for a
+  database still loading only until it, and its DNS fallback ends at the earlier of it and
+  `fallbackTimeout`, and is not started once it has passed.
+- ``LocalASNResolver`` waits for its database only until it; a loaded database answers whatever
+  the timeout.
+- ``CachingASNResolver`` stops each caller at it, even when the resolver behind it overruns.
+
+When time runs out the call returns every answer it has: an AS number whose name has not arrived
+has an empty `name`, and is not cached, so a later lookup asks for the name. A caller that leaves
+a shared lookup or database load, at its deadline or because it was cancelled, stops nothing; the
+next lookup uses the same work.
+
+**What a caller sees.**
+
+- A classified trace's ASN phase ends within its timeout (1.5 s in ``TraceClassifier``). One
+  started before the embedded database has loaded can come back without ASN data, where 0.18
+  waited for the load; with `.dns`, AS names can be empty when the names answer late.
+- A `timeout` of zero, below zero or NaN starts no lookup: only cached answers, or a database
+  already loaded, answer. Infinity, or a very large value, waits as long as the work takes.
+- A cancelled `LocalASNResolver.resolve` throws `CancellationError` while the database loads; a
+  cancelled `preload()` returns while the load continues.
+
+**What to change.** Nothing for a classified trace. If code calls a resolver directly with a small
+timeout and needs the database, preload it first:
+
+Before:
+
+```swift
+let asns = try await LocalASNResolver(source: .embedded).resolve(ipv4Addrs: ips, timeout: 0.1)
+```
+
+After:
+
+```swift
+let resolver = LocalASNResolver(source: .embedded)
+await resolver.preload()  // 0.19 waits for a loading database only until the timeout
+let asns = try await resolver.resolve(ipv4Addrs: ips, timeout: 0.1)
 ```

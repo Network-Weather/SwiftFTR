@@ -206,6 +206,39 @@ struct EnrichmentLifetimeTests {
     #expect(loads == 1)
   }
 
+  // MARK: - Shared work
+
+  @Test("Waiters that leave shared work, at a deadline or cancelled, leave nothing registered")
+  func waitersLeaveNothingRegistered() async throws {
+    let gate = StallGate()
+    defer { gate.open() }
+    let work = SharedASNWork<Void> { _ in await gate.waitAsync(limit: 60) }
+    let clock = MovableClock()
+    let timed = (0..<20).map { _ in
+      Task {
+        await TestSeams.$monotonicClock.withValue(clock.now) {
+          await work.wait(until: clock.now() + Self.timeout).outcome == nil
+        }
+      }
+    }
+    let cancelled = (0..<20).map { _ in Task { await work.wait(until: nil).outcome == nil } }
+    let registered = await eventually(within: Self.watchdog) { work.waiterCount == 40 }
+    #expect(registered)
+
+    clock.jump(by: 2 * Self.timeout)
+    for task in cancelled { task.cancel() }
+    for task in timed + cancelled {
+      let (unfinished, _) = try await measure(within: Self.watchdog) { await task.value }
+      #expect(unfinished)
+    }
+    #expect(work.waiterCount == 0)
+
+    // The work itself ran on.
+    gate.open()
+    let (ended, _) = try await measure(within: Self.watchdog) { await work.wait(until: nil) }
+    #expect(ended.outcome != nil)
+  }
+
   // MARK: - Extremes
 
   @Test("Extreme timeouts do not crash; a passed deadline starts nothing, an endless one waits")
