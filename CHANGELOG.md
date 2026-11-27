@@ -29,6 +29,12 @@ Unreleased
 
 ### New public API
 
+- **`SwiftFTRConfig.resolutionTimeout`** (default `SwiftFTRConfig.defaultResolutionTimeout`,
+  20 s; decision 7): how long `trace`, `traceClassified`, `traceStream`, `ping` and
+  `discoverPaths` wait for their destination to resolve. It must be finite and in (0, Int32.max]
+  seconds, as `PingConfig.timeout` must; any other value throws `invalidConfiguration` before
+  anything resolves, from `ping` too. The option comes as a further initializer, so existing
+  calls and stated function types keep their meaning.
 - **`PublicIPResolver`**, and `SwiftFTRConfig.publicIPResolver` with a
   `PublicIPResolverStrategy`: `.library` (the default: STUN only, see Behavior changes),
   `.disabled` (send nothing) or `.custom(_:)` (the caller's resolver). A resolver answers a `PublicIPRequest` (one
@@ -48,10 +54,15 @@ Unreleased
 
 ### Behavior changes
 
+- **`discoverPaths` resolves its target once, before its public-IP question,** and every flow
+  probes that one address, keeping the caller's name as its destination. A round-robin name could
+  give flows different addresses before. A name that does not resolve now fails the run before
+  any public-IP question (no STUN traffic, no caller resolver asked), and
+  `NetworkTopology.discoveryDuration` includes the lookup.
 - **Forward resolution no longer runs on the tracer actor or a cooperative thread.** `trace`,
   `traceClassified`, `traceStream`, `ping`, `tcpProbe`, `udpProbe` and multipath flows resolve
-  their destination in an executor slot. The wait ends at a deadline: 20 s for traces and ping,
-  `config.timeout` from entry for the probes, whose connect or receive window is what resolution
+  their destination in an executor slot. The wait ends at a deadline: `resolutionTimeout` (20 s by
+  default) for traces and ping, `config.timeout` from entry for the probes, whose connect or receive window is what resolution
   leaves. A trace or ping whose lookup times out throws `resolutionFailed` with details
   `"timed out"`; a probe reports its usual resolution failure and opens no socket. Cancelling the
   task, `cancelActiveTraces()` or `networkChanged()` during resolution returns at once, and a
