@@ -802,3 +802,51 @@ func runDetachedBlockingIO<T: Sendable>(
   let executor = TestSeams.blockingIOExecutor ?? blockingIOExecutor
   return try await executor.run(priority: priority, deadline: deadline, operation)
 }
+
+/// The executor that resolves literal destinations under `.auto` (NAT64 synthesis needs
+/// `getaddrinfo`), one slot of its own, so name lookups stalled in every slot of
+/// ``blockingIOExecutor`` cannot hold back a probe of a numeric address: the case a host app
+/// diagnosing broken DNS relies on.
+let literalLookupExecutor = BlockingIOExecutor(
+  maximumConcurrentOperations: 1, name: "com.networkweather.SwiftFTR.literal-lookup")
+
+/// Runs `lookup`, a blocking call, in a slot of `executor` (by default the task's
+/// `TestSeams.blockingIOExecutor` or ``blockingIOExecutor``) and waits for it until `deadline`, an
+/// instant on `clock`.
+///
+/// Nothing is submitted once the deadline has passed, and the worker checks it again before it
+/// calls `lookup`. When the wait ends, the order of precedence is: the calling task was
+/// cancelled (`CancellationError`); the deadline has passed (`nil`, whatever `lookup` produced,
+/// value or error); `lookup`'s own outcome. A queued lookup is withdrawn when the wait ends
+/// first; one already running finishes in its slot and its outcome is dropped. Read seams and
+/// the clock before calling: `lookup` runs on a worker, which cannot see task-locals.
+func awaitBlockingLookup<T: Sendable>(
+  until deadline: TimeInterval, clock: DiscoveryClock, on executor: BlockingIOExecutor? = nil,
+  _ lookup: @escaping @Sendable () throws -> T
+) async throws -> T? {
+  try Task.checkCancellation()
+  guard !clock.hasPassed(deadline) else { return nil }
+  let pool = executor ?? TestSeams.blockingIOExecutor ?? blockingIOExecutor
+  let outcome = await withTaskGroup(of: Result<T, Error>?.self) { group -> Result<T, Error>? in
+    group.addTask {
+      do {
+        return try await pool.run(priority: .userInitiated) { () -> Result<T, Error>? in
+          guard !clock.hasPassed(deadline) else { return nil }
+          return Result { try lookup() }
+        }
+      } catch {
+        return .failure(error)
+      }
+    }
+    group.addTask {
+      await clock.sleep(until: deadline)
+      return nil
+    }
+    // The first to finish decides; the other is cancelled, which withdraws a queued lookup.
+    defer { group.cancelAll() }
+    return await group.next() ?? nil
+  }
+  try Task.checkCancellation()
+  guard !clock.hasPassed(deadline), let outcome else { return nil }
+  return try outcome.get()
+}

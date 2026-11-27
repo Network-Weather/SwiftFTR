@@ -10,7 +10,9 @@ import Foundation
 ///
 /// See `docs/ROBUSTNESS-TESTING.md` for the battery that uses them.
 enum TestSeams {
-  /// Forward resolution of a trace, ping or probe destination, in place of `getaddrinfo`.
+  /// Forward resolution of a trace, ping or probe destination, in place of `getaddrinfo`. Runs in
+  /// an executor slot, as the lookup does; inputs answered without the resolver (forced-family
+  /// literals, mismatches, NULs, and the `.auto` literals `inlineResolution` names) never reach it.
   typealias ResolveHost =
     @Sendable (_ host: String, _ prefer: PreferredFamily) throws -> ResolvedHost
 
@@ -77,6 +79,9 @@ enum TestSeams {
   /// Executor for every `runDetachedBlockingIO` call, in place of the process-wide one.
   @TaskLocal static var blockingIOExecutor: BlockingIOExecutor?
 
+  /// Executor for `.auto` literal destinations, in place of `literalLookupExecutor`.
+  @TaskLocal static var literalLookupExecutor: BlockingIOExecutor?
+
   @TaskLocal static var fileControl: FileControl?
 
   @TaskLocal static var sendDatagram: SendDatagram?
@@ -88,7 +93,8 @@ enum TestSeams {
   @TaskLocal static var connectSocket: ConnectSocket?
 
   /// `monotonicNow()` in place of the real clock for every public-IP discovery deadline (the
-  /// budget, admission, name lookups and each exchange's cutoff), so a test can move the clock past
+  /// budget, admission, name lookups and each exchange's cutoff) and every forward-resolution
+  /// deadline, so a test can move the clock past
   /// a deadline, as a system sleep does, without waiting for it.
   @TaskLocal static var monotonicClock: (@Sendable () -> TimeInterval)?
 

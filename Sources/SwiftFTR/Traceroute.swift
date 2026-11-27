@@ -708,8 +708,8 @@ public actor SwiftFTR {
       interfaceIndex = try validateInterface(interfaceName)
     }
 
-    // Resolve destination (dual-stack, honors config.preferredFamily).
-    let resolved = try resolveHost(host: host, prefer: config.preferredFamily)
+    // Resolve destination (dual-stack, honors config.preferredFamily), off this actor.
+    let resolved = try await resolveTraceDestination(host, handle: handle)
 
     try handle.checkCancellation()
 
@@ -815,6 +815,17 @@ public actor SwiftFTR {
     }
   }
 
+  /// `host` resolved for this tracer's preferred family, waiting at most
+  /// ``forwardResolutionLimit`` and no longer than `handle` and the calling task allow.
+  private func resolveTraceDestination(_ host: String, handle: TraceHandle) async throws
+    -> ResolvedHost
+  {
+    let clock = DiscoveryClock.current
+    return try await resolveDestination(
+      host, prefer: config.preferredFamily, until: clock.now() + forwardResolutionLimit,
+      clock: clock, handle: handle)
+  }
+
   // Validate network interface exists and is available
   internal func validateInterface(_ interfaceName: String) throws -> UInt32 {
     #if os(macOS)
@@ -868,8 +879,10 @@ public actor SwiftFTR {
         "[SwiftFTR] Starting trace to \(host) with maxHops=\(maxHops), timeout=\(timeout)s, payloadSize=\(payloadSize)"
       )
     }
-    // Resolve host (dual-stack, honors config.preferredFamily).
-    let resolved = try resolveHost(host: host, prefer: config.preferredFamily)
+    // Resolve host (dual-stack, honors config.preferredFamily), off this actor, then hand off to
+    // probing only if nothing has cancelled the trace meanwhile.
+    let resolved = try await resolveTraceDestination(host, handle: handle)
+    try handle.checkCancellation()
     if config.enableLogging {
       let famName = resolved.family == AF_INET6 ? "v6" : "v4"
       print("[SwiftFTR] Resolved \(host) → \(resolved.canonical) (\(famName))")

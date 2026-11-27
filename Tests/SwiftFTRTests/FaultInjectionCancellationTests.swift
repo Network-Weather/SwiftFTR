@@ -196,7 +196,10 @@ struct FaultInjectionCancellationTests {
         return count
       }
       let receiving = await eventually(within: Self.watchdog) {
-        guard let handle = await tracer.activeTraces.first else { return false }
+        // Probes sent, so past resolution, whose wait also installs a handler.
+        guard network.probes.value > 0, let handle = await tracer.activeTraces.first else {
+          return false
+        }
         return await handle.hasCancellationHandler
       }
       #expect(receiving, "the stream never reached its receive window")

@@ -205,58 +205,6 @@ struct FaultInjectionEnrichmentTests {
     #expect(topology.publicIP == nil)
   }
 
-  /// Who ends a trace stalled in forward resolution.
-  enum ResolutionCanceller: String, CaseIterable, CustomTestStringConvertible, Sendable {
-    case taskCancel, cancelActiveTraces
-    var testDescription: String { rawValue }
-  }
-
-  @Test(
-    "A stalled forward resolution does not hold the tracer or its cancellation",
-    .disabled(
-      "finding 5 in docs/ROBUSTNESS-TESTING.md: getaddrinfo runs synchronously on the actor"),
-    arguments: ResolutionCanceller.allCases)
-  func forwardResolutionStall(canceller: ResolutionCanceller) async throws {
-    // One gated trace per cancellation source, so each source is the only thing that can end it.
-    let gate = StallGate()
-    defer { gate.open() }
-    let entered = FaultCounter()
-    let stall: TestSeams.ResolveHost = { host, _ in
-      entered.increment()
-      gate.wait(limit: 5)
-      throw TracerouteError.resolutionFailed(host: host, details: "stalled")
-    }
-    let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 1000, noReverseDNS: true))
-
-    await TestSeams.$resolveHost.withValue(stall) {
-      let task = Task { try await tracer.trace(to: "slow-resolver.test") }
-      #expect(await eventually(within: 2) { entered.value > 0 })
-
-      // The cancellation call itself must not wait for the resolver: the tracer's, because it is
-      // a call on the actor the resolver holds; the caller's, because it is synchronous.
-      let (_, callLag) = await measure {
-        switch canceller {
-        case .taskCancel: task.cancel()
-        case .cancelActiveTraces: await tracer.cancelActiveTraces()
-        }
-      }
-      #expect(callLag < 0.5, "cancelling took \(callLag)s behind a resolver stall")
-
-      let cancelledAt = monotonicNow()
-      let outcome = await task.result
-      let lag = monotonicNow() - cancelledAt
-      #expect(lag < 0.5, "a trace stalled in resolution returned \(lag)s after cancellation")
-      switch (canceller, outcome) {
-      case (.taskCancel, .failure(let error)):
-        #expect(error is CancellationError, "\(error)")
-      case (.cancelActiveTraces, .failure(TracerouteError.cancelled)):
-        break
-      default:
-        Issue.record("\(canceller): \(outcome)")
-      }
-    }
-  }
-
   // MARK: A full blocking-I/O executor
 
   /// Fills a private single-slot executor with a call that holds it for up to 20 s. Returns the
@@ -300,7 +248,8 @@ struct FaultInjectionEnrichmentTests {
         try await daemon.install {
           try await network.install {
             try await measure(within: Self.watchdog) {
-              try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
+              // A loopback literal resolves without a slot; a name would queue behind the occupant.
+              try await tracer.traceClassified(to: "127.0.0.1", resolver: EmptyASNResolver())
             }.0
           }
         }

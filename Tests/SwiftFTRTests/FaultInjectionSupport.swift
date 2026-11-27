@@ -400,7 +400,8 @@ final class FakeICMPNetwork: @unchecked Sendable {
   }
 
   /// Runs `body` with forward resolution and the ICMP socket factory pointed at this network, or
-  /// at `socketFactory` when one is given.
+  /// at `socketFactory` when one is given. Resolution is substituted only where the library asks
+  /// a resolver: a name, or a literal it does not answer itself (see `inlineResolution`).
   ///
   /// Public-IP discovery is substituted too: by the test's own substitute when one is bound, and
   /// otherwise by one that fails at once, so a classified trace inside `body` can never fall
@@ -424,7 +425,7 @@ final class FakeICMPNetwork: @unchecked Sendable {
     return try await TestSeams.$resolveHost.withValue(resolve) {
       try await TestSeams.$makeICMPSocket.withValue(makeSocket) {
         try await TestSeams.$discoverPublicIP.withValue(discover) {
-          try await TestSeams.$sendProbe.withValue(isolated ? Self.connectingSend : nil) {
+          try await TestSeams.$sendProbe.withValue(isolated ? connectingSend : nil) {
             try await body()
           }
         }
@@ -439,6 +440,21 @@ final class FakeICMPNetwork: @unchecked Sendable {
   /// can reach the socket. Production ICMP sockets are never connected; a connected one whose peer
   /// is gone reports ECONNREFUSED once on `recv`, which trace and ping both read as "nothing more
   /// to read now", and no test stops its network before the operation has closed its socket.
+  /// ``connectingSend`` aimed at this network whatever address the library resolved, so an
+  /// operation whose literal destination is answered without the resolution seam (and so has no
+  /// port) still reaches it.
+  var connectingSend: TestSeams.SendProbe {
+    let (address, length) = loopbackAddress(family: family, port: port)
+    return { fd, bytes, _, _ in
+      var own = address
+      return withUnsafePointer(to: &own) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          Self.connectingSend(fd, bytes, $0, length)
+        }
+      }
+    }
+  }
+
   static let connectingSend: TestSeams.SendProbe = { fd, bytes, destination, length in
     var peer = sockaddr_storage()
     var peerLength = socklen_t(MemoryLayout<sockaddr_storage>.size)

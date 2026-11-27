@@ -48,6 +48,16 @@ Unreleased
 
 ### Behavior changes
 
+- **Forward resolution no longer runs on the tracer actor or a cooperative thread.** `trace`,
+  `traceClassified`, `traceStream`, `ping`, `tcpProbe`, `udpProbe` and multipath flows resolve
+  their destination in an executor slot. The wait ends at a deadline: 20 s for traces and ping,
+  `config.timeout` from entry for the probes, whose connect or receive window is what resolution
+  leaves. A trace or ping whose lookup times out throws `resolutionFailed` with details
+  `"timed out"`; a probe reports its usual resolution failure and opens no socket. Cancelling the
+  task, `cancelActiveTraces()` or `networkChanged()` during resolution returns at once, and a
+  ping cancelled during its lookup throws `CancellationError` even if the lookup then fails.
+  Names share the eight executor slots with STUN server names; literals never queue behind
+  names (finding 5 in docs/ROBUSTNESS-TESTING.md).
 - **The library's public-IP resolver asks every STUN server at once, and the first answer
   decides** (David, 2026-11-24: "return as decisive the first public IP we get … The goal is to
   be as fast as possible"). Each server's request goes out as soon as its name has resolved, on

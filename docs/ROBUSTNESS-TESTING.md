@@ -70,7 +70,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 
 | Phase | Conditions | Operations | Tests |
 |---|---|---|---|
-| Forward resolution | fails (the injected error is checked, so a call that went around the seam fails); stalls (disabled, finding 5) | trace, traceClassified, traceStream, ping | `ProbeWindow`, `Enrichment` |
+| Forward resolution | fails (the injected error is checked, so a call that went around the seam fails); stalls; outlives its deadline; is cancelled while running or queued; every executor slot held | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ProbeWindow`, `ResolutionOffActor` |
 | Probe socket | creation fails the way `socket(2)` does; every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `ProbeWindow` |
 | Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |
@@ -180,8 +180,6 @@ Not covered, and why:
 
 - An overall deadline on `traceClassified` with an error naming the phase, and an executor-pressure
   reading (#84). Both are API additions for a minor release.
-- Moving forward resolution off the actor. It needs a resolution budget, which is a new
-  configuration field. The test that shows the defect is checked in disabled (finding 5).
 - `testBufferbloat`, which needs real load traffic, and the interface-bound HTTPS spike.
 - Raw-socket or privileged fault injection, and any test that sends traffic off the host.
 
@@ -222,13 +220,13 @@ numbers are as of the commit that added this section.
    truncated the timeout to a zero `timeval`, which disables `SO_RCVTIMEO`
    (`STUN.swift:213` after the fix). Reachable through the public `getPublicIPs(stunTimeout:)`.
    Test: `stunTinyTimeout`, still blocked at its watchdog before, immediate after.
-5. **Forward resolution is synchronous on the tracer actor and unbounded.** Confirmed (known from
-   #84), not fixed. `resolveHost` (`Traceroute.swift:629`, `:785`) calls `getaddrinfo` on the
-   actor, even for a literal under `.auto`, so a stalled resolver holds every other call on that
-   tracer, `cancelActiveTraces()` and `networkChanged()` included, and cannot be cancelled. With a
-   5 s injected stall, `cancelActiveTraces()` took 5.0 s to return. Not fixed: bounding it needs a
-   resolution budget, which is a configuration field. Test, disabled because it blocks for its
-   stall: `FaultInjectionEnrichmentTests.forwardResolutionStall`.
+5. **Forward resolution was synchronous on the tracer actor and unbounded.** Confirmed (known from
+   #84) and fixed. `resolveHost` called `getaddrinfo` on the actor, even for a literal under
+   `.auto`, so a stalled resolver held every other call on that tracer, `cancelActiveTraces()` and
+   `networkChanged()` included, and could not be cancelled; ping and the probes held a cooperative
+   thread. Resolution now runs in an executor slot under a deadline, and cancellation releases the
+   caller at once. Tests: `ResolutionOffActorTests`, among them `forwardResolutionStall` (a gated
+   lookup, each canceller, released while the gate is shut) and `resolutionHoldsNoPoolThread`.
 6. **A failed public-IP discovery was paid twice.** Confirmed and fixed. When discovery failed or
    timed out, `traceClassified` passed `publicIP: nil` to the classifier, which ran discovery again
    with the same budget, so the bound was two budgets. The classifier no longer discovers

@@ -401,19 +401,22 @@ struct FaultInjectionProbeWindowTests {
       }
     }
 
-    // The destination is a loopback literal: an operation that went around the substitute would
-    // resolve it locally and fail the details check, without asking any DNS server.
+    // The destination is a name with a 64-character label: an operation that went around the
+    // substitute would have it rejected by the system resolver, without a query, and fail the
+    // details check. (A loopback literal is answered without the resolver, so the seam would
+    // never see it.)
+    let host = String(repeating: "a", count: 64) + ".test"
     await TestSeams.$resolveHost.withValue(fail) {
-      await expectResolutionFailure("trace") { _ = try await tracer.trace(to: "127.0.0.1") }
+      await expectResolutionFailure("trace") { _ = try await tracer.trace(to: host) }
       await expectResolutionFailure("traceClassified") {
-        _ = try await tracer.traceClassified(to: "127.0.0.1", resolver: EmptyASNResolver())
+        _ = try await tracer.traceClassified(to: host, resolver: EmptyASNResolver())
       }
       await expectResolutionFailure("traceStream") {
-        for try await _ in tracer.traceStream(to: "127.0.0.1", config: Self.streamPastWatchdog) {}
+        for try await _ in tracer.traceStream(to: host, config: Self.streamPastWatchdog) {}
       }
       await expectResolutionFailure("ping") {
         _ = try await tracer.ping(
-          to: "127.0.0.1", config: PingConfig(count: 1, timeout: pingTimeout))
+          to: host, config: PingConfig(count: 1, timeout: pingTimeout))
       }
     }
     #expect(await tracer.activeTraces.isEmpty)

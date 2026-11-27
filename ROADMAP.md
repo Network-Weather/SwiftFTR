@@ -16,12 +16,12 @@ a network that drops mid-operation, a peer that accepts and then goes silent.
   What remains is the findings it left open, each with a disabled or missing test named there.
 - **Sequenced plan**: [docs/BLOCKING-IO.md](docs/BLOCKING-IO.md) orders the work into stages, each one
   pull request, with the gates each must pass.
-- **Known unbounded waits** (#84): `traceClassified` has no overall deadline, and forward
-  resolution runs `getaddrinfo` synchronously on the actor where it can be neither bounded nor
-  cancelled; a 5 s resolver stall made `cancelActiveTraces()` wait 5 s (finding 5). An overall
-  deadline whose error names the phase that was running is the requested API; a resolution
-  budget is what moving `getaddrinfo` onto the executor needs; a way to read executor pressure
-  (queued and running operations) is the companion.
+- **Known unbounded waits** (#84): `traceClassified` has no overall deadline. An overall
+  deadline whose error names the phase that was running is the requested API; a way to read
+  executor pressure (queued and running operations) is the companion.
+- **An absolute cutoff for the TCP and UDP probe operations**, as `UDPExchange` has. Their connect
+  and receive timers are relative and armed after socket setup, on Dispatch's uptime clock, so a
+  probe can run past `timeout` by its setup time, and by a system sleep.
 - **Standalone `getPublicIPs` has no caller-set bound** (finding 9): each STUN exchange is bounded
   by `stunTimeout` and each server-name lookup wait by a fixed 20 s, so a stalled resolver holds
   the call for about 20 s plus `stunTimeout` (longer if more sweeps than executor workers are
