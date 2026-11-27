@@ -17,6 +17,12 @@ struct ReverseDNSQuestion: Sendable, Equatable {
   /// and fe80::/10). Multicast never answers "no such name", so an unanswered question of this
   /// kind runs until its caller's deadline: it is evidence of no responder, not of a stall.
   let isMulticast: Bool
+  /// Whether the address is globally routable, with or without a zone suffix.
+  let isGlobal: Bool
+
+  /// The question as one string, `name%interfaceIndex`: the identity under which `RDNSCache`
+  /// shares, caches and holds off lookups, so every spelling of one question is one address.
+  var key: String { "\(name)%\(interfaceIndex)" }
 
   /// The question for `address`, or `nil` when it is not an IPv4 or IPv6 literal.
   ///
@@ -36,9 +42,10 @@ struct ReverseDNSQuestion: Sendable, Equatable {
   /// A string with an embedded NUL is no literal: `inet_pton` would see only the part before it.
   init?(address: String) {
     guard !containsNUL(address) else { return nil }
+    let isGlobal = ParsedIPAddress(address)?.scope == .global
     var v4 = in_addr()
     if address.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 {
-      self.init(ipv4: withUnsafeBytes(of: &v4) { Array($0) })
+      self.init(ipv4: withUnsafeBytes(of: &v4) { Array($0) }, isGlobal: isGlobal)
       return
     }
     let parts = address.split(separator: "%", maxSplits: 1, omittingEmptySubsequences: false)
@@ -57,7 +64,7 @@ struct ReverseDNSQuestion: Sendable, Equatable {
         guard let index = Self.interfaceIndex(zone: String(parts[1])) else { return nil }
         mappedIndex = index
       }
-      self.init(ipv4: octets, interfaceIndex: mappedIndex)
+      self.init(ipv4: octets, interfaceIndex: mappedIndex, isGlobal: isGlobal)
       return
     }
 
@@ -76,30 +83,31 @@ struct ReverseDNSQuestion: Sendable, Equatable {
     self.init(
       name: nibbles.joined(separator: ".") + ".ip6.arpa",
       interfaceIndex: interfaceIndex,
-      isMulticast: isLinkLocal)
+      isMulticast: isLinkLocal, isGlobal: isGlobal)
   }
 
   /// The index of the interface `zone` names, by name or as a decimal index, or `nil` when no
   /// interface has that name or index.
   private static func interfaceIndex(zone: String) -> UInt32? {
-    let byName = if_nametoindex(zone)
+    let byName = TestSeams.interfaceIndex?(zone) ?? if_nametoindex(zone)
     if byName != 0 { return byName }
     guard let index = UInt32(zone), index != 0 else { return nil }
     var name = [CChar](repeating: 0, count: Int(IF_NAMESIZE))
     return if_indextoname(index, &name) != nil ? index : nil
   }
 
-  private init(ipv4 octets: [UInt8], interfaceIndex: UInt32 = 0) {
+  private init(ipv4 octets: [UInt8], interfaceIndex: UInt32 = 0, isGlobal: Bool) {
     self.init(
       name: octets.reversed().map(String.init).joined(separator: ".") + ".in-addr.arpa",
       interfaceIndex: interfaceIndex,
-      isMulticast: octets[0] == 169 && octets[1] == 254)
+      isMulticast: octets[0] == 169 && octets[1] == 254, isGlobal: isGlobal)
   }
 
-  private init(name: String, interfaceIndex: UInt32, isMulticast: Bool) {
+  private init(name: String, interfaceIndex: UInt32, isMulticast: Bool, isGlobal: Bool) {
     self.name = name
     self.interfaceIndex = interfaceIndex
     self.isMulticast = isMulticast
+    self.isGlobal = isGlobal
   }
 }
 
@@ -330,16 +338,32 @@ final class ReverseDNSLookup: @unchecked Sendable {
     guard let question = ReverseDNSQuestion(address: address) else {
       return .error(.invalidAddress)
     }
+    return await lookup(question, timeout: timeout, limiter: limiter)
+  }
+
+  /// Looks up the PTR name `question` asks, on the interface it captured, without parsing an
+  /// address again. Otherwise as ``lookup(_:timeout:limiter:)``.
+  static func lookup(
+    _ question: ReverseDNSQuestion,
+    timeout: TimeInterval,
+    limiter: _ConcurrencySemaphore = ReverseDNSLookup.sharedLimiter
+  ) async -> ReverseDNSLookupOutcome {
     guard timeout > 0 else { return .timedOutBeforeQuery }
     // Read on the async side: the lookup's queue cannot see task-locals.
     let calls = TestSeams.dnsService ?? .system
-    let lookup = ReverseDNSLookup(question: question, calls: calls, limiter: limiter)
+    let lookup = ReverseDNSLookup(
+      question: question, calls: calls, limiter: limiter, admits: admits)
     return await withTaskCancellationHandler {
       await lookup.run(timeout: timeout)
     } onCancel: {
       lookup.cancel()
     }
   }
+
+  /// Asked once a lookup has its permit: `false` means its owner has dropped it, and it gives the
+  /// permit back without sending. Set for the task by whoever starts lookups it may drop.
+  @TaskLocal static var admits: (@Sendable () -> Bool)?
+  private let admits: (@Sendable () -> Bool)?
 
   let question: ReverseDNSQuestion
   private let calls: DNSServiceCalls
@@ -363,7 +387,11 @@ final class ReverseDNSLookup: @unchecked Sendable {
   private var tornDown = false
   private var holdsPermit = false
 
-  init(question: ReverseDNSQuestion, calls: DNSServiceCalls, limiter: _ConcurrencySemaphore) {
+  init(
+    question: ReverseDNSQuestion, calls: DNSServiceCalls, limiter: _ConcurrencySemaphore,
+    admits: (@Sendable () -> Bool)? = nil
+  ) {
+    self.admits = admits
     self.question = question
     self.calls = calls
     self.limiter = limiter
@@ -516,7 +544,9 @@ final class ReverseDNSLookup: @unchecked Sendable {
   private func permitAcquired() {
     dispatchPrecondition(condition: .onQueue(queue))
     holdsPermit = true
-    if tornDown {
+    let dropped = admits?() == false
+    if dropped { cancel() }
+    if tornDown || dropped {
       // Resolved, and torn down, while the permit was on its way: hand it straight on.
       releasePermit()
     } else {

@@ -253,10 +253,11 @@ public struct SwiftFTRConfig: Sendable {
   public let rdnsCacheSize: Int?
   /// How long a single reverse-DNS lookup may take before the trace gives up on it.
   ///
-  /// Reverse DNS runs through `getnameinfo`, which consults the system resolver and has no timeout
-  /// parameter of its own; an unanswered query holds it for 30 seconds. Hops whose lookup exceeds
-  /// this budget report numerically instead. Lookups run concurrently, so this bounds the whole
-  /// reverse-DNS phase rather than costing this much per hop.
+  /// Reverse DNS asks the system's DNS daemon for each hop's PTR record, and the query is stopped
+  /// when this budget passes. Hops whose lookup exceeds it report numerically instead. Lookups run
+  /// concurrently, so this bounds the whole reverse-DNS phase rather than costing this much per
+  /// hop. A link-local address, which the daemon asks by multicast on the link, gets at most one
+  /// second.
   ///
   /// Raise it on links whose legitimate resolver latency is high. `nil` uses the default of 5s.
   public let rdnsLookupTimeout: TimeInterval?
@@ -1126,8 +1127,11 @@ public actor SwiftFTR {
       var hostnameMap: [String: String] = [:]
       if !config.noReverseDNS {
         // Get any missing hostnames (destination and public IP)
+        // The trace has already asked about every hop address, so only addresses that are no hop
+        // (the destination when it did not answer, the public address) are asked here. Asking again
+        // about a hop that found no name would spend a second budget, and count a second stall.
         let ipsNeedingRDNS = allIPs.filter { ip in
-          !tr.hops.contains { $0.ipAddress == ip && $0.hostname != nil }
+          !tr.hops.contains { $0.ipAddress == ip }
         }
         if !ipsNeedingRDNS.isEmpty {
           try handle.checkCancellation()
@@ -1489,7 +1493,11 @@ public actor SwiftFTR {
     let ip = try await discoverPublicIP()
     let hostname: String?
     if !config.noReverseDNS {
-      hostname = await rdnsCache.lookup(ip)
+      // Raced against the caller's cancellation, as the trace waves are: the shared query runs on
+      // to its own deadline, and its outcome is still recorded.
+      hostname = try await withTraceCancellation(handle: TraceHandle()) {
+        await self.rdnsCache.lookup(ip)
+      }
     } else {
       hostname = nil
     }
@@ -1571,6 +1579,8 @@ public actor SwiftFTR {
   /// (e.g. RFC 1918 private addresses, CGNAT, link-local, loopback, IPv6 ULA).
   /// Globally routable Internet hostnames and their TTLs are preserved.
   /// Also resets the reverse-DNS stall breaker so subsequent lookups are attempted.
+  /// Lookups in flight, of global addresses too, are dropped: they give no hostname and cache
+  /// nothing, and the address is asked again by the next lookup.
   public func invalidateNetworkScopedRDNS() async {
     await rdnsCache.invalidateNetworkScoped()
   }

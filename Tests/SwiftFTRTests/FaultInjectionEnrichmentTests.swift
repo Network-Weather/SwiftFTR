@@ -117,45 +117,47 @@ struct FaultInjectionEnrichmentTests {
     }
   }
 
-  @Test("A stalled reverse-DNS wave costs its deadline once, then the breaker skips it")
+  @Test(
+    "A stalled hop costs its deadline once, is held off on the next trace, and two open the breaker"
+  )
   func reverseDNSStallBounded() async throws {
-    let gate = StallGate()
-    defer { gate.open() }
-    let lookups = FaultCounter()
-    let finished = FaultCounter()
-    let executor = BlockingIOExecutor(maximumConcurrentOperations: 4, name: "test.rdns-stall")
-    let deadline: TimeInterval = 0.3
-    let rdns = RDNSCache(lookupDeadline: deadline) { _ in
-      lookups.increment()
-      return try? await runDetachedBlockingIO(priority: .background, deadline: deadline) {
-        gate.wait(limit: 20)
-        finished.increment()
-        return String?.none
-      }
-    }
+    // A daemon that takes every question and never answers, behind the real lookup and its real
+    // deadline timer, as a resolver that stopped answering looks. Every hop of the fake path
+    // answers from one address, so each trace asks at most one question.
+    let daemon = FakeDNSService(deadline: .timer)
+    let rdns = RDNSCache(
+      lookupDeadline: 0.3, limiter: _ConcurrencySemaphore(maxConcurrent: 32))
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 3))
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000), rdns: rdns)
 
-    try await TestSeams.$blockingIOExecutor.withValue(executor) {
+    try await daemon.install {
       try await network.install {
         let (first, _) = try await measure(within: Self.watchdog) {
           try await tracer.trace(to: "fake.test")
         }
-        #expect(lookups.value > 0, "reverse DNS was never attempted")
-        #expect(finished.value == 0, "the trace waited for stalled lookups to end")
+        #expect(daemon.startedCount == 1, "one trace asked \(daemon.startedCount) questions")
         #expect(first.reached)
         #expect(first.hops.allSatisfy { $0.hostname == nil })
+        #expect(await rdns.isSuppressingLookups == false, "one stall opened the breaker")
 
-        let before = lookups.value
+        // The hop is held off, so the second trace asks nothing and pays no budget.
         _ = try await measure(within: Self.watchdog) { try await tracer.trace(to: "fake.test") }
-        // The trace's hops are cached by now, so ask for an address the cache has never seen.
-        let unseen = try await measure(within: Self.watchdog) { await rdns.lookup("198.51.100.77") }
+        #expect(daemon.startedCount == 1, "the held-off hop was asked again")
+        #expect(await rdns.isSuppressingLookups == false)
+
+        // A second address that stalls is the second stall, and opens the breaker.
+        _ = try await measure(within: Self.watchdog) { await rdns.lookup("198.51.100.77") }
+        #expect(daemon.startedCount == 2)
+        let unseen = try await measure(within: Self.watchdog) { await rdns.lookup("198.51.100.78") }
         #expect(unseen.0 == nil)
-        #expect(lookups.value == before, "the breaker should suppress further lookups")
+        #expect(daemon.startedCount == 2, "the breaker should suppress further lookups")
       }
     }
     #expect(await rdns.isSuppressingLookups)
+    // Every query the stalled wave asked was stopped, not abandoned.
+    #expect(await eventually(within: Self.watchdog) { daemon.liveCount == 0 })
+    #expect(daemon.misuse.unknown == 0 && daemon.misuse.double == 0)
   }
 
   @Test("discoverPaths honours the configured public-IP budget")
@@ -282,11 +284,10 @@ struct FaultInjectionEnrichmentTests {
     defer { gate.open() }
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 2))
     defer { network.stop() }
-    // A STUN attempt and reverse DNS both queue behind the occupant; only their deadlines end
-    // them.
-    let rdns = RDNSCache(lookupDeadline: 0.3) { _ in
-      try? await runDetachedBlockingIO(priority: .background, deadline: 0.3) { String?.none }
-    }
+    // A STUN attempt queues behind the occupant, and only its deadline ends it. Reverse DNS needs
+    // no slot: it asks the daemon, which here never answers, so its own deadline ends it.
+    let daemon = FakeDNSService(deadline: .timer)
+    let rdns = RDNSCache(lookupDeadline: 0.3, limiter: _ConcurrencySemaphore(maxConcurrent: 32))
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000, publicIPDiscoveryTimeout: 0.3), rdns: rdns)
     // Discovery whose answer needs an executor slot, as a STUN attempt does.
@@ -296,14 +297,17 @@ struct FaultInjectionEnrichmentTests {
 
     let trace = try await TestSeams.$blockingIOExecutor.withValue(executor) {
       try await TestSeams.$discoverPublicIP.withValue(discovery) {
-        try await network.install {
-          try await measure(within: Self.watchdog) {
-            try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
-          }.0
+        try await daemon.install {
+          try await network.install {
+            try await measure(within: Self.watchdog) {
+              try await tracer.traceClassified(to: "fake.test", resolver: EmptyASNResolver())
+            }.0
+          }
         }
       }
     }
     #expect(released.value == 0, "the trace waited for the occupant to free its slot")
+    #expect(daemon.startedCount > 0, "reverse DNS was never asked")
     #expect(trace.publicIP == nil, "discovery cannot have run with no free slot")
     #expect(trace.hops.count == 2)
   }

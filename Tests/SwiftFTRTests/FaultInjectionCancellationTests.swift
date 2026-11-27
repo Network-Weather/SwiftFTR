@@ -269,14 +269,10 @@ struct FaultInjectionCancellationTests {
       return STUNPublicIP(ip: "198.51.100.7")
     }
     let resolver = StallingASNResolver(stall: phase == .asnLookup, entered: entered)
-    // Reverse DNS on the executor under a long deadline, as production composes it.
-    let rdns = RDNSCache(lookupDeadline: 20) { _ in
-      entered.increment()
-      return try? await runDetachedBlockingIO(priority: .background, deadline: 20) {
-        gate.wait(limit: 20)
-        return String?.none
-      }
-    }
+    // Reverse DNS as production composes it, the real lookup under a long deadline, against a
+    // daemon that takes the question and never answers.
+    let daemon = FakeDNSService()
+    let rdns = RDNSCache(lookupDeadline: 20, limiter: _ConcurrencySemaphore(maxConcurrent: 32))
     let tracer = offlineTracer(
       SwiftFTRConfig(
         maxHops: 4, maxWaitMs: 20_000, noReverseDNS: phase != .reverseDNS,
@@ -285,21 +281,30 @@ struct FaultInjectionCancellationTests {
 
     await TestSeams.$blockingIOExecutor.withValue(executor) {
       await TestSeams.$discoverPublicIP.withValue(discovery) {
-        await network.install {
-          let task = Task { try await tracer.traceClassified(to: "fake.test", resolver: resolver) }
-          let reached = await eventually(within: Self.watchdog) {
-            switch phase {
-            case .probeWindow: network.probes.value >= 4
-            case .publicIPDiscovery, .reverseDNS, .asnLookup: entered.value > 0
+        await daemon.install {
+          await network.install {
+            let task = Task {
+              try await tracer.traceClassified(to: "fake.test", resolver: resolver)
             }
+            let reached = await eventually(within: Self.watchdog) {
+              switch phase {
+              case .probeWindow: network.probes.value >= 4
+              case .reverseDNS: daemon.scheduledCount > 0
+              case .publicIPDiscovery, .asnLookup: entered.value > 0
+              }
+            }
+            #expect(reached, "the trace never reached \(phase)")
+            await Self.expectPromptCancellation(
+              task, expected: Expected.forTrace(canceller), "\(phase)"
+            ) { await Self.cancel(task, on: tracer, by: canceller) }
           }
-          #expect(reached, "the trace never reached \(phase)")
-          await Self.expectPromptCancellation(
-            task, expected: Expected.forTrace(canceller), "\(phase)"
-          ) { await Self.cancel(task, on: tracer, by: canceller) }
         }
       }
     }
+    // The trace left its wave at once; the shared queries run on to their deadline, which the
+    // test now passes, and end.
+    daemon.expireDeadlines()
+    #expect(await eventually(within: Self.watchdog) { daemon.liveCount == 0 })
     #expect(await eventually(within: Self.watchdog) { await tracer.activeTraces.isEmpty })
   }
 
@@ -307,26 +312,18 @@ struct FaultInjectionCancellationTests {
     "A trace cancelled during its reverse-DNS wave ends promptly, reporting who cancelled it",
     arguments: Canceller.allCases)
   func reverseDNSWave(canceller: Canceller) async throws {
-    let gate = StallGate()
-    defer { gate.open() }
-    let started = FaultCounter()
-    let executor = BlockingIOExecutor(maximumConcurrentOperations: 4, name: "test.rdns-wave")
-    // Production composition: the lookup runs on the executor under the cache's deadline.
-    let rdns = RDNSCache(lookupDeadline: 20) { _ in
-      started.increment()
-      return try? await runDetachedBlockingIO(priority: .background, deadline: 20) {
-        gate.wait(limit: 20)
-        return String?.none
-      }
-    }
+    // Production composition: the real lookup under a long deadline, against a daemon that takes
+    // the question and never answers.
+    let daemon = FakeDNSService()
+    let rdns = RDNSCache(lookupDeadline: 20, limiter: _ConcurrencySemaphore(maxConcurrent: 32))
     let network = try FakeICMPNetwork(script: pathScript(destinationTTL: 3))
     defer { network.stop() }
     let tracer = offlineTracer(SwiftFTRConfig(maxHops: 4, maxWaitMs: 2000), rdns: rdns)
 
-    await TestSeams.$blockingIOExecutor.withValue(executor) {
+    await daemon.install {
       await network.install {
         let task = Task { try await tracer.trace(to: "fake.test") }
-        #expect(await eventually(within: Self.watchdog) { started.value > 0 })
+        #expect(await eventually(within: Self.watchdog) { daemon.scheduledCount > 0 })
         await Self.expectPromptCancellation(
           task, expected: Expected.forTrace(canceller), "reverse DNS"
         ) {
@@ -334,6 +331,10 @@ struct FaultInjectionCancellationTests {
         }
       }
     }
+    // The trace left its wave at once; the shared queries run on to their deadline, which the
+    // test now passes, and are then stopped.
+    daemon.expireDeadlines()
+    #expect(await eventually(within: Self.watchdog) { daemon.liveCount == 0 })
   }
 
   // MARK: discoverPaths
@@ -365,15 +366,12 @@ struct FaultInjectionCancellationTests {
       }
       return STUNPublicIP(ip: "198.51.100.7")
     }
-    // Reverse DNS on the executor under a long deadline, as production composes it.
-    let rdns = RDNSCache(lookupDeadline: 20) { _ in
-      guard phase == .reverseDNS else { return nil }
-      entered.increment()
-      return try? await runDetachedBlockingIO(priority: .background, deadline: 20) {
-        gate.wait(limit: 20)
-        return String?.none
-      }
-    }
+    // Reverse DNS that ignores cancellation, as the ASN resolver here does, so only a flow's own
+    // race against its cancellation can release it.
+    let rdns =
+      phase == .reverseDNS
+      ? stallingRDNSCache(gate: gate, limit: 20, entered: entered)
+      : RDNSCache { _, _ in .noSuchRecord }
     let tracer = SwiftFTR(
       config: SwiftFTRConfig(maxHops: 4, publicIPDiscoveryTimeout: 20),
       rdnsCache: rdns,
@@ -553,45 +551,29 @@ struct FaultInjectionCancellationTests {
   }
 
   @Test(
-    "Reverse-DNS lookups cut short by cancellation are not cached and do not trip the stall breaker"
+    "Reverse-DNS lookups by callers already cancelled ask nothing and do not trip the stall breaker"
   )
   func cancelledLookupNotCached() async throws {
-    // A lookup counts as a stall once it has run for 90% of this deadline.
-    let deadline: TimeInterval = 0.1
     let calls = FaultCounter()
-    let stalled = ["198.51.100.20", "198.51.100.21"]
-    let rdns = RDNSCache(lookupDeadline: deadline) { ip in
+    let rdns = RDNSCache { _, _ in
       calls.increment()
-      guard stalled.contains(ip) else {
-        // Slow but not cancelled: past the stall threshold, then no name.
-        try? await Task.sleep(nanoseconds: UInt64(deadline * 2 * 1_000_000_000))
-        return nil
-      }
-      // Like the production resolver: a cancelled wait comes back as nil.
-      try? await Task.sleep(nanoseconds: 60_000_000_000)
-      return Task.isCancelled ? nil : "late.example"
+      return .timedOut
     }
 
-    // Two lookups, each cancelled only after it has run past the stall threshold, so the
-    // cancellation guard is all that keeps them from opening the breaker, which two stalls do.
-    for (index, ip) in stalled.enumerated() {
-      let lookup = Task { await rdns.lookup(ip) }
-      defer { lookup.cancel() }
-      #expect(await eventually(within: Self.watchdog) { calls.value == index + 1 })
-      // Time passing is the condition: the lookup's elapsed time includes this wait.
-      try await Task.sleep(nanoseconds: UInt64(deadline * 2 * 1_000_000_000))
-      let (hostname, _) = try await measure(within: Self.watchdog) {
-        lookup.cancel()
-        return await lookup.value
-      }
+    // Two callers cancelled before they look up: they start nothing, so two stalls cannot come
+    // of them.
+    for ip in ["198.51.100.20", "198.51.100.21"] {
+      let hostname = await Task {
+        withUnsafeCurrentTask { $0?.cancel() }
+        return await rdns.lookup(ip)
+      }.value
       #expect(hostname == nil)
     }
-    #expect(await rdns.count == 0, "a cancelled lookup was cached")
+    #expect(calls.value == 0, "a cancelled caller started a query")
     let suppressedByCancelled = await rdns.isSuppressingLookups
     #expect(!suppressedByCancelled, "cancelled lookups counted toward the stall breaker")
 
-    // Control: two lookups that run as long without being cancelled do open the breaker, so the
-    // cancelled ones ran long enough to count had the guard let them through.
+    // Control: the same outcome from two lookups nobody cancelled does open the breaker.
     for ip in ["198.51.100.22", "198.51.100.23"] {
       _ = try await measure(within: Self.watchdog) { await rdns.lookup(ip) }
     }

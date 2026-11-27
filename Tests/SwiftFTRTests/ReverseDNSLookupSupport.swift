@@ -333,3 +333,16 @@ enum PTRData {
     return bytes
   }
 }
+
+extension ReverseDNSQuestion {
+  /// The question `address` asks, for tests; `address` must be an address literal.
+  static func of(_ address: String) -> ReverseDNSQuestion {
+    guard let question = ReverseDNSQuestion(address: address) else {
+      preconditionFailure("not an address literal: \(address)")
+    }
+    return question
+  }
+}
+
+/// The cache key of the question `address` asks, for tests that record what a resolver is asked.
+func ptrKey(_ address: String) -> String { ReverseDNSQuestion.of(address).key }

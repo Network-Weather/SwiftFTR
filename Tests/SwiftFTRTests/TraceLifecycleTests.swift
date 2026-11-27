@@ -15,7 +15,7 @@ struct TraceLifecycleTests {
     // Reverse DNS answers from a local stub, so populating the cache sends no query.
     let tracer = offlineTracer(
       SwiftFTRConfig(maxHops: 1, maxWaitMs: 1_000, noReverseDNS: false),
-      rdns: RDNSCache { _ in "one.one.one.one" }
+      rdns: RDNSCache { _, _ in .answer("one.one.one.one") }
     )
 
     // Populate rDNS cache with an entry

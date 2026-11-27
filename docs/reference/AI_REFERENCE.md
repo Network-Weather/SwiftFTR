@@ -1074,8 +1074,14 @@ struct TraceView: View {
   to `maxWaitMs` (less if the destination and every earlier hop answer first). The receive window
   does not grow with hop count. The burst itself can take up to 250 ms more when sends hit
   transient buffer pressure, and that time is not counted against `maxWaitMs`.
-- **rDNS phase**: lookups run concurrently, each bounded by `rdnsLookupTimeout` (default 5 s).
-  Results are cached per instance (TTL 86400 s, 1000 entries by default). Multipath flows use
+- **rDNS phase**: lookups run concurrently, each a PTR query to the system's DNS daemon bounded
+  by `rdnsLookupTimeout` (default 5 s; a link-local address gets at most 1 s). Hostnames found
+  are cached per instance (TTL 86400 s, 1000 entries by default); an address with no name is
+  asked again next time. An address whose lookup timed out is not asked again for 10 minutes
+  (David, 2026-11-24). Concurrent lookups of one address, as multipath flows make, share one
+  query (David, 2026-11-24). After unanswered lookups of
+  two different addresses in a row, the instance stops asking about any address, holdoffs
+  expired or not, until `networkChanged()`, `clearCaches()` or `invalidateNetworkScopedRDNS()`. Multipath flows use
   the instance's rDNS cache and ASN resolver, so they follow the same settings.
 - **Public IP** (classified trace and multipath only): one question per classified trace, bounded
   by `publicIPDiscoveryTimeout` (default 6 s), asked after the probes. An accepted answer is cached
