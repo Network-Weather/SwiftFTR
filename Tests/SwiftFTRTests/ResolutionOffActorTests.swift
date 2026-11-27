@@ -466,10 +466,12 @@ struct ResolutionOffActorTests {
     defer { close(silent.fd) }
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.rdo-budget")
     let slow: TestSeams.ResolveHost = { _, _ in
-      clock.jump(by: 59.5)
+      // Leaves 5 s: enough for a slow runner to reach the handoff, well inside the watchdog.
+      clock.jump(by: 55)
       return try blockingResolution(host: "127.0.0.1", prefer: .v4, substitute: nil)
     }
-    // The timeout outlasts the watchdog, so a probe given all of it fails the watchdog.
+    // The timeout outlasts the watchdog, so a probe given all of it fails the watchdog; one given
+    // what is left ends after about 5 s.
     let result = try await TestSeams.$blockingIOExecutor.withValue(executor) {
       try await TestSeams.$monotonicClock.withValue(clock.now) {
         try await TestSeams.$resolveHost.withValue(slow) {
