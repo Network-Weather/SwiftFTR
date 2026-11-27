@@ -278,7 +278,7 @@ struct ResolutionOffActorTests {
           let task = Task { try await tracer.ping(to: "gated.test", config: PingConfig(count: 1)) }
           #expect(await eventually(within: Self.watchdog) { entered.value == 1 })
           return try await measure(within: Self.watchdog) {
-            clock.jump(by: forwardResolutionLimit + 1)
+            clock.jump(by: SwiftFTRConfig.defaultResolutionTimeout + 1)
             return await task.result
           }.0
         }
@@ -310,7 +310,7 @@ struct ResolutionOffActorTests {
           #expect(
             await eventually(within: Self.watchdog) { held.executor.submissions.value > before })
           return try await measure(within: Self.watchdog) {
-            clock.jump(by: forwardResolutionLimit + 1)
+            clock.jump(by: SwiftFTRConfig.defaultResolutionTimeout + 1)
             return await task.result
           }.0
         }
