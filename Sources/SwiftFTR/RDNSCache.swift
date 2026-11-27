@@ -113,7 +113,8 @@ actor RDNSCache {
   private var inFlight: [String: InFlight] = [:]
   private var nextQueryID: UInt64 = 0
   /// Whether queries started since the last reset may still send; closed, then replaced, by it.
-  private var admitting = OSAllocatedUnfairLock(initialState: true)
+  typealias Admission = OSAllocatedUnfairLock<Bool>
+  private(set) var admitting = Admission(initialState: true)
   private let now: @Sendable () -> ContinuousClock.Instant
 
   /// Initialize a new rDNS cache.
@@ -158,9 +159,16 @@ actor RDNSCache {
   /// Look up a hostname for an IP address, using cache if available.
   /// - Parameter ip: The IP address to resolve, with a zone if it has one.
   /// - Returns: The hostname if one was found, nil otherwise, and nil for a cancelled caller.
-  func lookup(_ ip: String) async -> String? {
-    // A caller cancelled already starts nothing and joins nothing.
-    guard !Task.isCancelled, let question = ReverseDNSQuestion(address: ip) else { return nil }
+  func lookup(_ ip: String) async -> String? { await lookup(ip, admittedBy: admitting) }
+
+  /// A lookup that belongs to work admitted before a reset (a batch's later addresses) asks
+  /// nothing after it: its addresses are the old network's, and their timeouts are not evidence
+  /// about the new one.
+  func lookup(_ ip: String, admittedBy admission: Admission) async -> String? {
+    // A caller cancelled already, or admitted before a reset, starts nothing and joins nothing.
+    guard !Task.isCancelled, admission.withLock({ $0 }),
+      let question = ReverseDNSQuestion(address: ip)
+    else { return nil }
     let key = question.key
     let now = self.now()
 
@@ -243,10 +251,11 @@ actor RDNSCache {
   ///   router answering at several TTLs) is asked once, so it costs one lookup and one stall.
   /// - Returns: Dictionary mapping IP addresses to hostnames (only successful lookups included)
   func batchLookup(_ ips: [String]) async -> [String: String] {
-    await withTaskGroup(of: (String, String?).self) { group in
+    let admission = admitting
+    return await withTaskGroup(of: (String, String?).self) { group in
       for ip in Set(ips) {
         group.addTask {
-          await (ip, self.lookup(ip))
+          await (ip, self.lookup(ip, admittedBy: admission))
         }
       }
 
@@ -265,7 +274,7 @@ actor RDNSCache {
   /// closed first: cancelling a query frees its slot, and one still waiting must not take it.
   private func dropInFlight() {
     admitting.withLock { $0 = false }
-    admitting = OSAllocatedUnfairLock(initialState: true)
+    admitting = Admission(initialState: true)
     for query in inFlight.values { query.task.cancel() }
     inFlight.removeAll()
   }

@@ -209,7 +209,8 @@ Unreleased
   multipath flows and `discoverPublicIPWithHostname()` are still released at once when cancelled.
 - **A network change stops reverse lookups in flight.** `networkChanged()`, `clearCaches()` and
   `invalidateNetworkScopedRDNS()` cancel them, end every holdoff, and let none write or send
-  afterwards. A global address being looked up at that moment is asked again by the next trace.
+  afterwards. A global address being looked up at that moment is asked again by the next trace,
+  and a trace's batch of lookups that began before the change asks nothing more after it.
 - **A multipath flow cancelled during its own reverse-DNS wave returns at once.** The flow looked
   up the destination and the public address after its trace without racing the wait against
   its cancellation, as `trace` and `traceClassified` already did, so a lookup that ignored

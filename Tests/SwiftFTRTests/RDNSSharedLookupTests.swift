@@ -202,6 +202,32 @@ struct RDNSSharedLookupTests {
     #expect(daemon.startedCount == 5, "a question from before the reset was sent after it")
   }
 
+  @Test(
+    "A lookup admitted before a reset asks nothing after it, so an old batch cannot stall the new network",
+    arguments: Reset.allCases)
+  func lookupAdmittedBeforeResetAsksNothing(reset: Reset) async throws {
+    let asked = FaultCounter()
+    let cache = RDNSCache { _, _ in
+      asked.increment()
+      return .timedOut
+    }
+    let before = await cache.admitting
+    switch reset {
+    case .clear: await cache.clear()
+    case .invalidateNetworkScoped: await cache.invalidateNetworkScoped()
+    }
+    // What a batch started before the reset does for an address it had not reached yet.
+    for ip in ["192.168.1.1", "192.168.1.2"] {
+      #expect(await cache.lookup(ip, admittedBy: before) == nil)
+    }
+    #expect(asked.value == 0, "an address from before the reset was asked after it")
+    #expect(await cache.stallCount == 0)
+    #expect(await cache.isSuppressingLookups == false)
+    // A lookup made after the reset is admitted and asks.
+    #expect(await cache.lookup("192.168.1.3") == nil)
+    #expect(asked.value == 1)
+  }
+
   @Test("A shared query takes one permit from the limiter, however many lookups wait on it")
   func onePermitPerQuery() async throws {
     let limiter = _ConcurrencySemaphore(maxConcurrent: 1)
