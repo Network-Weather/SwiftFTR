@@ -263,9 +263,9 @@ overlap in time; the "After" column is what must have landed first.
 | ~~Library Resolver~~ | Multipath Asks Once | ~~Third part: the library's STUN-only resolver in its own file, bound before anything is sent (#151), the whoami query through recursive resolvers deleted (#153), `getPublicIPs` and `discoverPublicIPWithHostname()` on it.~~ Landed in #184 and #186, which also closed #151 and removed the STUN share of the budget. |
 | ~~Event-Based STUN~~ | Library Resolver | ~~The stage below: STUN on the event-based transport, servers tried at once, foreign replies ignored, a cancellable, bounded wait on each server-name lookup, and the rule for which answer is believed (decision 16).~~ Landed in #188, with the first public answer deciding. |
 | ~~Reverse-DNS Lookup~~ | | ~~The `DNSServiceQueryRecord` lookup object with its teardown contract and its tests, including the off-queue deallocate stress test, a check that every daemon connection is closed once its lookup is done (the limiter bounds queries, not descriptors; the lowered-limit experiment is opt-in) and the gated live comparison. Unused until the next row; the two are released together. One recorded deadline decides every outcome: the start makes no query once it has passed, and a reply that arrives after it is a timeout, not an answer; neither waits for the timer's handler to run (found in review of the first attempt, which was taken back out of `main` before release).~~ Landed. |
-| Reverse-DNS Cache | Reverse-DNS Lookup | `RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker, and `withTraceCancellation` around the multipath flow's reverse-DNS wait. |
+| ~~Reverse-DNS Cache~~ | Reverse-DNS Lookup | ~~`RDNSCache` on the new lookup: the concurrency cap, the link-local cap, what is cached, the stall breaker, and `withTraceCancellation` around the multipath flow's reverse-DNS wait.~~ Landed in #185 and #195, with lookups of one address sharing one query, a ten-minute holdoff after a timeout, and one identity and one write rule (David, 2026-11-24). |
 | Resolution Off The Actor | Event-Based STUN, Reverse-DNS Cache | The stage below, as one change: the resolution seam is one closure shared by trace, streaming trace, ping and the probes, so it becomes async for all of them together. If it outgrows the cap, the second pull request is the forward-resolution budget option (decision 7) and `discoverPaths` resolving once. |
-| Enrichment Lifetimes | Resolver Seam | The ASN lookup's timeout reaches every resolver it passes through (`HybridASNResolver` ignores it today), and a caller leaving a shared ASN database load neither cancels it for others nor leaves the resolver latched as failed. (Remembering a failed public-IP attempt moved to Resolver Seam.) |
+| ~~Enrichment Lifetimes~~ | Resolver Seam | ~~The ASN lookup's timeout reaches every resolver it passes through (`HybridASNResolver` ignores it today), and a caller leaving a shared ASN database load neither cancels it for others nor leaves the resolver latched as failed. (Remembering a failed public-IP attempt moved to Resolver Seam.)~~ Landed in #191 (which superseded #183): a caller out of time gets every answer already learned (David, 2026-11-24). |
 | Deadline For Traces | Resolution Off The Actor, Enrichment Lifetimes | The deadline clock, the phase bookkeeping and its lock, the `TracerouteError` deadline case (decision 6), the result field naming the phase, and the new configuration option, for `traceClassified`. Measured hops are committed when the receive window completes, so expiry in any later phase can return them. Every phase the default sums has a cap: both reverse-DNS waves, classification, and the scheduling allowance. |
 | Deadline For Multipath | Deadline For Traces | `discoverPaths` and its per-flow pipeline: the phase is reported on the topology, paths from finished batches are returned, and the actor-side publication check still rejects a result from before a network change. |
 | Offline Tripwire | every row above | A test-only check on each real network path that fails an offline test reaching anything but loopback or a fixture the test bound itself (ROADMAP). Tests that deliberately exercise the real transport against a loopback fixture keep doing so. Last, because it touches the paths the other rows rewrite. |
@@ -410,6 +410,13 @@ server answers at once; a private answer that arrives first does not win a trace
 
 ### Event-Based Reverse DNS
 
+Landed in #161, #164, #185 and #195. Three things were decided while it was built, beyond the
+text below (all David, 2026-11-24): an address whose question timed out is not asked again for
+ten minutes ("10 minutes is a reasonable in-memory cache of no response for a reverse DNS
+lookup"); lookups of one address share one query ("Build share lookups"); and the parsed PTR
+question is the lookup's one identity, with a query writing only while it is the current one
+for its address ("one identity, one write rule"). A reset cancels the lookups it drops.
+
 Replace `getnameinfo` in `RDNSCache` with a PTR query through `DNSServiceQueryRecord`. No
 thread is held, and an abandoned lookup is actually stopped. The system's own `getaddrinfo` and
 `getnameinfo` are built on the same daemon queries, and a comparison on one Mac returned the
@@ -475,8 +482,9 @@ So this stage changes where `getaddrinfo` runs, not what it returns:
 - One async adapter, used by trace, streaming trace, ping, the TCP and UDP probes, STUN server
   names and `discoverPaths` (which resolves once, with its forced-IPv4 contract, and passes the
   address to its flows while keeping the original hostname for display).
-- It submits `resolveHost` to the executor with a deadline. By this stage nothing else uses the
-  executor, so enrichment cannot starve a forward lookup, and the existing bridge with a
+- It submits `resolveHost` to the executor with a deadline. By this stage only STUN server-name lookups
+  also use the executor (two per sweep), so numeric addresses get a reserved slot of their own
+  and a stalled resolver cannot keep a ping to a literal from starting, and the existing bridge with a
   whole-call deadline is the path 0.17.1 fixed. Hints are unchanged, including the separate
   hint set `resolveSTUNServer` uses.
 - Forced-family literals keep their inline fast path. An `.auto` literal still needs
@@ -529,9 +537,10 @@ at expiry, and a blocking `getaddrinfo` already under way runs on in its slot.
   finished are returned when a later batch expires.
 - Public-IP discovery that was attempted and got no answer is remembered for the rest of the
   call, so the classifier does not start it again.
-- The shared ASN load in `_ASNMemoryCache` is cancelled when its last waiter leaves; each
-  subscriber's wait has its own deadline, which must not be part of the key that decides whether
-  two callers share a load. An injected `ASNResolver` that ignores cancellation cannot be
+- Shared ASN work (a cache flight, a database load, a hybrid's DNS fallback) runs on its own
+  budget and is never cancelled because a waiter left (David, 2026-11-24, with Enrichment
+  Lifetimes); each waiter's deadline bounds only its own wait and is not part of the key that
+  decides whether two callers share the work. An injected `ASNResolver` that ignores cancellation cannot be
   stopped: the caller is released and the documentation says so.
 
 Tests: a caller-tightened total with phases that each finish inside their own cap but whose sum
