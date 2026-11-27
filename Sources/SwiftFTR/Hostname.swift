@@ -246,6 +246,22 @@ internal func blockingResolution(
 /// How long a trace or ping waits for its destination to resolve (docs/BLOCKING-IO.md, decision 7).
 let forwardResolutionLimit: TimeInterval = 20
 
+/// Whether `host` is numeric to the system resolver, so its lookup takes the Literal Lane. Wider
+/// than a literal the library parses: the resolver also takes IPv4 shorthand ("127.1"), which
+/// `inet_aton` recognizes and `inet_pton` does not. `inet_aton` stops at whitespace and accepts
+/// what came before it, so only digits, dots and the hex and octal forms' characters qualify:
+/// nothing that could be a name reaches the lane.
+internal func isNumericDestination(_ host: String) -> Bool {
+  if detectAddressFamily(host) != -1 { return true }
+  guard !host.isEmpty,
+    host.utf8.allSatisfy({
+      $0 == 0x2E || Character(UnicodeScalar($0)).isHexDigit || $0 == 0x78 || $0 == 0x58
+    })
+  else { return false }
+  var shorthand = in_addr()
+  return inet_aton(host, &shorthand) == 1
+}
+
 /// Resolves `host` for an operation: inline when ``inlineResolution(host:prefer:)`` answers,
 /// otherwise in an executor slot, a literal on the Literal Lane (``literalLookupExecutor``) and a
 /// name on the main executor, so stalled name lookups cannot hold back a numeric destination.
@@ -260,11 +276,8 @@ internal func resolveDestination(
 ) async throws -> ResolvedHost {
   if let answer = try inlineResolution(host: host, prefer: prefer) { return answer }
   let substitute = TestSeams.resolveHost
-  // Numeric for lane selection is wider than a literal the library parses: the system resolver
-  // also takes IPv4 shorthand ("127.1"), which `inet_aton` recognizes and `inet_pton` does not.
-  var shorthand = in_addr()
-  let numeric = detectAddressFamily(host) != -1 || inet_aton(host, &shorthand) == 1
-  let lane = numeric ? (TestSeams.literalLookupExecutor ?? literalLookupExecutor) : nil
+  let lane =
+    isNumericDestination(host) ? (TestSeams.literalLookupExecutor ?? literalLookupExecutor) : nil
   let found = try await withTraceCancellation(handle: handle) {
     try await awaitBlockingLookup(until: deadline, clock: clock, on: lane) {
       try blockingResolution(host: host, prefer: prefer, substitute: substitute)

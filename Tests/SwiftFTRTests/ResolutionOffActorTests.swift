@@ -194,6 +194,17 @@ struct ResolutionOffActorTests {
     #expect(held.finished.value == 0)
   }
 
+  @Test("Only what the system resolver reads as a number takes the Literal Lane")
+  func numericDestinations() {
+    for host in ["127.1", "1.1.1.1", "0x7f.1", "017700000001", "2130706433", "::1", "fe80::1%lo0"] {
+      #expect(isNumericDestination(host), "\(host)")
+    }
+    // `inet_aton` alone accepts the first three: it stops at whitespace.
+    for host in ["127.1 example.com", "1.1.1.1\texample.com", "127.1\n", "", "example.com", "a.b"] {
+      #expect(!isNumericDestination(host), "\(host.debugDescription)")
+    }
+  }
+
   @Test("Inline answers equal the resolver's, and only resolver inputs reach the seam")
   func inlineParity() async throws {
     let inline = [
