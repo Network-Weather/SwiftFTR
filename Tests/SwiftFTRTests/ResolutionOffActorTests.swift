@@ -177,18 +177,20 @@ struct ResolutionOffActorTests {
               let pings = [
                 try await auto.ping(to: "127.0.0.1", config: PingConfig(count: 1)),
                 try await auto.ping(to: "192.0.2.1", config: PingConfig(count: 1)),
+                // IPv4 shorthand: numeric to the system resolver, not to `inet_pton`.
+                try await auto.ping(to: "127.1", config: PingConfig(count: 1)),
               ]
               return (traces.map(\.reached), pings.map(\.statistics.received))
             }
             #expect(results.0 == [true, true])
-            #expect(results.1 == [1, 1])
+            #expect(results.1 == [1, 1, 1])
           }
         }
       }
     }
     #expect(held.executor.submissions.value - mainBefore == 0, "a literal waited for a main slot")
-    // Only the non-loopback `.auto` literal needs the resolver, for NAT64.
-    #expect(lane.submissions.value - laneBefore == 1)
+    // The non-loopback `.auto` literal needs the resolver, for NAT64; so does the shorthand.
+    #expect(lane.submissions.value - laneBefore == 2)
     #expect(held.finished.value == 0)
   }
 
