@@ -746,3 +746,31 @@ let resolver = LocalASNResolver(source: .embedded)
 await resolver.preload()  // 0.19 waits for a loading database only until the timeout
 let asns = try await resolver.resolve(ipv4Addrs: ips, timeout: 0.1)
 ```
+
+## Forward resolution has a deadline and no longer holds the tracer
+
+**What changed.** A destination name is resolved in an executor slot rather than on the tracer
+actor (`trace`, `traceClassified`, `traceStream`, multipath flows) or a cooperative thread
+(`ping`, `tcpProbe`, `udpProbe`). The wait ends 20 s after a trace or ping starts resolving, and
+`config.timeout` after a probe starts; a probe's connect or receive window is what resolution
+left. Forced-family literals, IPv4 loopback and unscoped IPv6 literals are answered without a
+lookup; other `.auto` literals use a slot of their own, so stalled name lookups cannot delay them.
+Which address is probed does not change.
+
+**What a caller sees.**
+
+- A stalled resolver ends a trace or ping with `TracerouteError.resolutionFailed(host:details:)`,
+  details `"timed out"`, after 20 s; in 0.18 it waited as long as `getaddrinfo` took.
+- `tcpProbe` and `udpProbe` return their usual resolution failure (`"Failed to resolve hostname"`)
+  at `timeout`, with no socket opened, and a slow lookup shortens the connect or receive window.
+- Cancelling a task, or calling `cancelActiveTraces()` or `networkChanged()`, during resolution
+  returns at once. In 0.18 the tracer's calls waited behind the lookup, and a trace cancelled
+  during it still opened its socket and sent its probes. A ping cancelled during its lookup throws
+  `CancellationError`; 0.18 could throw `resolutionFailed`.
+- With all eight executor slots held by stalled name lookups, a further name waits for a slot and
+  times out at its deadline, and a classified trace's STUN server names wait too, so it may finish
+  without a public address.
+
+**What to change.** Nothing. A probe that resolves a slow name and needs its full connect or
+receive window raises `timeout` by the time resolution takes.
+

@@ -200,7 +200,7 @@ public struct TraceOptions: Sendable, Equatable {
 
 ```swift
 public enum PreferredFamily: Sendable, Codable {
-    case auto   // names and literals both go through getaddrinfo; the first answer is probed
+    case auto   // names and most literals go through getaddrinfo; the first answer is probed
     case v4     // IPv4 literal used as is; IPv6 literal or no IPv4 address throws resolutionFailed
     case v6     // IPv6 literal used as is; IPv4 literal or no IPv6 address throws resolutionFailed
 }
@@ -209,7 +209,13 @@ public enum PreferredFamily: Sendable, Codable {
 `.auto` does not force a literal's family. On an IPv6-only NAT64 network the system resolver
 synthesizes an IPv6 address for an IPv4 literal, so tracing `1.1.1.1` can probe, and report in
 `resolvedIP`, an IPv6 address. On dual-stack networks an IPv4 literal comes back unchanged. Use
-`.v4` or `.v6` to pin the family.
+`.v4` or `.v6` to pin the family. IPv4 loopback and unscoped IPv6 literals, which the system
+returns unchanged, are answered without it.
+
+Resolution runs in an executor slot, never on the tracer or a cooperative thread. Traces and ping
+wait at most 20 s for it (`resolutionFailed`, details `"timed out"`); `tcpProbe` and `udpProbe`
+spend their `timeout` on resolution and the probe together. Cancellation, `cancelActiveTraces()`
+and `networkChanged()` release a caller waiting on it at once.
 
 ### 5. TraceResult and TraceHop
 
