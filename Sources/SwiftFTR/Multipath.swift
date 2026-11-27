@@ -703,10 +703,8 @@ extension SwiftFTR {
         throw TracerouteError.sourceIPBindFailed(sourceIP: source, errno: errno, details: message)
       }
     }
-    // Literals resolve without `getaddrinfo` under a forced family.
-    if containsNUL(target) || detectAddressFamily(target) != -1 {
-      _ = try resolveHost(host: target, prefer: .v4)
-    }
+    // A literal, and a NUL, is decided without a resolver under the forced family.
+    _ = try inlineResolution(host: target, prefer: .v4)
   }
 
   /// Runs flow workers that reuse caches without escaping the caller's task group.

@@ -46,7 +46,10 @@ struct TraceLifecycleTests {
       }
 
       let receiving = await waitUntil {
-        guard let handle = await tracer.activeTraces.first else { return false }
+        // Probes sent, so past resolution, whose wait also installs a handler.
+        guard network.probes.value > 0, let handle = await tracer.activeTraces.first else {
+          return false
+        }
         return await handle.hasCancellationHandler
       }
       #expect(receiving, "The streaming trace should start before cancellation")
@@ -149,7 +152,10 @@ struct TraceLifecycleTests {
       }
 
       let receiving = await waitUntil {
-        guard let handle = await tracer.activeTraces.first else { return false }
+        // Probes sent, so past resolution, whose wait also installs a handler.
+        guard network.probes.value > 0, let handle = await tracer.activeTraces.first else {
+          return false
+        }
         return await handle.hasCancellationHandler
       }
       #expect(receiving, "The classified trace should reach its receive window before cancellation")

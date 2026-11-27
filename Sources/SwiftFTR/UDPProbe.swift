@@ -274,30 +274,41 @@ public func udpProbe(config: UDPProbeConfig) async throws -> UDPProbeResult {
   try config.validateForOperation()
   try Task.checkCancellation()
   let startTime = Date()
+  // One budget: resolution's wait ends `config.timeout` after entry, and the probe gets what is
+  // left, measured at the handoff.
+  let clock = DiscoveryClock.current
+  let deadline = clock.now() + config.timeout
+  let failed = UDPProbeResult(
+    host: config.host,
+    resolvedIP: config.host,
+    port: config.port,
+    isReachable: false,
+    rtt: nil,
+    responseType: nil,
+    error: "Failed to resolve hostname",
+    timestamp: startTime
+  )
 
-  // Resolve via the shared dual-stack helper (Hostname.swift).
+  // Resolve via the shared dual-stack helper (Hostname.swift), off this thread.
   let resolved: ResolvedHost
   do {
-    resolved = try resolveHost(host: config.host, prefer: config.preferredFamily)
+    resolved = try await resolveDestination(
+      config.host, prefer: config.preferredFamily, until: deadline, clock: clock)
   } catch {
     try Task.checkCancellation()
-    return UDPProbeResult(
-      host: config.host,
-      resolvedIP: config.host,
-      port: config.port,
-      isReachable: false,
-      rtt: nil,
-      responseType: nil,
-      error: "Failed to resolve hostname",
-      timestamp: startTime
-    )
+    return failed
   }
+
+  try Task.checkCancellation()
+  // Nothing left of the budget: no socket is made.
+  let remaining = deadline - clock.now()
+  guard remaining > 0 else { return failed }
 
   let result = try await performUDPProbe(
     resolved: resolved,
     port: config.port,
     payload: config.payload,
-    timeout: config.timeout,
+    timeout: remaining,
     interface: config.interface,
     sourceIP: config.sourceIP
   )

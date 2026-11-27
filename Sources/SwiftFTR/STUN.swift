@@ -491,7 +491,8 @@ func stunGetPublicIPv6(
 /// slot when the wait ends.
 let stunNameLookupLimit: TimeInterval = 20
 
-/// The clock every public-IP discovery deadline is on, and the only two things done with one.
+/// The clock every public-IP discovery and forward-resolution deadline is on, and the only two
+/// things done with one.
 /// A deadline is an absolute instant on `now`; `nil` is none. Every decision to send, submit or
 /// accept calls ``hasPassed(_:)`` immediately before it, and every blocking step calls it again
 /// as it returns; every wait for a deadline is ``sleep(until:)``.
@@ -562,7 +563,8 @@ private func literalSTUNEndpoint(host: String, port: UInt16, family: Int32) -> (
 }
 
 /// `server`'s name resolved for `family` on the executor, or `nil` when the lookup failed or its
-/// wait ended first. With no time left before `deadline`, nothing is submitted.
+/// wait ended first: at the earlier of `deadline` and ``stunNameLookupLimit``. With no time left,
+/// nothing is submitted; an endpoint that arrives after the limit is not used.
 ///
 /// - Throws: `CancellationError` when the calling task is cancelled.
 func lookUpSTUNServer(
@@ -572,30 +574,12 @@ func lookUpSTUNServer(
   let clock = DiscoveryClock.current
   let limit = min(
     deadline ?? .infinity, clock.now() + (TestSeams.stunNameLookupLimit ?? stunNameLookupLimit))
-  // No time left: nothing is submitted, so no lookup starts after the deadline.
-  guard !clock.hasPassed(limit) else { return nil }
-  typealias Endpoint = (server: sockaddr_storage, serverLen: socklen_t)
-  // The wait ends at `limit` on the deadline's own clock, raced here rather than handed to the
-  // executor, whose timer is on Dispatch's uptime clock and stands still while the Mac sleeps.
-  let found = try await withThrowingTaskGroup(of: Endpoint?.self) { group -> Endpoint? in
-    group.addTask {
-      try await runDetachedBlockingIO {
-        guard !clock.hasPassed(limit) else { return nil }
-        let endpoint = resolve(server.host, server.port, family)
-        // A lookup that returns after its limit is not used, whichever side of the race wins.
-        return clock.hasPassed(limit) ? nil : endpoint
-      }
-    }
-    group.addTask {
-      await clock.sleep(until: limit)
-      return nil
-    }
-    // The first to finish decides; the other is cancelled, which withdraws a queued lookup.
-    defer { group.cancelAll() }
-    return try await group.next() ?? nil
+  // Raced on the deadline's own clock, not the executor's timer, which is on Dispatch's uptime
+  // clock and stands still while the Mac sleeps.
+  let found = try await awaitBlockingLookup(until: limit, clock: clock) {
+    resolve(server.host, server.port, family)
   }
-  try Task.checkCancellation()
-  return found
+  return found ?? nil
 }
 
 /// One server's attempt in a sweep: its name resolved (a numeric address needs no lookup), then

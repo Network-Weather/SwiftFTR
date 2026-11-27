@@ -129,96 +129,75 @@ internal func makeProbeSocketNonBlocking(sockfd: Int32) -> String? {
   }
 }
 
-/// Dual-stack host resolver shared across `ping()`, `trace()`, and friends.
+/// Dual-stack host resolver shared across `ping()`, `trace()`, and friends, synchronously: the
+/// inline answers of ``inlineResolution(host:prefer:)``, otherwise ``blockingResolution(host:prefer:substitute:)``
+/// with the task's `TestSeams.resolveHost`. Operations resolve through
+/// ``resolveDestination(_:prefer:until:clock:handle:)``, which runs the blocking branch in an
+/// executor slot.
 ///
 /// Honors `PreferredFamily`:
-/// - `.auto`: literal IPs are dispatched by `detectAddressFamily`; hostnames use
-///   `getaddrinfo(AF_UNSPEC)` and take the first answer. Darwin's `getaddrinfo`
-///   returns addresses in RFC 6724 source/destination ordering, so the first
-///   answer is the system-preferred address for an outgoing connection from this
-///   host — not an arbitrary one. On a dual-stack host this typically means v6
-///   first when a routable v6 path exists, v4 otherwise.
+/// - `.auto`: hostnames and most literals use `getaddrinfo(AF_UNSPEC)` and take the first answer.
+///   Darwin's `getaddrinfo` returns addresses in RFC 6724 source/destination ordering, so the
+///   first answer is the system-preferred address for an outgoing connection from this host. A
+///   literal goes through it too, so the system can synthesize an IPv6 address for an IPv4
+///   literal on a NAT64 network.
 /// - `.v4` / `.v6`: forces the family; throws `.resolutionFailed` if unavailable.
 ///
 /// The canonical printable form (`inet_ntop`) is returned in `ResolvedHost.canonical`,
 /// with link-local scope suffix preserved as `addr%ifname` (downstream contract).
-///
-/// This helper lives at file scope rather than inside a particular executor so
-/// `Ping`, `Trace`, and (eventually) the probes can share it without duplication
-/// or cross-module coupling. The full resolver-dedup across `TCPProbe.swift` /
-/// `UDPProbe.swift` is Stage 5 in `docs/IPV6.md`; this is the smaller extraction
-/// that unblocks Stage 2 traceroute.
 internal func resolveHost(host: String, prefer: PreferredFamily) throws -> ResolvedHost {
-  if let substitute = TestSeams.resolveHost { return try substitute(host, prefer) }
+  if let answer = try inlineResolution(host: host, prefer: prefer) { return answer }
+  return try blockingResolution(host: host, prefer: prefer, substitute: TestSeams.resolveHost)
+}
+
+/// The answer for `host` that needs no resolver, or `nil` when it needs one. Throws for a NUL and
+/// for a literal of the other family than a forced one.
+///
+/// Answered here: a literal of a forced family; under `.auto`, an IPv4 loopback literal, which
+/// the system never synthesizes for (Libinfo's `_gai_nat64_can_v4_address_be_synthesized`), and
+/// an IPv6 literal with no zone outside fe80::/10, fec0::/10 and ff00::/8, which `getaddrinfo`
+/// returns unchanged. A zoned or scoped IPv6 literal (`getaddrinfo` turns `fe80:1::1` into
+/// `fe80::1` with scope 1) and every other `.auto` IPv4 literal (NAT64) are left to the resolver.
+/// Never consults a test seam, so it can run on any thread.
+internal func inlineResolution(host: String, prefer: PreferredFamily) throws -> ResolvedHost? {
   // `getaddrinfo` and `inet_pton` would see only the text before a NUL and resolve that instead.
   guard !containsNUL(host) else {
     throw TracerouteError.resolutionFailed(host: host, details: "contains a NUL character")
   }
-  let detected = detectAddressFamily(host)
-
-  // Force-mode fast paths: when the caller explicitly asked for v4 or v6, skip
-  // getaddrinfo and use the literal directly. This preserves the original
-  // behavior for callers that know their family and want microsecond resolution.
-  //
-  // In `.auto` mode we always go through getaddrinfo (even for literals) so
-  // macOS's resolver can synthesize a v4-mapped v6 address for v4 literals on
-  // NAT64 networks (RFC 6147 / Apple's CLAT). On dual-stack networks the
-  // resolver returns the v4 literal unchanged; on v6-only NAT64 networks it
-  // returns the synthesized v6 address and the trace/probe goes via v6
-  // transparently — no caller code changes required. The extra getaddrinfo
-  // call costs ~tens of microseconds; the NAT64 transparency it buys is worth
-  // it (matches Apple's own guidance for IPv6-compatible apps).
-  if prefer == .v4 && detected == AF_INET {
-    var sin = sockaddr_in()
-    sin.sin_family = sa_family_t(AF_INET)
-    sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    _ = inet_pton(AF_INET, host, &sin.sin_addr)
-    var storage = sockaddr_storage()
-    _ = withUnsafePointer(to: &sin) { src in
-      withUnsafeMutablePointer(to: &storage) { dst in
-        memcpy(dst, src, MemoryLayout<sockaddr_in>.size)
-      }
-    }
-    return ResolvedHost(
-      family: AF_INET, address: storage,
-      addressLen: socklen_t(MemoryLayout<sockaddr_in>.size), canonical: ipString(sin))
-  }
-  if prefer == .v6 && detected == AF_INET6 {
-    let (bare, scopeID) = parseIPv6Scoped(host)
-    var sin6 = sockaddr_in6()
-    sin6.sin6_family = sa_family_t(AF_INET6)
-    sin6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
-    sin6.sin6_scope_id = scopeID
-    _ = inet_pton(AF_INET6, bare, &sin6.sin6_addr)
-    var storage = sockaddr_storage()
-    _ = withUnsafePointer(to: &sin6) { src in
-      withUnsafeMutablePointer(to: &storage) { dst in
-        memcpy(dst, src, MemoryLayout<sockaddr_in6>.size)
-      }
-    }
-    return ResolvedHost(
-      family: AF_INET6, address: storage,
-      addressLen: socklen_t(MemoryLayout<sockaddr_in6>.size),
-      canonical: ipv6String(sin6.sin6_addr, scopeID: scopeID))
-  }
-  // Mismatched literal vs preferred family throws.
-  if prefer == .v4 && detected == AF_INET6 {
+  switch (prefer, detectAddressFamily(host)) {
+  case (.v4, AF_INET): return ipv4Literal(host)
+  case (.v6, AF_INET6): return ipv6Literal(host)
+  case (.v4, AF_INET6):
     throw TracerouteError.resolutionFailed(
       host: host, details: "Preferred family v4 but literal is v6")
-  }
-  if prefer == .v6 && detected == AF_INET {
+  case (.v6, AF_INET):
     throw TracerouteError.resolutionFailed(
       host: host, details: "Preferred family v6 but literal is v4")
+  case (.auto, AF_INET):
+    var addr = in_addr()
+    _ = inet_pton(AF_INET, host, &addr)
+    return UInt32(bigEndian: addr.s_addr) >> 24 == 127 ? ipv4Literal(host) : nil
+  case (.auto, AF_INET6):
+    var addr = in6_addr()
+    guard !host.contains("%"), inet_pton(AF_INET6, host, &addr) == 1 else { return nil }
+    let (first, second) = (addr.__u6_addr.__u6_addr8.0, addr.__u6_addr.__u6_addr8.1)
+    let scoped = first == 0xFF || (first == 0xFE && second & 0x80 == 0x80)
+    return scoped ? nil : ipv6Literal(host)
+  default:
+    return nil
   }
+}
 
-  // `.auto` mode (and any hostname path) — let getaddrinfo handle everything,
-  // including NAT64 synthesis for v4 literals on v6-only networks. The
-  // `AI_V4MAPPED | AI_ADDRCONFIG | AI_DEFAULT` flag set tells Darwin's resolver
-  // to synthesize a v4-mapped v6 address when only v6 is configured locally.
+/// The resolver branch for `host`: `substitute` when a test supplies one, otherwise
+/// `getaddrinfo`. Blocks for as long as the system resolver takes, so it runs in an executor slot.
+internal func blockingResolution(
+  host: String, prefer: PreferredFamily, substitute: TestSeams.ResolveHost?
+) throws -> ResolvedHost {
+  if let substitute { return try substitute(host, prefer) }
+  // `AI_V4MAPPED | AI_ADDRCONFIG` (`AI_DEFAULT`, not exposed in every Swift overlay) lets Darwin
+  // synthesize an IPv6 address for an IPv4 literal when only IPv6 is configured (NAT64).
   var hints = addrinfo()
   hints.ai_socktype = SOCK_DGRAM
-  // AI_DEFAULT == AI_V4MAPPED | AI_ADDRCONFIG. Hardcoded numeric form below
-  // because AI_DEFAULT isn't exposed in all Swift overlay versions.
   hints.ai_flags = AI_V4MAPPED | AI_ADDRCONFIG
   switch prefer {
   case .v4: hints.ai_family = AF_INET
@@ -262,4 +241,72 @@ internal func resolveHost(host: String, prefer: PreferredFamily) throws -> Resol
   }
   throw TracerouteError.resolutionFailed(
     host: host, details: "No matching address for preferred family")
+}
+
+/// How long a trace or ping waits for its destination to resolve (docs/BLOCKING-IO.md, decision 7).
+let forwardResolutionLimit: TimeInterval = 20
+
+/// Resolves `host` for an operation: inline when ``inlineResolution(host:prefer:)`` answers,
+/// otherwise in an executor slot, a literal on the Literal Lane (``literalLookupExecutor``) and a
+/// name on the main executor, so stalled name lookups cannot hold back a numeric destination.
+///
+/// The wait ends at `deadline` on `clock` with `resolutionFailed(details: "timed out")`, and at
+/// once when the calling task is cancelled (`CancellationError`) or `handle` is (its reason's
+/// error); a `getaddrinfo` already running finishes in its slot. The seam and the executor are
+/// read here, on the async side.
+internal func resolveDestination(
+  _ host: String, prefer: PreferredFamily, until deadline: TimeInterval, clock: DiscoveryClock,
+  handle: TraceHandle? = nil
+) async throws -> ResolvedHost {
+  if let answer = try inlineResolution(host: host, prefer: prefer) { return answer }
+  let substitute = TestSeams.resolveHost
+  let lane =
+    detectAddressFamily(host) == -1
+    ? nil : (TestSeams.literalLookupExecutor ?? literalLookupExecutor)
+  let found = try await withTraceCancellation(handle: handle) {
+    try await awaitBlockingLookup(until: deadline, clock: clock, on: lane) {
+      try blockingResolution(host: host, prefer: prefer, substitute: substitute)
+    }
+  }
+  guard let found else {
+    throw TracerouteError.resolutionFailed(host: host, details: "timed out")
+  }
+  return found
+}
+
+/// A literal of IPv4, parsed without the resolver. `host` must be one (``detectAddressFamily(_:)``).
+private func ipv4Literal(_ host: String) -> ResolvedHost {
+  var sin = sockaddr_in()
+  sin.sin_family = sa_family_t(AF_INET)
+  sin.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+  _ = inet_pton(AF_INET, host, &sin.sin_addr)
+  var storage = sockaddr_storage()
+  _ = withUnsafePointer(to: &sin) { src in
+    withUnsafeMutablePointer(to: &storage) { dst in
+      memcpy(dst, src, MemoryLayout<sockaddr_in>.size)
+    }
+  }
+  return ResolvedHost(
+    family: AF_INET, address: storage,
+    addressLen: socklen_t(MemoryLayout<sockaddr_in>.size), canonical: ipString(sin))
+}
+
+/// A literal of IPv6, with its `%zone` as the scope, parsed without the resolver.
+private func ipv6Literal(_ host: String) -> ResolvedHost {
+  let (bare, scopeID) = parseIPv6Scoped(host)
+  var sin6 = sockaddr_in6()
+  sin6.sin6_family = sa_family_t(AF_INET6)
+  sin6.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+  sin6.sin6_scope_id = scopeID
+  _ = inet_pton(AF_INET6, bare, &sin6.sin6_addr)
+  var storage = sockaddr_storage()
+  _ = withUnsafePointer(to: &sin6) { src in
+    withUnsafeMutablePointer(to: &storage) { dst in
+      memcpy(dst, src, MemoryLayout<sockaddr_in6>.size)
+    }
+  }
+  return ResolvedHost(
+    family: AF_INET6, address: storage,
+    addressLen: socklen_t(MemoryLayout<sockaddr_in6>.size),
+    canonical: ipv6String(sin6.sin6_addr, scopeID: scopeID))
 }

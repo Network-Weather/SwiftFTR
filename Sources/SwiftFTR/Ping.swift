@@ -220,8 +220,12 @@ struct PingExecutor: Sendable {
     try config.validateForOperation()
     try Task.checkCancellation()
 
-    // 1. Resolve target, honoring PreferredFamily.
-    let resolved = try resolveHost(host: target, prefer: config.preferredFamily)
+    // 1. Resolve target, honoring PreferredFamily, off this thread, within the tracer's
+    // forward-resolution budget; `config.timeout` is the reply window and is not spent here.
+    let clock = DiscoveryClock.current
+    let resolved = try await resolveDestination(
+      target, prefer: config.preferredFamily, until: clock.now() + forwardResolutionLimit,
+      clock: clock)
     try Task.checkCancellation()
 
     // 2. Create datagram ICMP socket for the resolved family.
