@@ -219,8 +219,10 @@ struct ResolutionOffActorTests {
           found.append("\(host): inline \(mine.canonical) vs getaddrinfo \(system.canonical)")
         }
       }
-      for host in resolver where try inlineResolution(host: host, prefer: .auto) != nil {
-        found.append("\(host): answered inline")
+      for host in resolver {
+        if try inlineResolution(host: host, prefer: .auto) != nil {
+          found.append("\(host): answered inline")
+        }
       }
       return found
     }
