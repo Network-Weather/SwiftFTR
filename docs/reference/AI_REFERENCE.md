@@ -132,6 +132,7 @@ public struct SwiftFTRConfig: Sendable {
     public let asnResolverStrategy: ASNResolverStrategy  // default .hybrid(.embedded)
     public let preferredFamily: PreferredFamily   // default .auto
     public let publicIPResolver: PublicIPResolverStrategy  // default .library
+    public let resolutionTimeout: TimeInterval    // default 20 s; destination lookup wait for traces, ping, discoverPaths
 
     public init(
         maxHops: Int = 40,
@@ -151,6 +152,8 @@ public struct SwiftFTRConfig: Sendable {
     )
     // The same parameters plus `publicIPResolver: PublicIPResolverStrategy = .library`.
     public init(maxHops:...preferredFamily:publicIPResolver:)
+    // The same plus `resolutionTimeout: TimeInterval = SwiftFTRConfig.defaultResolutionTimeout`.
+    public init(maxHops:...publicIPResolver:resolutionTimeout:)
 }
 
 public enum PublicIPResolverStrategy: Sendable {
@@ -177,8 +180,8 @@ public struct PublicIPObservation: Sendable, Hashable, Codable {
 
 Arguments must be passed in declaration order. Values are validated when an operation starts:
 `maxHops` outside 1...255, `maxWaitMs` below 1, `payloadSize` outside 0...65507, a negative or
-non-finite `rdnsCacheTTL`, a negative `rdnsCacheSize`, or a non-positive hybrid `fallbackTimeout`
-throws `TracerouteError.invalidConfiguration(reason:)`. The two enrichment budgets never throw: a
+non-finite `rdnsCacheTTL`, a negative `rdnsCacheSize`, a non-positive hybrid `fallbackTimeout`, or
+a `resolutionTimeout` that is not finite and in (0, Int32.max] (checked by `ping` too) throws `TracerouteError.invalidConfiguration(reason:)`. The two enrichment budgets never throw: a
 `rdnsLookupTimeout` or `publicIPDiscoveryTimeout` that is zero, negative, non-finite or out of
 range is replaced by its default (5 s and 6 s respectively). A `publicIP` that is not a globally
 routable address is not used, and it answers only traces of its own family. `interface`, `sourceIP`
@@ -213,7 +216,7 @@ synthesizes an IPv6 address for an IPv4 literal, so tracing `1.1.1.1` can probe,
 returns unchanged, are answered without it.
 
 Resolution runs in an executor slot, never on the tracer or a cooperative thread. Traces and ping
-wait at most 20 s for it (`resolutionFailed`, details `"timed out"`); `tcpProbe` and `udpProbe`
+wait at most `resolutionTimeout` (20 s by default) for it (`resolutionFailed`, details `"timed out"`); `tcpProbe` and `udpProbe`
 spend their `timeout` on resolution and the probe together. Cancellation, `cancelActiveTraces()`
 and `networkChanged()` release a caller waiting on it at once.
 

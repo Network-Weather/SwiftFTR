@@ -218,13 +218,14 @@ struct PingExecutor: Sendable {
   /// instance never share identifier/sequence space (downstream contract).
   func ping(to target: String, config: PingConfig) async throws -> PingResult {
     try config.validateForOperation()
+    try swiftFTRConfig.validateResolutionTimeout()
     try Task.checkCancellation()
 
     // 1. Resolve target, honoring PreferredFamily, off this thread, within the tracer's
     // forward-resolution budget; `config.timeout` is the reply window and is not spent here.
     let clock = DiscoveryClock.current
     let resolved = try await resolveDestination(
-      target, prefer: config.preferredFamily, until: clock.now() + forwardResolutionLimit,
+      target, prefer: config.preferredFamily, until: clock.now() + swiftFTRConfig.resolutionTimeout,
       clock: clock)
     try Task.checkCancellation()
 
