@@ -69,6 +69,8 @@ struct DeadlinePrepTests {
       return
     }
     #expect(value == 7)
+    // The race resumes its caller before it stops the wake-up, so the stop is waited for.
+    #expect(await eventually(within: 20) { staging.stopped.value == 1 })
     #expect(staging.armed.value == 1 && staging.stopped.value == 1)
   }
 
@@ -99,6 +101,8 @@ struct DeadlinePrepTests {
       Issue.record("expected expiry, got \(outcome)")
       return
     }
+    // The race resumes its caller before it stops the wake-up, so the stop is waited for.
+    #expect(await eventually(within: 20) { staging.stopped.value == 1 })
     #expect(staging.armed.value == 1 && staging.stopped.value == 1)
     #expect(await eventually(within: 20) { workCancelled.value == 1 })
   }
@@ -132,6 +136,8 @@ struct DeadlinePrepTests {
       Issue.record("expected expiry, got \(outcome)")
       return
     }
+    // The race resumes its caller before it stops the wake-up, so the stop is waited for.
+    #expect(await eventually(within: 20) { staging.stopped.value == 1 })
     #expect(staging.armed.value == 1 && staging.stopped.value == 1)
   }
 
@@ -157,6 +163,8 @@ struct DeadlinePrepTests {
     race.cancel()
     let (result, _) = try await measure(within: 20) { await resultOf { try await race.value } }
     #expect(throws: CancellationError.self) { try result.get() }
+    // The race resumes its caller before it stops the wake-up, so the stop is waited for.
+    #expect(await eventually(within: 20) { staging.stopped.value == 1 })
     #expect(staging.armed.value == 1 && staging.stopped.value == 1)
   }
 
