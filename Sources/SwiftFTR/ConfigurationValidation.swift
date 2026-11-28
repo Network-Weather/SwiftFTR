@@ -57,6 +57,13 @@ extension SwiftFTRConfig {
     if case .hybrid(_, let fallbackTimeout) = asnResolverStrategy {
       try validatePositiveTimeout(fallbackTimeout, named: "ASN fallbackTimeout")
     }
+    try validateResolutionTimeout()
+  }
+
+  /// Validates ``resolutionTimeout`` alone: for `ping`, which uses only that field of its tracer's
+  /// configuration.
+  func validateResolutionTimeout() throws {
+    try validatePositiveTimeout(resolutionTimeout, named: "resolutionTimeout")
   }
 
   /// A safe cache TTL used while retaining invalid public input for operation-time validation.

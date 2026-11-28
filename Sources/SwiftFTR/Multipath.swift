@@ -111,7 +111,8 @@ extension SwiftFTRConfig {
       sourceIP: sourceIP,
       asnResolverStrategy: asnResolverStrategy,
       preferredFamily: .v4,
-      publicIPResolver: publicIPResolver
+      publicIPResolver: publicIPResolver,
+      resolutionTimeout: resolutionTimeout
     )
   }
 }
@@ -641,21 +642,28 @@ extension SwiftFTR {
 
     let outcome: Result<NetworkTopology, Error>
     do {
-      // One question for the whole run, IPv4 by contract, before the first batch. Its answer, or
-      // its absence, is handed to every flow, so no flow asks again. It is asked on its own,
-      // before the race below, because both wait on the handle's one cancellation slot.
+      // One resolution and one question for the whole run, IPv4 by contract, before the first
+      // batch, each handed to every flow, so no flow resolves or asks again. Both run on their
+      // own, before the race below, because each waits on the handle's one cancellation slot. A
+      // name that does not resolve ends the run before the question is asked.
       try validateBeforeQuestion(target: target)
-      let asked = monotonicNow()
+      let started = monotonicNow()
+      let clock = DiscoveryClock.current
+      let destination = try await resolveDestination(
+        target, prefer: .v4, until: clock.now() + swiftConfig.resolutionTimeout, clock: clock,
+        handle: handle)
+      try handle.checkCancellation()
       let publicIP = try await publicIPObservation(for: .v4, handle: handle)
       let worker = MultipathWorkerSpawner(
         baseConfig: swiftConfig,
         rdnsCache: self.rdnsCache,
         asnResolver: self.asnResolver,
+        destination: destination,
         publicIP: publicIP
       )
       let discovery = MultipathDiscovery(
         worker: worker, config: swiftConfig, publicIP: publicIP,
-        elapsedBefore: monotonicNow() - asked)
+        elapsedBefore: monotonicNow() - started)
       outcome = .success(
         try await withThrowingTaskGroup(of: NetworkTopology?.self) { group in
           group.addTask {
@@ -689,9 +697,9 @@ extension SwiftFTR {
   }
 
   /// Rejects, before the run's public-IP question, every input a flow would reject only after it:
-  /// the interface, the source address (its form, its family, and whether this host can bind it),
-  /// and a numeric destination of the wrong family. So an unusable binding never sends discovery
-  /// traffic. A destination name that does not resolve is found only by the flows.
+  /// the interface and the source address (its form, its family, and whether this host can bind
+  /// it). So an unusable binding never sends discovery traffic. The destination, a literal of the
+  /// wrong family included, is checked by the run's one resolution, which follows.
   private func validateBeforeQuestion(target: String) throws {
     if let name = config.interface { _ = try validateInterface(name) }
     if let source = config.sourceIP {
@@ -703,8 +711,6 @@ extension SwiftFTR {
         throw TracerouteError.sourceIPBindFailed(sourceIP: source, errno: errno, details: message)
       }
     }
-    // A literal, and a NUL, is decided without a resolver under the forced family.
-    _ = try inlineResolution(host: target, prefer: .v4)
   }
 
   /// Runs flow workers that reuse caches without escaping the caller's task group.
@@ -712,6 +718,8 @@ extension SwiftFTR {
     let baseConfig: SwiftFTRConfig
     let rdnsCache: RDNSCache
     let asnResolver: ASNResolver
+    /// The parent's one resolution of the target, which every flow probes; a flow never resolves.
+    let destination: ResolvedHost
     /// The parent's public address, or `nil` when it has none; a flow never asks for one.
     let publicIP: PublicIPObservation?
 
@@ -726,6 +734,7 @@ extension SwiftFTR {
       let trace = try await worker.performClassifiedTraceWithFlowID(
         to: target,
         flowIdentifier: flowID.icmpID,
+        destination: destination,
         publicIP: publicIP
       )
       try Task.checkCancellation()
@@ -752,6 +761,7 @@ extension SwiftFTR {
   fileprivate func performClassifiedTraceWithFlowID(
     to host: String,
     flowIdentifier: UInt16,
+    destination: ResolvedHost,
     publicIP observation: PublicIPObservation?
   ) async throws -> ClassifiedTrace {
     try config.validateForOperation()
@@ -771,7 +781,8 @@ extension SwiftFTR {
 
     // Perform base trace with flow ID
     let tr = try await withTaskCancellationHandler {
-      try await performTrace(to: host, handle: handle, flowIdentifier: flowIdentifier)
+      try await performTrace(
+        to: host, resolved: destination, handle: handle, flowIdentifier: flowIdentifier)
     } onCancel: {
       handle.cancel(for: .callerTask)
     }

@@ -243,9 +243,6 @@ internal func blockingResolution(
     host: host, details: "No matching address for preferred family")
 }
 
-/// How long a trace or ping waits for its destination to resolve (docs/BLOCKING-IO.md, decision 7).
-let forwardResolutionLimit: TimeInterval = 20
-
 /// Whether `host` is numeric to the system resolver, so its lookup takes the Literal Lane. Wider
 /// than a literal the library parses: the resolver also takes IPv4 shorthand ("127.1"), which
 /// `inet_aton` recognizes and `inet_pton` does not. `inet_aton` stops at whitespace and accepts

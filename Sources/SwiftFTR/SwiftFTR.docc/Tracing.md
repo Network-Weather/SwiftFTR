@@ -55,8 +55,9 @@ for hop in classified.hops {
   address gets at most one second) and
   ``SwiftFTR/SwiftFTRConfig/publicIPDiscoveryTimeout`` bounds the one public-IP question a
   classified trace asks, after its probes. Hops whose lookups run out of time report numerically, and
-  classification proceeds without a public address. Resolving a hostname destination is not
-  bounded by either setting.
+  classification proceeds without a public address. Resolving a hostname destination is
+  bounded by ``SwiftFTR/SwiftFTRConfig/resolutionTimeout`` (20 s by default), which a
+  `discoverPaths` run spends once for all its flows.
 - Set ``SwiftFTR/SwiftFTRConfig/publicIP`` to use a known public address and bypass discovery for
   classified-trace enrichment of its address family, or
   ``SwiftFTR/SwiftFTRConfig/publicIPResolver`` to answer the question with your own

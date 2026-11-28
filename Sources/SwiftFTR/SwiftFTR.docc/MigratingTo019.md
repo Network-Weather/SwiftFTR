@@ -752,7 +752,8 @@ let asns = try await resolver.resolve(ipv4Addrs: ips, timeout: 0.1)
 **What changed.** A destination name is resolved in an executor slot rather than on the tracer
 actor (`trace`, `traceClassified`, `traceStream`, multipath flows) or a cooperative thread
 (`ping`, `tcpProbe`, `udpProbe`). The wait ends 20 s after a trace or ping starts resolving, and
-`config.timeout` after a probe starts; a probe's connect or receive window is what resolution
+`config.timeout` after a probe starts (traces and ping wait ``SwiftFTR/SwiftFTRConfig/resolutionTimeout``,
+20 s by default); a probe's connect or receive window is what resolution
 left. Forced-family literals, IPv4 loopback and unscoped IPv6 literals are answered without a
 lookup; other `.auto` literals use a slot of their own, so stalled name lookups cannot delay them.
 Which address is probed does not change.
@@ -773,4 +774,23 @@ Which address is probed does not change.
 
 **What to change.** Nothing. A probe that resolves a slow name and needs its full connect or
 receive window raises `timeout` by the time resolution takes.
+
+## A multipath run resolves its target once, before its public-IP question
+
+**What changed.** `discoverPaths` resolves its target once, as IPv4, within
+``SwiftFTR/SwiftFTRConfig/resolutionTimeout``, before it asks for the public address, and gives
+that address to every flow. In 0.18 each flow resolved the name for itself.
+
+**What a caller sees.**
+
+- Every path in a ``NetworkTopology`` was probed at one address. A name with rotating records could
+  give flows different addresses in 0.18, so paths to different hosts were compared as one
+  destination's. Each path's `destinationHost` is still the name the caller passed.
+- A name that does not resolve fails the run with `TracerouteError.resolutionFailed` before the
+  public-IP question: no STUN traffic is sent, a custom ``SwiftFTR/PublicIPResolver`` is not asked,
+  and nothing is cached.
+- ``NetworkTopology/discoveryDuration`` includes the lookup.
+
+**What to change.** Nothing, unless code relied on flows reaching different addresses of a
+rotating name: run `discoverPaths` once per address instead, passing each as a literal.
 

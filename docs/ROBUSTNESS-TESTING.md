@@ -70,7 +70,7 @@ the remaining tests with the library fixes they motivated. All of it is below.
 
 | Phase | Conditions | Operations | Tests |
 |---|---|---|---|
-| Forward resolution | fails (the injected error is checked, so a call that went around the seam fails); stalls; outlives its deadline; is cancelled while running or queued; every executor slot held | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe | `ProbeWindow`, `ResolutionOffActor` |
+| Forward resolution | fails (the injected error is checked, so a call that went around the seam fails); stalls; outlives its deadline; is cancelled while running or queued; every executor slot held | trace, traceClassified, traceStream, ping, tcpProbe, udpProbe, discoverPaths | `ProbeWindow`, `ResolutionOffActor`, `ResolutionBudget` |
 | Probe socket | creation fails the way `socket(2)` does; every send fails with a non-transient errno | trace, traceClassified, traceStream, ping | `ProbeWindow` |
 | Probe socket (ping) | every send fails: nothing is counted as sent, and the ping does not wait out a reply window | ping | `ProbeWindow` |
 | Probe window | no replies; late replies; truncated, garbage and seeded-random ICMPv4/ICMPv6 ahead of valid replies, which are still processed; another identifier; unreachable; a silent stream that must wait out its window and send its retries | trace, traceStream, ping | `ProbeWindow` |

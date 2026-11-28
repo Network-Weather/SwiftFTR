@@ -225,6 +225,10 @@ public struct SwiftFTRConfig: Sendable {
   /// resolvers.
   public static let defaultRDNSLookupTimeout: TimeInterval = 5.0
 
+  /// Default ``resolutionTimeout``, in seconds: how long the system resolver itself waits has not
+  /// been measured, so this is a judgement (docs/BLOCKING-IO.md, decision 7).
+  public static let defaultResolutionTimeout: TimeInterval = 20
+
   /// Maximum TTL/hops to probe (default: 40)
   public let maxHops: Int
   /// Maximum wait time per probe in milliseconds (default: 1000ms)
@@ -342,6 +346,15 @@ public struct SwiftFTRConfig: Sendable {
   /// ``PublicIPResolverStrategy/library``.
   public let publicIPResolver: PublicIPResolverStrategy
 
+  /// How long `trace`, `traceClassified`, `traceStream`, `ping` and `discoverPaths` wait for their
+  /// destination to resolve, in seconds (default: ``defaultResolutionTimeout``). The lookup runs
+  /// in an executor slot; when the wait ends first the operation throws
+  /// ``TracerouteError/resolutionFailed(host:details:)`` with details `"timed out"`, and a
+  /// `getaddrinfo` already running finishes on its own. Must be finite and in (0, `Int32.max`]:
+  /// any other value makes those operations throw ``TracerouteError/invalidConfiguration(reason:)``
+  /// before they resolve anything. `tcpProbe` and `udpProbe` spend their own `timeout` instead.
+  public let resolutionTimeout: TimeInterval
+
   /// Creates a new SwiftFTR configuration.
   ///
   /// - Parameters:
@@ -385,7 +398,8 @@ public struct SwiftFTRConfig: Sendable {
       rdnsCacheSize: rdnsCacheSize, rdnsLookupTimeout: rdnsLookupTimeout,
       publicIPDiscoveryTimeout: publicIPDiscoveryTimeout, interface: interface,
       sourceIP: sourceIP, asnResolverStrategy: asnResolverStrategy,
-      preferredFamily: preferredFamily, publicIPResolver: .library)
+      preferredFamily: preferredFamily, publicIPResolver: .library,
+      resolutionTimeout: SwiftFTRConfig.defaultResolutionTimeout)
   }
 
   /// Creates a new SwiftFTR configuration: the parameters of the initializer above, plus
@@ -408,6 +422,37 @@ public struct SwiftFTRConfig: Sendable {
     preferredFamily: PreferredFamily = .auto,
     publicIPResolver: PublicIPResolverStrategy = .library
   ) {
+    self.init(
+      maxHops: maxHops, maxWaitMs: maxWaitMs, payloadSize: payloadSize, publicIP: publicIP,
+      enableLogging: enableLogging, noReverseDNS: noReverseDNS, rdnsCacheTTL: rdnsCacheTTL,
+      rdnsCacheSize: rdnsCacheSize, rdnsLookupTimeout: rdnsLookupTimeout,
+      publicIPDiscoveryTimeout: publicIPDiscoveryTimeout, interface: interface,
+      sourceIP: sourceIP, asnResolverStrategy: asnResolverStrategy,
+      preferredFamily: preferredFamily, publicIPResolver: publicIPResolver,
+      resolutionTimeout: SwiftFTRConfig.defaultResolutionTimeout)
+  }
+
+  /// Creates a new SwiftFTR configuration: the parameters of the initializer above, plus
+  /// `resolutionTimeout`, how long an operation waits for its destination to resolve (default:
+  /// ``defaultResolutionTimeout``).
+  public init(
+    maxHops: Int = 40,
+    maxWaitMs: Int = 1000,
+    payloadSize: Int = 56,
+    publicIP: String? = nil,
+    enableLogging: Bool = false,
+    noReverseDNS: Bool = false,
+    rdnsCacheTTL: TimeInterval? = nil,
+    rdnsCacheSize: Int? = nil,
+    rdnsLookupTimeout: TimeInterval? = nil,
+    publicIPDiscoveryTimeout: TimeInterval? = nil,
+    interface: String? = nil,
+    sourceIP: String? = nil,
+    asnResolverStrategy: ASNResolverStrategy = .hybrid(.embedded),
+    preferredFamily: PreferredFamily = .auto,
+    publicIPResolver: PublicIPResolverStrategy = .library,
+    resolutionTimeout: TimeInterval = SwiftFTRConfig.defaultResolutionTimeout
+  ) {
     self.maxHops = maxHops
     self.maxWaitMs = maxWaitMs
     self.payloadSize = payloadSize
@@ -423,6 +468,7 @@ public struct SwiftFTRConfig: Sendable {
     self.asnResolverStrategy = asnResolverStrategy
     self.preferredFamily = preferredFamily
     self.publicIPResolver = publicIPResolver
+    self.resolutionTimeout = resolutionTimeout
   }
 }
 
@@ -816,13 +862,13 @@ public actor SwiftFTR {
   }
 
   /// `host` resolved for this tracer's preferred family, waiting at most
-  /// ``forwardResolutionLimit`` and no longer than `handle` and the calling task allow.
+  /// ``SwiftFTRConfig/resolutionTimeout`` and no longer than `handle` and the calling task allow.
   private func resolveTraceDestination(_ host: String, handle: TraceHandle) async throws
     -> ResolvedHost
   {
     let clock = DiscoveryClock.current
     return try await resolveDestination(
-      host, prefer: config.preferredFamily, until: clock.now() + forwardResolutionLimit,
+      host, prefer: config.preferredFamily, until: clock.now() + config.resolutionTimeout,
       clock: clock, handle: handle)
   }
 
@@ -848,8 +894,11 @@ public actor SwiftFTR {
   }
 
   // Internal implementation of trace with cancellation support
+  /// `resolved`, when given, is the destination already resolved for `host` (a multipath flow's,
+  /// from its parent); `host` is still what the result reports.
   internal func performTrace(
     to host: String,
+    resolved given: ResolvedHost? = nil,
     handle: TraceHandle,
     flowIdentifier: UInt16? = nil,
     maxHopsOverride: Int? = nil
@@ -881,7 +930,12 @@ public actor SwiftFTR {
     }
     // Resolve host (dual-stack, honors config.preferredFamily), off this actor, then hand off to
     // probing only if nothing has cancelled the trace meanwhile.
-    let resolved = try await resolveTraceDestination(host, handle: handle)
+    let resolved: ResolvedHost
+    if let given {
+      resolved = given
+    } else {
+      resolved = try await resolveTraceDestination(host, handle: handle)
+    }
     try handle.checkCancellation()
     if config.enableLogging {
       let famName = resolved.family == AF_INET6 ? "v6" : "v4"
