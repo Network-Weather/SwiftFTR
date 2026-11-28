@@ -176,9 +176,9 @@ func askWithinDeadline(_ resolver: any PublicIPResolver, _ request: PublicIPRequ
   let deadline = request.deadline
   // Nothing is started for a caller already cancelled.
   try Task.checkCancellation()
-  let race = DeadlineRace(deadline: deadline)
+  let race = DeadlineRace<PublicIPObservation?>(hasPassed: { ContinuousClock.now >= deadline })
   let arm = TestSeams.armPublicIPDeadline ?? sleepUntilDeadline
-  return try await withTaskCancellationHandler {
+  let outcome = try await withTaskCancellationHandler {
     try await withCheckedThrowingContinuation { continuation in
       race.attach(continuation)
       let ask = Task {
@@ -197,6 +197,8 @@ func askWithinDeadline(_ resolver: any PublicIPResolver, _ request: PublicIPRequ
   } onCancel: {
     race.commit(.cancellation)
   }
+  guard case .completed(let answer) = outcome else { return nil }
+  return answer
 }
 
 /// The default wake-up for ``askWithinDeadline(_:_:)``: a task sleeping until `deadline`.
@@ -213,26 +215,36 @@ func askWithinDeadline(_ resolver: any PublicIPResolver, _ request: PublicIPRequ
   return { timer.cancel() }
 }
 
-/// The race behind ``askWithinDeadline(_:_:)``: resumes one continuation with the first outcome
-/// committed, from any thread and in any order, then runs the cleanup once.
-final class DeadlineRace: @unchecked Sendable {
+/// How a wait raced against a deadline ended, when it was not cancelled: with the work's value,
+/// committed in time, or at the deadline. Distinct from any value, so a legitimate `nil` is not
+/// mistaken for expiry.
+enum DeadlineOutcome<Value: Sendable>: Sendable {
+  case completed(Value)
+  case expired
+}
+
+/// The race behind ``askWithinDeadline(_:_:)`` and ``raceDeadline(until:arm:_:)``: resumes one
+/// continuation with the first outcome committed, from any thread and in any order, then runs the
+/// cleanup once.
+final class DeadlineRace<Value: Sendable>: @unchecked Sendable {
   enum Event {
-    case answer(Result<PublicIPObservation?, Error>)
+    case answer(Result<Value, Error>)
     case wake
     case cancellation
   }
 
-  private let deadline: ContinuousClock.Instant
+  private let hasPassed: @Sendable () -> Bool
   private let lock = NSLock()
-  private var continuation: CheckedContinuation<PublicIPObservation?, Error>?
-  private var outcome: Result<PublicIPObservation?, Error>?
+  private var continuation: CheckedContinuation<DeadlineOutcome<Value>, Error>?
+  private var outcome: Result<DeadlineOutcome<Value>, Error>?
   private var cleanup: (@Sendable () -> Void)?
 
-  init(deadline: ContinuousClock.Instant) {
-    self.deadline = deadline
+  /// - Parameter hasPassed: Whether the deadline has passed, read under the race's lock.
+  init(hasPassed: @escaping @Sendable () -> Bool) {
+    self.hasPassed = hasPassed
   }
 
-  func attach(_ newContinuation: CheckedContinuation<PublicIPObservation?, Error>) {
+  func attach(_ newContinuation: CheckedContinuation<DeadlineOutcome<Value>, Error>) {
     lock.lock()
     guard let outcome else {
       continuation = newContinuation
@@ -244,15 +256,17 @@ final class DeadlineRace: @unchecked Sendable {
   }
 
   /// The one place an outcome is committed: the first committed is delivered. The clock is read
-  /// here, under the lock, for every event but cancellation (see ``askWithinDeadline(_:_:)``).
+  /// here, under the lock, for every event but cancellation, so an answer committed once the
+  /// deadline has passed is expiry, however late the wake-up runs; a wake-up that runs early
+  /// commits nothing.
   func commit(_ event: Event) {
     lock.lock()
     guard outcome == nil else {
       lock.unlock()
       return
     }
-    let passed = ContinuousClock.now >= deadline
-    let decided: Result<PublicIPObservation?, Error>
+    let passed = hasPassed()
+    let decided: Result<DeadlineOutcome<Value>, Error>
     switch event {
     case .cancellation:
       decided = .failure(CancellationError())
@@ -261,9 +275,9 @@ final class DeadlineRace: @unchecked Sendable {
         lock.unlock()
         return
       }
-      decided = .success(nil)
+      decided = .success(.expired)
     case .answer(let answer):
-      decided = passed ? .success(nil) : answer
+      decided = passed ? .success(.expired) : answer.map { .completed($0) }
     }
     outcome = decided
     let waiting = continuation

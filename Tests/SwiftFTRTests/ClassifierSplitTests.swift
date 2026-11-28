@@ -163,4 +163,20 @@ struct ClassifierSplitTests {
     let observed = Self.digest(result) + " || " + resolver.record
     #expect(observed == c.expected)
   }
+
+  /// The split parts, composed by hand as the trace will compose them, give the same output and
+  /// ask the same addresses; a lookup that throws is a `nil` map, as `try?` makes it.
+  @Test("The lookup addresses and categorization give the recorded output", arguments: cases)
+  func splitPartsMatchRecording(_ c: Case) async throws {
+    let classifier = TraceClassifier()
+    let trace = Self.trace(c)
+    let resolver = RecordingASNResolver(c.mapping, fails: c.fails)
+    let addresses = classifier.asnLookupAddresses(
+      trace: trace, destinationIP: c.destination, publicIP: c.publicIP)
+    let asnMap = try? await resolver.resolve(ipv4Addrs: addresses, timeout: 1.5)
+    let result = classifier.categorize(
+      trace: trace, destinationIP: c.destination, asnMap: asnMap, publicIP: c.publicIP,
+      vpnContext: c.vpn)
+    #expect(Self.digest(result) + " || " + resolver.record == c.expected)
+  }
 }
