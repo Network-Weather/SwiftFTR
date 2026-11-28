@@ -164,7 +164,12 @@ actor RDNSCache {
   /// A lookup that belongs to work admitted before a reset (a batch's later addresses) asks
   /// nothing after it: its addresses are the old network's, and their timeouts are not evidence
   /// about the new one.
-  func lookup(_ ip: String, admittedBy admission: Admission) async -> String? {
+  ///
+  /// Past `deadline`, only a cached answer is returned: nothing is joined or started. That check
+  /// and the start of a query are one step on this actor, so no query starts after the instant.
+  func lookup(_ ip: String, admittedBy admission: Admission, until deadline: TraceDeadline? = nil)
+    async -> String?
+  {
     // A caller cancelled already, or admitted before a reset, starts nothing and joins nothing.
     guard !Task.isCancelled, admission.withLock({ $0 }),
       let question = ReverseDNSQuestion(address: ip)
@@ -175,6 +180,7 @@ actor RDNSCache {
     if let entry = cache[key], now < entry.timestamp + ttl {
       return entry.hostname
     }
+    if deadline?.hasPassed == true { return nil }
 
     let task: Task<String?, Never>
     if let running = inFlight[key] {
@@ -269,6 +275,53 @@ actor RDNSCache {
     }
   }
 
+  /// ``batchLookup(_:)``, ending its wait at `deadline` with every answer its lookups gave before
+  /// the instant: `cut` is whether an address was still unanswered when the instant ended the wait.
+  /// The queries themselves run on to their own timeouts, and each outcome is applied once, as for
+  /// any other lookup. No query starts after the instant; past it, only cached answers are given.
+  /// A `nil` deadline is ``batchLookup(_:)`` exactly. A cancelled caller is released at once with
+  /// what it has.
+  func batchLookup(_ ips: [String], until deadline: TraceDeadline?) async -> (
+    names: [String: String], cut: Bool
+  ) {
+    guard let deadline else { return (await batchLookup(ips), false) }
+    let asked = Set(ips)
+    let admission = admitting
+    if deadline.hasPassed {
+      var names: [String: String] = [:]
+      for ip in asked {
+        names[ip] = await lookup(ip, admittedBy: admission, until: deadline)
+      }
+      return (names, names.count < asked.count)
+    }
+    // The answers live here rather than in the cache, which may be too small or too short-lived to
+    // hold them, and only those that arrive before the instant are kept.
+    let answers = BatchAnswers(deadline, observe: TestSeams.observeBatchAnswer)
+    let outcome = try? await raceDeadline(until: deadline) {
+      await withTaskGroup(of: Void.self) { group in
+        for ip in asked {
+          group.addTask {
+            answers.record(ip, await self.lookup(ip, admittedBy: admission, until: deadline))
+          }
+        }
+      }
+    }
+    var (names, _) = answers.snapshot
+    guard case .expired? = outcome else { return (names, false) }
+    // The instant ends the wait for missing answers; it does not discard one the cache already
+    // holds, whether it was there before the batch or arrived as the wait ended.
+    for ip in asked where names[ip] == nil { names[ip] = cachedHostname(ip) }
+    return (names, names.count < asked.count)
+  }
+
+  /// The unexpired cached answer for `ip`, read without asking anything.
+  private func cachedHostname(_ ip: String) -> String? {
+    guard let key = ReverseDNSQuestion(address: ip)?.key, let entry = cache[key],
+      now() < entry.timestamp + ttl
+    else { return nil }
+    return entry.hostname
+  }
+
   /// Forgets every query in flight and cancels it, so a request from before a reset neither
   /// goes out afterwards nor keeps a lookup slot from the new network's questions. Admission is
   /// closed first: cancelling a query frees its slot, and one still waiting must not take it.
@@ -340,5 +393,41 @@ actor RDNSCache {
     if let oldest = cache.min(by: { $0.value.timestamp < $1.value.timestamp }) {
       cache.removeValue(forKey: oldest.key)
     }
+  }
+}
+
+/// The answers one ``RDNSCache/batchLookup(_:until:)`` has gathered: each address once, and only
+/// while its deadline has not passed, so what the batch returns at the instant is what arrived
+/// before it.
+private final class BatchAnswers: @unchecked Sendable {
+  private let deadline: TraceDeadline
+  private let lock = NSLock()
+  private var names: [String: String] = [:]
+  private var answered = 0
+  private let observe: (@Sendable (String) -> Void)?
+
+  init(_ deadline: TraceDeadline, observe: (@Sendable (String) -> Void)?) {
+    self.deadline = deadline
+    self.observe = observe
+  }
+
+  /// Records that `ip`'s lookup returned `hostname` (`nil`: no name), unless the instant has passed.
+  func record(_ ip: String, _ hostname: String?) {
+    lock.lock()
+    guard !deadline.hasPassed else {
+      lock.unlock()
+      return
+    }
+    answered += 1
+    if let hostname { names[ip] = hostname }
+    lock.unlock()
+    observe?(ip)
+  }
+
+  /// The names gathered, and how many addresses' lookups returned.
+  var snapshot: (names: [String: String], answered: Int) {
+    lock.lock()
+    defer { lock.unlock() }
+    return (names, answered)
   }
 }

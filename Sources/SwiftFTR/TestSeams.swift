@@ -158,4 +158,8 @@ enum TestSeams {
   /// Awaited by a `traceStream` producer once its trace has ended, just before it unregisters and
   /// finishes the stream, so a test can order `cancelActiveTraces()` before or after that step.
   @TaskLocal static var beforeStreamCommit: (@Sendable () async -> Void)?
+
+  /// Called with each address whose answer a deadline-bounded reverse-DNS batch has kept, so a
+  /// test can pass the deadline only once an answer is in.
+  @TaskLocal static var observeBatchAnswer: (@Sendable (_ address: String) -> Void)?
 }

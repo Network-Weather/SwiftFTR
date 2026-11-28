@@ -242,20 +242,37 @@ public struct TraceClassifier: Sendable {
     publicIP: String?,
     vpnContext: VPNContext? = nil
   ) async throws -> ClassifiedTrace {
-    // Gather IPs
-    let hopIPs: [String] = trace.hops.compactMap { $0.ipAddress }
-    var allIPs = Set(hopIPs)
-    allIPs.insert(destinationIP)
-    let resolvedPublicIP: String? = publicIP
-    if let providedIP = publicIP {
-      allIPs.insert(providedIP)
-    }
+    let addresses = asnLookupAddresses(
+      trace: trace, destinationIP: destinationIP, publicIP: publicIP)
+    let asnMap = try? await resolver.resolve(ipv4Addrs: addresses, timeout: timeout)
+    return categorize(
+      trace: trace, destinationIP: destinationIP, asnMap: asnMap, publicIP: publicIP,
+      vpnContext: vpnContext)
+  }
 
-    // Lookup only globally routable addresses. Private and other non-global
-    // addresses do not have meaningful origin ASN data and must not reach a
-    // network-backed resolver.
-    let resolverIPs = Set(allIPs.compactMap(asnLookupAddress))
-    let asnMap = try? await resolver.resolve(ipv4Addrs: Array(resolverIPs), timeout: timeout)
+  /// The addresses ``classify(trace:destinationIP:resolver:timeout:publicIP:vpnContext:)`` asks
+  /// its resolver about: every hop, the destination and the public address, each once, and only
+  /// the globally routable ones. Private and other non-global addresses have no meaningful origin
+  /// ASN and must not reach a network-backed resolver.
+  func asnLookupAddresses(trace: TraceResult, destinationIP: String, publicIP: String?)
+    -> [String]
+  {
+    var allIPs = Set(trace.hops.compactMap { $0.ipAddress })
+    allIPs.insert(destinationIP)
+    if let publicIP { allIPs.insert(publicIP) }
+    return Array(Set(allIPs.compactMap(asnLookupAddress)))
+  }
+
+  /// Categories and interpolation for `trace` from the ASN answers in hand, with no lookup:
+  /// `asnMap` is `nil` when the lookup failed, which classifies as if no address had an answer.
+  func categorize(
+    trace: TraceResult,
+    destinationIP: String,
+    asnMap: [String: ASNInfo]?,
+    publicIP: String?,
+    vpnContext: VPNContext?
+  ) -> ClassifiedTrace {
+    let resolvedPublicIP: String? = publicIP
     let clientAS = resolvedPublicIP.flatMap { ip in
       asnLookupAddress(for: ip).flatMap { asnMap?[$0] }
     }
