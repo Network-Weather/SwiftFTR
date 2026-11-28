@@ -237,6 +237,26 @@ struct DeadlinePrepTests {
     #expect(await cache.inFlightCount == 1)
   }
 
+  @Test("A deadline that passes as the batch sets up still returns the answer the cache holds")
+  func cachedAnswerSurvivesExpiryDuringSetup() async throws {
+    let ptr = ScriptedPTR([Self.a: .answer("a.example")], gated: [])
+    let cache = RDNSCache(lookupDeadline: 30, resolver: ptr.resolver)
+    #expect(await cache.lookup(Self.a) == "a.example")
+    // The batch's first clock read is before the instant and every later one is past it, so the
+    // race expires without running a lookup.
+    let reads = FaultCounter()
+    let clock = DiscoveryClock(
+      now: {
+        reads.increment()
+        return reads.value == 1 ? 0 : 100
+      }, slice: 0.01)
+    let deadline = TraceDeadline(instant: 30, clock: clock)
+    let result = await cache.batchLookup([Self.a, Self.b], until: deadline)
+    #expect(result.names == [Self.a: "a.example"])
+    #expect(result.cut, "B was never answered")
+    #expect(ptr.count(Self.a) == 1 && ptr.count(Self.b) == 0, "a query started past the instant")
+  }
+
   @Test(
     "Past the deadline a lookup starts no query and joins none; a cached answer still comes back")
   func noQueryAfterDeadline() async throws {

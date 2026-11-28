@@ -306,9 +306,20 @@ actor RDNSCache {
         }
       }
     }
-    let (names, answered) = answers.snapshot
+    var (names, _) = answers.snapshot
     guard case .expired? = outcome else { return (names, false) }
-    return (names, answered < asked.count)
+    // The instant ends the wait for missing answers; it does not discard one the cache already
+    // holds, whether it was there before the batch or arrived as the wait ended.
+    for ip in asked where names[ip] == nil { names[ip] = cachedHostname(ip) }
+    return (names, names.count < asked.count)
+  }
+
+  /// The unexpired cached answer for `ip`, read without asking anything.
+  private func cachedHostname(_ ip: String) -> String? {
+    guard let key = ReverseDNSQuestion(address: ip)?.key, let entry = cache[key],
+      now() < entry.timestamp + ttl
+    else { return nil }
+    return entry.hostname
   }
 
   /// Forgets every query in flight and cancels it, so a request from before a reset neither
