@@ -31,6 +31,15 @@ struct ResolutionBudgetTests {
     }
   }
 
+  /// A clock that moves only when the test moves it, so no deadline passes on its own: a wait
+  /// bounded by the 20 s default instead of the configured budget outlives the watchdog.
+  final class ManualClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval = 1_000
+    func jump(by seconds: TimeInterval) { lock.withLock { value += seconds } }
+    var now: @Sendable () -> TimeInterval { { self.lock.withLock { self.value } } }
+  }
+
   /// A public-IP resolver that counts its questions and has no answer.
   struct CountingResolver: PublicIPResolver {
     let asked: FaultCounter
@@ -49,7 +58,7 @@ struct ResolutionBudgetTests {
     let gate = StallGate()
     defer { gate.open() }
     let entered = FaultCounter()
-    let clock = MovableClock()
+    let clock = ManualClock()
     let executor = BlockingIOExecutor(maximumConcurrentOperations: 1, name: "test.budget-reach")
     let stall: TestSeams.ResolveHost = { host, _ in
       entered.increment()
